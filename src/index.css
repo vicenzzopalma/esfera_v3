@@ -1,58 +1,70 @@
 /* ============================================================
-   Esfera v3 — Design System
-   TailwindCSS v4 + Custom Properties + Animações
+   Esfera v3 — Design System & Theme Engine
+   TailwindCSS v4 + Form Base Controls + Layout Offsets
    ============================================================ */
 
-/* ---- Google Font: Inter ---- */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
 @import "tailwindcss";
 
 /* ============================================================
-   THEME: Custom CSS classes via @theme
+   THEME CONFIGURATION
    ============================================================ */
 @theme {
-  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
 
   /* Animations */
-  --animate-fade-in: fade-in 0.3s ease-out;
-  --animate-scale-in: scale-in 0.3s ease-out;
-  --animate-shake: shake 0.6s ease-out;
-  --animate-float: float 6s ease-in-out infinite;
-  --animate-float-delayed: float-delayed 8s ease-in-out infinite;
-  --animate-pulse-slow: pulse-slow 4s ease-in-out infinite;
+  --animate-fade-in: fade-in 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-scale-in: scale-in 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-slide-down: slide-down 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-shake: shake 0.5s ease-in-out;
+  --animate-float: float 7s ease-in-out infinite;
+  --animate-float-delayed: float-delayed 9s ease-in-out infinite;
+  --animate-pulse-slow: pulse-slow 5s ease-in-out infinite;
+  --animate-glow-pulse: glow-pulse 3s ease-in-out infinite;
 
   @keyframes fade-in {
-    from { opacity: 0; transform: translateY(8px); }
+    from { opacity: 0; transform: translateY(6px); }
     to { opacity: 1; transform: translateY(0); }
   }
 
   @keyframes scale-in {
-    from { opacity: 0; transform: scale(0.95); }
+    from { opacity: 0; transform: scale(0.97); }
     to { opacity: 1; transform: scale(1); }
+  }
+
+  @keyframes slide-down {
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 
   @keyframes shake {
     0%, 100% { transform: translateX(0); }
-    10%, 50%, 90% { transform: translateX(-4px); }
-    30%, 70% { transform: translateX(4px); }
+    15%, 45%, 75% { transform: translateX(-4px); }
+    30%, 60%, 90% { transform: translateX(4px); }
   }
 
   @keyframes float {
     0%, 100% { transform: translate(0, 0) rotate(0deg); }
-    33% { transform: translate(30px, -30px) rotate(5deg); }
-    66% { transform: translate(-20px, 20px) rotate(-3deg); }
+    33% { transform: translate(25px, -25px) rotate(4deg); }
+    66% { transform: translate(-15px, 15px) rotate(-3deg); }
   }
 
   @keyframes float-delayed {
     0%, 100% { transform: translate(0, 0) rotate(0deg); }
-    33% { transform: translate(-25px, 25px) rotate(-4deg); }
-    66% { transform: translate(35px, -15px) rotate(6deg); }
+    33% { transform: translate(-20px, 20px) rotate(-4deg); }
+    66% { transform: translate(25px, -10px) rotate(5deg); }
   }
 
   @keyframes pulse-slow {
-    0%, 100% { opacity: 0.3; transform: scale(1); }
-    50% { opacity: 0.6; transform: scale(1.05); }
+    0%, 100% { opacity: 0.25; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.08); }
+  }
+
+  @keyframes glow-pulse {
+    0%, 100% { box-shadow: 0 0 15px rgba(124, 58, 237, 0.15); }
+    50% { box-shadow: 0 0 30px rgba(124, 58, 237, 0.35); }
   }
 }
 
@@ -61,15 +73,20 @@
    ============================================================ */
 :root,
 .dark {
-  --color-bg-primary: #0a0a0f;
-  --color-bg-secondary: #12121a;
-  --color-bg-card: #1a1a2e;
-  --color-bg-sidebar: #0f0f18;
-  --color-text-primary: #e2e8f0;
+  --color-bg-primary: #07080d;
+  --color-bg-secondary: #0e1017;
+  --color-bg-card: rgba(18, 20, 31, 0.85);
+  --color-bg-card-hover: rgba(26, 29, 45, 0.95);
+  --color-bg-sidebar: #090a10;
+  --color-bg-header: rgba(9, 10, 16, 0.9);
+  
+  --color-text-primary: #f1f5f9;
   --color-text-secondary: #94a3b8;
   --color-text-tertiary: #64748b;
-  --color-border: #1e293b;
-
+  
+  --color-border: rgba(255, 255, 255, 0.1);
+  --color-border-accent: rgba(139, 92, 246, 0.3);
+  
   color-scheme: dark;
 }
 
@@ -77,57 +94,82 @@
    LIGHT THEME
    ============================================================ */
 .light {
-  --color-bg-primary: #f1f5f9;
+  --color-bg-primary: #f8fafc;
   --color-bg-secondary: #ffffff;
-  --color-bg-card: #ffffff;
-  --color-bg-sidebar: #f8fafc;
+  --color-bg-card: rgba(255, 255, 255, 0.9);
+  --color-bg-card-hover: #ffffff;
+  --color-bg-sidebar: #ffffff;
+  --color-bg-header: rgba(255, 255, 255, 0.9);
+  
   --color-text-primary: #0f172a;
   --color-text-secondary: #475569;
   --color-text-tertiary: #94a3b8;
-  --color-border: #e2e8f0;
-
+  
+  --color-border: rgba(0, 0, 0, 0.1);
+  --color-border-accent: rgba(124, 58, 237, 0.25);
+  
   color-scheme: light;
 }
 
 /* ============================================================
-   UTILITY CLASSES (mapped to CSS vars)
+   UTILITY CLASSES & LAYOUT OFFSETS
    ============================================================ */
 @layer utilities {
-  .bg-primary {
-    background-color: var(--color-bg-primary);
-  }
+  .bg-primary { background-color: var(--color-bg-primary); }
+  .bg-secondary { background-color: var(--color-bg-secondary); }
+  .bg-card { background-color: var(--color-bg-card); }
+  .bg-sidebar { background-color: var(--color-bg-sidebar); }
+  .bg-header { background-color: var(--color-bg-header); }
+  
+  .text-primary { color: var(--color-text-primary); }
+  .text-secondary { color: var(--color-text-secondary); }
+  .text-tertiary { color: var(--color-text-tertiary); }
+  
+  .border-border { border-color: var(--color-border); }
+  .border-accent { border-color: var(--color-border-accent); }
 
-  .bg-secondary {
-    background-color: var(--color-bg-secondary);
-  }
-
-  .bg-card {
+  /* Glassmorphism Panel */
+  .glass-panel {
     background-color: var(--color-bg-card);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
   }
 
-  .bg-sidebar {
-    background-color: var(--color-bg-sidebar);
+  .glass-header {
+    background-color: var(--color-bg-header);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border-bottom: 1px solid var(--color-border);
   }
 
-  .text-primary {
-    color: var(--color-text-primary);
-  }
-
-  .text-secondary {
-    color: var(--color-text-secondary);
-  }
-
-  .text-tertiary {
-    color: var(--color-text-tertiary);
-  }
-
-  .border-border {
-    border-color: var(--color-border);
+  /* Gradient Text */
+  .gradient-text {
+    background: linear-gradient(135deg, #a855f7 0%, #6366f1 50%, #3b82f6 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
   }
 }
 
 /* ============================================================
-   GLOBAL STYLES
+   SIDEBAR & LAYOUT HARD-CODED OFFSETS
+   ============================================================ */
+.sidebar-panel {
+  width: 256px !important;
+  min-width: 256px !important;
+  max-width: 256px !important;
+}
+
+.layout-main-wrapper {
+  padding-left: 256px !important;
+}
+
+.statusbar-panel {
+  left: 256px !important;
+}
+
+/* ============================================================
+   GLOBAL RESET & FORM CONTROLS FIX
    ============================================================ */
 * {
   margin: 0;
@@ -136,8 +178,8 @@
 }
 
 html {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
-  font-size: 16px;
+  font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  font-size: 15px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -150,79 +192,100 @@ body {
   overflow-x: hidden;
 }
 
+/* Base Form Control Reset */
+label {
+  display: block;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  margin-bottom: 0.375rem;
+  color: var(--color-text-secondary);
+}
+
+input[type="text"],
+input[type="password"],
+input[type="number"],
+input[type="email"],
+select {
+  display: block;
+  width: 100%;
+  height: 2.75rem;
+  padding: 0 1rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  border-radius: 0.75rem;
+  background-color: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-primary);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.light input[type="text"],
+.light input[type="password"],
+.light input[type="number"],
+.light input[type="email"],
+.light select {
+  background-color: rgba(0, 0, 0, 0.03);
+}
+
+textarea {
+  display: block;
+  width: 100%;
+  padding: 0.75rem 1rem;
+  font-size: 0.875rem;
+  line-height: 1.375rem;
+  border-radius: 0.75rem;
+  background-color: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-primary);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: rgba(139, 92, 246, 0.5);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15);
+}
+
+.input-with-icon-left {
+  padding-left: 2.75rem !important;
+}
+
+.input-with-icon-right {
+  padding-right: 2.75rem !important;
+}
+
+/* Custom Select options */
+.light select option {
+  background-color: #ffffff;
+  color: #0f172a;
+}
+
+.dark select option {
+  background-color: #12141f;
+  color: #f1f5f9;
+}
+
 /* ============================================================
    CUSTOM SCROLLBAR
    ============================================================ */
-.custom-scrollbar::-webkit-scrollbar {
-  width: 6px;
-}
-
-.custom-scrollbar::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.custom-scrollbar::-webkit-scrollbar-thumb {
-  background: var(--color-border);
-  border-radius: 3px;
-}
-
-.custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: var(--color-text-tertiary);
-}
-
-/* Global scrollbar */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--color-bg-primary);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
   background: var(--color-border);
-  border-radius: 4px;
+  border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--color-text-tertiary);
 }
 
-/* ============================================================
-   FORM STYLES (Light Theme Fixes)
-   ============================================================ */
-.light select,
-.light option {
-  background-color: var(--color-bg-card);
-  color: var(--color-text-primary);
-}
-
-.light input,
-.light textarea {
-  background-color: rgba(0, 0, 0, 0.03);
-}
-
-/* Focus ring */
-input:focus,
-textarea:focus,
-select:focus {
-  outline: none;
-}
-
-/* ============================================================
-   LINE CLAMP
-   ============================================================ */
-.line-clamp-1 {
-  display: -webkit-box;
-  -webkit-line-clamp: 1;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.line-clamp-2 {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+.custom-scrollbar::-webkit-scrollbar {
+  width: 5px;
 }

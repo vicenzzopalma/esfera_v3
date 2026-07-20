@@ -8,6 +8,8 @@ import { useAuth } from "./context/AuthContext";
 import Layout from "./components/Layout";
 import LoginPage from "./pages/LoginPage";
 import CompaniesTab from "./pages/CompaniesTab";
+import PermissionsTab from "./pages/PermissionsTab";
+import DashboardTab from "./pages/DashboardTab";
 import DevicesTab from "./pages/DevicesTab";
 import CampaignsTab from "./pages/CampaignsTab";
 import AutomationsTab from "./pages/AutomationsTab";
@@ -92,6 +94,26 @@ function AppRoutes() {
             <RoleGate roles={["master"]}>
               <CompaniesTab />
             </RoleGate>
+          }
+        />
+
+        {/* Permissions (Master only) */}
+        <Route
+          path="/permissions"
+          element={
+            <RoleGate roles={["master"]}>
+              <PermissionsTab />
+            </RoleGate>
+          }
+        />
+
+        {/* Dashboard (requer empresa) */}
+        <Route
+          path="/dashboard"
+          element={
+            <CompanyGate>
+              <DashboardTab />
+            </CompanyGate>
           }
         />
 
