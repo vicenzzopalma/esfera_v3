@@ -254,6 +254,23 @@ input:focus, select:focus, textarea:focus {
   padding-right: 2.75rem !important;
 }
 
+.input-setting {
+  padding: 0.625rem 1rem;
+  border-radius: 0.75rem;
+  background-color: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--color-border, rgba(255, 255, 255, 0.08));
+  color: var(--color-primary, #f1f5f9);
+  font-size: 0.75rem;
+  transition: all 0.2s;
+}
+.input-setting:focus {
+  outline: none;
+  border-color: rgba(139, 92, 246, 0.4);
+}
+.input-setting::placeholder {
+  color: var(--color-tertiary, #64748b);
+}
+
 /* Custom Select options */
 .light select option {
   background-color: #ffffff;
