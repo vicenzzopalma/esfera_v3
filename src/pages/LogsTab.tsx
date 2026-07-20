@@ -1,156 +1,276 @@
 // ============================================================
-// Esfera v3 — Logs Tab
-// Tabela de logs do sistema com filtros
+// Esfera v3 — Logs Tab Avançado
+// Console de logs com filtros avançados, exportação CSV e auto-refresh
 // ============================================================
 
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
 import { MOCK_LOGS } from "../mock-data";
 import Card from "../components/ui/Card";
 import Badge from "../components/ui/Badge";
 import Button from "../components/ui/Button";
-import type { LogType } from "../types";
+import type { LogType, LogEntry } from "../types";
+import { invoke } from "@tauri-apps/api/core";
 import {
-  ScrollText,
   Search,
-  Filter,
   Info,
   AlertTriangle,
   XCircle,
   CheckCircle,
   Trash2,
+  Download,
+  Terminal,
+  RefreshCw,
+  Smartphone,
+  Megaphone,
+  Bot,
+  Shield,
+  Settings,
+  Clock,
 } from "lucide-react";
 
-const logTypeConfig: Record<LogType, { variant: "info" | "warning" | "danger" | "success"; label: string; icon: React.ReactNode; textColor: string }> = {
+const logTypeConfig: Record<
+  LogType,
+  { variant: "info" | "warning" | "danger" | "success"; label: string; icon: React.ReactNode; textColor: string }
+> = {
   info: { variant: "info", label: "Info", icon: <Info size={14} />, textColor: "text-blue-400" },
   warning: { variant: "warning", label: "Aviso", icon: <AlertTriangle size={14} />, textColor: "text-amber-400" },
   error: { variant: "danger", label: "Erro", icon: <XCircle size={14} />, textColor: "text-red-400" },
   success: { variant: "success", label: "Sucesso", icon: <CheckCircle size={14} />, textColor: "text-emerald-400" },
+  dispatch: { variant: "success", label: "Disparo", icon: <Megaphone size={14} />, textColor: "text-emerald-400" },
+  ban: { variant: "danger", label: "Ban", icon: <Shield size={14} />, textColor: "text-red-400" },
+  ai: { variant: "info", label: "IA", icon: <Bot size={14} />, textColor: "text-violet-400" },
+  system: { variant: "info", label: "Sistema", icon: <Settings size={14} />, textColor: "text-slate-400" },
+  device: { variant: "warning", label: "Device", icon: <Smartphone size={14} />, textColor: "text-amber-400" },
 };
+
+const ALL_LOG_TYPES: LogType[] = ["info", "warning", "error", "success", "dispatch", "ban", "ai", "system", "device"];
 
 export default function LogsTab() {
   const { selectedCompanyId } = useAuth();
   const [searchQuery, setSearchQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<LogType | "all">("all");
+  const [sourceFilter, setSourceFilter] = useState("all");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [logsList, setLogsList] = useState<LogEntry[]>([]);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [lastRefresh, setLastRefresh] = useState(new Date());
 
-  const logs = MOCK_LOGS.filter((l) => l.companyId === selectedCompanyId);
+  const fetchLogs = useCallback(async () => {
+    if (!selectedCompanyId) return;
+    try {
+      const data = await invoke<LogEntry[]>("get_logs", { companyId: selectedCompanyId });
+      setLogsList(data);
+    } catch {
+      setLogsList(MOCK_LOGS.filter((l) => l.companyId === selectedCompanyId));
+    }
+    setLastRefresh(new Date());
+  }, [selectedCompanyId]);
 
-  const filteredLogs = logs
+  useEffect(() => { fetchLogs(); }, [fetchLogs]);
+
+  // Auto-refresh every 5s
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const interval = setInterval(fetchLogs, 5000);
+    return () => clearInterval(interval);
+  }, [autoRefresh, fetchLogs]);
+
+  const filteredLogs = logsList
     .filter((l) => typeFilter === "all" || l.type === typeFilter)
+    .filter((l) => sourceFilter === "all" || l.source === sourceFilter)
+    .filter((l) => {
+      if (!dateFrom && !dateTo) return true;
+      const logDate = new Date(l.timestamp).getTime();
+      if (dateFrom && logDate < new Date(dateFrom).getTime()) return false;
+      if (dateTo && logDate > new Date(dateTo + "T23:59:59").getTime()) return false;
+      return true;
+    })
     .filter(
       (l) =>
         l.message.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        l.source.toLowerCase().includes(searchQuery.toLowerCase())
+        l.source.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (l.deviceSerial && l.deviceSerial.toLowerCase().includes(searchQuery.toLowerCase()))
     );
 
-  const logCounts = {
-    all: logs.length,
-    info: logs.filter((l) => l.type === "info").length,
-    warning: logs.filter((l) => l.type === "warning").length,
-    error: logs.filter((l) => l.type === "error").length,
-    success: logs.filter((l) => l.type === "success").length,
+  const logCounts: Record<string, number> = {
+    all: logsList.length,
+  };
+  ALL_LOG_TYPES.forEach((t) => {
+    logCounts[t] = logsList.filter((l) => l.type === t).length;
+  });
+
+  const uniqueSources = [...new Set(logsList.map((l) => l.source))];
+
+  const handleExportCSV = () => {
+    const headers = ["Horário", "Nível", "Origem", "Dispositivo", "Mensagem"];
+    const rows = filteredLogs.map((l) => [
+      new Date(l.timestamp).toLocaleString("pt-BR"),
+      logTypeConfig[l.type as LogType]?.label || l.type,
+      l.source,
+      l.deviceSerial || "",
+      `"${l.message.replace(/"/g, '""')}"`,
+    ]);
+    const csv = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `esfera_logs_${new Date().toISOString().split("T")[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleClearLogs = async () => {
+    try {
+      await invoke("clear_logs", { companyId: selectedCompanyId });
+    } catch { /* noop */ }
+    setLogsList([]);
   };
 
   return (
-    <div className="animate-fade-in">
+    <div className="space-y-6 animate-fade-in">
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-primary">Logs</h1>
-          <p className="text-sm text-secondary mt-1">
-            {logs.length} registros do sistema
+          <h2 className="text-xl font-bold text-primary tracking-tight">Console de Logs</h2>
+          <p className="text-xs text-tertiary mt-0.5">
+            Histórico detalhado de eventos — disparos, bans, IA, dispositivos e sistema.
           </p>
         </div>
-        <Button variant="danger" size="sm" icon={<Trash2 size={14} />}>
-          Limpar Logs
-        </Button>
-      </div>
-
-      {/* Filters */}
-      <div className="flex items-center gap-3 mb-6 flex-wrap">
-        {/* Search */}
-        <div className="relative flex-1 min-w-[200px] max-w-md">
-          <Search size={18} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-tertiary" />
-          <input
-            type="text"
-            placeholder="Buscar nos logs..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-11 pr-4 py-2.5 rounded-xl text-sm
-              bg-white/5 border border-border text-primary
-              placeholder:text-tertiary
-              focus:outline-none focus:border-violet-500/50 focus:ring-1 focus:ring-violet-500/30
-              transition-all"
-          />
-        </div>
-
-        {/* Type Filters */}
-        <div className="flex items-center gap-1.5">
-          <Filter size={16} className="text-tertiary mr-1" />
-          {(["all", "info", "warning", "error", "success"] as const).map((type) => (
-            <button
-              key={type}
-              onClick={() => setTypeFilter(type)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer
-                ${typeFilter === type
-                  ? "bg-violet-600/20 text-violet-400 border border-violet-500/30"
-                  : "bg-white/5 text-secondary border border-border hover:bg-white/10"
-                }`}
-            >
-              {type === "all" ? "Todos" : logTypeConfig[type].label}
-              <span className="ml-1 opacity-60">({logCounts[type]})</span>
-            </button>
-          ))}
+        <div className="flex items-center gap-2">
+          <Button
+            variant={autoRefresh ? "primary" : "secondary"}
+            size="sm"
+            icon={<RefreshCw size={14} className={autoRefresh ? "animate-spin" : ""} />}
+            onClick={() => setAutoRefresh(!autoRefresh)}
+          >
+            {autoRefresh ? "Auto-ON" : "Auto-OFF"}
+          </Button>
+          <Button variant="secondary" size="sm" icon={<Download size={14} />} onClick={handleExportCSV}>
+            Exportar CSV
+          </Button>
+          <Button variant="danger" size="sm" icon={<Trash2 size={14} />} onClick={handleClearLogs}>
+            Limpar
+          </Button>
         </div>
       </div>
+
+      {/* Stats Row */}
+      <div className="grid grid-cols-3 sm:grid-cols-5 lg:grid-cols-9 gap-2">
+        {ALL_LOG_TYPES.map((t) => (
+          <button
+            key={t}
+            onClick={() => setTypeFilter(typeFilter === t ? "all" : t)}
+            className={`flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-[11px] font-medium transition-all cursor-pointer border ${
+              typeFilter === t
+                ? `${logTypeConfig[t].textColor} bg-white/[0.06] border-current`
+                : "text-secondary bg-white/[0.02] border-border hover:bg-white/[0.04]"
+            }`}
+          >
+            {logTypeConfig[t].icon}
+            <span className="truncate">{logTypeConfig[t].label}</span>
+            <span className="opacity-60 ml-auto">({logCounts[t] || 0})</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Advanced Filters */}
+      <Card padding="sm">
+        <div className="flex flex-col lg:flex-row items-end gap-3">
+          {/* Search */}
+          <div className="relative w-full lg:w-80">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-tertiary pointer-events-none" />
+            <input
+              type="text"
+              placeholder="Pesquisar mensagem, origem ou device..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full pl-9 pr-3 py-2 rounded-xl bg-white/5 border border-border text-xs font-mono text-primary placeholder:text-tertiary focus:border-violet-500/40 transition-all"
+            />
+          </div>
+
+          {/* Source Filter */}
+          <select
+            value={sourceFilter}
+            onChange={(e) => setSourceFilter(e.target.value)}
+            className="px-3 py-2 rounded-xl bg-white/5 border border-border text-xs text-primary focus:border-violet-500/40 transition-all"
+          >
+            <option value="all">Todas as Origens</option>
+            {uniqueSources.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+
+          {/* Date From */}
+          <div className="flex items-center gap-1.5">
+            <Clock size={12} className="text-tertiary" />
+            <input
+              type="date"
+              value={dateFrom}
+              onChange={(e) => setDateFrom(e.target.value)}
+              className="px-2 py-2 rounded-xl bg-white/5 border border-border text-xs text-primary focus:border-violet-500/40 transition-all"
+            />
+            <span className="text-tertiary text-xs">até</span>
+            <input
+              type="date"
+              value={dateTo}
+              onChange={(e) => setDateTo(e.target.value)}
+              className="px-2 py-2 rounded-xl bg-white/5 border border-border text-xs text-primary focus:border-violet-500/40 transition-all"
+            />
+          </div>
+
+          <span className="text-[10px] text-tertiary font-mono ml-auto">
+            {filteredLogs.length} registros · {lastRefresh.toLocaleTimeString("pt-BR")}
+          </span>
+        </div>
+      </Card>
 
       {/* Logs Table */}
       <Card padding="none">
-        <div className="overflow-x-auto">
-          <table className="w-full">
-            <thead>
-              <tr className="border-b border-border">
-                <th className="text-left px-6 py-3 text-xs font-medium text-tertiary uppercase tracking-wider w-44">
-                  Timestamp
-                </th>
-                <th className="text-left px-6 py-3 text-xs font-medium text-tertiary uppercase tracking-wider w-24">
-                  Tipo
-                </th>
-                <th className="text-left px-6 py-3 text-xs font-medium text-tertiary uppercase tracking-wider w-28">
-                  Fonte
-                </th>
-                <th className="text-left px-6 py-3 text-xs font-medium text-tertiary uppercase tracking-wider">
-                  Mensagem
-                </th>
+        <div className="overflow-x-auto max-h-[60vh] overflow-y-auto custom-scrollbar">
+          <table className="w-full text-left border-collapse">
+            <thead className="sticky top-0 z-10 bg-card">
+              <tr className="border-b border-border text-[10px] font-bold text-tertiary uppercase tracking-wider">
+                <th className="px-4 py-3 w-40">Horário</th>
+                <th className="px-4 py-3 w-20">Nível</th>
+                <th className="px-4 py-3 w-28">Origem</th>
+                <th className="px-4 py-3 w-28">Device</th>
+                <th className="px-4 py-3">Mensagem</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-border">
-              {filteredLogs.map((log) => {
-                const config = logTypeConfig[log.type];
+            <tbody className="divide-y divide-border text-xs font-mono">
+              {filteredLogs.map((log, idx) => {
+                const config = logTypeConfig[log.type as LogType] || logTypeConfig.info;
                 return (
-                  <tr key={log.id} className="hover:bg-white/[0.02] transition-colors">
-                    <td className="px-6 py-3">
-                      <span className="text-xs text-tertiary font-mono">
-                        {new Date(log.timestamp).toLocaleString("pt-BR", {
-                          day: "2-digit",
-                          month: "2-digit",
-                          hour: "2-digit",
-                          minute: "2-digit",
-                          second: "2-digit",
-                        })}
-                      </span>
+                  <tr key={log.id || idx} className="hover:bg-white/[0.02] transition-colors">
+                    <td className="px-4 py-2.5 text-tertiary whitespace-nowrap">
+                      {new Date(log.timestamp).toLocaleString("pt-BR", {
+                        day: "2-digit",
+                        month: "2-digit",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                        second: "2-digit",
+                      })}
                     </td>
-                    <td className="px-6 py-3">
-                      <Badge variant={config.variant} dot>
+                    <td className="px-4 py-2.5">
+                      <Badge variant={config.variant} dot className="text-[10px]">
                         {config.label}
                       </Badge>
                     </td>
-                    <td className="px-6 py-3">
-                      <span className="text-xs text-secondary font-medium">{log.source}</span>
+                    <td className="px-4 py-2.5 text-secondary font-sans font-medium">{log.source}</td>
+                    <td className="px-4 py-2.5 text-tertiary font-sans">
+                      {log.deviceSerial ? (
+                        <span className="inline-flex items-center gap-1">
+                          <Smartphone size={10} />
+                          {log.deviceSerial}
+                        </span>
+                      ) : (
+                        "—"
+                      )}
                     </td>
-                    <td className="px-6 py-3">
-                      <span className={`text-sm ${config.textColor}`}>{log.message}</span>
-                    </td>
+                    <td className={`px-4 py-2.5 ${config.textColor}`}>{log.message}</td>
                   </tr>
                 );
               })}
@@ -158,9 +278,10 @@ export default function LogsTab() {
           </table>
 
           {filteredLogs.length === 0 && (
-            <div className="flex flex-col items-center justify-center py-16 text-secondary">
-              <ScrollText size={48} className="mb-3 opacity-30" />
-              <p>Nenhum log encontrado</p>
+            <div className="flex flex-col items-center justify-center py-16 text-center text-tertiary">
+              <Terminal size={40} className="mb-2 opacity-30" />
+              <p className="text-sm font-medium text-secondary">Nenhum log encontrado</p>
+              <p className="text-xs">Ajuste os filtros ou aguarde novos eventos.</p>
             </div>
           )}
         </div>

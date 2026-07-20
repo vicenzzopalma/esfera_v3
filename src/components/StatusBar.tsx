@@ -15,9 +15,7 @@ export default function StatusBar() {
   const onlineDevices = companyDevices.filter((d) => d.status === "online");
 
   return (
-    <footer className="fixed bottom-0 left-64 right-0 h-8 z-30
-      bg-sidebar border-t border-border
-      flex items-center justify-between px-4 text-xs text-tertiary">
+    <footer style={{ left: "256px" }} className="fixed bottom-0 right-0 h-8 z-30 bg-sidebar border-t border-border flex items-center justify-between px-4 text-xs text-tertiary">
 
       <div className="flex items-center gap-4">
         {/* Status de conexão */}
