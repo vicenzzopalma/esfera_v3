@@ -27,7 +27,7 @@ pub struct Dispatcher;
 impl Dispatcher {
     /// Inicia o worker assíncrono do motor de disparos em background com suporte a AppHandle
     pub fn start_worker(db_arc: Arc<Mutex<Database>>, app_handle: Option<AppHandle>) {
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             loop {
                 // Intervalo da fila de sincronização principal (a cada 3 segundos)
                 sleep(Duration::from_secs(3)).await;
