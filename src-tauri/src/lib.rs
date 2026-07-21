@@ -13,10 +13,22 @@ mod dispatcher;
 use commands::*;
 use db::Database;
 use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+
+fn get_db_path() -> String {
+    if let Some(mut dir) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        dir.push("esfera_v3");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.push("esfera_v3.db");
+        return dir.to_string_lossy().to_string();
+    }
+    "esfera_v3.db".to_string()
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let db = Database::init("esfera_v3.db").expect("Falha ao inicializar banco SQLite esfera_v3.db");
+    let db_path = get_db_path();
+    let db = Database::init(&db_path).expect("Falha ao inicializar banco SQLite esfera_v3.db");
     let db_arc = Arc::new(Mutex::new(db));
 
     let db_arc_clone = Arc::clone(&db_arc);
