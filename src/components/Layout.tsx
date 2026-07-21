@@ -20,8 +20,10 @@ export default function Layout() {
         <Header />
 
         {/* Viewport de Conteúdo das Abas */}
-        <main className="flex-1 p-6 pb-16 overflow-y-auto min-w-0">
-          <Outlet />
+        <main className="flex-1 p-6 md:p-8 pb-20 overflow-y-auto min-w-0">
+          <div className="max-w-7xl mx-auto w-full space-y-6">
+            <Outlet />
+          </div>
         </main>
       </div>
 
