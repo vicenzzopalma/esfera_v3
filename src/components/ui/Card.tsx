@@ -32,9 +32,9 @@ export default function Card({
     <div
       className={`rounded-2xl glass-panel relative overflow-hidden transition-all duration-300 ${
         hover
-          ? "hover:border-violet-500/40 hover:-translate-y-0.5 hover:shadow-xl hover:shadow-violet-500/10 cursor-pointer"
+          ? "hover:border-violet-500/40 hover:-translate-y-1 hover:shadow-2xl hover:shadow-violet-500/15 cursor-pointer"
           : ""
-      } ${glow ? "border-violet-500/30 shadow-lg shadow-violet-500/15" : ""} ${
+      } ${glow ? "border-violet-500/40 shadow-xl shadow-violet-500/20" : ""} ${
         paddingClasses[padding]
       } ${className}`}
       {...props}
