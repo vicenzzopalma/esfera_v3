@@ -38,6 +38,7 @@ import {
   XCircle,
   Activity,
   Wrench,
+  Zap,
 } from "lucide-react";
 
 const statusConfig: Record<
@@ -730,37 +731,40 @@ function ScreenMirrorModal({
 }) {
   const [screenSrc, setScreenSrc] = useState<string | null>(null);
   const [loadingFrame, setLoadingFrame] = useState(false);
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [autoRefresh, setAutoRefresh] = useState(false);
   const [lastTouchPos, setLastTouchPos] = useState<{ x: number; y: number } | null>(null);
   const imgRef = useRef<HTMLImageElement>(null);
 
-  const fetchScreenFrame = async () => {
+  const fetchScreenFrame = useCallback(async () => {
+    if (!isOpen) return;
     setLoadingFrame(true);
     try {
-      const base64Data = await invoke<string>("capture_device_screen", { serial: device.serial });
-      if (base64Data) {
-        setScreenSrc(base64Data);
-      }
+      const src = await invoke<string>("capture_screen", { serial: device.serial });
+      setScreenSrc(src);
     } catch {
       setScreenSrc(null);
     } finally {
       setLoadingFrame(false);
     }
-  };
+  }, [isOpen, device.serial]);
 
   useEffect(() => {
-    if (!isOpen) return;
-    fetchScreenFrame();
+    if (!isOpen) {
+      setScreenSrc(null);
+      setAutoRefresh(false);
+      return;
+    }
 
     let intervalId: any = null;
     if (autoRefresh) {
-      intervalId = setInterval(fetchScreenFrame, 1500);
+      fetchScreenFrame();
+      intervalId = setInterval(fetchScreenFrame, 2000);
     }
 
     return () => {
       if (intervalId) clearInterval(intervalId);
     };
-  }, [isOpen, autoRefresh, device.serial]);
+  }, [isOpen, autoRefresh, fetchScreenFrame]);
 
   const handleImageClick = async (e: React.MouseEvent<HTMLImageElement>) => {
     if (!imgRef.current) return;
@@ -775,7 +779,7 @@ function ScreenMirrorModal({
 
     try {
       await invoke("send_adb_tap", { serial: device.serial, x: normX, y: normY });
-      fetchScreenFrame();
+      if (autoRefresh) fetchScreenFrame();
     } catch {
       console.log(`Toque simulado na posição ADB: X=${normX}, Y=${normY}`);
     }
@@ -784,7 +788,7 @@ function ScreenMirrorModal({
   const handleKeyevent = async (code: number) => {
     try {
       await invoke("send_adb_keyevent", { serial: device.serial, keycode: code });
-      fetchScreenFrame();
+      if (autoRefresh) fetchScreenFrame();
     } catch {
       console.log(`Evento de tecla simulado: Keycode ${code}`);
     }
@@ -794,62 +798,83 @@ function ScreenMirrorModal({
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      title={`Transmissão da Tela: ${device.model} (${device.serial})`}
+      title={`Controle Direct ADB & Espelhamento: ${device.model} (${device.serial})`}
+      size="lg"
       footer={
         <div className="flex items-center justify-between w-full">
           <div className="flex items-center gap-3 text-xs text-tertiary">
-            <div className="flex items-center gap-1.5">
-              <Sparkles size={14} className="text-violet-400" />
-              <span>Resolução Stream: 1080x2400</span>
-            </div>
-            <button
-              onClick={() => setAutoRefresh(!autoRefresh)}
-              className="px-2 py-1 rounded-lg bg-white/5 border border-border text-[11px] font-mono text-violet-300 hover:bg-white/10 transition-colors cursor-pointer"
-            >
-              {autoRefresh ? "⚡ Refresh Live (1.5s)" : "⏸️ Pausado"}
-            </button>
+            <span className="flex items-center gap-1.5 font-mono text-[11px] text-violet-300">
+              <Zap size={13} className="text-amber-400" /> Disparos operam 100% em background via ADB (independente do espelhamento)
+            </span>
           </div>
           <Button variant="secondary" onClick={onClose}>
-            Fechar Espelhamento
+            Fechar Painel
           </Button>
         </div>
       }
     >
       <div className="flex flex-col items-center space-y-4">
-        <div className="flex items-center justify-between w-full max-w-sm px-4 py-2 rounded-2xl bg-white/5 border border-border">
-          <button
-            onClick={() => handleKeyevent(4)}
-            className="p-2 rounded-xl hover:bg-white/10 text-secondary hover:text-violet-300 transition-colors cursor-pointer flex items-center gap-1.5 text-xs font-semibold"
-          >
-            <ArrowLeft size={16} />
-            <span>Voltar</span>
-          </button>
+        {/* Barra de Pré-Opções & Controles Diretos ADB (Independente do Streaming) */}
+        <div className="w-full space-y-3 p-3.5 rounded-2xl bg-white/5 border border-border">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-primary flex items-center gap-1.5">
+              <Sparkles size={14} className="text-violet-400" /> Comandos Diretos ADB (Sem Carga de Vídeo)
+            </span>
+            <button
+              onClick={() => {
+                if (!autoRefresh) {
+                  fetchScreenFrame();
+                }
+                setAutoRefresh(!autoRefresh);
+              }}
+              className={`px-3 py-1.5 rounded-xl border text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
+                autoRefresh
+                  ? "bg-amber-500/20 text-amber-300 border-amber-500/30"
+                  : "bg-violet-600/20 text-violet-300 border-violet-500/30 hover:bg-violet-600/30"
+              }`}
+            >
+              {autoRefresh ? "⏸️ Pausar Streaming" : "▶️ Iniciar Streaming de Vídeo"}
+            </button>
+          </div>
 
-          <button
-            onClick={() => handleKeyevent(3)}
-            className="p-2 rounded-xl hover:bg-white/10 text-secondary hover:text-violet-300 transition-colors cursor-pointer flex items-center gap-1.5 text-xs font-semibold"
-          >
-            <Home size={16} />
-            <span>Inicio</span>
-          </button>
-
-          <button
-            onClick={() => handleKeyevent(26)}
-            className="p-2 rounded-xl hover:bg-white/10 text-secondary hover:text-red-300 transition-colors cursor-pointer flex items-center gap-1.5 text-xs font-semibold"
-          >
-            <Power size={16} />
-            <span>Tela</span>
-          </button>
-
-          <button
-            onClick={fetchScreenFrame}
-            className="p-2 rounded-xl hover:bg-white/10 text-violet-400 transition-colors cursor-pointer"
-          >
-            <RefreshCw size={16} className={loadingFrame ? "animate-spin" : ""} />
-          </button>
+          <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-border/50">
+            <button
+              onClick={() => handleKeyevent(4)}
+              className="px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-secondary hover:text-white border border-border text-xs font-semibold transition-colors cursor-pointer flex items-center gap-1"
+            >
+              <ArrowLeft size={14} /> Voltar
+            </button>
+            <button
+              onClick={() => handleKeyevent(3)}
+              className="px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-secondary hover:text-white border border-border text-xs font-semibold transition-colors cursor-pointer flex items-center gap-1"
+            >
+              <Home size={14} /> Início
+            </button>
+            <button
+              onClick={() => handleKeyevent(187)}
+              className="px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-secondary hover:text-white border border-border text-xs font-semibold transition-colors cursor-pointer flex items-center gap-1"
+            >
+              <Layers size={14} /> Recentes
+            </button>
+            <button
+              onClick={() => handleKeyevent(26)}
+              className="px-3 py-1.5 rounded-xl bg-red-500/10 hover:bg-red-500/20 text-red-300 border border-red-500/20 text-xs font-semibold transition-colors cursor-pointer flex items-center gap-1"
+            >
+              <Power size={14} /> Tela On/Off
+            </button>
+            {autoRefresh && (
+              <button
+                onClick={fetchScreenFrame}
+                className="px-3 py-1.5 rounded-xl bg-violet-600/20 hover:bg-violet-600/30 text-violet-300 border border-violet-500/30 text-xs font-semibold transition-colors cursor-pointer flex items-center gap-1 ml-auto"
+              >
+                <RefreshCw size={14} className={loadingFrame ? "animate-spin" : ""} /> Atualizar Frame
+              </button>
+            )}
+          </div>
         </div>
 
-        <div className="relative w-64 h-[500px] rounded-[36px] bg-black border-4 border-slate-800 shadow-2xl overflow-hidden flex flex-col items-center justify-between p-2 group select-none">
+        {/* Display do Aparelho (Somente Sob Demanda) */}
+        <div className="relative w-64 h-[480px] rounded-[36px] bg-black border-4 border-slate-800 shadow-2xl overflow-hidden flex flex-col items-center justify-between p-2 group select-none">
           <div className="w-16 h-4 bg-slate-900 rounded-full mb-1 z-20 flex items-center justify-center">
             <div className="w-2.5 h-2.5 rounded-full bg-slate-800" />
           </div>
@@ -865,21 +890,24 @@ function ScreenMirrorModal({
               />
             ) : (
               <div className="w-full h-full flex flex-col justify-center items-center p-4 bg-gradient-to-b from-slate-900 to-slate-950 text-center font-sans">
-                <Smartphone size={36} className="text-violet-400 opacity-60 mb-3 animate-pulse" />
+                <Smartphone size={36} className="text-violet-400 opacity-60 mb-3" />
                 <p className="text-xs font-bold text-white mb-1">
-                  {loadingFrame ? "Carregando Frame Real..." : "Dispositivo Inacessível / Sem Sinal ADB"}
+                  {loadingFrame ? "Capturando Frame..." : autoRefresh ? "Buscando Tela..." : "Streaming de Vídeo Pausado"}
                 </p>
                 <p className="text-[10px] text-slate-400 leading-tight max-w-[200px]">
-                  {loadingFrame
-                    ? "Capturando tela do aparelho via exec-out com sanitizador C++ HPC..."
-                    : `Serial '${device.serial}' não respondeu. Certifique-se que o celular está com a Depuração USB/Wi-Fi ativa e o ADB pareado.`}
+                  {autoRefresh
+                    ? "Streaming ativado. Clique na tela para enviar toques diretos."
+                    : "Use o botão '▶️ Iniciar Streaming' acima para visualizar a tela em tempo real sem afetar a velocidade dos disparos em background."}
                 </p>
-                {!loadingFrame && (
+                {!autoRefresh && (
                   <button
-                    onClick={fetchScreenFrame}
-                    className="mt-4 px-3 py-1.5 rounded-xl bg-violet-600/30 hover:bg-violet-600/50 border border-violet-500/40 text-violet-200 text-[10px] font-semibold transition-all cursor-pointer flex items-center gap-1.5"
+                    onClick={() => {
+                      setAutoRefresh(true);
+                      fetchScreenFrame();
+                    }}
+                    className="mt-4 px-3.5 py-2 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 text-white text-xs font-semibold shadow-lg shadow-violet-600/30 transition-all cursor-pointer flex items-center gap-1.5"
                   >
-                    <RefreshCw size={12} /> Tentar Tentar Novamente
+                    <Eye size={14} /> Visualizar Tela Ao Vivo
                   </button>
                 )}
               </div>
