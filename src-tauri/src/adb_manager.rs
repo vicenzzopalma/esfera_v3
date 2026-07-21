@@ -532,4 +532,31 @@ impl AdbManager {
 
         (brand, model)
     }
+
+    /// Lança o Scrcpy H.264 nativo em 60 FPS com aceleração por hardware
+    pub fn launch_scrcpy(serial: &str) -> Result<String, String> {
+        let title = format!("Esfera v3 — Stream H.264 ({})", serial);
+        let result = Command::new("scrcpy")
+            .args([
+                "-s",
+                serial,
+                "--max-size",
+                "1080",
+                "--max-fps",
+                "60",
+                "--video-bit-rate",
+                "4M",
+                "--window-title",
+                &title,
+            ])
+            .spawn();
+
+        match result {
+            Ok(_) => Ok(format!("Scrcpy H.264 inicializado com sucesso para {}!", serial)),
+            Err(e) => Err(format!(
+                "Scrcpy nativo não encontrado no sistema ({}). Certifique-se de que o executável 'scrcpy.exe' esteja instalado e adicionado ao PATH do Windows.",
+                e
+            )),
+        }
+    }
 }

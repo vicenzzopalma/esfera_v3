@@ -701,3 +701,8 @@ pub fn rewrite_message_ai(message: String, contact_name: String) -> Result<Strin
     let personalized = message.replace("{nome}", &contact_name);
     Ok(format!("{}, {}! {}\n\n{}", hour, contact_name, g, c))
 }
+
+#[tauri::command]
+pub fn launch_scrcpy_stream(serial: String) -> Result<String, String> {
+    AdbManager::launch_scrcpy(&serial)
+}

@@ -818,23 +818,39 @@ function ScreenMirrorModal({
         <div className="w-full space-y-3 p-3.5 rounded-2xl bg-white/5 border border-border">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold text-primary flex items-center gap-1.5">
-              <Sparkles size={14} className="text-violet-400" /> Comandos Diretos ADB (Sem Carga de Vídeo)
+              <Sparkles size={14} className="text-violet-400" /> Comandos Diretos ADB & Stream de Alta Performance
             </span>
-            <button
-              onClick={() => {
-                if (!autoRefresh) {
-                  fetchScreenFrame();
-                }
-                setAutoRefresh(!autoRefresh);
-              }}
-              className={`px-3 py-1.5 rounded-xl border text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
-                autoRefresh
-                  ? "bg-amber-500/20 text-amber-300 border-amber-500/30"
-                  : "bg-violet-600/20 text-violet-300 border-violet-500/30 hover:bg-violet-600/30"
-              }`}
-            >
-              {autoRefresh ? "⏸️ Pausar Streaming" : "▶️ Iniciar Streaming de Vídeo"}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={async () => {
+                  try {
+                    const msg = await invoke<string>("launch_scrcpy_stream", { serial: device.serial });
+                    alert(msg);
+                  } catch (err: any) {
+                    alert(typeof err === "string" ? err : err?.message || "Erro ao iniciar Scrcpy.");
+                  }
+                }}
+                className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 text-white text-xs font-bold shadow-lg shadow-emerald-600/30 hover:from-emerald-500 hover:to-teal-500 transition-all cursor-pointer flex items-center gap-1.5"
+              >
+                ⚡ Scrcpy H.264 (60 FPS Nativo)
+              </button>
+
+              <button
+                onClick={() => {
+                  if (!autoRefresh) {
+                    fetchScreenFrame();
+                  }
+                  setAutoRefresh(!autoRefresh);
+                }}
+                className={`px-3 py-1.5 rounded-xl border text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
+                  autoRefresh
+                    ? "bg-amber-500/20 text-amber-300 border-amber-500/30"
+                    : "bg-violet-600/20 text-violet-300 border-violet-500/30 hover:bg-violet-600/30"
+                }`}
+              >
+                {autoRefresh ? "⏸️ Pausar Streaming Web" : "▶️ Streaming Web Canvas"}
+              </button>
+            </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-border/50">

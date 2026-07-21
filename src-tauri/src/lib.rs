@@ -110,6 +110,7 @@ pub fn run() {
             scan_adb_subnet,
             deploy_adb_keepalive,
             get_hardware_uuid,
+            launch_scrcpy_stream,
             // AI Config
             get_ai_config,
             save_ai_config,
