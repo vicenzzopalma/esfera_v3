@@ -890,7 +890,7 @@ function ContactsModal({
             <tbody className="divide-y divide-border">
               {contacts.map((contact) => (
                 <tr key={contact.id} className="hover:bg-white/[0.02]">
-                  <td className="py-2.5 font-medium text-primary">{contact.name}</td>
+                  <td className="py-2.5 font-medium text-primary">{contact.contactName}</td>
                   <td className="py-2.5 font-mono text-secondary">{contact.phone}</td>
                   <td className="py-2.5">
                     {contact.status === "sent" ? (

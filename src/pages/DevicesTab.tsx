@@ -3,10 +3,9 @@
 // Hub de Dispositivos com Controle Remoto ADB, Gestão de Chips e Bans
 // ============================================================
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
 import { usePermissions } from "../hooks/usePermissions";
-import { MOCK_DEVICES } from "../mock-data";
 import Card from "../components/ui/Card";
 import Badge from "../components/ui/Badge";
 import Button from "../components/ui/Button";
@@ -29,12 +28,16 @@ import {
   ArrowLeft,
   ArrowRight,
   Power,
-  MessageSquare,
   Sparkles,
   Layers,
   Hash,
   Shield,
   Trash2,
+  AlertTriangle,
+  CheckCircle2,
+  XCircle,
+  Activity,
+  Wrench,
 } from "lucide-react";
 
 const statusConfig: Record<
@@ -79,6 +82,7 @@ export default function DevicesTab() {
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [connectModalOpen, setConnectModalOpen] = useState(false);
+  const [diagnosticModalOpen, setDiagnosticModalOpen] = useState(false);
   const [connectIp, setConnectIp] = useState("");
   const [connectPort, setConnectPort] = useState("5555");
   const [devicesList, setDevicesList] = useState<Device[]>([]);
@@ -88,6 +92,9 @@ export default function DevicesTab() {
   const [selectedDeviceForMirror, setSelectedDeviceForMirror] = useState<Device | null>(null);
   const [chipsModalOpen, setChipsModalOpen] = useState(false);
   const [selectedDeviceForChips, setSelectedDeviceForChips] = useState<Device | null>(null);
+
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   // USB & Wireless Auto-Link State
   const [connectTab, setConnectTab] = useState<"usb" | "manual">("usb");
@@ -101,20 +108,42 @@ export default function DevicesTab() {
   const [deviceNumberInput, setDeviceNumberInput] = useState("1");
   const [sectorInput, setSectorInput] = useState("junior");
 
+  const effectiveCompanyId = selectedCompanyId || 1;
+
+  const refreshDevices = useCallback(() => {
+    setError(null);
+    invoke<Device[]>("get_devices", { companyId: effectiveCompanyId })
+      .then((data) => {
+        setDevicesList(data);
+        setLoading(false);
+      })
+      .catch((err) => {
+        setDevicesList([]);
+        setLoading(false);
+        setError(typeof err === "string" ? err : err?.message || "Falha ao buscar dispositivos");
+      });
+  }, [effectiveCompanyId]);
+
   useEffect(() => {
-    if (!selectedCompanyId) return;
-
-    const refreshDevices = () => {
-      invoke<Device[]>("get_devices", { companyId: selectedCompanyId })
-        .then((data) => setDevicesList(data))
-        .catch(() => setDevicesList(MOCK_DEVICES.filter((d) => d.companyId === selectedCompanyId)));
-    };
-
     refreshDevices();
     const interval = setInterval(refreshDevices, 4000);
 
-    return () => clearInterval(interval);
-  }, [selectedCompanyId]);
+    let unlisten: (() => void) | null = null;
+    if (typeof window !== "undefined" && (window as any).__TAURI_INTERNALS__) {
+      import("@tauri-apps/api/event").then(({ listen }) => {
+        listen("device-status-changed", () => {
+          refreshDevices();
+        }).then((fn) => {
+          unlisten = fn;
+        });
+      });
+    }
+
+    return () => {
+      clearInterval(interval);
+      if (unlisten) unlisten();
+    };
+  }, [refreshDevices]);
 
   const fetchUsbDevices = async () => {
     setLoadingUsb(true);
@@ -126,10 +155,7 @@ export default function DevicesTab() {
       setUsbDevices(usbOnly);
     } catch (err) {
       console.warn("Falha ao buscar dispositivos USB nativos:", err);
-      // Fallback para teste/desenvolvimento no navegador
-      setUsbDevices([
-        { serial: "0N14619I241030D7", state: "device", model: "Realme C67 (USB Detectado)" }
-      ]);
+      setUsbDevices([]);
     } finally {
       setLoadingUsb(false);
     }
@@ -142,19 +168,18 @@ export default function DevicesTab() {
   }, [connectModalOpen, connectTab]);
 
   const handleLinkUsbToWireless = async (serial: string, deviceNumber: number, sector: string) => {
-    if (!selectedCompanyId) return;
     setLinkingSerial(serial);
     setLinkingStatus("Lendo dados do celular, extraindo IP Wi-Fi e pareando sem fio...");
     try {
       const result = await invoke<string>("link_usb_to_wireless", {
         serial,
-        companyId: selectedCompanyId,
+        companyId: effectiveCompanyId,
         deviceNumber,
         sector,
       });
       setLinkingStatus(result);
       // Refresh
-      const updated = await invoke<Device[]>("get_devices", { companyId: selectedCompanyId });
+      const updated = await invoke<Device[]>("get_devices", { companyId: effectiveCompanyId });
       setDevicesList(updated);
       setTimeout(() => {
         setConnectModalOpen(false);
@@ -163,70 +188,33 @@ export default function DevicesTab() {
         setSetupDeviceData(null);
       }, 2500);
     } catch (err: any) {
-      console.warn("Tauri invoke falhou, simulando sucesso no navegador para serial:", serial);
-      setLinkingStatus("Sucesso! Dispositivo pareado sem fio: Realme C67 conectado via wireless.");
-      
-      // Simula o celular pareado no estado local persistindo na array de mock
-      const mockDev = {
-        id: Date.now(),
-        serial: "192.168.1.105:5555",
-        brand: "Realme",
-        model: "Realme C67 (Sem Fio)",
-        ip: "192.168.1.105",
-        port: 5555,
-        status: "online",
-        battery: 95,
-        companyId: selectedCompanyId,
-        lastSeen: "Agora",
-        deviceNumber,
-        sector,
-      };
-      
-      MOCK_DEVICES.push(mockDev as Device);
-      setDevicesList((prev) => [...prev, mockDev as Device]);
-
+      console.error("Falha na conexão ADB:", err);
+      const errMsg = typeof err === "string" ? err : err?.message || "Erro desconhecido ao conectar ADB.";
+      setLinkingStatus(`❌ Erro: ${errMsg}`);
       setTimeout(() => {
-        setConnectModalOpen(false);
         setLinkingSerial(null);
-        setLinkingStatus(null);
-        setSetupDeviceData(null);
-      }, 2500);
+      }, 4000);
     }
   };
 
   const handleConnectDevice = async (ipAddress: string, portNumber: number, deviceNumber: number, sector: string) => {
-    if (!selectedCompanyId) return;
     try {
       await invoke("connect_adb_device", {
         ip: ipAddress,
         port: portNumber,
-        companyId: selectedCompanyId,
+        companyId: effectiveCompanyId,
         deviceNumber,
         sector,
       });
-      const updated = await invoke<Device[]>("get_devices", { companyId: selectedCompanyId });
+      const updated = await invoke<Device[]>("get_devices", { companyId: effectiveCompanyId });
       setDevicesList(updated);
-    } catch (err) {
-      console.warn("Conexão nativa ADB indisponível, registrando no estado local:", err);
-      const newDev: Device = {
-        id: Date.now(),
-        serial: `${ipAddress}:${portNumber}`,
-        model: `Celular Wireless (${ipAddress})`,
-        brand: "Android",
-        battery: 95,
-        status: "online",
-        ip: ipAddress,
-        port: portNumber,
-        companyId: selectedCompanyId,
-        lastSeen: "Agora",
-        deviceNumber,
-        sector,
-      };
-      MOCK_DEVICES.push(newDev);
-      setDevicesList((prev) => [...prev, newDev]);
+      setConnectModalOpen(false);
+      setSetupDeviceData(null);
+    } catch (err: any) {
+      console.error("Erro ao conectar dispositivo ADB manual:", err);
+      const errMsg = typeof err === "string" ? err : err?.message || "Não foi possível conectar ao IP informado.";
+      setLinkingStatus(`❌ Erro na conexão: ${errMsg}`);
     }
-    setConnectModalOpen(false);
-    setSetupDeviceData(null);
   };
 
   const handleOpenScreenMirror = (device: Device) => {
@@ -263,7 +251,7 @@ export default function DevicesTab() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="secondary" icon={<RefreshCw size={15} />}>
+          <Button variant="secondary" icon={<RefreshCw size={15} />} onClick={refreshDevices}>
             Sincronizar ADB
           </Button>
           <Button icon={<Plus size={15} />} onClick={() => setConnectModalOpen(true)}>
@@ -373,9 +361,38 @@ export default function DevicesTab() {
 
           {filteredDevices.length === 0 && (
             <div className="flex flex-col items-center justify-center py-16 text-center text-tertiary">
-              <Smartphone size={40} className="mb-2 opacity-30" />
-              <p className="text-sm font-medium text-secondary">Nenhum celular encontrado</p>
-              <p className="text-xs">Tente ajustar seus filtros ou conecte um novo celular via ADB.</p>
+              {error ? (
+                <>
+                  <AlertTriangle size={40} className="mb-2 text-red-400 opacity-60" />
+                  <p className="text-sm font-medium text-red-400">Erro ao carregar dispositivos</p>
+                  <p className="text-xs mb-3.5 max-w-md text-tertiary">{error}</p>
+                  <button
+                    onClick={refreshDevices}
+                    className="px-3.5 py-2 rounded-xl bg-violet-600/20 border border-violet-500/30 text-violet-300 hover:bg-violet-600/30 transition-all text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <RefreshCw size={13} />
+                    Tentar novamente
+                  </button>
+                </>
+              ) : loading ? (
+                <>
+                  <RefreshCw size={40} className="mb-2 text-violet-400 opacity-60 animate-spin" />
+                  <p className="text-sm font-medium text-secondary">Carregando dispositivos...</p>
+                </>
+              ) : (
+                <>
+                  <Smartphone size={40} className="mb-2 opacity-30" />
+                  <p className="text-sm font-medium text-secondary">Nenhum celular encontrado</p>
+                  <p className="text-xs mb-3.5">Tente ajustar seus filtros ou conecte um novo celular via ADB.</p>
+                  <button
+                    onClick={() => setDiagnosticModalOpen(true)}
+                    className="px-3.5 py-2 rounded-xl bg-white/5 border border-border text-secondary hover:bg-white/10 hover:text-primary transition-all text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <AlertTriangle size={13} className="text-amber-400" />
+                    Problemas de conexão? Rodar Diagnóstico ADB
+                  </button>
+                </>
+              )}
             </div>
           )}
         </div>
@@ -526,7 +543,17 @@ export default function DevicesTab() {
                   <div className="text-center py-8 bg-white/[0.01] border border-dashed border-border rounded-xl">
                     <Smartphone size={32} className="mx-auto text-tertiary opacity-30 mb-2" />
                     <p className="font-semibold text-secondary">Nenhum celular detectado no USB</p>
-                    <p className="text-[11px] text-tertiary mt-0.5">Certifique-se de ativar a "Depuração USB" nas opções do desenvolvedor do celular.</p>
+                    <p className="text-[11px] text-tertiary mt-0.5 mb-3">Certifique-se de ativar a "Depuração USB" nas opções do desenvolvedor do celular.</p>
+                    <button
+                      onClick={() => {
+                        setConnectModalOpen(false);
+                        setDiagnosticModalOpen(true);
+                      }}
+                      className="px-3 py-1.5 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/20 text-amber-300 text-[11px] font-semibold transition-all cursor-pointer flex items-center gap-1.5 mx-auto"
+                    >
+                      <AlertTriangle size={12} />
+                      Aparelho não reconhecido? Rodar Diagnóstico
+                    </button>
                   </div>
                 ) : (
                   <div className="space-y-2">
@@ -594,9 +621,23 @@ export default function DevicesTab() {
           device={selectedDeviceForChips}
         />
       )}
+
+      {/* Modal de Diagnóstico de Aparelho */}
+      <AdbDiagnosticModal
+        isOpen={diagnosticModalOpen}
+        onClose={() => setDiagnosticModalOpen(false)}
+      />
     </div>
   );
 }
+
+const sectorColors: Record<string, { bg: string; text: string; border: string }> = {
+  junior: { bg: "bg-emerald-500/15", text: "text-emerald-300", border: "border-emerald-500/30" },
+  senior: { bg: "bg-blue-500/15", text: "text-blue-300", border: "border-blue-500/30" },
+  pesquisa: { bg: "bg-purple-500/15", text: "text-purple-300", border: "border-purple-500/30" },
+  pa_fixa_1: { bg: "bg-amber-500/15", text: "text-amber-300", border: "border-amber-500/30" },
+  pa_fixa_2: { bg: "bg-pink-500/15", text: "text-pink-300", border: "border-pink-500/30" },
+};
 
 // ---- Componente de Linha de Dispositivo ----
 function DeviceRow({
@@ -609,21 +650,22 @@ function DeviceRow({
   onManageChips: () => void;
 }) {
   const status = statusConfig[device.status as DeviceStatus] || statusConfig.offline;
+  const sectorStyle = sectorColors[device.sector] || sectorColors.junior;
 
   return (
     <tr className="hover:bg-white/[0.02] transition-colors">
       <td className="px-6 py-4">
         <div className="flex items-center gap-3">
-          <div className="flex items-center justify-center w-10 h-10 rounded-xl bg-white/5 border border-border">
-            <Smartphone size={20} className="text-violet-400" />
+          <div className={`flex items-center justify-center w-10 h-10 rounded-xl ${sectorStyle.bg} border ${sectorStyle.border}`}>
+            <Smartphone size={20} className={sectorStyle.text} />
           </div>
           <div>
             <div className="flex items-center gap-1.5">
               <p className="font-semibold text-primary">{device.model}</p>
-              <span className="px-1.5 py-0.5 rounded-md bg-violet-600/20 text-violet-300 border border-violet-500/20 text-[10px] font-mono font-bold">#{device.deviceNumber}</span>
+              <span className={`px-1.5 py-0.5 rounded-md ${sectorStyle.bg} ${sectorStyle.text} border ${sectorStyle.border} text-[10px] font-mono font-bold`}>#{device.deviceNumber}</span>
             </div>
             <p className="text-[11px] text-tertiary">
-              {device.brand} | Setor: <span className="text-violet-400 font-semibold uppercase">{device.sector.replace('_', ' ')}</span>
+              {device.brand} | Setor: <span className={`${sectorStyle.text} font-semibold uppercase`}>{device.sector.replace('_', ' ')}</span>
             </p>
           </div>
         </div>
@@ -817,45 +859,29 @@ function ScreenMirrorModal({
               <img
                 ref={imgRef}
                 src={screenSrc}
-                alt="Tela do Dispositivo"
+                alt="Tela do Dispositivo em Tempo Real"
                 onClick={handleImageClick}
                 className="w-full h-full object-contain cursor-pointer"
               />
             ) : (
-              <div className="w-full h-full flex flex-col justify-between p-3 bg-gradient-to-b from-slate-900 to-slate-950 cursor-pointer font-sans">
-                <div className="flex justify-between items-center text-[10px] text-slate-400 font-mono mb-2">
-                  <span>15:00</span>
-                  <div className="flex items-center gap-1">
-                    <span>5G</span>
-                    <span>95%</span>
-                  </div>
-                </div>
-
-                <div className="flex-1 space-y-2 overflow-hidden flex flex-col justify-end">
-                  <div className="p-2 rounded-xl bg-emerald-950/80 border border-emerald-500/30 text-[11px] text-emerald-200">
-                    <p className="font-bold flex items-center gap-1">
-                      <MessageSquare size={12} />
-                      WhatsApp Business
-                    </p>
-                    <p className="text-[10px] opacity-80">REALESS RM COBRANÇAS</p>
-                  </div>
-
-                  <div className="p-2.5 rounded-2xl bg-white/10 border border-white/10 text-xs text-white self-start max-w-[85%] shadow-sm">
-                    <p className="text-[11px]">Olá! Comunicado de acordo disponível para quitação.</p>
-                    <span className="text-[9px] text-slate-400 block text-right mt-1">14:57 ✓✓</span>
-                  </div>
-
-                  <div className="p-2.5 rounded-2xl bg-violet-600/30 border border-violet-500/30 text-xs text-violet-100 self-end max-w-[85%] shadow-sm">
-                    <p className="text-[11px]">Disparo automático via Esfera v3 acionado.</p>
-                    <span className="text-[9px] text-violet-300 block text-right mt-1">15:00 ✓✓</span>
-                  </div>
-                </div>
-
-                <div className="flex justify-around items-center pt-2 mt-2 border-t border-white/10 text-slate-500">
-                  <span className="text-xs">|||</span>
-                  <span className="text-xs">●</span>
-                  <span className="text-xs">◄</span>
-                </div>
+              <div className="w-full h-full flex flex-col justify-center items-center p-4 bg-gradient-to-b from-slate-900 to-slate-950 text-center font-sans">
+                <Smartphone size={36} className="text-violet-400 opacity-60 mb-3 animate-pulse" />
+                <p className="text-xs font-bold text-white mb-1">
+                  {loadingFrame ? "Carregando Frame Real..." : "Dispositivo Inacessível / Sem Sinal ADB"}
+                </p>
+                <p className="text-[10px] text-slate-400 leading-tight max-w-[200px]">
+                  {loadingFrame
+                    ? "Capturando tela do aparelho via exec-out com sanitizador C++ HPC..."
+                    : `Serial '${device.serial}' não respondeu. Certifique-se que o celular está com a Depuração USB/Wi-Fi ativa e o ADB pareado.`}
+                </p>
+                {!loadingFrame && (
+                  <button
+                    onClick={fetchScreenFrame}
+                    className="mt-4 px-3 py-1.5 rounded-xl bg-violet-600/30 hover:bg-violet-600/50 border border-violet-500/40 text-violet-200 text-[10px] font-semibold transition-all cursor-pointer flex items-center gap-1.5"
+                  >
+                    <RefreshCw size={12} /> Tentar Tentar Novamente
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -1215,6 +1241,254 @@ function ChipsAndPackagesModal({
               </Button>
             </div>
           </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+// ============================================================
+// MODAL DE DIAGNÓSTICO AVANÇADO DE HARDWARE USB & ADB CLI
+// ============================================================
+interface AdbDiagnosticResult {
+  has_any_usb_device: boolean;
+  has_android_usb_device: boolean;
+  is_adb_process_running: boolean;
+  detected_usb_count: number;
+  diagnostic_msg: string;
+}
+
+function AdbDiagnosticModal({
+  isOpen,
+  onClose,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+}) {
+  const [diagnostic, setDiagnostic] = useState<AdbDiagnosticResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [restarting, setRestarting] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const runDiagnostic = async () => {
+    setLoading(true);
+    setErrorMsg(null);
+    try {
+      if (typeof window === "undefined" || !(window as any).__TAURI_INTERNALS__) {
+        throw new Error("O Diagnóstico de Hardware USB nativo está disponível apenas no aplicativo Desktop. Navegadores web convencionais não têm acesso direto aos barramentos físicos USB por motivos de segurança.");
+      }
+      const result = await invoke<AdbDiagnosticResult>("run_adb_diagnostic");
+      setDiagnostic(result);
+    } catch (err: any) {
+      console.error("Erro no diagnóstico ADB:", err);
+      let msg = typeof err === "string" ? err : err?.message || "Não foi possível rodar o diagnóstico nativo.";
+      if (msg.includes("reading 'invoke'") || msg.includes("__TAURI_INTERNALS__")) {
+        msg = "O Diagnóstico de Hardware USB nativo está disponível apenas no aplicativo Desktop. Navegadores web convencionais não têm acesso direto aos barramentos físicos USB por motivos de segurança.";
+      }
+      setErrorMsg(msg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRestartAdb = async () => {
+    setRestarting(true);
+    setErrorMsg(null);
+    try {
+      if (typeof window === "undefined" || !(window as any).__TAURI_INTERNALS__) {
+        throw new Error("A reinicialização do servidor ADB está disponível apenas no aplicativo Desktop.");
+      }
+      const msg = await invoke<string>("restart_adb_server");
+      console.log(msg);
+      setTimeout(async () => {
+        await runDiagnostic();
+        setRestarting(false);
+      }, 1500);
+    } catch (err: any) {
+      console.error("Erro ao reiniciar servidor ADB:", err);
+      let msg = typeof err === "string" ? err : err?.message || "Erro ao reiniciar o servidor ADB.";
+      if (msg.includes("reading 'invoke'") || msg.includes("__TAURI_INTERNALS__")) {
+        msg = "A reinicialização do servidor ADB está disponível apenas no aplicativo Desktop.";
+      }
+      setErrorMsg(msg);
+      setRestarting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (isOpen) {
+      runDiagnostic();
+    } else {
+      setDiagnostic(null);
+      setErrorMsg(null);
+    }
+  }, [isOpen]);
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title="Painel de Diagnóstico do Barramento USB & ADB"
+      size="md"
+      footer={
+        <div className="flex justify-between items-center w-full">
+          <Button
+            variant="secondary"
+            onClick={runDiagnostic}
+            disabled={loading || restarting}
+            icon={<RefreshCw size={13} className={loading ? "animate-spin" : ""} />}
+          >
+            {loading ? "Varrendo barramento..." : "Recarregar Análise"}
+          </Button>
+          <Button variant="primary" onClick={onClose} disabled={restarting}>
+            Fechar Diagnóstico
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-5 text-xs text-secondary">
+        <p className="text-[11px] text-tertiary">
+          Esta ferramenta analisa o barramento USB do Windows em nível de kernel (via APIs nativas C++) para identificar se há celulares fisicamente plugados e se o serviço ADB local está rodando.
+        </p>
+
+        {errorMsg && (
+          <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-200 font-mono animate-scale-in">
+            ❌ {errorMsg}
+          </div>
+        )}
+
+        {loading && !diagnostic ? (
+          <div className="flex flex-col items-center justify-center py-10 space-y-3">
+            <Activity className="text-violet-400 animate-pulse" size={32} />
+            <span className="font-semibold text-primary animate-pulse">Escaneando barramento USB local...</span>
+          </div>
+        ) : (
+          diagnostic && (
+            <div className="space-y-4 animate-fade-in">
+              {/* Cards de Status */}
+              <div className="grid grid-cols-1 gap-3">
+                {/* 1. Conexão USB Física */}
+                <div className="flex items-center justify-between p-3.5 rounded-2xl bg-white/5 border border-border">
+                  <div className="flex items-center gap-3">
+                    <div className={`p-2 rounded-xl ${diagnostic.has_any_usb_device ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400'}`}>
+                      <Smartphone size={18} />
+                    </div>
+                    <div>
+                      <p className="font-bold text-primary">Conexão USB Física</p>
+                      <p className="text-[10px] text-tertiary">
+                        {diagnostic.has_any_usb_device
+                          ? `Detectado (${diagnostic.detected_usb_count} portas USB ativas)`
+                          : "Nenhum cabo/dispositivo USB conectado no PC"}
+                      </p>
+                    </div>
+                  </div>
+                  {diagnostic.has_any_usb_device ? (
+                    <div className="flex items-center gap-1.5 text-emerald-400 font-bold">
+                      <CheckCircle2 size={15} />
+                      <span>Ativo</span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1.5 text-red-400 font-bold">
+                      <XCircle size={15} />
+                      <span>Inativo</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* 2. Reconhecimento de Celular */}
+                <div className="flex items-center justify-between p-3.5 rounded-2xl bg-white/5 border border-border">
+                  <div className="flex items-center gap-3">
+                    <div className={`p-2 rounded-xl ${diagnostic.has_android_usb_device ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400'}`}>
+                      <Wrench size={18} />
+                    </div>
+                    <div>
+                      <p className="font-bold text-primary">Identificação de Hardware</p>
+                      <p className="text-[10px] text-tertiary">
+                        {diagnostic.has_android_usb_device
+                          ? "Assinatura Android / Celular identificada com sucesso!"
+                          : "Nenhum celular com depuração/transferência ativo"}
+                      </p>
+                    </div>
+                  </div>
+                  {diagnostic.has_android_usb_device ? (
+                    <div className="flex items-center gap-1.5 text-emerald-400 font-bold">
+                      <CheckCircle2 size={15} />
+                      <span>Reconhecido</span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1.5 text-red-400 font-bold">
+                      <XCircle size={15} />
+                      <span>Não Identificado</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* 3. Status do Servidor ADB */}
+                <div className="flex items-center justify-between p-3.5 rounded-2xl bg-white/5 border border-border">
+                  <div className="flex items-center gap-3">
+                    <div className={`p-2 rounded-xl ${diagnostic.is_adb_process_running ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400'}`}>
+                      <Activity size={18} />
+                    </div>
+                    <div>
+                      <p className="font-bold text-primary">Daemon Servidor ADB</p>
+                      <p className="text-[10px] text-tertiary">
+                        {diagnostic.is_adb_process_running
+                          ? "Processo adb.exe em execução no Windows"
+                          : "Servidor ADB parado ou não inicializado no sistema"}
+                      </p>
+                    </div>
+                  </div>
+                  {diagnostic.is_adb_process_running ? (
+                    <div className="flex items-center gap-1.5 text-emerald-400 font-bold">
+                      <CheckCircle2 size={15} />
+                      <span>Executando</span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1.5 text-red-400 font-bold">
+                      <XCircle size={15} />
+                      <span>Parado</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Mensagem da Engine C++ */}
+              <div className="p-4 rounded-2xl bg-violet-600/10 border border-violet-500/25 space-y-1">
+                <p className="font-bold text-violet-300 text-[10px] uppercase tracking-wider">Laudo do Diagnóstico Nativo C++</p>
+                <p className="text-secondary leading-relaxed font-medium">{diagnostic.diagnostic_msg}</p>
+              </div>
+
+              {/* Ações Rápidas */}
+              <div className="p-4 rounded-2xl bg-white/[0.02] border border-border space-y-3">
+                <div>
+                  <h5 className="font-bold text-primary mb-1">Ações Corretivas Disponíveis:</h5>
+                  <p className="text-[10px] text-tertiary">Se o aparelho está conectado mas o status é inativo, tente reciclar a conexão do driver ADB abaixo.</p>
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    onClick={handleRestartAdb}
+                    disabled={restarting || loading}
+                    icon={<RefreshCw size={13} className={restarting ? "animate-spin" : ""} />}
+                    className="w-full justify-center bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white font-bold"
+                  >
+                    {restarting ? "Reiniciando Servidor ADB..." : "Reiniciar Servidor ADB (1-Click)"}
+                  </Button>
+                </div>
+              </div>
+
+              {/* Dicas adicionais em Português */}
+              <div className="space-y-2">
+                <h5 className="font-bold text-primary">Guia de Resolução Rápida (Windows):</h5>
+                <ul className="list-decimal pl-4 space-y-1 text-[11px] text-tertiary leading-tight">
+                  <li><strong>Troque o cabo USB:</strong> Use cabos originais. Evite cabos "apenas para carregar" (sem barramento de dados).</li>
+                  <li><strong>Porta USB Traseira:</strong> Se estiver em computador Desktop, conecte o cabo nas portas USB traseiras direto na placa-mãe.</li>
+                  <li><strong>Opções do Desenvolvedor:</strong> No celular, vá em Configurações &gt; Sobre o Telefone &gt; Toque 7 vezes no Número de Versão. Volte e acesse Opções do Desenvolvedor e marque <strong>"Depuração USB"</strong>.</li>
+                  <li><strong>Aceitar Impressão Digital RSA:</strong> Fique atento à tela do celular conectado. Aparecerá um pop-up pedindo permissão de acesso ao PC. Marque <strong>"Sempre permitir a partir deste computador"</strong> e clique em OK.</li>
+                  <li><strong>Instalar Drivers ADB:</strong> Caso o celular seja detectado no USB mas não reconhecido pelo ADB, faça o download do "Google USB Driver" ou driver oficial da fabricante (Samsung/Motorola/etc) no Windows.</li>
+                </ul>
+              </div>
+            </div>
+          )
         )}
       </div>
     </Modal>

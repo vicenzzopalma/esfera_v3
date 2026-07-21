@@ -5,27 +5,29 @@
 // ============================================================
 
 mod adb_manager;
+mod ai_engine;
 mod commands;
 mod db;
 mod dispatcher;
 
 use commands::*;
 use db::Database;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let db = Database::init("esfera_v3.db").expect("Falha ao inicializar banco SQLite esfera_v3.db");
+    let db_arc = Arc::new(Mutex::new(db));
 
-    let app_state = AppState {
-        db: Mutex::new(db),
-    };
-
-    dispatcher::Dispatcher::start_worker();
-
+    let db_arc_clone = Arc::clone(&db_arc);
+    
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(app_state)
+        .setup(move |app| {
+            dispatcher::Dispatcher::start_worker(db_arc_clone, Some(app.handle().clone()));
+            Ok(())
+        })
+        .manage(AppState { db: db_arc })
         .invoke_handler(tauri::generate_handler![
             // Auth
             login,
@@ -59,6 +61,7 @@ pub fn run() {
             capture_device_screen,
             send_adb_tap,
             send_adb_keyevent,
+            get_hpc_capabilities,
             // Chips
             get_device_chips,
             add_device_chip,
@@ -90,6 +93,11 @@ pub fn run() {
             // USB / Pairing
             list_usb_devices,
             link_usb_to_wireless,
+            run_adb_diagnostic,
+            restart_adb_server,
+            scan_adb_subnet,
+            deploy_adb_keepalive,
+            get_hardware_uuid,
             // AI Config
             get_ai_config,
             save_ai_config,

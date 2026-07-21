@@ -5,7 +5,6 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
-import { MOCK_LOGS } from "../mock-data";
 import Card from "../components/ui/Card";
 import Badge from "../components/ui/Badge";
 import Button from "../components/ui/Button";
@@ -63,7 +62,7 @@ export default function LogsTab() {
       const data = await invoke<LogEntry[]>("get_logs", { companyId: selectedCompanyId });
       setLogsList(data);
     } catch {
-      setLogsList(MOCK_LOGS.filter((l) => l.companyId === selectedCompanyId));
+      setLogsList([]);
     }
     setLastRefresh(new Date());
   }, [selectedCompanyId]);
