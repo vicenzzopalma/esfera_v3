@@ -88,14 +88,26 @@ impl Dispatcher {
                             campaign.message.replace("{nome}", &contact.contact_name)
                         };
 
-                        let _ = message_to_send;
+                        // 3. Execução Humana Tecla-por-Tecla via C++ HPC
+                        let active_devices = {
+                            if let Ok(db) = db_arc.lock() {
+                                db.get_devices(campaign.company_id)
+                            } else {
+                                Vec::new()
+                            }
+                        };
 
-                        // 3. Cálculo de Delay Gaussiano Nativo via Engine C++ HPC
+                        if let Some(target_dev) = active_devices.first() {
+                            let _ = AdbManager::type_text_human_hpc(&target_dev.serial, &message_to_send);
+                            let _ = AdbManager::send_keyevent(&target_dev.serial, 66);
+                        }
+
+                        // 4. Cálculo de Delay Gaussiano Nativo entre disparos via Engine C++ HPC
                         let delay_min_ms = campaign.delay_min * 1000;
                         let delay_max_ms = campaign.delay_max * 1000;
                         let gaussian_delay_ms = AdbManager::calculate_gaussian_delay(delay_min_ms, delay_max_ms);
 
-                        // Simula/executa o envio
+                        // Aguarda o intervalo Gaussiano C++ HPC antes do próximo envio
                         sleep(Duration::from_millis(gaussian_delay_ms as u64)).await;
 
                         // 4. Atualização no banco

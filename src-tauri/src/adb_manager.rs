@@ -479,6 +479,30 @@ impl AdbManager {
         }
     }
 
+    /// Digitação humana tecla-por-tecla via C++ HPC Gaussian Delay (caractere a caractere)
+    pub fn type_text_human_hpc(serial: &str, text: &str) -> Result<(), String> {
+        for ch in text.chars() {
+            let char_delay_ms = Self::calculate_gaussian_delay(45, 160);
+            std::thread::sleep(std::time::Duration::from_millis(char_delay_ms as u64));
+
+            let ch_str = match ch {
+                ' ' => "%s".to_string(),
+                '"' => "\\\"".to_string(),
+                '\\' => "\\\\".to_string(),
+                '&' => "\\&".to_string(),
+                '<' => "\\<".to_string(),
+                '>' => "\\>".to_string(),
+                '|' => "\\|".to_string(),
+                c => c.to_string(),
+            };
+
+            let _ = Command::new("adb")
+                .args(["-s", serial, "shell", "input", "text", &ch_str])
+                .output();
+        }
+        Ok(())
+    }
+
     pub fn get_device_info(serial: &str) -> (String, String) {
         let brand_out = Command::new("adb")
             .arg("-s")
