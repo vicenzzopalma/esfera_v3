@@ -1274,15 +1274,12 @@ function AdbDiagnosticModal({
     setLoading(true);
     setErrorMsg(null);
     try {
-      if (typeof window === "undefined" || !(window as any).__TAURI_INTERNALS__) {
-        throw new Error("O Diagnóstico de Hardware USB nativo está disponível apenas no aplicativo Desktop. Navegadores web convencionais não têm acesso direto aos barramentos físicos USB por motivos de segurança.");
-      }
       const result = await invoke<AdbDiagnosticResult>("run_adb_diagnostic");
       setDiagnostic(result);
     } catch (err: any) {
       console.error("Erro no diagnóstico ADB:", err);
       let msg = typeof err === "string" ? err : err?.message || "Não foi possível rodar o diagnóstico nativo.";
-      if (msg.includes("reading 'invoke'") || msg.includes("__TAURI_INTERNALS__")) {
+      if (msg.includes("reading 'invoke'") || msg.includes("invoke is not") || msg.includes("not found")) {
         msg = "O Diagnóstico de Hardware USB nativo está disponível apenas no aplicativo Desktop. Navegadores web convencionais não têm acesso direto aos barramentos físicos USB por motivos de segurança.";
       }
       setErrorMsg(msg);
@@ -1295,9 +1292,6 @@ function AdbDiagnosticModal({
     setRestarting(true);
     setErrorMsg(null);
     try {
-      if (typeof window === "undefined" || !(window as any).__TAURI_INTERNALS__) {
-        throw new Error("A reinicialização do servidor ADB está disponível apenas no aplicativo Desktop.");
-      }
       const msg = await invoke<string>("restart_adb_server");
       console.log(msg);
       setTimeout(async () => {
@@ -1307,7 +1301,7 @@ function AdbDiagnosticModal({
     } catch (err: any) {
       console.error("Erro ao reiniciar servidor ADB:", err);
       let msg = typeof err === "string" ? err : err?.message || "Erro ao reiniciar o servidor ADB.";
-      if (msg.includes("reading 'invoke'") || msg.includes("__TAURI_INTERNALS__")) {
+      if (msg.includes("reading 'invoke'") || msg.includes("invoke is not") || msg.includes("not found")) {
         msg = "A reinicialização do servidor ADB está disponível apenas no aplicativo Desktop.";
       }
       setErrorMsg(msg);
