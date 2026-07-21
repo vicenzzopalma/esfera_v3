@@ -9,11 +9,11 @@ use crate::db::{
     AuditLog, AutomationRule, Campaign, Company, Database, Device, User,
     Chip, Contact, DevicePackage, AiConfig, Permission, SectorPermission,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::State;
 
 pub struct AppState {
-    pub db: Mutex<Database>,
+    pub db: Arc<Mutex<Database>>,
 }
 
 // ============================================================
@@ -70,12 +70,22 @@ pub fn update_company(
 
 #[tauri::command]
 pub fn get_devices(state: State<'_, AppState>, company_id: i32) -> Result<Vec<Device>, String> {
+    let target_company_id = if company_id <= 0 { 1 } else { company_id };
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let mut db_devices = db.get_devices(company_id);
+    let mut db_devices = db.get_devices(target_company_id);
     let active_adb_list = AdbManager::list_devices().unwrap_or_default();
 
     for adb_dev in &active_adb_list {
-        let existing_idx = db_devices.iter().position(|d| d.serial == adb_dev.serial);
+        if adb_dev.serial == "*" || adb_dev.serial.starts_with('*') {
+            continue;
+        }
+
+        let existing_idx = db_devices.iter().position(|d| {
+            d.serial == adb_dev.serial
+                || (adb_dev.serial.contains(':') && d.serial == adb_dev.serial.split(':').next().unwrap_or(""))
+                || (d.serial.contains(':') && d.serial.split(':').next().unwrap_or("") == adb_dev.serial)
+        });
+
         let status = if adb_dev.state == "device" {
             "online".to_string()
         } else if adb_dev.state == "unauthorized" {
@@ -101,6 +111,7 @@ pub fn get_devices(state: State<'_, AppState>, company_id: i32) -> Result<Vec<De
                 format!("{} (USB)", model)
             };
             let new_dev = Device {
+                id: 0,
                 serial: adb_dev.serial.clone(),
                 name,
                 brand,
@@ -113,8 +124,8 @@ pub fn get_devices(state: State<'_, AppState>, company_id: i32) -> Result<Vec<De
                 port: 5555,
                 status,
                 battery,
-                company_id,
-                device_number: 1,
+                company_id: target_company_id,
+                device_number: (db_devices.len() + 1) as i32,
                 sector: "junior".to_string(),
             };
             db.upsert_device(&new_dev)?;
@@ -122,14 +133,72 @@ pub fn get_devices(state: State<'_, AppState>, company_id: i32) -> Result<Vec<De
     }
 
     for dev in &mut db_devices {
-        let is_active = active_adb_list.iter().any(|d| d.serial == dev.serial);
-        if !is_active && dev.status != "offline" {
-            dev.status = "offline".to_string();
-            db.upsert_device(dev)?;
+        let is_active = active_adb_list.iter().any(|adb_d| {
+            adb_d.serial == dev.serial
+                || (adb_d.serial.contains(':') && dev.serial == adb_d.serial.split(':').next().unwrap_or(""))
+                || (dev.serial.contains(':') && dev.serial.split(':').next().unwrap_or("") == adb_d.serial)
+        });
+
+        if !is_active {
+            // Tenta auto-reconexão inteligente se o dispositivo wireless tiver IP cadastrado
+            let ip_to_try = if !dev.ip.is_empty() {
+                dev.ip.clone()
+            } else if dev.serial.contains(':') {
+                dev.serial.split(':').next().unwrap_or("").to_string()
+            } else {
+                "".to_string()
+            };
+
+            if !ip_to_try.is_empty() && ip_to_try.contains('.') {
+                let port = if dev.port > 0 { dev.port } else { 5555 };
+                if let Ok(_) = AdbManager::connect_device(&ip_to_try, port) {
+                    let full_serial = format!("{}:{}", ip_to_try, port);
+                    let battery = AdbManager::get_battery_level(&full_serial).unwrap_or(85);
+                    dev.status = "online".to_string();
+                    dev.battery = battery;
+                    db.upsert_device(dev)?;
+                    continue;
+                }
+            }
+
+            if dev.status != "offline" {
+                dev.status = "offline".to_string();
+                db.upsert_device(dev)?;
+            }
         }
     }
 
-    Ok(db.get_devices(company_id))
+    Ok(db.get_devices(target_company_id))
+}
+
+#[tauri::command]
+pub fn get_hpc_capabilities() -> crate::adb_manager::EsferaHardwareCaps {
+    AdbManager::get_hardware_capabilities()
+}
+
+#[tauri::command]
+pub fn run_adb_diagnostic() -> crate::adb_manager::EsferaAdbDiagnosticResult {
+    AdbManager::run_diagnostic()
+}
+
+#[tauri::command]
+pub fn restart_adb_server() -> Result<String, String> {
+    AdbManager::restart_server()
+}
+
+#[tauri::command]
+pub fn scan_adb_subnet(subnet_prefix: String) -> Vec<String> {
+    AdbManager::scan_subnet(&subnet_prefix)
+}
+
+#[tauri::command]
+pub fn deploy_adb_keepalive(serial: String) -> Result<String, String> {
+    AdbManager::deploy_keepalive(&serial)
+}
+
+#[tauri::command]
+pub fn get_hardware_uuid() -> String {
+    AdbManager::get_hardware_uuid()
 }
 
 #[tauri::command]
@@ -145,6 +214,7 @@ pub fn connect_adb_device(
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let serial = format!("{}:{}", ip, port);
     let dev = Device {
+        id: 0,
         serial: serial.clone(),
         name: format!("Celular Wireless ({})", ip),
         brand: "Android".to_string(),
@@ -344,9 +414,17 @@ pub fn update_chip_status(state: State<'_, AppState>, chip_id: i32, status: Stri
 }
 
 #[tauri::command]
-pub fn set_chip_restriction(state: State<'_, AppState>, chip_id: i32, status: String, restricted_until: String) -> Result<(), String> {
+pub fn set_chip_restriction(state: State<'_, AppState>, chip_id: i32, restriction_type: String, days: Option<i32>) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.set_chip_restriction(chip_id, &status, &restricted_until)
+    let restricted_until = if restriction_type == "restrito_custom" {
+        let d = days.unwrap_or(1).max(1);
+        format!("{} days", d)
+    } else if restriction_type == "restrito_7d" {
+        "7 days".to_string()
+    } else {
+        "1 day".to_string()
+    };
+    db.set_chip_restriction(chip_id, &restriction_type, &restricted_until)
 }
 
 #[tauri::command]
@@ -504,6 +582,7 @@ pub fn link_usb_to_wireless(
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let wireless_serial = format!("{}:5555", ip);
     let device = Device {
+        id: 0,
         serial: wireless_serial,
         name: format!("{} (Sem Fio)", model),
         brand,

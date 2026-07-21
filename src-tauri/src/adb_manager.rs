@@ -13,9 +13,186 @@ pub struct AdbDeviceInfo {
     pub model: String,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct EsferaHardwareCaps {
+    pub supports_avx2: bool,
+    pub supports_avx512: bool,
+    pub supports_sse42: bool,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EsferaAdbDiagnostic {
+    pub has_any_usb_device: bool,
+    pub has_android_usb_device: bool,
+    pub is_adb_process_running: bool,
+    pub detected_usb_count: i32,
+    pub diagnostic_msg: [u8; 256],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EsferaAdbDiagnosticResult {
+    pub has_any_usb_device: bool,
+    pub has_android_usb_device: bool,
+    pub is_adb_process_running: bool,
+    pub detected_usb_count: i32,
+    pub diagnostic_msg: String,
+}
+
+extern "C" {
+    pub fn esfera_hpc_detect_hardware(caps: *mut EsferaHardwareCaps);
+    pub fn esfera_hpc_run_adb_diagnostic(diag: *mut EsferaAdbDiagnostic);
+    pub fn esfera_hpc_sanitize_png_buffer(
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        max_out_len: usize,
+        out_written: *mut usize,
+    ) -> i32;
+    pub fn esfera_hpc_calculate_gaussian_delay(min_ms: i32, max_ms: i32) -> i32;
+    pub fn esfera_hpc_generate_hardware_uuid(out_uuid_buf: *mut u8, max_len: usize);
+    pub fn esfera_hpc_generate_bezier_points(
+        start_x: i32,
+        start_y: i32,
+        end_x: i32,
+        end_y: i32,
+        out_pts_x: *mut i32,
+        out_pts_y: *mut i32,
+        max_points: i32,
+        out_count: *mut i32,
+    ) -> i32;
+}
+
 pub struct AdbManager;
 
 impl AdbManager {
+    /// Detecta capacidades da CPU via Engine C++ HPC nativa
+    pub fn get_hardware_capabilities() -> EsferaHardwareCaps {
+        let mut caps = EsferaHardwareCaps {
+            supports_avx2: false,
+            supports_avx512: false,
+            supports_sse42: false,
+        };
+        unsafe {
+            esfera_hpc_detect_hardware(&mut caps);
+        }
+        caps
+    }
+
+    /// Calcula atraso gaussiano imprevisível em C++ HPC
+    pub fn calculate_gaussian_delay(min_ms: i32, max_ms: i32) -> i32 {
+        unsafe { esfera_hpc_calculate_gaussian_delay(min_ms, max_ms) }
+    }
+
+    /// Obtém UUID de Licenciamento de Hardware vinculado à CPU e Placa-mãe em C++
+    pub fn get_hardware_uuid() -> String {
+        let mut buf = vec![0u8; 128];
+        unsafe {
+            esfera_hpc_generate_hardware_uuid(buf.as_mut_ptr(), buf.len());
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(128);
+        String::from_utf8_lossy(&buf[..len]).into_owned()
+    }
+
+    /// Varredura multithread de sub-rede na porta 5555
+    pub fn scan_subnet(subnet_prefix: &str) -> Vec<String> {
+        use std::net::TcpStream;
+        use std::time::Duration;
+        use std::sync::Mutex;
+        use std::sync::Arc;
+
+        let active_ips = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        let prefix = if subnet_prefix.is_empty() { "192.168.1" } else { subnet_prefix.trim_end_matches('.') };
+
+        for i in 1..=254 {
+            let ip = format!("{}.{}", prefix, i);
+            let active_ips_clone = Arc::clone(&active_ips);
+            let handle = std::thread::spawn(move || {
+                let addr = format!("{}:5555", ip);
+                if let Ok(socket_addr) = addr.parse() {
+                    if TcpStream::connect_timeout(&socket_addr, Duration::from_millis(150)).is_ok() {
+                        if let Ok(mut ips) = active_ips_clone.lock() {
+                            ips.push(ip);
+                        }
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let _ = handle.join();
+        }
+
+        let lock = active_ips.lock().unwrap();
+        lock.clone()
+    }
+
+    /// Aplica script Keep-Alive nativo para manter conexão Wi-Fi ativa sem suspensão
+    pub fn deploy_keepalive(serial: &str) -> Result<String, String> {
+        let commands = vec![
+            "settings put global wifi_sleep_policy 2",
+            "settings put global stay_on_while_plugged_in 7",
+            "settings put global low_power 0",
+            "settings put global low_power_trigger_level 0",
+            "dumpsys deviceidle disable",
+        ];
+        for cmd in commands {
+            let _ = Command::new("adb")
+                .args(["-s", serial, "shell", cmd])
+                .output();
+        }
+        Ok("Keep-Alive nativo aplicado com sucesso no dispositivo.".to_string())
+    }
+
+    /// Executa o diagnóstico avançado de hardware/processos USB & ADB
+    pub fn run_diagnostic() -> EsferaAdbDiagnosticResult {
+        let mut diag = EsferaAdbDiagnostic {
+            has_any_usb_device: false,
+            has_android_usb_device: false,
+            is_adb_process_running: false,
+            detected_usb_count: 0,
+            diagnostic_msg: [0u8; 256],
+        };
+        unsafe {
+            esfera_hpc_run_adb_diagnostic(&mut diag);
+        }
+        
+        let len = diag.diagnostic_msg.iter().position(|&c| c == 0).unwrap_or(256);
+        let msg = String::from_utf8_lossy(&diag.diagnostic_msg[..len]).into_owned();
+
+        EsferaAdbDiagnosticResult {
+            has_any_usb_device: diag.has_any_usb_device,
+            has_android_usb_device: diag.has_android_usb_device,
+            is_adb_process_running: diag.is_adb_process_running,
+            detected_usb_count: diag.detected_usb_count,
+            diagnostic_msg: msg,
+        }
+    }
+
+    /// Reinicia o servidor ADB (kill-server & start-server)
+    pub fn restart_server() -> Result<String, String> {
+        let _ = Command::new("adb")
+            .arg("kill-server")
+            .output();
+
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+
+        let output = Command::new("adb")
+            .arg("start-server")
+            .output()
+            .map_err(|e| format!("Falha ao iniciar servidor ADB: {}", e))?;
+
+        if output.status.success() {
+            Ok("Servidor ADB reiniciado com sucesso!".to_string())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("Falha ao iniciar servidor ADB: {}", stderr.trim()))
+        }
+    }
+
     /// Executa `adb devices -l` e retorna a lista de dispositivos físicos/wireless conectados
     pub fn list_devices() -> Result<Vec<AdbDeviceInfo>, String> {
         let output = Command::new("adb")
@@ -33,7 +210,7 @@ impl AdbManager {
 
         for line in stdout.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with("List of devices") {
+            if line.is_empty() || line.starts_with("List of devices") || line.starts_with('*') {
                 continue;
             }
 
@@ -131,7 +308,39 @@ impl AdbManager {
             }
         }
 
-        Err("Não foi possível detectar o IP Wi-Fi do dispositivo".to_string())
+        // Método 4: ifconfig wlan0
+        if let Ok(output) = Command::new("adb").args(["-s", serial, "shell", "ifconfig", "wlan0"]).output() {
+            let out = String::from_utf8_lossy(&output.stdout);
+            for line in out.lines() {
+                if line.contains("inet addr:") {
+                    let parts: Vec<&str> = line.split("inet addr:").collect();
+                    if parts.len() > 1 {
+                        let ip = parts[1].split_whitespace().next().unwrap_or("").trim().to_string();
+                        if ip.contains('.') {
+                            return Ok(ip);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Método 5: dumpsys wifi
+        if let Ok(output) = Command::new("adb").args(["-s", serial, "shell", "dumpsys", "wifi"]).output() {
+            let out = String::from_utf8_lossy(&output.stdout);
+            for line in out.lines() {
+                if line.contains("ip_address=") {
+                    let parts: Vec<&str> = line.split("ip_address=").collect();
+                    if parts.len() > 1 {
+                        let ip = parts[1].split_whitespace().next().unwrap_or("").trim().to_string();
+                        if ip.contains('.') && !ip.starts_with("0.0.0.0") {
+                            return Ok(ip);
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(format!("Não foi possível detectar o IP Wi-Fi do celular '{}'. Verifique se o aparelho está conectado à rede Wi-Fi.", serial))
     }
 
     /// Habilita porta TCP no dispositivo
@@ -155,11 +364,15 @@ impl AdbManager {
             .output()
             .map_err(|e| format!("Falha ao executar 'adb connect': {}", e))?;
 
-        let result = String::from_utf8_lossy(&output.stdout).to_string();
-        if result.contains("connected to") || result.contains("already connected") {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{} {}", stdout, stderr);
+        let lower = combined.to_lowercase();
+
+        if lower.contains("connected to") || lower.contains("already connected") {
             Ok(format!("Dispositivo {} conectado com sucesso!", target))
         } else {
-            Err(format!("Falha na conexão ADB: {}", result))
+            Err(format!("Não foi possível conectar a {}: {}", target, combined.trim()))
         }
     }
 
@@ -202,7 +415,7 @@ impl AdbManager {
         Ok(85) // Valor padrão de fallback se não puder ler
     }
 
-    /// Captura a tela do dispositivo via `adb -s <serial> exec-out screencap -p` e retorna Base64 PNG
+    /// Captura a tela do dispositivo via `adb -s <serial> exec-out screencap -p` e aplica sanitização nativa C++ HPC
     pub fn capture_screen(serial: &str) -> Result<String, String> {
         let output = Command::new("adb")
             .args(["-s", serial, "exec-out", "screencap", "-p"])
@@ -210,11 +423,31 @@ impl AdbManager {
             .map_err(|e| format!("Falha ao executar screencap ADB: {}", e))?;
 
         if output.status.success() && !output.stdout.is_empty() {
+            let raw_bytes = &output.stdout;
+            let mut sanitized = vec![0u8; raw_bytes.len()];
+            let mut out_written: usize = 0;
+
+            let status = unsafe {
+                esfera_hpc_sanitize_png_buffer(
+                    raw_bytes.as_ptr(),
+                    raw_bytes.len(),
+                    sanitized.as_mut_ptr(),
+                    sanitized.len(),
+                    &mut out_written,
+                )
+            };
+
+            let final_bytes = if status == 0 && out_written > 0 {
+                &sanitized[..out_written]
+            } else {
+                raw_bytes.as_slice()
+            };
+
             use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&output.stdout);
+            let b64 = base64::engine::general_purpose::STANDARD.encode(final_bytes);
             Ok(format!("data:image/png;base64,{}", b64))
         } else {
-            Err("Não foi possível capturar o frame da tela do celular".to_string())
+            Err(format!("Não foi possível capturar o frame da tela do celular ({})", serial))
         }
     }
 

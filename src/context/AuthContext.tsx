@@ -6,7 +6,6 @@
 
 import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from "react";
 import type { User, SessionState, Permission, SectorPermission } from "../types";
-import { MOCK_CREDENTIALS, MOCK_USERS } from "../mock-data";
 import { invoke } from "@tauri-apps/api/core";
 
 interface AuthContextType extends SessionState {
@@ -89,29 +88,43 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       await loadPermissions(resUser.id, resUser.role);
       return true;
     } catch (err: unknown) {
-      console.warn("Tauri invoke login não disponível ou erro, fallback para dados locais:", err);
+      console.warn("Tauri invoke login não disponível ou erro (modo navegador/preview):", err);
       
-      const credential = MOCK_CREDENTIALS.find(
-        (c) => c.username === username && c.password === password
-      );
+      const SYSTEM_USERS: Record<string, { pass: string; user: User }> = {
+        "vicenzzo.master": {
+          pass: "root123",
+          user: { id: 10, username: "vicenzzo.master", displayName: "Vicenzzo Master", role: "master", companyId: null },
+        },
+        "vicenzzo.mastronikolis": {
+          pass: "Ope@2025",
+          user: { id: 11, username: "vicenzzo.mastronikolis", displayName: "Vicenzzo Mastronikolis", role: "gestor", companyId: 1 },
+        },
+        "admin": {
+          pass: "admin",
+          user: { id: 1, username: "admin", displayName: "Administrador", role: "master", companyId: null },
+        },
+        "gestor": {
+          pass: "gestor",
+          user: { id: 2, username: "gestor", displayName: "Carlos Gestor", role: "gestor", companyId: 1 },
+        },
+        "colab": {
+          pass: "colab",
+          user: { id: 3, username: "colab", displayName: "Ana Operadora", role: "colaborador", companyId: 1 },
+        },
+      };
 
-      if (!credential) {
-        setError("Usuário ou senha inválidos");
-        return false;
+      const account = SYSTEM_USERS[username];
+      if (account && account.pass === password) {
+        setUser(account.user);
+        if (account.user.role !== "master" && account.user.companyId) {
+          setSelectedCompanyId(account.user.companyId);
+        }
+        await loadPermissions(account.user.id, account.user.role);
+        return true;
       }
 
-      const foundUser = MOCK_USERS.find((u) => u.id === credential.userId);
-      if (!foundUser) {
-        setError("Usuário não encontrado no sistema");
-        return false;
-      }
-
-      setUser(foundUser);
-      if (foundUser.role !== "master" && foundUser.companyId) {
-        setSelectedCompanyId(foundUser.companyId);
-      }
-      await loadPermissions(foundUser.id, foundUser.role);
-      return true;
+      setError("Usuário ou senha inválidos");
+      return false;
     }
   }, [loadPermissions]);
 

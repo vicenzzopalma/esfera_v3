@@ -13,6 +13,7 @@ use sha2::{Sha256, Digest};
 // ============================================================
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Company {
     pub id: i32,
     pub name: String,
@@ -23,6 +24,7 @@ pub struct Company {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct User {
     pub id: i32,
     pub username: String,
@@ -33,7 +35,9 @@ pub struct User {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Device {
+    pub id: i32,
     pub serial: String,
     pub name: String,
     pub brand: String,
@@ -48,6 +52,7 @@ pub struct Device {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Campaign {
     pub id: i32,
     pub name: String,
@@ -69,6 +74,7 @@ pub struct Campaign {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct AutomationRule {
     pub id: i32,
     pub name: String,
@@ -85,6 +91,7 @@ pub struct AutomationRule {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct AuditLog {
     pub id: i32,
     pub timestamp: String,
@@ -95,6 +102,7 @@ pub struct AuditLog {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Chip {
     pub id: i32,
     pub device_id: i32,
@@ -106,6 +114,7 @@ pub struct Chip {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Contact {
     pub id: i32,
     pub campaign_id: i32,
@@ -116,6 +125,7 @@ pub struct Contact {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct DevicePackage {
     pub device_id: i32,
     pub package_name: String,
@@ -126,6 +136,7 @@ pub struct DevicePackage {
 // --- Novos structs Fase 1 ---
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct SentHistory {
     pub phone: String,
     pub campaign_id: i32,
@@ -133,6 +144,7 @@ pub struct SentHistory {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct DeviceStatus {
     pub device_id: String,
     pub package_name: String,
@@ -141,6 +153,7 @@ pub struct DeviceStatus {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct DevicePrefs {
     pub device_id: String,
     pub campaign_id: i32,
@@ -149,6 +162,7 @@ pub struct DevicePrefs {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct AiConfig {
     pub company_id: i32,
     pub provider: String,
@@ -160,6 +174,7 @@ pub struct AiConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Permission {
     pub user_id: i32,
     pub permission_key: String,
@@ -167,6 +182,7 @@ pub struct Permission {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct SectorPermission {
     pub user_id: i32,
     pub sector: String,
@@ -518,7 +534,11 @@ impl Database {
         let _ = self.conn.execute("ALTER TABLE ESF_Contact ADD COLUMN RetryCount INTEGER DEFAULT 0;", []);
         let _ = self.conn.execute("ALTER TABLE ESF_Contact ADD COLUMN CustomMessage TEXT DEFAULT '';", []);
         let _ = self.conn.execute("ALTER TABLE ESF_Contact ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_Contact ADD COLUMN CreatedAt TEXT DEFAULT (datetime('now'));", []);
+        // Limpeza de dispositivos, campanhas e logs falsos legados de desenvolvimento
+        let _ = self.conn.execute("DELETE FROM ESF_Device WHERE AdbDeviceId LIKE 'adb-dev-%';", []);
+        let _ = self.conn.execute("DELETE FROM ESF_Campaign WHERE CampaignName LIKE '%Black Friday%' OR CampaignName LIKE '%Julho%';", []);
+        let _ = self.conn.execute("DELETE FROM ESF_AutomationRule WHERE RuleName LIKE '%Preço%' OR RuleName LIKE '%Humano%';", []);
+        let _ = self.conn.execute("DELETE FROM ESF_AuditLog WHERE Message LIKE '%adb-dev-%';", []);
 
         Ok(())
     }
@@ -529,9 +549,9 @@ impl Database {
             .query_row("SELECT COUNT(*) FROM ESF_Company", [], |r| r.get(0))?;
 
         if count == 0 {
-            // Empresa
+            // Empresa Padrão
             self.conn.execute(
-                "INSERT INTO ESF_Company (CompanyId, CompanyName, DeviceLimit, UserLimit) VALUES (1, 'REALESS RM COBRANÇAS', 50, 20);",
+                "INSERT INTO ESF_Company (CompanyId, CompanyName, DeviceLimit, UserLimit) VALUES (1, 'Empresa Principal', 50, 20);",
                 [],
             )?;
 
@@ -556,40 +576,6 @@ impl Database {
                     "gestor", hash_gestor2,
                     "colab", hash_colab,
                 ],
-            )?;
-
-            // Dispositivos Padrão
-            self.conn.execute(
-                "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector) VALUES
-                ('adb-dev-01', 'Samsung S21 #01', 'Samsung', 'Galaxy S21', '192.168.1.101', 5555, 'online', 88, 1, 1, 'junior'),
-                ('adb-dev-02', 'Xiaomi Note 12 #02', 'Xiaomi', 'Redmi Note 12', '192.168.1.102', 5555, 'online', 65, 1, 2, 'senior'),
-                ('adb-dev-03', 'Motorola Edge #03', 'Motorola', 'Edge 40', '192.168.1.103', 5555, 'offline', 15, 1, 3, 'pesquisa');",
-                [],
-            )?;
-
-            // Campanhas Padrão
-            self.conn.execute(
-                "INSERT INTO ESF_Campaign (CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, Status, TotalContacts, SentContacts, FailedContacts, CompanyId) VALUES
-                (1, 'Cobrança Preventiva Julho', 'Olá {nome}!', 'Identificamos uma pendência em sua conta. Clique no link para regularizar.', 'Equipe REALESS', 30, 90, 1, 1, 'running', 1250, 480, 12, 1),
-                (2, 'Black Friday Antecipada', 'Oi {nome}', 'Super ofertas exclusivas para você hoje!', 'Abraços!', 15, 45, 0, 0, 'paused', 3000, 1200, 45, 1);",
-                [],
-            )?;
-
-            // Automações Padrão
-            self.conn.execute(
-                "INSERT INTO ESF_AutomationRule (RuleId, RuleName, Keyword, ResponseText, IsActive, TriggeredCount, CompanyId) VALUES
-                (1, 'Resposta de Preço', 'preco', 'Olá! Nossos planos começam a partir de R$ 99/mês. Acesse nosso site!', 1, 142, 1),
-                (2, 'Atendimento Humano', 'suporte', 'Entendido! Encaminhei seu contato para um de nossos especialistas.', 1, 89, 1);",
-                [],
-            )?;
-
-            // Logs Padrão
-            self.conn.execute(
-                "INSERT INTO ESF_AuditLog (CompanyId, LogType, Source, Message) VALUES
-                (1, 'info', 'ADB Engine', 'Dispositivo adb-dev-01 conectado com sucesso.'),
-                (1, 'success', 'Campaign Engine', 'Disparo de 50 mensagens concluído para a campanha Cobrança Preventiva.'),
-                (1, 'warning', 'ADB Engine', 'Bateria do dispositivo adb-dev-03 caiu para 15%.');",
-                [],
             )?;
 
             // Permissões padrão para o gestor (UserId = 2)
@@ -713,7 +699,7 @@ impl Database {
 
     pub fn get_devices(&self, company_id: i32) -> Vec<Device> {
         let mut stmt = match self.conn.prepare(
-            "SELECT AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device WHERE CompanyId = ?1"
+            "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device WHERE CompanyId = ?1"
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -721,17 +707,18 @@ impl Database {
 
         let rows = stmt.query_map(params![company_id], |row| {
             Ok(Device {
-                serial: row.get(0)?,
-                name: row.get(1)?,
-                brand: row.get(2)?,
-                model: row.get(3)?,
-                ip: row.get(4)?,
-                port: row.get(5)?,
-                status: row.get(6)?,
-                battery: row.get(7)?,
-                company_id: row.get(8)?,
-                device_number: row.get(9)?,
-                sector: row.get(10)?,
+                id: row.get(0)?,
+                serial: row.get(1)?,
+                name: row.get(2)?,
+                brand: row.get(3)?,
+                model: row.get(4)?,
+                ip: row.get(5)?,
+                port: row.get(6)?,
+                status: row.get(7)?,
+                battery: row.get(8)?,
+                company_id: row.get(9)?,
+                device_number: row.get(10)?,
+                sector: row.get(11)?,
             })
         });
 
@@ -840,6 +827,44 @@ impl Database {
             ]
         ).map_err(|e| e.to_string())?;
         Ok(self.conn.last_insert_rowid() as i32)
+    }
+
+    pub fn get_running_campaigns(&self) -> Result<Vec<Campaign>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt FROM ESF_Campaign WHERE Status = 'running' AND ExcluidoEm IS NULL"
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(Campaign {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                greeting: row.get(2)?,
+                message: row.get(3)?,
+                closing: row.get(4)?,
+                delay_min: row.get(5)?,
+                delay_max: row.get(6)?,
+                use_spintax: row.get::<_, i32>(7)? == 1,
+                use_ai: row.get::<_, i32>(8)? == 1,
+                ai_model: row.get(9)?,
+                ai_prompt: row.get(10)?,
+                status: row.get(11)?,
+                contacts_count: row.get(12)?,
+                sent_count: row.get(13)?,
+                failed_count: row.get(14)?,
+                company_id: row.get(15)?,
+                updated_at: row.get(16)?,
+            })
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn increment_campaign_sent_count(&self, campaign_id: i32) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ESF_Campaign SET SentContacts = SentContacts + 1, UpdatedAt = datetime('now') WHERE CampaignId = ?1",
+            params![campaign_id],
+        )?;
+        Ok(())
     }
 
     pub fn update_campaign(&self, c: &Campaign) -> Result<(), String> {

@@ -30,6 +30,7 @@ export type DeviceStatus = "online" | "offline" | "connecting" | "error";
 export interface Device {
   id: number;
   serial: string;
+  name?: string;
   model: string;
   brand: string;
   status: DeviceStatus;
@@ -37,7 +38,7 @@ export interface Device {
   companyId: number;
   ip?: string;
   port?: number;
-  lastSeen: string;
+  lastSeen?: string;
   deviceNumber: number;
   sector: string;
 }
@@ -143,7 +144,8 @@ export type ContactStatus = "pending" | "sent" | "failed" | "replied" | "process
 
 export interface Contact {
   id: number;
-  name: string;
+  contactName?: string;
+  name?: string;
   phone: string;
   status: ContactStatus;
   campaignId: number;

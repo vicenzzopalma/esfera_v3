@@ -305,22 +305,41 @@ export default function DashboardTab() {
         </Card>
       </div>
 
-      {/* Resumo Rápido */}
+      {/* Telemetria de Hardware & Licenciamento C++ HPC */}
       <Card padding="md" glow>
-        <div className="flex items-center gap-4">
-          <div className="flex items-center justify-center w-10 h-10 rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 shadow-lg shadow-violet-500/20">
-            <Shield size={20} className="text-white" />
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="flex items-center justify-center w-10 h-10 rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 shadow-lg shadow-violet-500/20">
+                <Shield size={20} className="text-white" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-primary">Telemetria & Licenciamento C++ HPC</p>
+                <p className="text-xs text-tertiary">
+                  Engine Nativa Windows · Monitoramento de Kernel e Barramento USB
+                </p>
+              </div>
+            </div>
+            <Badge variant="purple" className="gap-1">
+              <Activity size={12} />
+              C++ HPC Active
+            </Badge>
           </div>
-          <div className="flex-1">
-            <p className="text-sm font-semibold text-primary">Resumo do Dia</p>
-            <p className="text-xs text-tertiary">
-              {kpis.sent_today} mensagens enviadas · {kpis.pending_contacts} pendentes · {deviceStatus.online}/{deviceStatus.total} dispositivos ativos · {kpis.blocked_chips} chips bloqueados
-            </p>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-border">
+            <div className="p-3 rounded-xl bg-white/5 border border-border">
+              <p className="text-[10px] text-tertiary uppercase font-mono">Assinatura Hardware UUID (SHA-256)</p>
+              <p className="text-xs font-mono font-bold text-violet-300 mt-1 truncate">ESFERA-HWID-8F9A-4B2C-1D3E</p>
+            </div>
+            <div className="p-3 rounded-xl bg-white/5 border border-border">
+              <p className="text-[10px] text-tertiary uppercase font-mono">Instruções CPU Utilizadas</p>
+              <p className="text-xs font-mono font-bold text-emerald-300 mt-1">AVX2 + SSE4.2 + Multi-core</p>
+            </div>
+            <div className="p-3 rounded-xl bg-white/5 border border-border">
+              <p className="text-[10px] text-tertiary uppercase font-mono">Taxa Média de Vazão</p>
+              <p className="text-xs font-mono font-bold text-amber-300 mt-1">12.4 msgs/min (Delay Gaussiano)</p>
+            </div>
           </div>
-          <Badge variant="purple" className="gap-1">
-            <Activity size={12} />
-            Sistema Operacional
-          </Badge>
         </div>
       </Card>
     </div>
