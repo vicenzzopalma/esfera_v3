@@ -1,0 +1,4 @@
+*.db
+*.db-shm
+*.db-wal
+esfera_v3.db*
