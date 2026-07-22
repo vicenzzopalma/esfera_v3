@@ -14,11 +14,12 @@ use crate::master_client::MasterClient;
 use crate::session::{LoginResponse, SessionManager};
 use std::sync::{Arc, Mutex};
 use tauri::State;
+use tokio::sync::Mutex as TokioMutex;
 
 pub struct AppState {
     pub db: Arc<Mutex<Database>>,
     pub sessions: Arc<Mutex<SessionManager>>,
-    pub master_client: Arc<Mutex<Option<MasterClient>>>,
+    pub master_client: Arc<TokioMutex<Option<MasterClient>>>,
 }
 
 fn validate_session(
@@ -1221,16 +1222,10 @@ pub async fn hub_invoke(
     token: String,
     cmd: String,
     args: serde_json::Value,
+    company_id: i32,
 ) -> Result<serde_json::Value, String> {
-    let session = validate_session(&state.sessions, &token)?;
-    let company_id = session.company_id.ok_or_else(|| "Master mode requer empresa selecionada.".to_string())?;
-    let client = {
-        let mc = state.master_client.lock().map_err(|e| e.to_string())?;
-        mc.as_ref().map(|c| {
-            use std::sync::Arc;
-            // We can't clone MasterClient easily. Let's use Arc.
-            unimplemented!()
-        }).ok_or_else(|| "Hub não conectado.".to_string())
-    };
+    validate_session(&state.sessions, &token)?;
+    let mc = state.master_client.lock().await;
+    let client = mc.as_ref().ok_or_else(|| "Hub não conectado. Verifique configurações.".to_string())?;
     client.send_command(company_id, &cmd, args).await
 }
