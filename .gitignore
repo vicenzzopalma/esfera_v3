@@ -22,3 +22,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Database & Temporary Media
+*.db
+*.db-shm
+*.db-wal
+*.mp4
+

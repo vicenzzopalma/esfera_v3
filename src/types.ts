@@ -57,14 +57,14 @@ export interface Campaign {
   contactsCount: number;
   sentCount: number;
   failedCount: number;
-  deviceIds: number[];
+  deviceIds?: number[];
   companyId: number;
   useSpintax: boolean;
   useAI: boolean;
   aiModel?: string;
   aiTemperature?: number;
   aiPrompt?: string;
-  createdAt: string;
+  createdAt?: string;
   updatedAt: string;
 }
 
@@ -230,6 +230,14 @@ export interface SectorPermission {
   sector: string;
   canView: boolean;
   canConfigure: boolean;
+}
+
+export interface AppConfig {
+  hub_enabled: boolean;
+  hub_address: string;
+  empresa_server_enabled: boolean;
+  empresa_server_port: number;
+  mode: "local" | "empresa" | "master";
 }
 
 export interface DashboardKpis {

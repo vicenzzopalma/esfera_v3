@@ -4,10 +4,15 @@ version = "0.1.0"
 description = "Esfera v3 — Plataforma de Disparos e Automação ADB"
 authors = ["vicenzzopalma"]
 edition = "2021"
+default-run = "esfera_v3"
 
 [lib]
 name = "esfera_v3_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "esfera-hub"
+path = "src/bin/hub.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

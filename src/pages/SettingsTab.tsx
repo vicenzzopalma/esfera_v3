@@ -8,8 +8,8 @@ import { useAuth } from "../context/AuthContext";
 import Card from "../components/ui/Card";
 import Button from "../components/ui/Button";
 import Toggle from "../components/ui/Toggle";
-import { invoke } from "@tauri-apps/api/core";
-import type { AiConfig } from "../types";
+import { api } from "../tauri";
+import type { AiConfig, AppConfig } from "../types";
 import {
   Save,
   Globe,
@@ -21,6 +21,7 @@ import {
   Zap,
   RotateCcw,
   Brain,
+  Wifi,
 } from "lucide-react";
 
 export default function SettingsTab() {
@@ -64,10 +65,18 @@ export default function SettingsTab() {
   const [logRetention, setLogRetention] = useState("30");
   const [sessionTimeout, setSessionTimeout] = useState("60");
 
+  // Hub config
+  const [hubEnabled, setHubEnabled] = useState(false);
+  const [hubAddress, setHubAddress] = useState("");
+  const [empresaServerEnabled, setEmpresaServerEnabled] = useState(false);
+  const [empresaServerPort, setEmpresaServerPort] = useState(7777);
+  const [appMode, setAppMode] = useState<"local" | "empresa" | "master">("local");
+  const [hubStatus, setHubStatus] = useState("");
+
   // Load AI config
   useEffect(() => {
     if (!selectedCompanyId) return;
-    invoke<AiConfig>("get_ai_config", { companyId: selectedCompanyId })
+    api<AiConfig>("get_ai_config", { companyId: selectedCompanyId })
       .then((cfg) => {
         if (cfg) {
           setAiProvider(cfg.provider || "ollama_local");
@@ -81,10 +90,23 @@ export default function SettingsTab() {
       .catch(() => {});
   }, [selectedCompanyId]);
 
+  // Load app config
+  useEffect(() => {
+    api<AppConfig>("get_app_config")
+      .then((cfg) => {
+        setHubEnabled(cfg.hub_enabled);
+        setHubAddress(cfg.hub_address);
+        setEmpresaServerEnabled(cfg.empresa_server_enabled);
+        setEmpresaServerPort(cfg.empresa_server_port);
+        setAppMode(cfg.mode);
+      })
+      .catch(() => {});
+  }, []);
+
   const handleSaveAll = async () => {
     if (!selectedCompanyId) return;
     try {
-      await invoke("save_ai_config", {
+      await api("save_ai_config", {
         companyId: selectedCompanyId,
         config: {
           provider: aiProvider,
@@ -95,13 +117,21 @@ export default function SettingsTab() {
           endpoint: aiEndpoint,
         },
       });
+      await api("save_app_config", {
+        hub_enabled: hubEnabled,
+        hub_address: hubAddress,
+        empresa_server_enabled: empresaServerEnabled,
+        empresa_server_port: empresaServerPort,
+        mode: appMode,
+      });
+      setHubStatus("Configurações salvas. Reinicie o app para aplicar alterações de rede.");
     } catch { /* noop */ }
   };
 
   const handleTestAI = async () => {
     setAiTestResult("Testando...");
     try {
-      const result = await invoke<string>("rewrite_message_ai", {
+      const result = await api<string>("rewrite_message_ai", {
         message: "Olá {nome}, sua fatura está pendente.",
         contactName: "Maria",
       });
@@ -252,6 +282,44 @@ export default function SettingsTab() {
               </div>
             )}
           </div>
+        </div>
+      </Card>
+
+      {/* === HUB / DISTRIBUÍDO === */}
+      <Card>
+        <SectionHeader icon={<Wifi size={18} />} color="blue" title="Conexão Distribuída (Hub)" subtitle="Conecte esta instância ao Hub central ou sirva na LAN" />
+        <div className="space-y-4 text-xs">
+          <div>
+            <label className="block font-semibold text-secondary mb-1">Modo de Operação</label>
+            <select value={appMode} onChange={(e) => setAppMode(e.target.value as "local" | "empresa" | "master")} className="w-full input-setting">
+              <option value="local">Local (standalone, sem Hub)</option>
+              <option value="empresa">Empresa (conecta ao Hub + serve LAN)</option>
+              <option value="master">Master (controle remoto via Hub)</option>
+            </select>
+          </div>
+          {appMode !== "local" && (
+            <>
+              <div>
+                <label className="block font-semibold text-secondary mb-1">Endereço do Hub (IP:Porta)</label>
+                <input type="text" value={hubAddress} onChange={(e) => setHubAddress(e.target.value)} placeholder="192.168.1.100:8888" className="w-full input-setting font-mono" />
+              </div>
+              <ToggleRow label="Habilitar Conexão com Hub" desc="Mantém conexão persistente com o servidor central" checked={hubEnabled} onChange={setHubEnabled} />
+            </>
+          )}
+          {appMode === "empresa" && (
+            <>
+              <ToggleRow label="Servidor LAN (Empresa Server)" desc="Aceita conexões de Gestores/Colaboradores na rede local" checked={empresaServerEnabled} onChange={setEmpresaServerEnabled} />
+              {empresaServerEnabled && (
+                <div>
+                  <label className="block font-semibold text-secondary mb-1">Porta do Servidor LAN</label>
+                  <input type="number" value={empresaServerPort} onChange={(e) => setEmpresaServerPort(parseInt(e.target.value) || 7777)} min={1024} max={65535} className="w-32 input-setting font-mono" />
+                </div>
+              )}
+            </>
+          )}
+          {hubStatus && (
+            <p className="text-xs text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded-lg p-2">{hubStatus}</p>
+          )}
         </div>
       </Card>
 

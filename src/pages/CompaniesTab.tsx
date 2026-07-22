@@ -12,7 +12,7 @@ import Badge from "../components/ui/Badge";
 import Button from "../components/ui/Button";
 import Modal from "../components/ui/Modal";
 import Toggle from "../components/ui/Toggle";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from "../tauri";
 import type { Company } from "../types";
 import {
   Building2,
@@ -40,7 +40,7 @@ export default function CompaniesTab() {
   const [editActive, setEditActive] = useState(true);
 
   useEffect(() => {
-    invoke<Company[]>("get_companies")
+    api<Company[]>("get_companies")
       .then((data) => {
         if (data && data.length > 0) {
           setCompaniesList(data);

@@ -9,7 +9,7 @@ import Card from "../components/ui/Card";
 import Badge from "../components/ui/Badge";
 import Button from "../components/ui/Button";
 import type { LogType, LogEntry } from "../types";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from "../tauri";
 import {
   Search,
   Info,
@@ -59,7 +59,7 @@ export default function LogsTab() {
   const fetchLogs = useCallback(async () => {
     if (!selectedCompanyId) return;
     try {
-      const data = await invoke<LogEntry[]>("get_logs", { companyId: selectedCompanyId });
+      const data = await api<LogEntry[]>("get_logs", { companyId: selectedCompanyId });
       setLogsList(data);
     } catch {
       setLogsList([]);
@@ -123,7 +123,7 @@ export default function LogsTab() {
 
   const handleClearLogs = async () => {
     try {
-      await invoke("clear_logs", { companyId: selectedCompanyId });
+      await api("clear_logs", { companyId: selectedCompanyId });
     } catch { /* noop */ }
     setLogsList([]);
   };
