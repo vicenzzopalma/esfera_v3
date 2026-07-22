@@ -5,7 +5,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from "../tauri";
 import { MOCK_USERS } from "../mock-data";
 import { Shield, Users, Save, RotateCcw, Check, Info } from "lucide-react";
 import Button from "../components/ui/Button";
@@ -83,8 +83,8 @@ export default function PermissionsTab() {
     setLoading(true);
     try {
       const [perms, sectorPerms] = await Promise.all([
-        invoke<Permission[]>("get_user_permissions", { userId }),
-        invoke<SectorPermission[]>("get_sector_permissions", { userId }),
+        api<Permission[]>("get_user_permissions", { userId }),
+        api<SectorPermission[]>("get_sector_permissions", { userId }),
       ]);
       setPermissions(perms.length > 0 ? perms : DEFAULT_PERMISSIONS.map((p) => ({ ...p, userId })));
       setSectorPermissions(sectorPerms.length > 0 ? sectorPerms : DEFAULT_SECTOR_PERMISSIONS.map((sp) => ({ ...sp, userId })));
@@ -122,14 +122,14 @@ export default function PermissionsTab() {
     setSaving(true);
     try {
       for (const perm of permissions) {
-        await invoke("update_user_permission", {
+        await api("update_user_permission", {
           userId: Number(selectedUserId),
           permissionKey: perm.permissionKey,
           enabled: perm.enabled,
         });
       }
       for (const sp of sectorPermissions) {
-        await invoke("update_sector_permission", {
+        await api("update_sector_permission", {
           userId: Number(selectedUserId),
           sector: sp.sector,
           canView: sp.canView,

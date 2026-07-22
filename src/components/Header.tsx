@@ -3,17 +3,17 @@
 // Barra superior com breadcrumb, switcher de empresas, status ADB e perfil
 // ============================================================
 
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
-import { MOCK_COMPANIES, MOCK_DEVICES } from "../mock-data";
+import { api } from "../tauri";
+import type { Company, Device } from "../types";
 import {
   Building2,
   ChevronDown,
   Sun,
   Moon,
-  Search,
   CheckCircle2,
   Cpu,
   LogOut,
@@ -22,6 +22,8 @@ import {
 
 const PAGE_TITLES: Record<string, { title: string; subtitle: string }> = {
   "/companies": { title: "Gestão de Empresas", subtitle: "Gerencie permissões e cotas de clientes" },
+  "/permissions": { title: "Permissões", subtitle: "Controle de acesso por usuário e setor" },
+  "/dashboard": { title: "Dashboard", subtitle: "Indicadores e KPIs em tempo real" },
   "/devices": { title: "Hub de Dispositivos ADB", subtitle: "Conexões ativas e status em tempo real" },
   "/campaigns": { title: "Central de Campanhas", subtitle: "Disparos inteligentes e fluxo de contatos" },
   "/automations": { title: "Regras de Automação", subtitle: "Respostas automáticas por palavras-chave" },
@@ -37,6 +39,11 @@ export default function Header() {
 
   const [companyDropdownOpen, setCompanyDropdownOpen] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const [companies, setCompanies] = useState<Company[]>([]);
+  const [onlineDevicesCount, setOnlineDevicesCount] = useState(0);
+
+  const companyDropdownRef = useRef<HTMLDivElement>(null);
+  const userMenuRef = useRef<HTMLDivElement>(null);
 
   if (!user) return null;
 
@@ -45,9 +52,39 @@ export default function Header() {
     subtitle: "Plataforma de Disparos Inteligentes",
   };
 
-  const selectedCompany = MOCK_COMPANIES.find((c) => c.id === selectedCompanyId);
-  const companyDevices = MOCK_DEVICES.filter((d) => d.companyId === selectedCompanyId);
-  const onlineDevicesCount = companyDevices.filter((d) => d.status === "online").length;
+  const selectedCompany = companies.find((c) => c.id === selectedCompanyId);
+
+  // Carregar empresas do backend
+  useEffect(() => {
+    api<Company[]>("get_companies")
+      .then((data) => setCompanies(data || []))
+      .catch(() => setCompanies([]));
+  }, []);
+
+  // Carregar contagem de dispositivos online
+  useEffect(() => {
+    if (!selectedCompanyId) { setOnlineDevicesCount(0); return; }
+    api<Device[]>("get_devices", { companyId: selectedCompanyId })
+      .then((data) => {
+        const online = (data || []).filter((d) => d.status === "online").length;
+        setOnlineDevicesCount(online);
+      })
+      .catch(() => setOnlineDevicesCount(0));
+  }, [selectedCompanyId]);
+
+  // Bug 7: Fechar dropdowns ao clicar fora
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (companyDropdownRef.current && !companyDropdownRef.current.contains(e.target as Node)) {
+        setCompanyDropdownOpen(false);
+      }
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) {
+        setUserMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   const handleCompanySelect = (companyId: number) => {
     enterCompany(companyId);
@@ -81,18 +118,8 @@ export default function Header() {
         </div>
       </div>
 
-      {/* Right: Actions, Search, Switcher & User */}
+      {/* Right: Actions, Switcher & User */}
       <div className="flex items-center gap-3">
-        {/* Quick Search Bar */}
-        <div className="relative hidden md:flex items-center">
-          <Search size={15} className="absolute left-3.5 text-tertiary pointer-events-none z-10" />
-          <input
-            type="text"
-            placeholder="Pesquisa rápida (Ctrl+K)..."
-            className="w-56 input-with-icon-left focus:w-64 focus:border-violet-500/40 transition-all"
-          />
-        </div>
-
         {/* Engine ADB Status Badge */}
         <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white/[0.03] border border-border text-xs">
           <Cpu size={14} className="text-indigo-400" />
@@ -105,7 +132,7 @@ export default function Header() {
 
         {/* Company Switcher Dropdown (Master only) */}
         {user.role === "master" && (
-          <div className="relative">
+          <div className="relative" ref={companyDropdownRef}>
             <button
               onClick={() => setCompanyDropdownOpen(!companyDropdownOpen)}
               className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white/5 border border-border hover:bg-white/10 text-xs font-medium text-primary transition-all cursor-pointer"
@@ -122,7 +149,10 @@ export default function Header() {
                 <div className="px-3 py-2 text-[10px] uppercase font-bold text-tertiary tracking-wider border-b border-border mb-1">
                   Trocar Empresa
                 </div>
-                {MOCK_COMPANIES.map((c) => (
+                {companies.length === 0 && (
+                  <div className="px-3 py-2 text-xs text-tertiary">Nenhuma empresa cadastrada</div>
+                )}
+                {companies.map((c) => (
                   <button
                     key={c.id}
                     onClick={() => handleCompanySelect(c.id)}
@@ -159,7 +189,7 @@ export default function Header() {
         </button>
 
         {/* User Profile Menu */}
-        <div className="relative">
+        <div className="relative" ref={userMenuRef}>
           <button
             onClick={() => setUserMenuOpen(!userMenuOpen)}
             className="flex items-center gap-2 p-1 rounded-xl hover:bg-white/5 transition-all cursor-pointer"

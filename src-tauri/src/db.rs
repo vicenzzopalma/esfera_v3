@@ -62,6 +62,7 @@ pub struct Campaign {
     pub delay_min: i32,
     pub delay_max: i32,
     pub use_spintax: bool,
+    #[serde(alias = "useAI")]
     pub use_ai: bool,
     pub ai_model: String,
     pub ai_prompt: String,

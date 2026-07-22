@@ -12,7 +12,7 @@ import Button from "../components/ui/Button";
 import Modal from "../components/ui/Modal";
 import Toggle from "../components/ui/Toggle";
 import type { Campaign, CampaignStatus, Contact } from "../types";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from "../tauri";
 import {
   Megaphone,
   Plus,
@@ -61,7 +61,7 @@ export default function CampaignsTab() {
 
   useEffect(() => {
     if (!selectedCompanyId) return;
-    invoke<Campaign[]>("get_campaigns", { companyId: selectedCompanyId })
+    api<Campaign[]>("get_campaigns", { companyId: selectedCompanyId })
       .then((data) => setCampaignsList(data))
       .catch(() => setCampaignsList(MOCK_CAMPAIGNS.filter((c) => c.companyId === selectedCompanyId)));
   }, [selectedCompanyId]);
@@ -154,7 +154,7 @@ export default function CampaignsTab() {
   const handleConfirmImport = async () => {
     if (!selectedCampaign || parsedContacts.length === 0) return;
     try {
-      await invoke("import_campaign_contacts", {
+      await api("import_campaign_contacts", {
         campaignId: selectedCampaign.id,
         contacts: parsedContacts.map((c) => [c.name, c.phone]),
       });
@@ -178,7 +178,7 @@ export default function CampaignsTab() {
   // Campaign dispatch controls
   const handleStartCampaign = async (campaign: Campaign) => {
     try {
-      await invoke("start_campaign", { campaignId: campaign.id });
+      await api("start_campaign", { campaignId: campaign.id });
     } catch { /* noop */ }
     setCampaignsList((prev) =>
       prev.map((c) => (c.id === campaign.id ? { ...c, status: "running" as const } : c))
@@ -187,7 +187,7 @@ export default function CampaignsTab() {
 
   const handlePauseCampaign = async (campaign: Campaign) => {
     try {
-      await invoke("pause_campaign", { campaignId: campaign.id });
+      await api("pause_campaign", { campaignId: campaign.id });
     } catch { /* noop */ }
     setCampaignsList((prev) =>
       prev.map((c) => (c.id === campaign.id ? { ...c, status: "paused" as const } : c))
@@ -196,7 +196,7 @@ export default function CampaignsTab() {
 
   const handleSendBatch = async (campaign: Campaign) => {
     try {
-      const result = await invoke<{ sent_in_batch: number; remaining: number; campaign_complete: boolean }>(
+      const result = await api<{ sent_in_batch: number; remaining: number; campaign_complete: boolean }>(
         "send_campaign",
         { campaignId: campaign.id }
       );
@@ -336,9 +336,18 @@ export default function CampaignsTab() {
           isOpen={editModalOpen}
           onClose={() => setEditModalOpen(false)}
           campaign={selectedCampaign}
-          onSaved={() => {
+          onSaved={(savedCamp) => {
+            setCampaignsList((prev) => {
+              const idx = prev.findIndex((c) => c.id === savedCamp.id);
+              if (idx >= 0) {
+                const updated = [...prev];
+                updated[idx] = savedCamp;
+                return updated;
+              }
+              return [savedCamp, ...prev];
+            });
             if (selectedCompanyId) {
-              invoke<Campaign[]>("get_campaigns", { companyId: selectedCompanyId })
+              api<Campaign[]>("get_campaigns", { companyId: selectedCompanyId })
                 .then((data) => setCampaignsList(data))
                 .catch(() => {});
             }
@@ -591,10 +600,10 @@ function CampaignEditModal({
   isOpen: boolean;
   onClose: () => void;
   campaign: Campaign | null;
-  onSaved: () => void;
+  onSaved: (campaign: Campaign) => void;
 }) {
   const { selectedCompanyId } = useAuth();
-  const [useSpintax, setUseSpintax] = useState(campaign?.useSpintax ?? false);
+  const [useSpintax, setUseSpintax] = useState(campaign?.useSpintax ?? true);
   const [useAI, setUseAI] = useState(campaign?.useAI ?? false);
 
   const [nameText, setNameText] = useState(campaign?.name || "");
@@ -605,20 +614,37 @@ function CampaignEditModal({
   const [delayMaxVal, setDelayMaxVal] = useState(campaign?.delayMax || 90);
   const [aiModelVal, setAiModelVal] = useState(campaign?.aiModel || "gpt-4o-mini");
   const [aiPromptVal, setAiPromptVal] = useState(campaign?.aiPrompt || "");
-
   const [spintaxPreview, setSpintaxPreview] = useState("");
+
+  useEffect(() => {
+    if (isOpen) {
+      setNameText(campaign?.name || "");
+      setGreetingText(campaign?.greeting || "{Olá|Oi|Bom dia} {nome}, tudo bem?");
+      setBodyText(campaign?.message || "Temos uma condição especial disponível para você hoje!");
+      setClosingText(campaign?.closing || "Atenciosamente, {Equipe REALESS|Setor Financeiro}");
+      setDelayMinVal(campaign?.delayMin || 30);
+      setDelayMaxVal(campaign?.delayMax || 90);
+      setUseSpintax(campaign?.useSpintax ?? true);
+      setUseAI(campaign?.useAI ?? false);
+      setAiModelVal(campaign?.aiModel || "gpt-4o-mini");
+      setAiPromptVal(campaign?.aiPrompt || "");
+      setSpintaxPreview("");
+    }
+  }, [isOpen, campaign]);
 
   const handleSaveCampaign = async () => {
     if (!selectedCompanyId) return;
+    const finalName = nameText.trim() || `Campanha ${new Date().toLocaleDateString("pt-BR")} ${new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}`;
     const payload = {
       id: campaign?.id || 0,
-      name: nameText,
+      name: finalName,
       greeting: greetingText,
       message: bodyText,
       closing: closingText,
       delayMin: parseInt(String(delayMinVal), 10) || 30,
       delayMax: parseInt(String(delayMaxVal), 10) || 90,
       useSpintax,
+      useAi: useAI,
       useAI,
       aiModel: aiModelVal,
       aiPrompt: aiPromptVal,
@@ -631,11 +657,37 @@ function CampaignEditModal({
     };
 
     try {
-      await invoke("create_campaign", { campaign: payload });
-      onSaved();
+      if (campaign?.id) {
+        await api("update_campaign", { campaign: payload });
+      } else {
+        const newId = await api<number>("create_campaign", { campaign: payload });
+        if (newId) payload.id = newId;
+      }
+      onSaved(payload as unknown as Campaign);
       onClose();
     } catch (err) {
-      console.error("Falha ao salvar campanha:", err);
+      console.warn("Criando/atualizando campanha no estado local:", err);
+      const fallbackCamp: Campaign = {
+        id: campaign?.id || Date.now(),
+        name: finalName,
+        greeting: greetingText,
+        message: bodyText,
+        closing: closingText,
+        delayMin: parseInt(String(delayMinVal), 10) || 30,
+        delayMax: parseInt(String(delayMaxVal), 10) || 90,
+        useSpintax,
+        useAI,
+        aiModel: aiModelVal,
+        aiPrompt: aiPromptVal,
+        status: (campaign?.status || "draft") as CampaignStatus,
+        contactsCount: campaign?.contactsCount || 0,
+        sentCount: campaign?.sentCount || 0,
+        failedCount: campaign?.failedCount || 0,
+        companyId: selectedCompanyId,
+        updatedAt: new Date().toISOString().split("T")[0],
+      };
+      onSaved(fallbackCamp);
+      onClose();
     }
   };
 
@@ -661,7 +713,7 @@ function CampaignEditModal({
   const handleTestAI = async () => {
     const msg = `${greetingText} ${bodyText} ${closingText}`.trim();
     try {
-      const rewritten = await invoke<string>("rewrite_message_ai", { message: msg, contactName: "Maria" });
+      const rewritten = await api<string>("rewrite_message_ai", { message: msg, contactName: "Maria" });
       setSpintaxPreview(rewritten);
     } catch {
       setSpintaxPreview("[IA Mock] " + msg.replace("{nome}", "Maria"));
@@ -823,7 +875,7 @@ function ContactsModal({
 
   useEffect(() => {
     if (!isOpen || !campaign) return;
-    invoke<Contact[]>("get_campaign_contacts", { campaignId: campaign.id })
+    api<Contact[]>("get_campaign_contacts", { campaignId: campaign.id })
       .then((data) => setContacts(data))
       .catch(() => {
         setContacts([

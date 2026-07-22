@@ -13,7 +13,7 @@ import Modal from "../components/ui/Modal";
 import Toggle from "../components/ui/Toggle";
 import type { Automation, AutomationTriggerType, AutomationActionType } from "../types";
 import { TRIGGER_LABELS, ACTION_LABELS } from "../types";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from "../tauri";
 import {
   Bot,
   Plus,
@@ -99,7 +99,7 @@ export default function AutomationsTab() {
 
   useEffect(() => {
     if (!selectedCompanyId) return;
-    invoke<Automation[]>("get_automations", { companyId: selectedCompanyId })
+    api<Automation[]>("get_automations", { companyId: selectedCompanyId })
       .then((data) => setAutomationsList(data))
       .catch(() => setAutomationsList(MOCK_AUTOMATIONS.filter((a) => a.companyId === selectedCompanyId)));
   }, [selectedCompanyId]);
@@ -169,8 +169,8 @@ export default function AutomationsTab() {
     };
 
     try {
-      await invoke("create_automation", { automation: payload });
-      const updated = await invoke<Automation[]>("get_automations", { companyId: selectedCompanyId });
+      await api("create_automation", { automation: payload });
+      const updated = await api<Automation[]>("get_automations", { companyId: selectedCompanyId });
       setAutomationsList(updated);
     } catch {
       if (!selectedAutomation) {
@@ -214,7 +214,7 @@ export default function AutomationsTab() {
       prev.map((a) => (a.id === id ? { ...a, active: newActive } : a))
     );
     try {
-      await invoke("update_automation", {
+      await api("update_automation", {
         automation: automationsList.find((a) => a.id === id),
       });
     } catch { /* noop */ }
@@ -222,7 +222,7 @@ export default function AutomationsTab() {
 
   const handleDelete = async (id: number) => {
     try {
-      await invoke("soft_delete_automation", { automationId: id });
+      await api("soft_delete_automation", { automationId: id });
     } catch { /* noop */ }
     setAutomationsList((prev) => prev.filter((a) => a.id !== id));
   };

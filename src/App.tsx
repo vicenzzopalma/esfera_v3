@@ -51,6 +51,15 @@ function CompanyGate({ children }: { children: ReactNode }) {
     return <Navigate to="/companies" replace />;
   }
 
+  // Gestor ou Colaborador sem empresa → tenta restaurar do user.companyId ou redireciona ao login
+  if (user.role !== "master" && selectedCompanyId === null) {
+    if (user.companyId) {
+      // Auto-restaura a empresa do usuário (não deveria chegar aqui, mas é safety net)
+      return <Navigate to="/" replace />;
+    }
+    return <Navigate to="/login" replace />;
+  }
+
   return <>{children}</>;
 }
 
@@ -107,12 +116,14 @@ function AppRoutes() {
           }
         />
 
-        {/* Dashboard (requer empresa) */}
+        {/* Dashboard (requer empresa + master/gestor) */}
         <Route
           path="/dashboard"
           element={
             <CompanyGate>
-              <DashboardTab />
+              <RoleGate roles={["master", "gestor"]}>
+                <DashboardTab />
+              </RoleGate>
             </CompanyGate>
           }
         />

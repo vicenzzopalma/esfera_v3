@@ -6,7 +6,7 @@
 import { useState, useEffect } from "react";
 import { useAuth } from "../context/AuthContext";
 import { usePermissions } from "../hooks/usePermissions";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from "../tauri";
 import { MOCK_COMPANIES } from "../mock-data";
 import Card from "../components/ui/Card";
 import Badge from "../components/ui/Badge";
@@ -59,7 +59,7 @@ export default function DashboardTab() {
     if (!selectedCompanyId) return;
     setLoading(true);
     try {
-      const data = await invoke<KpiData>("get_dashboard_kpis", { companyId: selectedCompanyId });
+      const data = await api<KpiData>("get_dashboard_kpis", { companyId: selectedCompanyId });
       setKpis(data);
     } catch {
       // Fallback mock
@@ -71,7 +71,7 @@ export default function DashboardTab() {
       });
     }
     try {
-      const devices = await invoke<{ id: number; status: string }[]>("get_devices", { companyId: selectedCompanyId });
+      const devices = await api<{ id: number; status: string }[]>("get_devices", { companyId: selectedCompanyId });
       const online = devices.filter((d) => d.status === "online").length;
       setDeviceStatus({ online, offline: devices.length - online, total: devices.length });
     } catch {

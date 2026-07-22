@@ -135,4 +135,44 @@ impl Dispatcher {
             }
         });
     }
+
+    /// Loop persistente de manter conexões ADB vivas e reinjetar Keep-Alive continuamente
+    pub fn start_persistent_adb_keepalive_loop(db_arc: Arc<Mutex<Database>>) {
+        tauri::async_runtime::spawn(async move {
+            loop {
+                // Roda a cada 5 segundos no segundo plano
+                sleep(Duration::from_secs(5)).await;
+
+                let saved_devices = {
+                    if let Ok(db) = db_arc.lock() {
+                        db.get_devices(1)
+                    } else {
+                        Vec::new()
+                    }
+                };
+
+                for dev in saved_devices {
+                    let ip_target = if !dev.ip.is_empty() {
+                        dev.ip.clone()
+                    } else if dev.serial.contains(':') {
+                        dev.serial.split(':').next().unwrap_or("").to_string()
+                    } else {
+                        "".to_string()
+                    };
+
+                    if !ip_target.is_empty() && ip_target.contains('.') {
+                        let port = if dev.port > 0 { dev.port } else { 5555 };
+                        // Executa adb connect permanente em segundo plano
+                        if let Ok(_) = AdbManager::connect_device(&ip_target, port) {
+                            let full_serial = format!("{}:{}", ip_target, port);
+                            // Reinjeta as regras de Keep-Alive nativo do Android
+                            let _ = AdbManager::deploy_keepalive(&full_serial);
+                        }
+                    } else if !dev.serial.is_empty() && !dev.serial.contains(':') {
+                        let _ = AdbManager::deploy_keepalive(&dev.serial);
+                    }
+                }
+            }
+        });
+    }
 }

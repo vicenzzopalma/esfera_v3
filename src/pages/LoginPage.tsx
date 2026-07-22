@@ -138,32 +138,34 @@ export default function LoginPage() {
             </button>
           </form>
 
-          {/* Quick Credentials Widget */}
-          <div className="pt-2">
-            <div className="rounded-2xl bg-white/[0.02] border border-border p-4">
-              <div className="flex items-center gap-1.5 text-[11px] font-bold text-tertiary uppercase tracking-wider mb-3">
-                <Sparkles size={14} className="text-violet-400" />
-                <span>Atalhos de Login Rápido</span>
-              </div>
+          {/* Quick Credentials Widget — APENAS em modo de desenvolvimento */}
+          {import.meta.env.DEV && (
+            <div className="pt-2">
+              <div className="rounded-2xl bg-white/[0.02] border border-border p-4">
+                <div className="flex items-center gap-1.5 text-[11px] font-bold text-tertiary uppercase tracking-wider mb-3">
+                  <Sparkles size={14} className="text-violet-400" />
+                  <span>Atalhos de Login (DEV)</span>
+                </div>
 
-              <div className="grid grid-cols-2 gap-2.5">
-                <button
-                  type="button"
-                  onClick={() => fillCredentials("vicenzzo.master", "root123")}
-                  className="py-2.5 px-3 rounded-xl bg-violet-600/20 hover:bg-violet-600/30 text-xs font-semibold text-violet-300 border border-violet-500/30 transition-colors cursor-pointer text-center"
-                >
-                  Vicenzzo Master
-                </button>
-                <button
-                  type="button"
-                  onClick={() => fillCredentials("vicenzzo.mastronikolis", "Ope@2025")}
-                  className="py-2.5 px-3 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-xs font-semibold text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer text-center"
-                >
-                  Gestor Realess
-                </button>
+                <div className="grid grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => fillCredentials("vicenzzo.master", "root123")}
+                    className="py-2.5 px-3 rounded-xl bg-violet-600/20 hover:bg-violet-600/30 text-xs font-semibold text-violet-300 border border-violet-500/30 transition-colors cursor-pointer text-center"
+                  >
+                    Vicenzzo Master
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => fillCredentials("vicenzzo.mastronikolis", "Ope@2025")}
+                    className="py-2.5 px-3 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-xs font-semibold text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer text-center"
+                  >
+                    Gestor Realess
+                  </button>
+                </div>
               </div>
             </div>
-          </div>
+          )}
         </div>
       </div>
     </div>

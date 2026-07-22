@@ -6,7 +6,7 @@
 
 import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from "react";
 import type { User, SessionState, Permission, SectorPermission } from "../types";
-import { invoke } from "@tauri-apps/api/core";
+import { api, setToken, getToken } from "../tauri";
 
 interface AuthContextType extends SessionState {
   login: (username: string, password: string) => Promise<boolean>;
@@ -36,14 +36,36 @@ const MASTER_DEFAULT_SECTOR_PERMISSIONS: SectorPermission[] = [
   { userId: 0, sector: "junior", canView: true, canConfigure: true },
   { userId: 0, sector: "senior", canView: true, canConfigure: true },
   { userId: 0, sector: "pesquisa", canView: true, canConfigure: true },
-  { userId: 0, sector: "pa_fixa_1", canView: true, canConfigure: true },
-  { userId: 0, sector: "pa_fixa_2", canView: true, canConfigure: true },
+  { userId: 0, sector: "pa_fixa", canView: true, canConfigure: true },
   { userId: 0, sector: "comercial", canView: true, canConfigure: true },
 ];
 
+// Helpers para persistência de sessão em localStorage
+const STORAGE_KEY_USER = "esfera_v3_user";
+const STORAGE_KEY_COMPANY = "esfera_v3_company";
+
+function loadFromStorage<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveToStorage(key: string, value: unknown) {
+  try {
+    if (value === null || value === undefined) {
+      localStorage.removeItem(key);
+    } else {
+      localStorage.setItem(key, JSON.stringify(value));
+    }
+  } catch { /* localStorage indisponível */ }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [selectedCompanyId, setSelectedCompanyId] = useState<number | null>(null);
+  const [user, setUser] = useState<User | null>(() => loadFromStorage<User>(STORAGE_KEY_USER));
+  const [selectedCompanyId, setSelectedCompanyId] = useState<number | null>(() => loadFromStorage<number>(STORAGE_KEY_COMPANY));
   const [error, setError] = useState<string | null>(null);
   const [permissions, setPermissions] = useState<Permission[]>([]);
   const [sectorPermissions, setSectorPermissions] = useState<SectorPermission[]>([]);
@@ -58,8 +80,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     try {
       const [perms, sectorPerms] = await Promise.all([
-        invoke<Permission[]>("get_user_permissions", { userId }),
-        invoke<SectorPermission[]>("get_sector_permissions", { userId }),
+        api<Permission[]>("get_user_permissions", { userId }),
+        api<SectorPermission[]>("get_sector_permissions", { userId }),
       ]);
       setPermissions(perms);
       setSectorPermissions(sectorPerms);
@@ -80,12 +102,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setError(null);
 
     try {
-      const resUser = await invoke<User>("login", { username, password });
-      setUser(resUser);
-      if (resUser.role !== "master" && resUser.companyId) {
-        setSelectedCompanyId(resUser.companyId);
+      const res = await api<{ token: string; user: User }>("login", { username, password });
+      setToken(res.token);
+      setUser(res.user);
+      saveToStorage(STORAGE_KEY_USER, res.user);
+      if (res.user.role !== "master" && res.user.companyId) {
+        setSelectedCompanyId(res.user.companyId);
+        saveToStorage(STORAGE_KEY_COMPANY, res.user.companyId);
       }
-      await loadPermissions(resUser.id, resUser.role);
+      await loadPermissions(res.user.id, res.user.role);
       return true;
     } catch (err: unknown) {
       console.warn("Tauri invoke login não disponível ou erro (modo navegador/preview):", err);
@@ -116,8 +141,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const account = SYSTEM_USERS[username];
       if (account && account.pass === password) {
         setUser(account.user);
+        saveToStorage(STORAGE_KEY_USER, account.user);
         if (account.user.role !== "master" && account.user.companyId) {
           setSelectedCompanyId(account.user.companyId);
+          saveToStorage(STORAGE_KEY_COMPANY, account.user.companyId);
         }
         await loadPermissions(account.user.id, account.user.role);
         return true;
@@ -129,19 +156,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [loadPermissions]);
 
   const logout = useCallback(() => {
+    const token = getToken();
+    if (token) {
+      api("logout", {}).catch(() => {});
+    }
+    setToken(null);
     setUser(null);
     setSelectedCompanyId(null);
     setError(null);
     setPermissions([]);
     setSectorPermissions([]);
+    saveToStorage(STORAGE_KEY_USER, null);
+    saveToStorage(STORAGE_KEY_COMPANY, null);
   }, []);
 
   const enterCompany = useCallback((companyId: number) => {
     setSelectedCompanyId(companyId);
+    saveToStorage(STORAGE_KEY_COMPANY, companyId);
   }, []);
 
   const leaveCompany = useCallback(() => {
     setSelectedCompanyId(null);
+    saveToStorage(STORAGE_KEY_COMPANY, null);
   }, []);
 
   const hasPermission = useCallback((key: string): boolean => {

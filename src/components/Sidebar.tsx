@@ -6,7 +6,9 @@
 import { useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { usePermissions } from "../hooks/usePermissions";
-import { MOCK_COMPANIES } from "../mock-data";
+import { api } from "../tauri";
+import type { Company } from "../types";
+import { useState, useEffect } from "react";
 import {
   Smartphone,
   Megaphone,
@@ -126,7 +128,15 @@ export default function Sidebar() {
   if (!user) return null;
 
   const insideCompany = selectedCompanyId !== null;
-  const selectedCompany = MOCK_COMPANIES.find((c) => c.id === selectedCompanyId);
+
+  const [companies, setCompanies] = useState<Company[]>([]);
+  useEffect(() => {
+    api<Company[]>("get_companies")
+      .then((data) => setCompanies(data || []))
+      .catch(() => setCompanies([]));
+  }, []);
+
+  const selectedCompany = companies.find((c) => c.id === selectedCompanyId);
 
   const handleBackToCompanies = () => {
     leaveCompany();
