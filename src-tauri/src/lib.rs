@@ -24,6 +24,7 @@ use session::SessionManager;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::sync::Mutex as TokioMutex;
 
 fn get_db_path() -> String {
     if let Some(mut dir) = std::env::var_os("APPDATA").map(PathBuf::from) {
@@ -43,7 +44,7 @@ pub fn run() {
 
     let db_arc_clone = Arc::clone(&db_arc);
     let sessions = Arc::new(Mutex::new(SessionManager::new()));
-    let master_client: Arc<Mutex<Option<MasterClient>>> = Arc::new(Mutex::new(None));
+    let master_client: Arc<TokioMutex<Option<MasterClient>>> = Arc::new(TokioMutex::new(None));
 
     let app_config = config::load_config();
 
@@ -121,11 +122,11 @@ pub fn run() {
                     match MasterClient::connect(&hub_addr).await {
                         Ok(client) => {
                             println!("Conectado ao Hub {} como Master", hub_addr);
-                            *mc.lock().unwrap() = Some(client);
+                            *mc.lock().await = Some(client);
                             backoff = 1;
                             loop {
                                 tokio::time::sleep(Duration::from_secs(10)).await;
-                                if mc.lock().unwrap().is_none() { break; }
+                                if mc.lock().await.is_none() { break; }
                             }
                         }
                         Err(e) => {
@@ -148,7 +149,7 @@ pub fn run() {
             adb_manager::AdbManager::start_auto_reconnect_daemon(db_arc_clone);
             Ok(())
         })
-        .manage(AppState { db: db_arc, sessions })
+        .manage(AppState { db: db_arc, sessions, master_client })
         .invoke_handler(tauri::generate_handler![
             // Auth
             login,
@@ -243,6 +244,8 @@ pub fn run() {
             resume_campaign,
             start_campaign,
             rewrite_message_ai,
+            // Hub / Master
+            hub_invoke,
             // Config
             get_app_config,
             save_app_config,
