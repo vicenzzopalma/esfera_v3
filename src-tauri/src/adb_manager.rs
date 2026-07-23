@@ -6,6 +6,16 @@
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
+pub fn create_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    cmd
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AdbDeviceInfo {
     pub serial: String,
@@ -146,7 +156,7 @@ impl AdbManager {
             "dumpsys deviceidle whitelist +com.google.android.gms",
         ];
         for cmd in commands {
-            let _ = Command::new("adb")
+            let _ = create_cmd("adb")
                 .args(["-s", serial, "shell", cmd])
                 .output();
         }
@@ -170,7 +180,7 @@ impl AdbManager {
         let mut msg = String::from_utf8_lossy(&diag.diagnostic_msg[..len]).into_owned();
 
         // Checagem em tempo real no Windows PnP para falha física no cabo USB / descritor
-        if let Ok(output) = Command::new("powershell")
+        if let Ok(output) = create_cmd("powershell")
             .args(["-Command", "Get-PnpDevice -PresentOnly | Where-Object { $_.Status -eq 'Error' } | Select-Object -ExpandProperty FriendlyName"])
             .output()
         {
@@ -191,13 +201,13 @@ impl AdbManager {
 
     /// Reinicia o servidor ADB (kill-server & start-server)
     pub fn restart_server() -> Result<String, String> {
-        let _ = Command::new("adb")
+        let _ = create_cmd("adb")
             .arg("kill-server")
             .output();
 
         std::thread::sleep(std::time::Duration::from_millis(1000));
 
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .arg("start-server")
             .output()
             .map_err(|e| format!("Falha ao iniciar servidor ADB: {}", e))?;
@@ -212,7 +222,7 @@ impl AdbManager {
 
     /// Executa `adb devices -l` e retorna a lista de dispositivos físicos/wireless conectados
     pub fn list_devices() -> Result<Vec<AdbDeviceInfo>, String> {
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .arg("devices")
             .arg("-l")
             .output()
@@ -257,7 +267,7 @@ impl AdbManager {
     /// Obtém o endereço IP do wlan0 do dispositivo para conexão Wireless
     pub fn get_device_wifi_ip(serial: &str) -> Result<String, String> {
         // Método 1: getprop dhcp.wlan0.ipaddress
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .arg("-s")
             .arg(serial)
             .arg("shell")
@@ -272,7 +282,7 @@ impl AdbManager {
         }
 
         // Método 2: ip route
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .arg("-s")
             .arg(serial)
             .arg("shell")
@@ -297,7 +307,7 @@ impl AdbManager {
         }
 
         // Método 3: ip addr show wlan0
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .arg("-s")
             .arg(serial)
             .arg("shell")
@@ -326,7 +336,7 @@ impl AdbManager {
         }
 
         // Método 4: ifconfig wlan0
-        if let Ok(output) = Command::new("adb").args(["-s", serial, "shell", "ifconfig", "wlan0"]).output() {
+        if let Ok(output) = create_cmd("adb").args(["-s", serial, "shell", "ifconfig", "wlan0"]).output() {
             let out = String::from_utf8_lossy(&output.stdout);
             for line in out.lines() {
                 if line.contains("inet addr:") {
@@ -342,7 +352,7 @@ impl AdbManager {
         }
 
         // Método 5: dumpsys wifi
-        if let Ok(output) = Command::new("adb").args(["-s", serial, "shell", "dumpsys", "wifi"]).output() {
+        if let Ok(output) = create_cmd("adb").args(["-s", serial, "shell", "dumpsys", "wifi"]).output() {
             let out = String::from_utf8_lossy(&output.stdout);
             for line in out.lines() {
                 if line.contains("ip_address=") {
@@ -362,7 +372,7 @@ impl AdbManager {
 
     /// Habilita porta TCP no dispositivo
     pub fn enable_tcpip(serial: &str, port: i32) -> Result<(), String> {
-        let _ = Command::new("adb")
+        let _ = create_cmd("adb")
             .arg("-s")
             .arg(serial)
             .arg("tcpip")
@@ -375,7 +385,7 @@ impl AdbManager {
     /// Conecta a um dispositivo via IP:Porta usando `adb connect ip:port`
     pub fn connect_device(ip: &str, port: i32) -> Result<String, String> {
         let target = format!("{}:{}", ip, port);
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .arg("connect")
             .arg(&target)
             .output()
@@ -396,7 +406,7 @@ impl AdbManager {
     /// Executa `adb pair <ip>:<port> <code>` para parear celular Android 11+ via Wi-Fi sem cabo
     pub fn pair_device(ip: &str, port: u16, code: &str) -> Result<String, String> {
         let target = format!("{}:{}", ip, port);
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .arg("pair")
             .arg(&target)
             .arg(code)
@@ -417,7 +427,7 @@ impl AdbManager {
 
     /// Desconecta de um dispositivo via `adb disconnect serial`
     pub fn disconnect_device(serial: &str) -> Result<String, String> {
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .arg("disconnect")
             .arg(serial)
             .output()
@@ -429,7 +439,7 @@ impl AdbManager {
 
     /// Obtém o nível de bateria de um celular via `adb -s <serial> shell dumpsys battery`
     pub fn get_battery_level(serial: &str) -> Result<i32, String> {
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .arg("-s")
             .arg(serial)
             .arg("shell")
@@ -456,7 +466,7 @@ impl AdbManager {
 
     /// Captura a tela do dispositivo via `adb -s <serial> exec-out screencap -p` e aplica sanitização nativa C++ HPC
     pub fn capture_screen(serial: &str) -> Result<String, String> {
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .args(["-s", serial, "exec-out", "screencap", "-p"])
             .output()
             .map_err(|e| format!("Falha ao executar screencap ADB: {}", e))?;
@@ -492,7 +502,7 @@ impl AdbManager {
 
     /// Envia um toque na tela via `adb -s <serial> shell input tap x y`
     pub fn tap_screen(serial: &str, x: u32, y: u32) -> Result<(), String> {
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .args(["-s", serial, "shell", "input", "tap", &x.to_string(), &y.to_string()])
             .output()
             .map_err(|e| format!("Falha ao enviar toque ADB: {}", e))?;
@@ -506,7 +516,7 @@ impl AdbManager {
 
     /// Envia um evento de tecla via `adb -s <serial> shell input keyevent <keycode>`
     pub fn send_keyevent(serial: &str, keycode: u32) -> Result<(), String> {
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .args(["-s", serial, "shell", "input", "keyevent", &keycode.to_string()])
             .output()
             .map_err(|e| format!("Falha ao enviar keyevent ADB: {}", e))?;
@@ -535,7 +545,7 @@ impl AdbManager {
                 c => c.to_string(),
             };
 
-            let _ = Command::new("adb")
+            let _ = create_cmd("adb")
                 .args(["-s", serial, "shell", "input", "text", &ch_str])
                 .output();
         }
@@ -543,7 +553,7 @@ impl AdbManager {
     }
 
     pub fn get_device_info(serial: &str) -> (String, String) {
-        let brand_out = Command::new("adb")
+        let brand_out = create_cmd("adb")
             .arg("-s")
             .arg(serial)
             .arg("shell")
@@ -551,7 +561,7 @@ impl AdbManager {
             .arg("ro.product.brand")
             .output();
         
-        let model_out = Command::new("adb")
+        let model_out = create_cmd("adb")
             .arg("-s")
             .arg(serial)
             .arg("shell")
@@ -575,7 +585,7 @@ impl AdbManager {
     /// Lança o Scrcpy H.264 nativo em 60 FPS com aceleração por hardware
     pub fn launch_scrcpy(serial: &str) -> Result<String, String> {
         let title = format!("Esfera v3 — Stream H.264 ({})", serial);
-        let result = Command::new("scrcpy")
+        let result = create_cmd("scrcpy")
             .args([
                 "-s",
                 serial,
@@ -604,7 +614,7 @@ impl AdbManager {
         let camera_arg = if facing == "front" { "front" } else { "back" };
         let title = format!("Esfera v3 — Câmera Ao Vivo ({}) [{}]", serial, camera_arg.to_uppercase());
 
-        let result = Command::new("scrcpy")
+        let result = create_cmd("scrcpy")
             .args([
                 "-s",
                 serial,
@@ -620,7 +630,7 @@ impl AdbManager {
         match result {
             Ok(_) => Ok(format!("Transmissão de Câmera ({}) iniciada com sucesso para {}!", camera_arg, serial)),
             Err(e) => {
-                let fallback = Command::new("scrcpy")
+                let fallback = create_cmd("scrcpy")
                     .args(["-s", serial, "--window-title", &title])
                     .spawn();
                 match fallback {
@@ -634,7 +644,7 @@ impl AdbManager {
     /// Injeta a imagem da tela do computador ou QR Code diretamente na Câmera Virtual do Celular
     pub fn inject_virtual_camera_feed(serial: &str, target_type: &str) -> Result<String, String> {
         // Passo 1: Executa a varredura ADB de pacotes de Câmera Virtual instalados no Android
-        let pm_out = Command::new("adb")
+        let pm_out = create_cmd("adb")
             .args(["-s", serial, "shell", "pm", "list", "packages"])
             .output();
 
@@ -646,7 +656,7 @@ impl AdbManager {
         // Passo 2: Se o app de Câmera Virtual não estiver instalado, faz a instalação automatizada do APK Agente
         if !packages.contains("com.esfera.virtualcamera") && !packages.contains("com.vcam") {
             let apk_path = "public/Esfera_Agent_ADB.apk";
-            let install_out = Command::new("adb")
+            let install_out = create_cmd("adb")
                 .args(["-s", serial, "install", "-r", apk_path])
                 .output();
 
@@ -662,7 +672,7 @@ impl AdbManager {
             "com.esfera.virtualcamera.INJECT_QRCODE"
         };
 
-        let broadcast_out = Command::new("adb")
+        let broadcast_out = create_cmd("adb")
             .args([
                 "-s",
                 serial,
@@ -708,7 +718,7 @@ impl AdbManager {
 
         let mut success_count = 0;
         for cmd in &commands {
-            let res = Command::new("adb")
+            let res = create_cmd("adb")
                 .arg("-s")
                 .arg(serial)
                 .args(cmd)
@@ -736,13 +746,13 @@ impl AdbManager {
             "public/Esfera_Agent_ADB.apk"
         };
 
-        let output = Command::new("adb")
+        let output = create_cmd("adb")
             .args(["-s", serial, "install", "-r", "-g", apk_path])
             .output()
             .map_err(|e| format!("Falha ao executar 'adb install': {}", e))?;
 
         if output.status.success() {
-            let _ = Command::new("adb")
+            let _ = create_cmd("adb")
                 .args(["-s", serial, "shell", "am", "start", "-n", "com.mouldybread.adbautoenable/.MainActivity"])
                 .output();
 
@@ -763,13 +773,13 @@ impl AdbManager {
                 let devices = db.get_devices(1);
                 for dev in devices {
                     if dev.serial.contains(':') {
-                        let _ = Command::new("adb")
+                        let _ = create_cmd("adb")
                             .arg("connect")
                             .arg(&dev.serial)
                             .output();
                     } else if !dev.ip.is_empty() {
                         let target = format!("{}:{}", dev.ip, dev.port);
-                        let _ = Command::new("adb")
+                        let _ = create_cmd("adb")
                             .arg("connect")
                             .arg(&target)
                             .output();

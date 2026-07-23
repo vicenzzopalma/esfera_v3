@@ -144,6 +144,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
+            let caps = adb_manager::AdbManager::get_hardware_capabilities();
+            let hwid = adb_manager::AdbManager::get_hardware_uuid();
+            println!("[Esfera v3 HPC Engine] HWID: {}", hwid);
+            println!("[Esfera v3 HPC Engine] CPU Hardware Dispatch -> AVX2: {}, AVX-512: {}, SSE4.2: {}", caps.supports_avx2, caps.supports_avx512, caps.supports_sse42);
+
             dispatcher::Dispatcher::start_worker(db_arc_clone.clone(), Some(app.handle().clone()));
             dispatcher::Dispatcher::start_persistent_adb_keepalive_loop(db_arc_clone.clone());
             adb_manager::AdbManager::start_auto_reconnect_daemon(db_arc_clone);

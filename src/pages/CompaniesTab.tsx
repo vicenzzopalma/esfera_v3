@@ -55,7 +55,9 @@ export default function CompaniesTab() {
     c.name.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  const activeCompaniesCount = companiesList.filter((c) => c.status === "active").length;
+  const isCompanyActive = (c: any) => c.status === "active" || c.isActive === true || c.is_active === true || c.is_active === 1;
+
+  const activeCompaniesCount = companiesList.filter(isCompanyActive).length;
   const totalDevicesAllocated = companiesList.reduce((acc, c) => acc + (c.deviceCount || 0), 0);
   const totalUsersAllocated = companiesList.reduce((acc, c) => acc + (c.userCount || 0), 0);
 
@@ -197,8 +199,8 @@ export default function CompaniesTab() {
                   </div>
 
                   <div className="flex items-center gap-2">
-                    <Badge variant={company.status === "active" ? "success" : "neutral"} dot>
-                      {company.status === "active" ? "Ativa" : "Inativa"}
+                    <Badge variant={isCompanyActive(company) ? "success" : "neutral"} dot>
+                      {isCompanyActive(company) ? "Ativa" : "Inativa"}
                     </Badge>
                     <button
                       onClick={() => handleOpenEditModal(company)}

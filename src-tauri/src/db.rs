@@ -19,7 +19,10 @@ pub struct Company {
     pub name: String,
     pub device_limit: i32,
     pub user_limit: i32,
+    pub device_count: i32,
+    pub user_count: i32,
     pub is_active: bool,
+    pub status: String,
     pub created_at: String,
 }
 
@@ -258,15 +261,15 @@ impl Database {
     pub fn init(db_path: &str) -> Result<Self> {
         let conn = Connection::open(db_path)?;
 
-        // --- Fase 1.1: Performance Pragmas ---
+        // --- Performance Pragmas ---
         conn.execute_batch("
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
             PRAGMA busy_timeout=5000;
             PRAGMA foreign_keys=ON;
-            PRAGMA cache_size=-4000;
+            PRAGMA cache_size=-16000;
             PRAGMA temp_store=MEMORY;
-            PRAGMA mmap_size=30000000;
+            PRAGMA mmap_size=67108864;
         ")?;
 
         let db = Database { conn };
@@ -500,6 +503,17 @@ impl Database {
             [],
         )?;
 
+        // 16. Performance Indexes (Microsecond Lookups)
+        self.conn.execute_batch("
+            CREATE INDEX IF NOT EXISTS idx_device_company ON ESF_Device (CompanyId);
+            CREATE INDEX IF NOT EXISTS idx_campaign_company ON ESF_Campaign (CompanyId, ExcluidoEm);
+            CREATE INDEX IF NOT EXISTS idx_contact_campaign ON ESF_Contact (CampaignId, Status, ExcluidoEm);
+            CREATE INDEX IF NOT EXISTS idx_chip_device ON ESF_Chip (DeviceId, ExcluidoEm);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_company ON ESF_AuditLog (CompanyId, LogId DESC);
+            CREATE INDEX IF NOT EXISTS idx_automation_company ON ESF_AutomationRule (CompanyId, ExcluidoEm);
+            CREATE INDEX IF NOT EXISTS idx_sent_history ON ESF_SentHistory (Phone, CampaignId);
+        ")?;
+
         Ok(())
     }
 
@@ -541,6 +555,9 @@ impl Database {
         let _ = self.conn.execute("DELETE FROM ESF_AutomationRule WHERE RuleName LIKE '%Preço%' OR RuleName LIKE '%Humano%';", []);
         let _ = self.conn.execute("DELETE FROM ESF_AuditLog WHERE Message LIKE '%adb-dev-%';", []);
 
+        // Garante que a empresa #1 seja REALESS e que nenhuma informação seja perdida
+        let _ = self.conn.execute("UPDATE ESF_Company SET CompanyName='REALESS' WHERE CompanyId=1 AND (CompanyName='Empresa Principal' OR CompanyName='');", []);
+
         Ok(())
     }
 
@@ -550,9 +567,9 @@ impl Database {
             .query_row("SELECT COUNT(*) FROM ESF_Company", [], |r| r.get(0))?;
 
         if count == 0 {
-            // Empresa Padrão
+            // Empresa Padrão REALESS
             self.conn.execute(
-                "INSERT INTO ESF_Company (CompanyId, CompanyName, DeviceLimit, UserLimit) VALUES (1, 'Empresa Principal', 50, 20);",
+                "INSERT INTO ESF_Company (CompanyId, CompanyName, DeviceLimit, UserLimit) VALUES (1, 'REALESS', 100, 50);",
                 [],
             )?;
 
@@ -644,20 +661,27 @@ impl Database {
 
     pub fn get_companies(&self) -> Vec<Company> {
         let mut stmt = match self.conn.prepare(
-            "SELECT CompanyId, CompanyName, DeviceLimit, UserLimit, IsActive, CreatedAt FROM ESF_Company"
+            "SELECT c.CompanyId, c.CompanyName, c.DeviceLimit, c.UserLimit, c.IsActive, c.CreatedAt,
+                    (SELECT COUNT(*) FROM ESF_Device d WHERE d.CompanyId = c.CompanyId) AS DeviceCount,
+                    (SELECT COUNT(*) FROM ESF_User u WHERE u.CompanyId = c.CompanyId) AS UserCount
+             FROM ESF_Company c"
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
 
         let rows = stmt.query_map([], |row| {
+            let is_act: bool = row.get::<_, i32>(4)? == 1;
             Ok(Company {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 device_limit: row.get(2)?,
                 user_limit: row.get(3)?,
-                is_active: row.get::<_, i32>(4)? == 1,
+                is_active: is_act,
+                status: if is_act { "active".to_string() } else { "inactive".to_string() },
                 created_at: row.get(5)?,
+                device_count: row.get(6).unwrap_or(0),
+                user_count: row.get(7).unwrap_or(0),
             })
         });
 
@@ -681,7 +705,10 @@ impl Database {
             name: name.to_string(),
             device_limit,
             user_limit: 10,
+            device_count: 0,
+            user_count: 1,
             is_active: true,
+            status: "active".to_string(),
             created_at: chrono::Utc::now().format("%Y-%m-%d").to_string(),
         })
     }
@@ -699,14 +726,58 @@ impl Database {
     // ============================================================
 
     pub fn get_devices(&self, company_id: i32) -> Vec<Device> {
+        let (sql, use_param) = if company_id <= 0 {
+            ("SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device", false)
+        } else {
+            ("SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device WHERE CompanyId = ?1", true)
+        };
+
+        let mut stmt = match self.conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        let mapper = |row: &rusqlite::Row| {
+            Ok(Device {
+                id: row.get(0)?,
+                serial: row.get(1)?,
+                name: row.get(2)?,
+                brand: row.get(3)?,
+                model: row.get(4)?,
+                ip: row.get(5)?,
+                port: row.get(6)?,
+                status: row.get(7)?,
+                battery: row.get(8)?,
+                company_id: row.get(9)?,
+                device_number: row.get(10)?,
+                sector: row.get(11)?,
+            })
+        };
+
+        if use_param {
+            let rows = stmt.query_map(params![company_id], mapper);
+            match rows {
+                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                Err(_) => vec![],
+            }
+        } else {
+            let rows = stmt.query_map([], mapper);
+            match rows {
+                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                Err(_) => vec![],
+            }
+        }
+    }
+
+    pub fn get_all_devices(&self) -> Vec<Device> {
         let mut stmt = match self.conn.prepare(
-            "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device WHERE CompanyId = ?1"
+            "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device"
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
 
-        let rows = stmt.query_map(params![company_id], |row| {
+        let rows = stmt.query_map([], |row| {
             Ok(Device {
                 id: row.get(0)?,
                 serial: row.get(1)?,
@@ -1124,7 +1195,7 @@ impl Database {
         let mut stmt = match self.conn.prepare(
             "SELECT c.ChipId, c.DeviceId, c.PhoneNumber, c.ChipName, c.Status, c.RestrictedUntil, c.CreatedAt
              FROM ESF_Chip c
-             JOIN ESF_Device d ON c.DeviceId = d.AdbDeviceId
+             JOIN ESF_Device d ON c.DeviceId = d.rowid
              WHERE d.CompanyId = ?1
              AND c.ExcluidoEm IS NULL
              AND c.Status IN ('banido', 'restrito_24h', 'restrito_7d', 'restrito_custom')
@@ -1527,7 +1598,7 @@ impl Database {
     pub fn send_campaign_next_batch(&self, campaign_id: i32) -> Result<serde_json::Value, String> {
         // Get next 5 pending contacts
         let mut stmt = self.conn.prepare(
-            "SELECT ContactId, Name, Phone FROM ESF_Contact
+            "SELECT ContactId, ContactName, Phone FROM ESF_Contact
              WHERE CampaignId=?1 AND Status='pending' AND ExcluidoEm IS NULL
              ORDER BY ContactId LIMIT 5;"
         ).map_err(|e| e.to_string())?;
@@ -1604,10 +1675,6 @@ impl Database {
     }
 
     pub fn update_campaign_status(&self, campaign_id: i32, status: &str) -> Result<(), String> {
-        self.conn.execute(
-            "UPDATE ESF_Campaign SET Status=?1 WHERE CampaignId=?2;",
-            params![status, campaign_id],
-        ).map_err(|e| e.to_string())?;
-        Ok(())
+        self.set_campaign_status(campaign_id, status)
     }
 }
