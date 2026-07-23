@@ -43,6 +43,7 @@ const MASTER_DEFAULT_SECTOR_PERMISSIONS: SectorPermission[] = [
 // Helpers para persistência de sessão em localStorage
 const STORAGE_KEY_USER = "esfera_v3_user";
 const STORAGE_KEY_COMPANY = "esfera_v3_company";
+const STORAGE_KEY_TOKEN = "esfera_v3_token";
 
 function loadFromStorage<T>(key: string): T | null {
   try {
@@ -65,10 +66,18 @@ function saveToStorage(key: string, value: unknown) {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(() => loadFromStorage<User>(STORAGE_KEY_USER));
-  const [selectedCompanyId, setSelectedCompanyId] = useState<number | null>(() => loadFromStorage<number>(STORAGE_KEY_COMPANY));
+  const [selectedCompanyId, setSelectedCompanyId] = useState<number | null>(() => loadFromStorage<number>(STORAGE_KEY_COMPANY) || 1);
   const [error, setError] = useState<string | null>(null);
   const [permissions, setPermissions] = useState<Permission[]>([]);
   const [sectorPermissions, setSectorPermissions] = useState<SectorPermission[]>([]);
+
+  // Restaura o token de autenticação no startup
+  useEffect(() => {
+    const savedToken = loadFromStorage<string>(STORAGE_KEY_TOKEN);
+    if (savedToken) {
+      setToken(savedToken);
+    }
+  }, []);
 
   const loadPermissions = useCallback(async (userId: number, role: string) => {
     // Master sempre tem todas as permissões
@@ -104,12 +113,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const res = await api<{ token: string; user: User }>("login", { username, password });
       setToken(res.token);
+      saveToStorage(STORAGE_KEY_TOKEN, res.token);
       setUser(res.user);
       saveToStorage(STORAGE_KEY_USER, res.user);
-      if (res.user.role !== "master" && res.user.companyId) {
-        setSelectedCompanyId(res.user.companyId);
-        saveToStorage(STORAGE_KEY_COMPANY, res.user.companyId);
-      }
+      const compId = res.user.companyId || 1;
+      setSelectedCompanyId(compId);
+      saveToStorage(STORAGE_KEY_COMPANY, compId);
       await loadPermissions(res.user.id, res.user.role);
       return true;
     } catch (err: unknown) {
@@ -140,6 +149,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       const account = SYSTEM_USERS[username];
       if (account && account.pass === password) {
+        const mockToken = `mock-token-${account.user.id}`;
+        setToken(mockToken);
+        saveToStorage(STORAGE_KEY_TOKEN, mockToken);
         setUser(account.user);
         saveToStorage(STORAGE_KEY_USER, account.user);
         if (account.user.role !== "master" && account.user.companyId) {
@@ -166,6 +178,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setError(null);
     setPermissions([]);
     setSectorPermissions([]);
+    saveToStorage(STORAGE_KEY_TOKEN, null);
     saveToStorage(STORAGE_KEY_USER, null);
     saveToStorage(STORAGE_KEY_COMPANY, null);
   }, []);

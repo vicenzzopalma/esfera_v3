@@ -84,23 +84,14 @@ export default function DevicesTab() {
   const [loadingUsb, setLoadingUsb] = useState(false);
   const [linkingSerial, setLinkingSerial] = useState<string | null>(null);
   const [linkingStatus, setLinkingStatus] = useState<string | null>(null);
+  const [installingApk, setInstallingApk] = useState(false);
 
   const [setupDeviceData, setSetupDeviceData] = useState<{ serial?: string; ip?: string; port?: number } | null>(null);
   const [deviceNumberInput, setDeviceNumberInput] = useState("1");
   const [deviceNameInput, setDeviceNameInput] = useState("Aparelho 1");
   const [sectorInput, setSectorInput] = useState("junior");
 
-  if (!selectedCompanyId) {
-    return (
-      <div className="flex flex-col items-center justify-center py-20 text-center">
-        <AlertTriangle size={48} className="text-amber-400 mb-4" />
-        <h2 className="text-lg font-bold text-primary mb-2">Nenhuma empresa selecionada</h2>
-        <p className="text-sm text-secondary">Selecione uma empresa na barra lateral para visualizar os dispositivos.</p>
-      </div>
-    );
-  }
-
-  const effectiveCompanyId = selectedCompanyId;
+  const effectiveCompanyId = selectedCompanyId || 1;
 
   const prepareDeviceSetup = (data: { serial?: string; ip?: string; port?: number }) => {
     const nextNum = devicesList.length + 1;
@@ -248,33 +239,47 @@ export default function DevicesTab() {
 
   // Filtra APENAS os celulares reais existentes com memoização HPC para 0ms de lag no React
   const filteredDevices = useMemo(() => {
-    return devicesList
+    return (devicesList || [])
       .filter((device, _, arr) => {
-        // Se for uma serial USB offline e o mesmo modelo já estiver online via Wi-Fi, descarta a duplicata USB
-        if (device.status === "offline" && !device.serial.includes(":")) {
+        if (!device) return false;
+        const serial = String(device.serial || "");
+        const status = String(device.status || "offline");
+        const model = String(device.model || "");
+        const brand = String(device.brand || "");
+        const ip = String(device.ip || "");
+        const sector = String(device.sector || "junior").toLowerCase().replace(/[- _.]/g, "");
+
+        // Se for USB offline e o mesmo modelo já estiver online via Wi-Fi, descarta a duplicata USB
+        if (status === "offline" && !serial.includes(":")) {
           const hasOnlineWireless = arr.some(
-            (other) => other.model === device.model && other.status === "online" && other.serial.includes(":")
+            (other) => other && String(other.model || "") === model && String(other.status || "") === "online" && String(other.serial || "").includes(":")
           );
           if (hasOnlineWireless) return false;
         }
 
-        if (sectorTab !== "all" && device.sector !== sectorTab) return false;
-        if (statusFilter !== "all" && device.status !== statusFilter) return false;
+        if (sectorTab !== "all") {
+          const targetSector = sectorTab.toLowerCase().replace(/[- _.]/g, "");
+          if (sector !== targetSector) return false;
+        }
+
+        if (statusFilter !== "all" && status !== statusFilter) return false;
 
         if (searchQuery) {
-          const q = searchQuery.toLowerCase();
-          const matchesModel = device.model.toLowerCase().includes(q);
-          const matchesBrand = device.brand.toLowerCase().includes(q);
-          const matchesSerial = device.serial.toLowerCase().includes(q);
-          const matchesIp = device.ip ? device.ip.toLowerCase().includes(q) : false;
+          const q = searchQuery.toLowerCase().trim();
+          const matchesModel = model.toLowerCase().includes(q);
+          const matchesBrand = brand.toLowerCase().includes(q);
+          const matchesSerial = serial.toLowerCase().includes(q);
+          const matchesIp = ip.toLowerCase().includes(q);
           return matchesModel || matchesBrand || matchesSerial || matchesIp;
         }
 
         return true;
       })
       .sort((a, b) => {
-        const nameA = a.name || `Aparelho ${a.deviceNumber}`;
-        const nameB = b.name || `Aparelho ${b.deviceNumber}`;
+        if (!a) return -1;
+        if (!b) return 1;
+        const nameA = String(a.name || a.model || `Aparelho ${a.deviceNumber || 1}`);
+        const nameB = String(b.name || b.model || `Aparelho ${b.deviceNumber || 1}`);
         return nameA.localeCompare(nameB, undefined, { numeric: true, sensitivity: "base" });
       });
   }, [devicesList, sectorTab, statusFilter, searchQuery]);
@@ -295,19 +300,27 @@ export default function DevicesTab() {
             { id: "senior", label: "Senior" },
             { id: "pa_fixa", label: "PA FIXA" },
             { id: "pesquisa", label: "Pesquisa" },
-          ].map((tab) => (
-            <button
-              key={tab.id}
-              onClick={() => setSectorTab(tab.id)}
-              className={`px-4 py-2 rounded-full text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
-                sectorTab === tab.id
-                  ? "bg-blue-600 text-white shadow-lg shadow-blue-600/40 border border-blue-400/30 scale-105"
-                  : "bg-slate-900/80 text-slate-300 border border-slate-800 hover:bg-slate-800 hover:text-white"
-              }`}
-            >
-              {tab.label}
-            </button>
-          ))}
+          ].map((tab) => {
+            const count = tab.id === "all"
+              ? devicesList.length
+              : devicesList.filter((d) => String(d.sector || "junior").toLowerCase().replace(/[- _.]/g, "") === tab.id.replace(/[- _.]/g, "")).length;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setSectorTab(tab.id)}
+                className={`px-4 py-2 rounded-full text-xs font-bold transition-all cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
+                  sectorTab === tab.id
+                    ? "bg-blue-600 text-white shadow-lg shadow-blue-600/40 border border-blue-400/30 scale-105"
+                    : "bg-slate-900/80 text-slate-300 border border-slate-800 hover:bg-slate-800 hover:text-white"
+                }`}
+              >
+                <span>{tab.label}</span>
+                <span className="px-1.5 py-0.5 rounded-full bg-white/10 text-[10px] font-mono">
+                  {count}
+                </span>
+              </button>
+            );
+          })}
         </div>
 
         {/* Busca e Ações Principais */}
@@ -324,27 +337,37 @@ export default function DevicesTab() {
           </div>
 
           <Button
+            disabled={installingApk}
             onClick={async () => {
-              if (devicesList.length === 0) {
-                alert("Nenhum celular detectado para instalação remota.");
+              const onlineDevs = devicesList.filter((d) => d.status === "online");
+              if (onlineDevs.length === 0) {
+                alert("Nenhum celular online detectado para instalação remota.");
                 return;
               }
+              setInstallingApk(true);
               let ok = 0;
-              for (const dev of devicesList) {
+              let errors: string[] = [];
+              for (const dev of onlineDevs) {
                 try {
                   await api("install_agent_apk", { serial: dev.serial });
                   ok++;
-                } catch (e) {
-                  console.warn("Erro ao instalar no dispositivo:", e);
+                } catch (e: any) {
+                  const msg = typeof e === "string" ? e : e?.message || "Erro desconhecido";
+                  errors.push(`${dev.model} (${dev.serial}): ${msg}`);
                 }
               }
-              alert(`📲 Instalação remota concluída!\nO Agente APK foi enviado e ativado em ${ok} de ${devicesList.length} celulares com sucesso!`);
+              setInstallingApk(false);
+              if (errors.length > 0) {
+                alert(`📲 Instalação remota finalizada!\n✅ Sucesso em ${ok} de ${onlineDevs.length} celular(es).\n\n⚠️ Erros:\n${errors.join("\n")}`);
+              } else {
+                alert(`📲 Instalação remota concluída com sucesso!\nO Agente APK foi enviado e ativado em ${ok} de ${onlineDevs.length} celulares!`);
+              }
             }}
-            icon={<Smartphone size={15} className="text-emerald-300" />}
-            className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold rounded-xl text-xs shadow-lg shadow-emerald-600/30 cursor-pointer"
+            icon={<Smartphone size={15} className={installingApk ? "animate-spin text-amber-300" : "text-emerald-300"} />}
+            className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold rounded-xl text-xs shadow-lg shadow-emerald-600/30 cursor-pointer disabled:opacity-50"
             title="Transfere e instala silenciosamente o app Agente Esfera v3 no celular via ADB"
           >
-            📲 Auto-Instalar Agente APK
+            {installingApk ? "📲 Instalando APK..." : "📲 Auto-Instalar Agente APK"}
           </Button>
 
           <Button
