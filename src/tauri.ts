@@ -26,17 +26,22 @@ export function getToken(): string | null {
 export async function api<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
   await ensureConfig();
 
-  // Master mode: roteia comandos via Hub (exceto login/logout/config)
+  // Master mode: tenta rotear comandos via Hub se configurado; se desconectado, executa localmente
   if (_mode === "master" && !["login", "logout", "get_app_config", "save_app_config", "hub_invoke"].includes(cmd)) {
-    const companyId = (args.companyId ?? args.company_id ?? 0) as number;
-    return invoke<T>("hub_invoke", {
-      token: _token,
-      cmd,
-      args: { ...args },
-      companyId,
-    });
+    try {
+      const companyId = (args.companyId ?? args.company_id ?? 0) as number;
+      return await invoke<T>("hub_invoke", {
+        token: _token,
+        cmd,
+        args: { ...args },
+        companyId,
+      });
+    } catch {
+      // Fallback local instantâneo quando o Hub remoto estiver desconectado
+      return invoke<T>(cmd, { token: _token, ...args });
+    }
   }
 
-  // Modo normal: chama comando local com token
+  // Modo local padrão: chama comando Tauri nativo diretamente com token
   return invoke<T>(cmd, { token: _token, ...args });
 }

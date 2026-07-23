@@ -54,6 +54,7 @@ impl SessionManager {
             .unwrap_or_default()
             .as_millis() as i64;
 
+        self.cleanup_expired();
         self.sessions.insert(token.clone(), UserSession {
             token: token.clone(),
             user_id,

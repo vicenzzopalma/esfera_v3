@@ -89,6 +89,7 @@ impl Dispatcher {
                         };
 
                         // 3. Execução Humana Tecla-por-Tecla via C++ HPC
+                        // 3. Execução Humana Tecla-por-Tecla via C++ HPC em dispositivos ONLINE
                         let active_devices = {
                             if let Ok(db) = db_arc.lock() {
                                 db.get_devices(campaign.company_id)
@@ -97,7 +98,9 @@ impl Dispatcher {
                             }
                         };
 
-                        if let Some(target_dev) = active_devices.first() {
+                        let online_devices: Vec<_> = active_devices.into_iter().filter(|d| d.status == "online").collect();
+
+                        if let Some(target_dev) = online_devices.first() {
                             let _ = AdbManager::type_text_human_hpc(&target_dev.serial, &message_to_send);
                             let _ = AdbManager::send_keyevent(&target_dev.serial, 66);
                         }
@@ -140,12 +143,12 @@ impl Dispatcher {
     pub fn start_persistent_adb_keepalive_loop(db_arc: Arc<Mutex<Database>>) {
         tauri::async_runtime::spawn(async move {
             loop {
-                // Roda a cada 5 segundos no segundo plano
-                sleep(Duration::from_secs(5)).await;
+                // Roda a cada 30 segundos em segundo plano (otimizado)
+                sleep(Duration::from_secs(30)).await;
 
                 let saved_devices = {
                     if let Ok(db) = db_arc.lock() {
-                        db.get_devices(1)
+                        db.get_all_devices()
                     } else {
                         Vec::new()
                     }

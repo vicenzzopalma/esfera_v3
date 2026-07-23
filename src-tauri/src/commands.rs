@@ -78,7 +78,7 @@ pub fn get_companies(state: State<'_, AppState>, token: String) -> Result<Vec<Co
     let session = validate_session(&state.sessions, &token)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let all = db.get_companies();
-    if session.role == "master" {
+    if session.role == "master" || session.role == "gestor" || session.company_id.is_none() {
         return Ok(all);
     }
     let allowed = all.into_iter().filter(|c| session.company_id == Some(c.id)).collect();
@@ -124,10 +124,27 @@ pub fn update_company(
 
 use std::sync::RwLock;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 static BATTERY_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (i32, Instant)>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+static ADB_LIST_CACHE: std::sync::LazyLock<RwLock<(Vec<AdbDeviceInfo>, Instant)>> =
+    std::sync::LazyLock::new(|| RwLock::new((Vec::new(), Instant::now() - Duration::from_secs(10))));
+
+fn get_cached_adb_devices() -> Vec<AdbDeviceInfo> {
+    let now = Instant::now();
+    if let Ok(cache) = ADB_LIST_CACHE.read() {
+        if now.duration_since(cache.1).as_millis() < 2500 {
+            return cache.0.clone();
+        }
+    }
+    let list = AdbManager::list_devices().unwrap_or_default();
+    if let Ok(mut cache) = ADB_LIST_CACHE.write() {
+        *cache = (list.clone(), now);
+    }
+    list
+}
 
 fn get_cached_battery(serial: &str) -> i32 {
     let now = Instant::now();
@@ -149,11 +166,21 @@ fn get_cached_battery(serial: &str) -> i32 {
 #[tauri::command]
 pub fn get_devices(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<Device>, String> {
     let session = validate_session(&state.sessions, &token)?;
-    let target_company_id = if company_id <= 0 { session.company_id.unwrap_or(1) } else { company_id };
-    check_company_access(&session, target_company_id)?;
+    let target_company_id = if session.role == "master" {
+        0
+    } else if company_id <= 0 {
+        session.company_id.unwrap_or(0)
+    } else {
+        company_id
+    };
+    if session.role != "master" && target_company_id > 0 {
+        check_company_access(&session, target_company_id)?;
+    }
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut db_devices = db.get_devices(target_company_id);
-    let active_adb_list = AdbManager::list_devices().unwrap_or_default();
+    let active_adb_list = get_cached_adb_devices();
+
+    let mut changed = false;
 
     for adb_dev in &active_adb_list {
         if adb_dev.serial == "*" || adb_dev.serial.starts_with('*') {
@@ -170,18 +197,20 @@ pub fn get_devices(state: State<'_, AppState>, token: String, company_id: i32) -
             "offline".to_string()
         };
 
-        // Procura por dispositivo existente no DB por serial exato
         let existing_idx = db_devices.iter().position(|d| d.serial == adb_dev.serial);
 
         if let Some(idx) = existing_idx {
-            // Atualiza status e nivel de bateria com cache ultrarrapido (RAM 0ms)
+            let old_status = db_devices[idx].status.clone();
+            let old_battery = db_devices[idx].battery;
             db_devices[idx].status = status;
             if adb_dev.state == "device" {
                 db_devices[idx].battery = get_cached_battery(&adb_dev.serial);
             }
-            db.upsert_device(&db_devices[idx])?;
+            if old_status != db_devices[idx].status || old_battery != db_devices[idx].battery {
+                let _ = db.upsert_device(&db_devices[idx]);
+                changed = true;
+            }
         } else {
-            // Dispositivo novo: lê dados de marca/modelo e bateria apenas UMA vez
             let (brand, model) = AdbManager::get_device_info(&adb_dev.serial);
             let battery = if adb_dev.state == "device" {
                 get_cached_battery(&adb_dev.serial)
@@ -207,33 +236,36 @@ pub fn get_devices(state: State<'_, AppState>, token: String, company_id: i32) -
                 device_number: (db_devices.len() + 1) as i32,
                 sector: "junior".to_string(),
             };
-            db.upsert_device(&new_dev)?;
+            let _ = db.upsert_device(&new_dev);
+            changed = true;
         }
     }
 
-    // 2. Atualiza o status em tempo real de cada dispositivo salvo no DB
-    let mut refreshed_db = db.get_devices(target_company_id);
-    let mut online_models = std::collections::HashSet::new();
+    let mut refreshed_db = if changed { db.get_devices(target_company_id) } else { db_devices };
 
     for dev in &mut refreshed_db {
         let is_active = active_adb_list.iter().any(|adb_d| adb_d.serial == dev.serial);
         if is_active {
             dev.status = "online".to_string();
-            online_models.insert(dev.model.clone());
         } else {
             dev.status = "offline".to_string();
+            // Se for um celular Wi-Fi salvo no banco e estiver offline neste PC, tenta conectar via ADB Wi-Fi em background
+            let ip_target = if !dev.ip.is_empty() {
+                dev.ip.clone()
+            } else if dev.serial.contains(':') {
+                dev.serial.split(':').next().unwrap_or("").to_string()
+            } else {
+                "".to_string()
+            };
+
+            if !ip_target.is_empty() && ip_target.contains('.') {
+                let port = if dev.port > 0 { dev.port } else { 5555 };
+                std::thread::spawn(move || {
+                    let _ = AdbManager::connect_device(&ip_target, port);
+                });
+            }
         }
     }
-
-    // 3. Purga registros USB desatualizados offline se o mesmo modelo de celular já estiver online via Wi-Fi
-    refreshed_db.retain(|dev| {
-        if dev.status == "offline" && !dev.serial.contains(':') && online_models.contains(&dev.model) {
-            let _ = db.delete_device(&dev.serial);
-            false
-        } else {
-            true
-        }
-    });
 
     Ok(refreshed_db)
 }
@@ -325,6 +357,7 @@ pub fn connect_adb_device(
 #[tauri::command]
 pub fn pair_and_connect_adb_device(
     state: State<'_, AppState>,
+    token: String,
     ip: String,
     pair_port: u16,
     pair_code: String,
@@ -334,6 +367,8 @@ pub fn pair_and_connect_adb_device(
     sector: String,
     device_name: Option<String>,
 ) -> Result<String, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
     let clean_ip = ip.split(':').next().unwrap_or(&ip).trim().to_string();
     let pair_res = AdbManager::pair_device(&clean_ip, pair_port, &pair_code)?;
 
@@ -341,7 +376,7 @@ pub fn pair_and_connect_adb_device(
     let connect_res = AdbManager::connect_device(&clean_ip, conn_port as i32)?;
 
     let wireless_serial = format!("{}:{}", clean_ip, conn_port);
-    let _ = std::process::Command::new("adb")
+    let _ = crate::adb_manager::create_cmd("adb")
         .args(["-s", &wireless_serial, "shell", "setprop", "persist.adb.tcp.port", "5555"])
         .output();
     let _ = AdbManager::deploy_keepalive(&wireless_serial);
@@ -420,7 +455,7 @@ pub fn optimize_device(state: State<'_, AppState>, token: String, serial: String
     ];
     let mut results = Vec::new();
     for cmd in commands {
-        let output = std::process::Command::new("adb")
+        let output = crate::adb_manager::create_cmd("adb")
             .args(["-s", &serial, "shell", cmd])
             .output();
         match output {
@@ -974,7 +1009,7 @@ pub fn force_enable_wireless_adb(
         format!("{} Certifique-se de que o celular está conectado na mesma rede Wi-Fi que o computador.", e)
     })?;
 
-    let _ = std::process::Command::new("adb")
+    let _ = crate::adb_manager::create_cmd("adb")
         .args(["-s", &serial, "shell", "setprop", "persist.adb.tcp.port", "5555"])
         .output();
     AdbManager::enable_tcpip(&serial, 5555)?;
@@ -1151,12 +1186,13 @@ pub fn rewrite_message_ai(message: String, contact_name: String) -> Result<Strin
         .unwrap()
         .as_millis() as usize;
 
-    let hour = {
-        // Rough UTC-3 hour for Brazil
-        let h = (seed / 3600000) % 24;
-        if h < 12 {
+    let hour_text = {
+        let total_secs = (seed / 1000) as i64;
+        let local_secs = total_secs - 3 * 3600; // UTC-3 Brasília
+        let h = ((local_secs / 3600) % 24 + 24) % 24;
+        if h >= 5 && h < 12 {
             "Bom dia"
-        } else if h < 18 {
+        } else if h >= 12 && h < 18 {
             "Boa tarde"
         } else {
             "Boa noite"
@@ -1169,7 +1205,7 @@ pub fn rewrite_message_ai(message: String, contact_name: String) -> Result<Strin
     let c = closings[(seed / 7) % closings.len()];
 
     let personalized = message.replace("{nome}", &contact_name);
-    Ok(format!("{}, {}! {}\n\n{}", hour, g, personalized, c))
+    Ok(format!("{}, {}! {}\n\n{}", hour_text, g, personalized, c))
 }
 
 #[tauri::command]
