@@ -738,16 +738,48 @@ impl AdbManager {
 
 
 
+    fn find_agent_apk_path() -> Result<std::path::PathBuf, String> {
+        let candidates = vec![
+            std::path::PathBuf::from("Esfera_Agent_ADB.apk"),
+            std::path::PathBuf::from("public/Esfera_Agent_ADB.apk"),
+            std::path::PathBuf::from("../public/Esfera_Agent_ADB.apk"),
+            std::path::PathBuf::from("../../public/Esfera_Agent_ADB.apk"),
+            std::path::PathBuf::from("../../../public/Esfera_Agent_ADB.apk"),
+        ];
+
+        for path in &candidates {
+            if path.exists() {
+                return Ok(path.clone());
+            }
+        }
+
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let exe_candidates = vec![
+                    exe_dir.join("Esfera_Agent_ADB.apk"),
+                    exe_dir.join("public/Esfera_Agent_ADB.apk"),
+                    exe_dir.join("../public/Esfera_Agent_ADB.apk"),
+                    exe_dir.join("../../public/Esfera_Agent_ADB.apk"),
+                    exe_dir.join("../../../public/Esfera_Agent_ADB.apk"),
+                ];
+                for path in exe_candidates {
+                    if path.exists() {
+                        return Ok(path);
+                    }
+                }
+            }
+        }
+
+        Err("Arquivo 'Esfera_Agent_ADB.apk' não encontrado. Certifique-se de que o APK está presente na pasta 'public'.".to_string())
+    }
+
     /// Instala silenciosamente o aplicativo Agente Esfera v3 (.APK) no celular via ADB e ativa as permissões de segundo plano
     pub fn install_agent_apk(serial: &str) -> Result<String, String> {
-        let apk_path = if std::path::Path::new("Esfera_Agent_ADB.apk").exists() {
-            "Esfera_Agent_ADB.apk"
-        } else {
-            "public/Esfera_Agent_ADB.apk"
-        };
+        let apk_path_buf = Self::find_agent_apk_path()?;
+        let apk_str = apk_path_buf.to_str().ok_or("Caminho do arquivo APK inválido.")?;
 
         let output = create_cmd("adb")
-            .args(["-s", serial, "install", "-r", "-g", apk_path])
+            .args(["-s", serial, "install", "-r", "-g", apk_str])
             .output()
             .map_err(|e| format!("Falha ao executar 'adb install': {}", e))?;
 
@@ -761,7 +793,9 @@ impl AdbManager {
             Ok(format!("📱 App Agente Esfera v3 instalado e ativado no celular {} com sucesso!", serial))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!("Falha na instalação do APK no celular: {}", stderr.trim()))
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let err_msg = if !stderr.trim().is_empty() { stderr.trim() } else { stdout.trim() };
+            Err(format!("Falha na instalação do APK no celular {}: {}", serial, err_msg))
         }
     }
 

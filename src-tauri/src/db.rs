@@ -246,7 +246,7 @@ pub fn hash_password(password: &str) -> String {
 }
 
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    hash_password(password) == hash
+    password == hash || hash_password(password) == hash
 }
 
 // ============================================================
@@ -729,7 +729,7 @@ impl Database {
         let (sql, use_param) = if company_id <= 0 {
             ("SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device", false)
         } else {
-            ("SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device WHERE CompanyId = ?1", true)
+            ("SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device WHERE CompanyId = ?1 OR CompanyId = 0 OR CompanyId IS NULL", true)
         };
 
         let mut stmt = match self.conn.prepare(sql) {
@@ -769,6 +769,34 @@ impl Database {
         }
     }
 
+    pub fn upsert_device(&self, device: &Device) -> Result<(), String> {
+        let target_comp = if device.company_id <= 0 { 1 } else { device.company_id };
+        self.conn
+            .execute(
+                "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT(AdbDeviceId) DO UPDATE SET
+                DeviceName=excluded.DeviceName, Brand=excluded.Brand, Model=excluded.Model,
+                DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
+                BatteryLevel=excluded.BatteryLevel, DeviceNumber=excluded.DeviceNumber, Sector=excluded.Sector;",
+                params![
+                    device.serial,
+                    device.name,
+                    device.brand,
+                    device.model,
+                    device.ip,
+                    device.port,
+                    device.status,
+                    device.battery,
+                    target_comp,
+                    device.device_number,
+                    device.sector,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn get_all_devices(&self) -> Vec<Device> {
         let mut stmt = match self.conn.prepare(
             "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device"
@@ -799,34 +827,6 @@ impl Database {
             Err(_) => vec![],
         }
     }
-
-    pub fn upsert_device(&self, device: &Device) -> Result<(), String> {
-        self.conn
-            .execute(
-                "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                ON CONFLICT(AdbDeviceId) DO UPDATE SET
-                DeviceName=excluded.DeviceName, Brand=excluded.Brand, Model=excluded.Model,
-                DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
-                BatteryLevel=excluded.BatteryLevel, DeviceNumber=excluded.DeviceNumber, Sector=excluded.Sector;",
-                params![
-                    device.serial,
-                    device.name,
-                    device.brand,
-                    device.model,
-                    device.ip,
-                    device.port,
-                    device.status,
-                    device.battery,
-                    device.company_id,
-                    device.device_number,
-                    device.sector,
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
     pub fn delete_device(&self, serial: &str) -> Result<(), String> {
         self.conn.execute(
             "DELETE FROM ESF_Device WHERE AdbDeviceId = ?1;",

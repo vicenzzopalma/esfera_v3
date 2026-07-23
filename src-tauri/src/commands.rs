@@ -135,7 +135,8 @@ static ADB_LIST_CACHE: std::sync::LazyLock<RwLock<(Vec<AdbDeviceInfo>, Instant)>
 fn get_cached_adb_devices() -> Vec<AdbDeviceInfo> {
     let now = Instant::now();
     if let Ok(cache) = ADB_LIST_CACHE.read() {
-        if now.duration_since(cache.1).as_millis() < 2500 {
+        let ttl_ms = if cache.0.is_empty() { 500 } else { 2500 };
+        if now.duration_since(cache.1).as_millis() < ttl_ms {
             return cache.0.clone();
         }
     }
