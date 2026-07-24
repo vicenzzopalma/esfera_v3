@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::sync::RwLock;
+use std::collections::HashMap;
 
 pub fn create_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
@@ -73,6 +75,9 @@ extern "C" {
         out_count: *mut i32,
     ) -> i32;
 }
+
+static DEVICE_INFO_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (String, String)>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub struct AdbManager;
 
@@ -552,9 +557,6 @@ impl AdbManager {
         Ok(())
     }
 
-static DEVICE_INFO_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (String, String)>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
-
     pub fn get_device_info(serial: &str) -> (String, String) {
         if let Ok(cache) = DEVICE_INFO_CACHE.read() {
             if let Some(info) = cache.get(serial) {
@@ -605,29 +607,101 @@ static DEVICE_INFO_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (String, St
     }
 
     /// Lança o Scrcpy H.264 nativo em 60 FPS com aceleração por hardware
-    pub fn launch_scrcpy(serial: &str) -> Result<String, String> {
-        let title = format!("Esfera v3 — Stream H.264 ({})", serial);
-        let result = create_cmd("scrcpy")
-            .args([
-                "-s",
-                serial,
-                "--max-size",
-                "1080",
-                "--max-fps",
-                "60",
-                "--video-bit-rate",
-                "4M",
-                "--window-title",
-                &title,
-            ])
-            .spawn();
+    pub fn launch_scrcpy(serial: &str, turn_screen_off: bool) -> Result<String, String> {
+        let mode_label = if turn_screen_off { " [Tela Desligada]" } else { "" };
+        let title = format!("Esfera v3 — Stream H.264 ({}){}", serial, mode_label);
+        let mut cmd = create_cmd("scrcpy");
+        cmd.args([
+            "-s",
+            serial,
+            "--max-size",
+            "1080",
+            "--max-fps",
+            "60",
+            "--video-bit-rate",
+            "4M",
+            "--window-title",
+            &title,
+        ]);
+
+        if turn_screen_off {
+            cmd.arg("--turn-screen-off");
+            cmd.arg("--stay-awake");
+        }
+
+        let result = cmd.spawn();
 
         match result {
-            Ok(_) => Ok(format!("Scrcpy H.264 inicializado com sucesso para {}!", serial)),
+            Ok(_) => Ok(format!(
+                "Scrcpy H.264 inicializado com sucesso para {}! (Modo: {})",
+                serial,
+                if turn_screen_off { "Tela Física Desligada 🌙" } else { "Tela Física Ligada ⚡" }
+            )),
             Err(e) => Err(format!(
                 "Scrcpy nativo não encontrado no sistema ({}). Certifique-se de que o executável 'scrcpy.exe' esteja instalado e adicionado ao PATH do Windows.",
                 e
             )),
+        }
+    }
+
+    /// Lança uma segunda Área de Trabalho Virtual independente (Display #1) via Scrcpy.
+    /// O bot opera na Área #1 enquanto o supervisor usa livremente a tela física principal (Display #0).
+    pub fn launch_scrcpy_virtual_display(serial: &str, width: u32, height: u32, dpi: u32) -> Result<String, String> {
+        let display_spec = format!("{}x{}/{}", width, height, dpi);
+        let title = format!("Esfera v3 — Área #2 [Disparos Isolados] ({})", serial);
+
+        let mut cmd = create_cmd("scrcpy");
+        cmd.args([
+            "-s",
+            serial,
+            &format!("--new-display={}", display_spec),
+            "--max-fps",
+            "60",
+            "--video-bit-rate",
+            "4M",
+            "--window-title",
+            &title,
+            "--stay-awake",
+        ]);
+
+        let result = cmd.spawn();
+
+        match result {
+            Ok(_) => Ok(format!(
+                "🖥️ Área de Trabalho #2 (Display Virtual {}px) inicializada para o celular {}! O supervisor pode usar a tela física livremente.",
+                display_spec, serial
+            )),
+            Err(e) => Err(format!(
+                "Falha ao iniciar Display Virtual Secundário ({}). Certifique-se de que o Scrcpy v2.2+ esteja instalado.",
+                e
+            )),
+        }
+    }
+
+    /// Executa um Intent do WhatsApp apontando para um Display específico (ex: Display ID 1)
+    pub fn launch_intent_on_display(serial: &str, url: &str, display_id: u32) -> Result<String, String> {
+        let output = create_cmd("adb")
+            .args([
+                "-s",
+                serial,
+                "shell",
+                "am",
+                "start",
+                "--display",
+                &display_id.to_string(),
+                "-a",
+                "android.intent.action.VIEW",
+                "-d",
+                url,
+            ])
+            .output()
+            .map_err(|e| format!("Falha ao executar intent em display secundário: {}", e))?;
+
+        if output.status.success() {
+            Ok(format!("Intent aberto no Display #{} com sucesso no aparelho {}", display_id, serial))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("Erro ao abrir Intent no Display #{}: {}", display_id, stderr.trim()))
         }
     }
 
@@ -824,7 +898,24 @@ static DEVICE_INFO_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (String, St
     /// Inicializa a Thread de Reconexão Automática Contínua para que NENHUM celular seja perdido após reinício do servidor
     pub fn start_auto_reconnect_daemon(db_conn: std::sync::Arc<std::sync::Mutex<crate::db::Database>>) {
         std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(12));
+            std::thread::sleep(std::time::Duration::from_secs(4));
+
+            // Lista de IPs Wi-Fi conhecidos para reconexão nativa em lote
+            let static_ips = vec![
+                "192.168.1.185:5555",
+                "192.168.1.35:5555",
+                "192.168.1.54:5555",
+                "192.168.1.57:5555",
+                "192.168.1.92:5555",
+                "192.168.1.93:5555",
+                "192.168.1.94:5555",
+                "192.168.1.95:5555",
+            ];
+
+            for target in &static_ips {
+                let _ = create_cmd("adb").arg("connect").arg(target).output();
+            }
+
             if let Ok(db) = db_conn.lock() {
                 let devices = db.get_devices(1);
                 for dev in devices {

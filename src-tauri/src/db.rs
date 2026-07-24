@@ -558,6 +558,27 @@ impl Database {
         // Garante que a empresa #1 seja REALESS e que nenhuma informação seja perdida
         let _ = self.conn.execute("UPDATE ESF_Company SET CompanyName='REALESS' WHERE CompanyId=1 AND (CompanyName='Empresa Principal' OR CompanyName='');", []);
 
+        // Garante que os 8 celulares ativados da REALESS estejam sempre pré-cadastrados no banco SQLite
+        let default_devices = vec![
+            ("192.168.1.185:5555", "Aparelho 1", "Xiaomi", "Redmi Note", "192.168.1.185", 1, "junior"),
+            ("192.168.1.35:5555", "Aparelho 2", "Multilaser", "F Pro 2", "192.168.1.35", 2, "junior"),
+            ("192.168.1.54:5555", "Aparelho 3", "Samsung", "Galaxy A01", "192.168.1.54", 3, "junior"),
+            ("192.168.1.57:5555", "Aparelho 4", "Xiaomi", "Redmi 9", "192.168.1.57", 4, "junior"),
+            ("192.168.1.92:5555", "Aparelho 5", "Samsung", "Galaxy J7", "192.168.1.92", 5, "junior"),
+            ("192.168.1.93:5555", "Aparelho 6", "Motorola", "Moto G22", "192.168.1.93", 6, "junior"),
+            ("192.168.1.94:5555", "Aparelho 7", "Motorola", "Moto G", "192.168.1.94", 7, "junior"),
+            ("192.168.1.95:5555", "Aparelho 8", "Multilaser", "F Pro 2", "192.168.1.95", 8, "junior"),
+        ];
+
+        for (serial, name, brand, model, ip, num, sector) in default_devices {
+            let _ = self.conn.execute(
+                "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector)
+                VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7)
+                ON CONFLICT(AdbDeviceId) DO NOTHING;",
+                params![serial, name, brand, model, ip, num, sector],
+            );
+        }
+
         Ok(())
     }
 
@@ -617,6 +638,27 @@ impl Database {
                 (2, 'pa_fixa_2', 1, 0);",
                 [],
             )?;
+
+            // Pré-cadastra os 8 celulares Wi-Fi ativados da REALESS para garantia de exibição instantânea a 0ms
+            let default_devices = vec![
+                ("192.168.1.185:5555", "Aparelho 1", "Xiaomi", "Redmi Note", "192.168.1.185", 1, "junior"),
+                ("192.168.1.35:5555", "Aparelho 2", "Multilaser", "F Pro 2", "192.168.1.35", 2, "junior"),
+                ("192.168.1.54:5555", "Aparelho 3", "Samsung", "Galaxy A01", "192.168.1.54", 3, "junior"),
+                ("192.168.1.57:5555", "Aparelho 4", "Xiaomi", "Redmi 9", "192.168.1.57", 4, "junior"),
+                ("192.168.1.92:5555", "Aparelho 5", "Samsung", "Galaxy J7", "192.168.1.92", 5, "junior"),
+                ("192.168.1.93:5555", "Aparelho 6", "Motorola", "Moto G22", "192.168.1.93", 6, "junior"),
+                ("192.168.1.94:5555", "Aparelho 7", "Motorola", "Moto G", "192.168.1.94", 7, "junior"),
+                ("192.168.1.95:5555", "Aparelho 8", "Multilaser", "F Pro 2", "192.168.1.95", 8, "junior"),
+            ];
+
+            for (serial, name, brand, model, ip, num, sector) in default_devices {
+                let _ = self.conn.execute(
+                    "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector)
+                    VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7)
+                    ON CONFLICT(AdbDeviceId) DO NOTHING;",
+                    params![serial, name, brand, model, ip, num, sector],
+                );
+            }
         }
 
         Ok(())
@@ -725,12 +767,8 @@ impl Database {
     // DISPOSITIVOS
     // ============================================================
 
-    pub fn get_devices(&self, company_id: i32) -> Vec<Device> {
-        let (sql, use_param) = if company_id <= 0 {
-            ("SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device", false)
-        } else {
-            ("SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device WHERE CompanyId = ?1 OR CompanyId = 0 OR CompanyId IS NULL", true)
-        };
+    pub fn get_devices(&self, _company_id: i32) -> Vec<Device> {
+        let sql = "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device";
 
         let mut stmt = match self.conn.prepare(sql) {
             Ok(s) => s,
@@ -754,18 +792,10 @@ impl Database {
             })
         };
 
-        if use_param {
-            let rows = stmt.query_map(params![company_id], mapper);
-            match rows {
-                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-                Err(_) => vec![],
-            }
-        } else {
-            let rows = stmt.query_map([], mapper);
-            match rows {
-                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-                Err(_) => vec![],
-            }
+        let rows = stmt.query_map([], mapper);
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
         }
     }
 

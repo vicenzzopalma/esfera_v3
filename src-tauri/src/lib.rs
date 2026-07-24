@@ -229,6 +229,8 @@ pub fn run() {
             deploy_adb_keepalive,
             get_hardware_uuid,
             launch_scrcpy_stream,
+            launch_virtual_display_stream,
+            send_intent_to_display,
             launch_camera_stream,
             inject_virtual_camera,
             optimize_device_hpc,
