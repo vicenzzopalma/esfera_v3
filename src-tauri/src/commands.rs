@@ -159,7 +159,7 @@ static ADB_LIST_CACHE: std::sync::LazyLock<RwLock<(Vec<AdbDeviceInfo>, Instant)>
 fn get_cached_adb_devices() -> Vec<AdbDeviceInfo> {
     let now = Instant::now();
     if let Ok(cache) = ADB_LIST_CACHE.read() {
-        let ttl_ms = if cache.0.is_empty() { 500 } else { 2500 };
+        let ttl_ms = if cache.0.is_empty() { 1000 } else { 6000 };
         if now.duration_since(cache.1).as_millis() < ttl_ms {
             return cache.0.clone();
         }
@@ -175,7 +175,7 @@ fn get_cached_battery(serial: &str) -> i32 {
     let now = Instant::now();
     if let Ok(cache) = BATTERY_CACHE.read() {
         if let Some((level, timestamp)) = cache.get(serial) {
-            if now.duration_since(*timestamp).as_secs() < 60 {
+            if now.duration_since(*timestamp).as_secs() < 120 {
                 return *level;
             }
         }
@@ -189,110 +189,114 @@ fn get_cached_battery(serial: &str) -> i32 {
 }
 
 #[tauri::command]
-pub fn get_devices(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<Device>, String> {
-    let session = validate_session(&state.sessions, &token)?;
-    let target_company_id = if session.role == "master" {
-        0
-    } else if company_id <= 0 {
-        session.company_id.unwrap_or(0)
-    } else {
-        company_id
-    };
-    if session.role != "master" && target_company_id > 0 {
-        check_company_access(&session, target_company_id)?;
-    }
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let mut db_devices = db.get_devices(target_company_id);
-    let active_adb_list = get_cached_adb_devices();
+pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<Device>, String> {
+    let state_db = state.db.clone();
+    let state_sessions = state.sessions.clone();
 
-    let mut changed = false;
-
-    for adb_dev in &active_adb_list {
-        if adb_dev.serial == "*" || adb_dev.serial.starts_with('*') {
-            continue;
-        }
-
-        let is_wireless = adb_dev.serial.contains(':') || adb_dev.serial.contains('.');
-
-        let status = if adb_dev.state == "device" {
-            "online".to_string()
-        } else if adb_dev.state == "unauthorized" {
-            "connecting".to_string()
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = validate_session(&state_sessions, &token)?;
+        let target_company_id = if session.role == "master" {
+            0
+        } else if company_id <= 0 {
+            session.company_id.unwrap_or(0)
         } else {
-            "offline".to_string()
+            company_id
         };
+        if session.role != "master" && target_company_id > 0 {
+            check_company_access(&session, target_company_id)?;
+        }
+        let db = state_db.lock().map_err(|e| e.to_string())?;
+        let mut db_devices = db.get_devices(target_company_id);
+        let active_adb_list = get_cached_adb_devices();
 
-        let existing_idx = db_devices.iter().position(|d| d.serial == adb_dev.serial);
+        let mut changed = false;
 
-        if let Some(idx) = existing_idx {
-            let old_status = db_devices[idx].status.clone();
-            let old_battery = db_devices[idx].battery;
-            db_devices[idx].status = status;
-            if adb_dev.state == "device" {
-                db_devices[idx].battery = get_cached_battery(&adb_dev.serial);
+        for adb_dev in &active_adb_list {
+            if adb_dev.serial == "*" || adb_dev.serial.starts_with('*') {
+                continue;
             }
-            if old_status != db_devices[idx].status || old_battery != db_devices[idx].battery {
-                let _ = db.upsert_device(&db_devices[idx]);
+
+            let is_wireless = adb_dev.serial.contains(':') || adb_dev.serial.contains('.');
+
+            let status = if adb_dev.state == "device" {
+                "online".to_string()
+            } else if adb_dev.state == "unauthorized" {
+                "connecting".to_string()
+            } else {
+                "offline".to_string()
+            };
+
+            let existing_idx = db_devices.iter().position(|d| d.serial == adb_dev.serial);
+
+            if let Some(idx) = existing_idx {
+                let old_status = db_devices[idx].status.clone();
+                let old_battery = db_devices[idx].battery;
+                db_devices[idx].status = status;
+                if adb_dev.state == "device" {
+                    db_devices[idx].battery = get_cached_battery(&adb_dev.serial);
+                }
+                if old_status != db_devices[idx].status || old_battery != db_devices[idx].battery {
+                    let _ = db.upsert_device(&db_devices[idx]);
+                    changed = true;
+                }
+            } else {
+                let (brand, model) = AdbManager::get_device_info(&adb_dev.serial);
+                let battery = if adb_dev.state == "device" {
+                    get_cached_battery(&adb_dev.serial)
+                } else {
+                    0
+                };
+
+                let new_dev = Device {
+                    id: 0,
+                    serial: adb_dev.serial.clone(),
+                    name: format!("Aparelho {}", db_devices.len() + 1),
+                    brand,
+                    model,
+                    ip: if is_wireless {
+                        adb_dev.serial.split(':').next().unwrap_or("").to_string()
+                    } else {
+                        "".to_string()
+                    },
+                    port: 5555,
+                    status,
+                    battery,
+                    company_id: target_company_id,
+                    device_number: (db_devices.len() + 1) as i32,
+                    sector: "junior".to_string(),
+                };
+                let _ = db.upsert_device(&new_dev);
                 changed = true;
             }
-        } else {
-            let (brand, model) = AdbManager::get_device_info(&adb_dev.serial);
-            let battery = if adb_dev.state == "device" {
-                get_cached_battery(&adb_dev.serial)
-            } else {
-                0
-            };
+        }
 
-            let new_dev = Device {
-                id: 0,
-                serial: adb_dev.serial.clone(),
-                name: format!("Aparelho {}", db_devices.len() + 1),
-                brand,
-                model,
-                ip: if is_wireless {
-                    adb_dev.serial.split(':').next().unwrap_or("").to_string()
+        let mut refreshed_db = if changed { db.get_devices(target_company_id) } else { db_devices };
+
+        for dev in &mut refreshed_db {
+            let is_active = active_adb_list.iter().any(|adb_d| adb_d.serial == dev.serial);
+            if is_active {
+                dev.status = "online".to_string();
+            } else {
+                dev.status = "offline".to_string();
+                let ip_target = if !dev.ip.is_empty() {
+                    dev.ip.clone()
+                } else if dev.serial.contains(':') {
+                    dev.serial.split(':').next().unwrap_or("").to_string()
                 } else {
                     "".to_string()
-                },
-                port: 5555,
-                status,
-                battery,
-                company_id: target_company_id,
-                device_number: (db_devices.len() + 1) as i32,
-                sector: "junior".to_string(),
-            };
-            let _ = db.upsert_device(&new_dev);
-            changed = true;
-        }
-    }
+                };
 
-    let mut refreshed_db = if changed { db.get_devices(target_company_id) } else { db_devices };
-
-    for dev in &mut refreshed_db {
-        let is_active = active_adb_list.iter().any(|adb_d| adb_d.serial == dev.serial);
-        if is_active {
-            dev.status = "online".to_string();
-        } else {
-            dev.status = "offline".to_string();
-            // Se for um celular Wi-Fi salvo no banco e estiver offline neste PC, tenta conectar via ADB Wi-Fi em background
-            let ip_target = if !dev.ip.is_empty() {
-                dev.ip.clone()
-            } else if dev.serial.contains(':') {
-                dev.serial.split(':').next().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            };
-
-            if !ip_target.is_empty() && ip_target.contains('.') {
-                let port = if dev.port > 0 { dev.port } else { 5555 };
-                std::thread::spawn(move || {
-                    let _ = AdbManager::connect_device(&ip_target, port);
-                });
+                if !ip_target.is_empty() && ip_target.contains('.') {
+                    let port = if dev.port > 0 { dev.port } else { 5555 };
+                    std::thread::spawn(move || {
+                        let _ = AdbManager::connect_device(&ip_target, port);
+                    });
+                }
             }
         }
-    }
 
-    Ok(refreshed_db)
+        Ok(refreshed_db)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -496,7 +500,7 @@ pub fn optimize_device(state: State<'_, AppState>, token: String, serial: String
 }
 
 #[tauri::command]
-pub fn get_device_ip(serial: String) -> Result<String, String> {
+pub fn get_device_ip(_token: String, serial: String) -> Result<String, String> {
     AdbManager::get_device_wifi_ip(&serial)
 }
 
@@ -655,17 +659,17 @@ pub fn clear_logs(state: State<'_, AppState>, token: String, company_id: i32) ->
 // ============================================================
 
 #[tauri::command]
-pub fn capture_device_screen(serial: String) -> Result<String, String> {
+pub fn capture_device_screen(_token: String, serial: String) -> Result<String, String> {
     AdbManager::capture_screen(&serial)
 }
 
 #[tauri::command]
-pub fn send_adb_tap(serial: String, x: u32, y: u32) -> Result<(), String> {
+pub fn send_adb_tap(_token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
     AdbManager::tap_screen(&serial, x, y)
 }
 
 #[tauri::command]
-pub fn send_adb_keyevent(serial: String, keycode: u32) -> Result<(), String> {
+pub fn send_adb_keyevent(_token: String, serial: String, keycode: u32) -> Result<(), String> {
     AdbManager::send_keyevent(&serial, keycode)
 }
 
@@ -972,12 +976,14 @@ pub fn update_device_package_status(
 // ============================================================
 
 #[tauri::command]
-pub fn list_usb_devices(_token: String) -> Result<Vec<AdbDeviceInfo>, String> {
-    AdbManager::list_devices()
+pub async fn list_usb_devices(_token: String) -> Result<Vec<AdbDeviceInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::list_devices()
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn link_usb_to_wireless(
+pub async fn link_usb_to_wireless(
     state: State<'_, AppState>,
     token: String,
     serial: String,
@@ -986,79 +992,80 @@ pub fn link_usb_to_wireless(
     sector: String,
     device_name: Option<String>,
 ) -> Result<String, String> {
-    let session = validate_session(&state.sessions, &token)?;
-    check_company_access(&session, company_id)?;
-    let ip = AdbManager::get_device_wifi_ip(&serial)?;
-    AdbManager::enable_tcpip(&serial, 5555)?;
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    let link_msg = AdbManager::connect_device(&ip, 5555)?;
-    let (brand, model) = AdbManager::get_device_info(&serial);
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let wireless_serial = format!("{}:5555", ip);
-    let final_name = device_name
-        .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| format!("Aparelho {}", device_number));
-    let device = Device {
-        id: 0,
-        serial: wireless_serial.clone(),
-        name: final_name,
-        brand,
-        model,
-        ip,
-        port: 5555,
-        status: "online".to_string(),
-        battery: 100,
-        company_id,
-        device_number,
-        sector,
-    };
-    db.upsert_device(&device)?;
-    let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
-    let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
-    let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
-    // Injeta regras Keep-Alive no celular
-    let _ = AdbManager::deploy_keepalive(&wireless_serial);
-    let _ = AdbManager::deploy_keepalive(&serial);
-    Ok(format!(
-        "Sucesso! Dispositivo pareado sem fio: {}",
-        link_msg
-    ))
+    let state_db = state.db.clone();
+    let state_sessions = state.sessions.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = validate_session(&state_sessions, &token)?;
+        check_company_access(&session, company_id)?;
+        let ip = AdbManager::get_device_wifi_ip(&serial)?;
+        AdbManager::enable_tcpip(&serial, 5555)?;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let link_msg = AdbManager::connect_device(&ip, 5555)?;
+        let (brand, model) = AdbManager::get_device_info(&serial);
+        let db = state_db.lock().map_err(|e| e.to_string())?;
+        let wireless_serial = format!("{}:5555", ip);
+        let final_name = device_name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| format!("Aparelho {}", device_number));
+        let device = Device {
+            id: 0,
+            serial: wireless_serial.clone(),
+            name: final_name,
+            brand,
+            model,
+            ip,
+            port: 5555,
+            status: "online".to_string(),
+            battery: 100,
+            company_id,
+            device_number,
+            sector,
+        };
+        db.upsert_device(&device)?;
+        let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
+        let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
+        let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
+        let _ = AdbManager::deploy_keepalive(&wireless_serial);
+        let _ = AdbManager::deploy_keepalive(&serial);
+        Ok(format!(
+            "Sucesso! Dispositivo pareado sem fio: {}",
+            link_msg
+        ))
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn force_reconnect_all_adb(state: State<'_, AppState>) -> Result<String, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let devices = db.get_devices(1);
-    let mut reconnected = Vec::new();
+pub async fn force_reconnect_all_adb(_token: String, state: State<'_, AppState>) -> Result<String, String> {
+    let state_db = state.db.clone();
 
-    for dev in devices {
-        let target = if !dev.ip.is_empty() {
-            format!("{}:5555", dev.ip)
-        } else if dev.serial.contains(':') {
-            dev.serial.clone()
-        } else {
-            "".to_string()
-        };
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = state_db.lock().map_err(|e| e.to_string())?;
+        let devices = db.get_devices(1);
+        let mut reconnected = Vec::new();
 
-        if !target.is_empty() && target.contains('.') {
-            let output = crate::adb_manager::create_cmd("adb")
-                .arg("connect")
-                .arg(&target)
-                .output();
-            if let Ok(out) = output {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if s.contains("connected") {
+        for dev in devices {
+            let target = if !dev.ip.is_empty() {
+                format!("{}:5555", dev.ip)
+            } else if dev.serial.contains(':') {
+                dev.serial.clone()
+            } else {
+                "".to_string()
+            };
+
+            if !target.is_empty() && target.contains('.') {
+                if let Ok(_) = AdbManager::connect_device(&dev.ip, dev.port) {
                     reconnected.push(format!("✓ {} ({})", dev.model, target));
                 }
             }
         }
-    }
 
-    if reconnected.is_empty() {
-        Ok("Disparada reconexão via Wi-Fi para todos os celulares salvos!".to_string())
-    } else {
-        Ok(format!("⚡ Reconexão Wi-Fi Concluída:\n{}", reconnected.join("\n")))
-    }
+        if reconnected.is_empty() {
+            Ok("Disparada reconexão via Wi-Fi para todos os celulares salvos!".to_string())
+        } else {
+            Ok(format!("⚡ Reconexão Wi-Fi Concluída:\n{}", reconnected.join("\n")))
+        }
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1324,7 +1331,7 @@ pub fn start_campaign(state: State<'_, AppState>, token: String, campaign_id: i3
 }
 
 #[tauri::command]
-pub fn rewrite_message_ai(message: String, contact_name: String) -> Result<String, String> {
+pub fn rewrite_message_ai(_token: String, message: String, contact_name: String) -> Result<String, String> {
     // Mock AI rewrite - adds temporal greeting and name personalization
     use std::time::{SystemTime, UNIX_EPOCH};
     let seed = SystemTime::now()
@@ -1355,13 +1362,14 @@ pub fn rewrite_message_ai(message: String, contact_name: String) -> Result<Strin
 }
 
 #[tauri::command]
-pub fn launch_scrcpy_stream(serial: String, turn_screen_off: Option<bool>) -> Result<String, String> {
+pub fn launch_scrcpy_stream(_token: String, serial: String, turn_screen_off: Option<bool>) -> Result<String, String> {
     let turn_off = turn_screen_off.unwrap_or(false);
     AdbManager::launch_scrcpy(&serial, turn_off)
 }
 
 #[tauri::command]
 pub fn launch_virtual_display_stream(
+    _token: String,
     serial: String,
     width: Option<u32>,
     height: Option<u32>,
@@ -1375,6 +1383,7 @@ pub fn launch_virtual_display_stream(
 
 #[tauri::command]
 pub fn send_intent_to_display(
+    _token: String,
     serial: String,
     url: String,
     display_id: Option<u32>,
@@ -1384,23 +1393,23 @@ pub fn send_intent_to_display(
 }
 
 #[tauri::command]
-pub fn launch_camera_stream(serial: String, facing: Option<String>) -> Result<String, String> {
+pub fn launch_camera_stream(_token: String, serial: String, facing: Option<String>) -> Result<String, String> {
     let camera_facing = facing.unwrap_or_else(|| "back".to_string());
     AdbManager::launch_scrcpy_camera(&serial, &camera_facing)
 }
 
 #[tauri::command]
-pub fn inject_virtual_camera(serial: String, target_type: String) -> Result<String, String> {
+pub fn inject_virtual_camera(_token: String, serial: String, target_type: String) -> Result<String, String> {
     AdbManager::inject_virtual_camera_feed(&serial, &target_type)
 }
 
 #[tauri::command]
-pub fn optimize_device_hpc(serial: String) -> Result<String, String> {
+pub fn optimize_device_hpc(_token: String, serial: String) -> Result<String, String> {
     AdbManager::optimize_device_performance(&serial)
 }
 
 #[tauri::command]
-pub fn install_agent_apk(serial: String) -> Result<String, String> {
+pub fn install_agent_apk(_token: String, serial: String) -> Result<String, String> {
     AdbManager::install_agent_apk(&serial)
 }
 
@@ -1409,12 +1418,12 @@ pub fn install_agent_apk(serial: String) -> Result<String, String> {
 // ============================================================
 
 #[tauri::command]
-pub fn get_app_config() -> AppConfig {
+pub fn get_app_config(_token: String) -> AppConfig {
     config::load_config()
 }
 
 #[tauri::command]
-pub fn save_app_config(config: AppConfig) -> Result<(), String> {
+pub fn save_app_config(_token: String, config: AppConfig) -> Result<(), String> {
     config::save_config(&config)
 }
 

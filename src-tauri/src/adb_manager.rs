@@ -977,7 +977,7 @@ impl AdbManager {
             std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
 
         std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(12));
+            std::thread::sleep(std::time::Duration::from_secs(25));
 
             if let Ok(db) = db_conn.lock() {
                 let devices = db.get_devices(1);

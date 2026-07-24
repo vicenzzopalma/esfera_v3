@@ -143,8 +143,8 @@ impl Dispatcher {
     pub fn start_persistent_adb_keepalive_loop(db_arc: Arc<Mutex<Database>>) {
         tauri::async_runtime::spawn(async move {
             loop {
-                // Roda a cada 30 segundos em segundo plano (otimizado)
-                sleep(Duration::from_secs(30)).await;
+                // Roda a cada 45 segundos em segundo plano (ultra otimizado 0% CPU)
+                sleep(Duration::from_secs(45)).await;
 
                 let saved_devices = {
                     if let Ok(db) = db_arc.lock() {
