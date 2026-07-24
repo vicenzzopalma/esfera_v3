@@ -3,11 +3,10 @@
 // Painel de indicadores com KPIs, atividade recente e status
 // ============================================================
 
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useAuth } from "../context/AuthContext";
 import { usePermissions } from "../hooks/usePermissions";
-import { api } from "../tauri";
-import { MOCK_COMPANIES } from "../mock-data";
+import { useDashboardKpis, useDevices } from "../hooks/useQueries";
 import Card from "../components/ui/Card";
 import Badge from "../components/ui/Badge";
 import Button from "../components/ui/Button";
@@ -25,91 +24,24 @@ import {
   Zap,
 } from "lucide-react";
 
-interface KpiData {
-  blocked_chips: number;
-  config_changes_today: number;
-  sent_today: number;
-  pending_contacts: number;
-}
-
-interface DeviceStatus {
-  online: number;
-  offline: number;
-  total: number;
-}
-
-const defaultKpis: KpiData = {
-  blocked_chips: 0,
-  config_changes_today: 0,
-  sent_today: 0,
-  pending_contacts: 0,
-};
-
 export default function DashboardTab() {
   const { selectedCompanyId } = useAuth();
   const { canAccessDashboard } = usePermissions();
-  const [kpis, setKpis] = useState<KpiData>(defaultKpis);
-  const [deviceStatus, setDeviceStatus] = useState<DeviceStatus>({ online: 0, offline: 0, total: 0 });
-  const [loading, setLoading] = useState(true);
-  const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
+  const [lastRefresh, setLastRefresh] = useState(new Date());
 
-  const selectedCompany = MOCK_COMPANIES.find((c) => c.id === selectedCompanyId);
-
-  const fetchDashboard = async () => {
-    if (!selectedCompanyId) return;
-    setLoading(true);
-    try {
-      const data = await api<KpiData>("get_dashboard_kpis", { companyId: selectedCompanyId });
-      setKpis(data);
-    } catch {
-      // Fallback mock
-      setKpis({
-        blocked_chips: 3,
-        config_changes_today: 12,
-        sent_today: 147,
-        pending_contacts: 203,
-      });
-    }
-    try {
-      const devices = await api<{ id: number; status: string }[]>("get_devices", { companyId: selectedCompanyId });
-      const online = devices.filter((d) => d.status === "online").length;
-      setDeviceStatus({ online, offline: devices.length - online, total: devices.length });
-    } catch {
-      setDeviceStatus({ online: 4, offline: 1, total: 5 });
-    }
-    setLoading(false);
-    setLastRefresh(new Date());
-  };
+  const { data: kpis, isLoading: kpisLoading, refetch: refetchKpis } = useDashboardKpis(selectedCompanyId);
+  const { data: devices, isLoading: devsLoading, refetch: refetchDevs } = useDevices(selectedCompanyId);
+  const loading = kpisLoading || devsLoading;
 
   useEffect(() => {
-    let mounted = true;
-    const doFetch = async () => {
-      if (!selectedCompanyId) return;
-      setLoading(true);
-      try {
-        const data = await api<KpiData>("get_dashboard_kpis", { companyId: selectedCompanyId });
-        if (mounted) setKpis(data);
-      } catch {
-        if (mounted) setKpis({
-          blocked_chips: 3,
-          config_changes_today: 12,
-          sent_today: 147,
-          pending_contacts: 203,
-        });
-      }
-      try {
-        const devices = await api<{ id: number; status: string }[]>("get_devices", { companyId: selectedCompanyId });
-        if (!mounted) return;
-        const online = devices.filter((d) => d.status === "online").length;
-        setDeviceStatus({ online, offline: devices.length - online, total: devices.length });
-      } catch {
-        if (mounted) setDeviceStatus({ online: 4, offline: 1, total: 5 });
-      }
-      if (mounted) { setLoading(false); setLastRefresh(new Date()); }
-    };
-    doFetch();
-    return () => { mounted = false; };
-  }, [selectedCompanyId]);
+    if (!loading) setLastRefresh(new Date());
+  }, [kpisLoading, devsLoading]);
+
+  const online = devices?.filter((d) => d.status === "online").length ?? 0;
+  const total = devices?.length ?? 0;
+  const deviceStatus = { online, offline: total - online, total };
+
+  const handleRefresh = () => { refetchKpis(); refetchDevs(); };
 
   if (!canAccessDashboard) {
     return (
@@ -128,7 +60,7 @@ export default function DashboardTab() {
   const kpiCards = [
     {
       label: "Mensagens Enviadas Hoje",
-      value: kpis.sent_today,
+      value: kpis?.sentToday ?? 0,
       icon: <MessageSquare size={22} />,
       color: "from-emerald-600 to-green-500",
       shadowColor: "shadow-emerald-500/20",
@@ -137,7 +69,7 @@ export default function DashboardTab() {
     },
     {
       label: "Contatos Pendentes",
-      value: kpis.pending_contacts,
+      value: kpis?.pendingContacts ?? 0,
       icon: <Clock size={22} />,
       color: "from-amber-600 to-orange-500",
       shadowColor: "shadow-amber-500/20",
@@ -146,7 +78,7 @@ export default function DashboardTab() {
     },
     {
       label: "Chips Bloqueados",
-      value: kpis.blocked_chips,
+      value: kpis?.blockedChips ?? 0,
       icon: <AlertTriangle size={22} />,
       color: "from-red-600 to-rose-500",
       shadowColor: "shadow-red-500/20",
@@ -155,7 +87,7 @@ export default function DashboardTab() {
     },
     {
       label: "Alterações Hoje",
-      value: kpis.config_changes_today,
+      value: kpis?.configChangesToday ?? 0,
       icon: <Activity size={22} />,
       color: "from-violet-600 to-indigo-500",
       shadowColor: "shadow-violet-500/20",
@@ -173,7 +105,7 @@ export default function DashboardTab() {
             Dashboard
           </h2>
           <p className="text-sm text-tertiary mt-1">
-            {selectedCompany ? selectedCompany.name : "Visão geral do sistema"} — Indicadores em tempo real
+            Visão geral do sistema — Indicadores em tempo real
           </p>
         </div>
         <div className="flex items-center gap-3">
@@ -183,7 +115,7 @@ export default function DashboardTab() {
           <Button
             variant="secondary"
             size="sm"
-            onClick={fetchDashboard}
+            onClick={handleRefresh}
             loading={loading}
           >
             <RefreshCw size={14} />

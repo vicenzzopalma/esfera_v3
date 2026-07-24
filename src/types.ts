@@ -247,6 +247,12 @@ export interface DashboardKpis {
   pendingContacts: number;
 }
 
+export interface AdbDeviceInfo {
+  serial: string;
+  state: string;
+  model: string;
+}
+
 // --- Helper para status de chip ---
 export const CHIP_STATUS_CONFIG: Record<ChipStatus, { label: string; color: string; bgColor: string; borderColor: string }> = {
   livre: { label: "Livre", color: "text-emerald-400", bgColor: "bg-emerald-500/15", borderColor: "border-emerald-500/30" },

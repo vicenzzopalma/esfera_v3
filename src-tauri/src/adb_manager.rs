@@ -39,7 +39,7 @@ pub fn run_cmd_timeout(mut cmd: Command, timeout: Duration) -> Result<std::proce
         Ok(result) => result,
         Err(_) => {
             #[cfg(windows)]
-            { let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output(); }
+            { let _ = create_cmd("taskkill").args(["/F", "/PID", &pid.to_string()]).output(); }
             #[cfg(unix)]
             { let _ = std::process::Command::new("kill").arg(pid.to_string()).output(); }
             Err(format!("Comando excedeu timeout de {}s.", timeout.as_secs()))
@@ -152,47 +152,36 @@ impl AdbManager {
         String::from_utf8_lossy(&buf[..len]).into_owned()
     }
 
-    /// Varredura segura de sub-rede na porta 5555 usando pool fixo de 16 threads para evitar estouro de pilha/memória
+    /// Varredura segura de sub-rede na porta 5555 usando scope (zero overhead de join manual)
     pub fn scan_subnet(subnet_prefix: &str) -> Vec<String> {
         use std::net::TcpStream;
         use std::time::Duration;
-        use std::sync::{Arc, Mutex};
 
-        let active_ips = Arc::new(Mutex::new(Vec::new()));
         let prefix = if subnet_prefix.is_empty() { "192.168.1" } else { subnet_prefix.trim_end_matches('.') }.to_string();
-
         let num_workers = 16;
-        let mut handles = Vec::new();
+        let active_ips = std::sync::Mutex::new(Vec::new());
 
-        for worker_id in 0..num_workers {
-            let active_ips_clone = Arc::clone(&active_ips);
-            let prefix_clone = prefix.clone();
-
-            let handle = std::thread::spawn(move || {
-                let start = worker_id * 16 + 1;
-                let end = ((worker_id + 1) * 16).min(254);
-
-                for i in start..=end {
-                    let ip = format!("{}.{}", prefix_clone, i);
-                    let addr = format!("{}:5555", ip);
-                    if let Ok(socket_addr) = addr.parse() {
-                        if TcpStream::connect_timeout(&socket_addr, Duration::from_millis(60)).is_ok() {
-                            if let Ok(mut ips) = active_ips_clone.lock() {
+        std::thread::scope(|s| {
+            for worker_id in 0..num_workers {
+                let prefix_ref = &prefix;
+                let ips_ref = &active_ips;
+                s.spawn(move || {
+                    let start = worker_id * 16 + 1;
+                    let end = ((worker_id + 1) * 16).min(254);
+                    for i in start..=end {
+                        let ip = format!("{}.{}", prefix_ref, i);
+                        if let Ok(addr) = format!("{}:5555", ip).parse() {
+                            if TcpStream::connect_timeout(&addr, Duration::from_millis(60)).is_ok() {
+                                let mut ips = ips_ref.lock().unwrap();
                                 ips.push(ip);
                             }
                         }
                     }
-                }
-            });
-            handles.push(handle);
-        }
+                });
+            }
+        });
 
-        for handle in handles {
-            let _ = handle.join();
-        }
-
-        let lock = active_ips.lock().unwrap_or_else(|e| e.into_inner());
-        lock.clone()
+        active_ips.into_inner().unwrap_or_default()
     }
 
     /// Injeta scripts e propriedades persistentes no Android para proibir o desligamento do Wi-Fi e ADB
