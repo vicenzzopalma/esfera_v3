@@ -118,7 +118,11 @@ export default function DevicesTab() {
 
   useEffect(() => {
     refreshDevices();
-    const interval = setInterval(refreshDevices, 5000);
+    const interval = setInterval(() => {
+      if (typeof document !== "undefined" && !document.hidden) {
+        refreshDevices();
+      }
+    }, 7000);
     return () => clearInterval(interval);
   }, [refreshDevices]);
 
