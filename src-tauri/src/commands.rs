@@ -369,6 +369,8 @@ pub fn connect_adb_device(
         sector,
     };
     db.upsert_device(&dev)?;
+    let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
+    let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
     let _ = AdbManager::deploy_keepalive(&serial);
     let _ = db.add_log(
         company_id,
@@ -405,6 +407,8 @@ pub fn pair_and_connect_adb_device(
         .args(["-s", &wireless_serial, "shell", "setprop", "persist.adb.tcp.port", "5555"])
         .output();
     let _ = AdbManager::deploy_keepalive(&wireless_serial);
+    let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
+    let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
 
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let (brand, model) = AdbManager::get_device_info(&wireless_serial);
@@ -1009,6 +1013,9 @@ pub fn link_usb_to_wireless(
         sector,
     };
     db.upsert_device(&device)?;
+    let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
+    let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
+    let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
     // Injeta regras Keep-Alive no celular
     let _ = AdbManager::deploy_keepalive(&wireless_serial);
     let _ = AdbManager::deploy_keepalive(&serial);
@@ -1055,8 +1062,8 @@ pub fn force_reconnect_all_adb(state: State<'_, AppState>) -> Result<String, Str
 }
 
 #[tauri::command]
-pub fn inject_all_devices_immunity() -> Result<String, String> {
-    let active_devices = AdbManager::list_devices().unwrap_or_default();
+pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -> Result<String, String> {
+    let active_devices = AdbManager::list_devices()?;
     let online_devices: Vec<_> = active_devices.into_iter().filter(|d| d.state == "device").collect();
     let count = online_devices.len();
 
@@ -1064,14 +1071,51 @@ pub fn inject_all_devices_immunity() -> Result<String, String> {
         return Ok("Nenhum celular online detectado via ADB no momento. Conecte via cabo USB ou Wi-Fi e tente novamente.".to_string());
     }
 
+    let db_arc = state.db.clone();
     std::thread::spawn(move || {
-        for dev in online_devices {
-            let _ = AdbManager::inject_device_immunity(&dev.serial);
+        for (idx, dev) in online_devices.iter().enumerate() {
+            let existing_id = AdbManager::get_persistent_device_id(&dev.serial);
+            let pid = match existing_id {
+                Some(id) => id,
+                None => {
+                    let new_id = format!("ESFERA_DEV_{:03}", idx + 1);
+                    let _ = AdbManager::inject_persistent_device_id(&dev.serial, &new_id);
+                    new_id
+                }
+            };
+
+            if let Err(e) = AdbManager::inject_device_immunity(&dev.serial, Some(&pid)) {
+                eprintln!("Falha ao injetar imunidade em {}: {}", dev.serial, e);
+            }
+
+            if dev.serial.contains(':') {
+                let ip_parts: Vec<&str> = dev.serial.split(':').collect();
+                let ip = ip_parts[0];
+                let (brand, model) = AdbManager::get_device_info(&dev.serial);
+                let dev_num = (idx + 1) as i32;
+                if let Ok(db) = db_arc.lock() {
+                    let device_obj = Device {
+                        id: 0,
+                        serial: dev.serial.clone(),
+                        name: format!("Aparelho {}", dev_num),
+                        brand,
+                        model,
+                        ip: ip.to_string(),
+                        port: 5555,
+                        status: "online".to_string(),
+                        battery: 100,
+                        company_id: 1,
+                        device_number: dev_num,
+                        sector: "junior".to_string(),
+                    };
+                    let _ = db.upsert_device(&device_obj);
+                }
+            }
         }
     });
 
     Ok(format!(
-        "🛡️ Injeção de Imunidade e MAC Físico iniciada em segundo plano para {} celulares online!",
+        "🛡️ Injeção de Imunidade, MAC Físico e Kernel ID iniciada para {} celulares online!",
         count
     ))
 }
@@ -1080,7 +1124,11 @@ pub fn inject_all_devices_immunity() -> Result<String, String> {
 pub fn inject_single_device_immunity(_token: String, serial: String) -> Result<String, String> {
     let s = serial.clone();
     std::thread::spawn(move || {
-        let _ = AdbManager::inject_device_immunity(&s);
+        let existing_id = AdbManager::get_persistent_device_id(&s);
+        let pid = existing_id.unwrap_or_else(|| "ESFERA_DEV_001".to_string());
+        if let Err(e) = AdbManager::inject_device_immunity(&s, Some(&pid)) {
+            eprintln!("Falha ao injetar imunidade em {}: {}", s, e);
+        }
     });
     Ok(format!("🛡️ Injeção de Imunidade enviada em segundo plano para {}!", serial))
 }
@@ -1101,6 +1149,10 @@ pub fn force_enable_wireless_adb(
         format!("{} Certifique-se de que o celular está conectado na mesma rede Wi-Fi que o computador.", e)
     })?;
 
+    // 1. Gera e Injeta a ID permanente no Kernel do Celular (ex: ESFERA_DEV_001)
+    let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
+    let _ = AdbManager::inject_persistent_device_id(&serial, &persistent_id);
+
     let _ = crate::adb_manager::create_cmd("adb")
         .args(["-s", &serial, "shell", "setprop", "persist.adb.tcp.port", "5555"])
         .output();
@@ -1111,8 +1163,10 @@ pub fn force_enable_wireless_adb(
     let (brand, model) = AdbManager::get_device_info(&serial);
     let wireless_serial = format!("{}:5555", ip);
 
+    // 2. Injeta Imunidade + MAC Físico + Kernel ID na conexão Wi-Fi
+    let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
+    let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
     let _ = AdbManager::deploy_keepalive(&wireless_serial);
-    let _ = AdbManager::deploy_keepalive(&serial);
 
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let final_name = device_name
