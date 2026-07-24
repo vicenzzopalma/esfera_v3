@@ -38,6 +38,7 @@ import {
   Table,
   CheckCircle2,
   XCircle,
+  Shield,
 } from "lucide-react";
 
 export type SectorType = "junior" | "senior" | "pa_fixa" | "pesquisa";
@@ -379,6 +380,24 @@ export default function DevicesTab() {
             className="bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-xs shadow-lg shadow-blue-600/30"
           >
             + Conectar Celular
+          </Button>
+
+          <Button
+            variant="secondary"
+            onClick={async () => {
+              try {
+                const msg = await api<string>("inject_all_devices_immunity", {});
+                alert(msg);
+                refreshDevices();
+              } catch (e: any) {
+                alert(typeof e === "string" ? e : e?.message || "Erro ao injetar imunidade.");
+              }
+            }}
+            icon={<Shield size={14} className="text-cyan-400" />}
+            className="bg-cyan-950/60 hover:bg-cyan-900 border-cyan-600/50 text-cyan-200 rounded-xl text-xs font-extrabold shadow-lg"
+            title="Injeta no Android a fixação de MAC Físico (desativa MAC aleatório) e imuniza a porta TCP 5555"
+          >
+            🛡️ Injetar Imunidade & MAC Físico
           </Button>
 
           <Button

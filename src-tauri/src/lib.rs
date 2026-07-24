@@ -223,6 +223,8 @@ pub fn run() {
             link_usb_to_wireless,
             force_enable_wireless_adb,
             force_reconnect_all_adb,
+            inject_all_devices_immunity,
+            inject_single_device_immunity,
             pair_and_connect_adb_device,
             run_adb_diagnostic,
             restart_adb_server,

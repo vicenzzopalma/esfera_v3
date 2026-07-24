@@ -1080,6 +1080,42 @@ pub fn force_reconnect_all_adb(state: State<'_, AppState>) -> Result<String, Str
 }
 
 #[tauri::command]
+pub fn inject_all_devices_immunity(state: State<'_, AppState>) -> Result<String, String> {
+    let mut results = Vec::new();
+
+    let active_devices = AdbManager::list_devices().unwrap_or_default();
+    for dev in active_devices {
+        if let Ok(_) = AdbManager::inject_device_immunity(&dev.serial) {
+            results.push(format!("✓ {}", dev.serial));
+        }
+    }
+
+    if let Ok(db) = state.db.lock() {
+        let db_devs = db.get_devices(1);
+        for dev in db_devs {
+            if !dev.serial.is_empty() && !results.iter().any(|r| r.contains(&dev.serial)) {
+                let _ = AdbManager::inject_device_immunity(&dev.serial);
+                results.push(format!("✓ {} ({})", dev.model, dev.serial));
+            }
+        }
+    }
+
+    if results.is_empty() {
+        Ok("Nenhum celular ativo detectado no momento para injeção. Conecte via cabo USB ou Wi-Fi e tente novamente.".to_string())
+    } else {
+        Ok(format!(
+            "🛡️ INJEÇÃO GERAL DE IMUNIDADE & MAC FÍSICO CONCLUÍDA!\nForçada a identificação nativa e porta 5555 fixa em {} celulares.",
+            results.len()
+        ))
+    }
+}
+
+#[tauri::command]
+pub fn inject_single_device_immunity(serial: String) -> Result<String, String> {
+    AdbManager::inject_device_immunity(&serial)
+}
+
+#[tauri::command]
 pub fn force_enable_wireless_adb(
     state: State<'_, AppState>,
     token: String,
