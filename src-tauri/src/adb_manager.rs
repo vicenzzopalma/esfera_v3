@@ -5,38 +5,44 @@
 
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::sync::mpsc;
 use std::sync::RwLock;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub fn run_cmd_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process::Output, String> {
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("Falha ao iniciar comando: {}", e))?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = out.read_to_end(&mut stdout);
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = err.read_to_end(&mut stderr);
-                }
-                return Ok(std::process::Output { status, stdout, stderr });
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    return Err(format!("Comando excedeu timeout de {}s.", timeout.as_secs()));
-                }
-                std::thread::sleep(Duration::from_millis(40));
-            }
-            Err(e) => return Err(format!("Erro ao aguardar processo: {}", e)),
+    let pid = child.id();
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let status = child.wait();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(mut out) = child.stdout.take() {
+            use std::io::Read;
+            let _ = out.read_to_end(&mut stdout);
+        }
+        if let Some(mut err) = child.stderr.take() {
+            use std::io::Read;
+            let _ = err.read_to_end(&mut stderr);
+        }
+        let _ = tx.send(match status {
+            Ok(s) => Ok(std::process::Output { status: s, stdout, stderr }),
+            Err(e) => Err(format!("Erro no processo: {}", e)),
+        });
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => {
+            #[cfg(windows)]
+            { let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output(); }
+            #[cfg(unix)]
+            { let _ = std::process::Command::new("kill").arg(pid.to_string()).output(); }
+            Err(format!("Comando excedeu timeout de {}s.", timeout.as_secs()))
         }
     }
 }
@@ -109,7 +115,10 @@ extern "C" {
     ) -> i32;
 }
 
-static DEVICE_INFO_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (String, String)>>> =
+static DEVICE_INFO_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (String, String, Instant)>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+static BATTERY_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (i32, Instant)>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub struct AdbManager;
@@ -316,25 +325,24 @@ impl AdbManager {
         Ok(devices)
     }
 
-    /// Obtém o endereço IP do wlan0 do dispositivo para conexão Wireless
-    /// Obtém o endereço IP do wlan0 do dispositivo para conexão Wireless com timeout seguro de 2s
+    /// Obtém o endereço IP do wlan0 via shell único combinado (3 métodos em 1 chamada)
     pub fn get_device_wifi_ip(serial: &str) -> Result<String, String> {
-        // Método 1: getprop dhcp.wlan0.ipaddress
-        let mut cmd1 = create_cmd("adb");
-        cmd1.args(["-s", serial, "shell", "getprop", "dhcp.wlan0.ipaddress"]);
-        if let Ok(output) = run_cmd_timeout(cmd1, Duration::from_secs(2)) {
-            let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s", serial, "shell", "getprop dhcp.wlan0.ipaddress; echo '---'; ip route; echo '---'; ip addr show wlan0"]);
+        let output = run_cmd_timeout(cmd, Duration::from_secs(3))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let sections: Vec<&str> = stdout.split("---").collect();
+
+        if let Some(s0) = sections.first() {
+            let ip = s0.trim();
             if !ip.is_empty() && ip.contains('.') && !ip.starts_with("127.") {
-                return Ok(ip);
+                return Ok(ip.to_string());
             }
         }
 
-        // Método 2: ip route
-        let mut cmd2 = create_cmd("adb");
-        cmd2.args(["-s", serial, "shell", "ip", "route"]);
-        if let Ok(output) = run_cmd_timeout(cmd2, Duration::from_secs(2)) {
-            let route_out = String::from_utf8_lossy(&output.stdout);
-            for line in route_out.lines() {
+        if let Some(s1) = sections.get(1) {
+            for line in s1.lines() {
                 if line.contains("wlan0") && line.contains("src") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if let Some(src_idx) = parts.iter().position(|&x| x == "src") {
@@ -349,12 +357,8 @@ impl AdbManager {
             }
         }
 
-        // Método 3: ip addr show wlan0
-        let mut cmd3 = create_cmd("adb");
-        cmd3.args(["-s", serial, "shell", "ip", "addr", "show", "wlan0"]);
-        if let Ok(output) = run_cmd_timeout(cmd3, Duration::from_secs(2)) {
-            let addr_out = String::from_utf8_lossy(&output.stdout);
-            for line in addr_out.lines() {
+        if let Some(s2) = sections.get(2) {
+            for line in s2.lines() {
                 if line.trim().starts_with("inet ") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() > 1 {
@@ -436,31 +440,38 @@ impl AdbManager {
         Ok(result)
     }
 
-    /// Obtém o nível de bateria de um celular via `adb -s <serial> shell dumpsys battery`
+    /// Obtém o nível de bateria via cache TTL de 15s + ADB sob demanda
     pub fn get_battery_level(serial: &str) -> Result<i32, String> {
+        if let Ok(cache) = BATTERY_CACHE.read() {
+            if let Some(&(level, ts)) = cache.get(serial) {
+                if ts.elapsed() < Duration::from_secs(15) {
+                    return Ok(level);
+                }
+            }
+        }
+
         let output = create_cmd("adb")
             .arg("-s")
             .arg(serial)
             .arg("shell")
-            .arg("dumpsys")
-            .arg("battery")
+            .arg("dumpsys battery | grep level:")
             .output()
             .map_err(|e| format!("Falha ao consultar bateria via ADB: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             let line = line.trim();
-            if line.starts_with("level:") {
-                let parts: Vec<&str> = line.split(':').collect();
-                if parts.len() == 2 {
-                    if let Ok(level) = parts[1].trim().parse::<i32>() {
-                        return Ok(level);
+            if let Some(val) = line.strip_prefix("level:") {
+                if let Ok(level) = val.trim().parse::<i32>() {
+                    if let Ok(mut cache) = BATTERY_CACHE.write() {
+                        cache.insert(serial.to_string(), (level, Instant::now()));
                     }
+                    return Ok(level);
                 }
             }
         }
 
-        Ok(85) // Valor padrão de fallback se não puder ler
+        Ok(85)
     }
 
     /// Captura a tela do dispositivo via `adb -s <serial> exec-out screencap -p` e aplica sanitização nativa C++ HPC
@@ -527,13 +538,12 @@ impl AdbManager {
         }
     }
 
-    /// Digitação humana tecla-por-tecla via C++ HPC Gaussian Delay (caractere a caractere)
+    /// Digitação humana com delays Gaussianos — batch único ADB shell
     pub fn type_text_human_hpc(serial: &str, text: &str) -> Result<(), String> {
+        let mut shell_cmds = Vec::new();
         for ch in text.chars() {
-            let char_delay_ms = Self::calculate_gaussian_delay(45, 160);
-            std::thread::sleep(std::time::Duration::from_millis(char_delay_ms as u64));
-
-            let ch_str = match ch {
+            let delay_ms = Self::calculate_gaussian_delay(45, 160);
+            let escaped = match ch {
                 ' ' => "%s".to_string(),
                 '"' => "\\\"".to_string(),
                 '\\' => "\\\\".to_string(),
@@ -543,65 +553,52 @@ impl AdbManager {
                 '|' => "\\|".to_string(),
                 c => c.to_string(),
             };
-
-            let result = create_cmd("adb")
-                .args(["-s", serial, "shell", "input", "text", &ch_str])
-                .output();
-
-            if let Err(e) = result {
-                return Err(format!("Falha ao digitar caractere '{}': {}", ch, e));
-            }
+            shell_cmds.push(format!("input text {}; sleep {}", escaped, delay_ms as f64 / 1000.0));
         }
-        Ok(())
+        let full_cmd = shell_cmds.join(" ");
+        let output = create_cmd("adb")
+            .args(["-s", serial, "shell", &full_cmd])
+            .output()
+            .map_err(|e| format!("Falha ao digitar texto: {}", e))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("Falha ao digitar texto: {}", stderr.trim()))
+        }
     }
 
+    /// Consulta marca+modelo do celular em shell único com cache TTL de 30s
     pub fn get_device_info(serial: &str) -> (String, String) {
         if let Ok(cache) = DEVICE_INFO_CACHE.read() {
             if let Some(info) = cache.get(serial) {
-                if !info.0.is_empty() && !info.1.is_empty() {
-                    return info.clone();
+                if info.2.elapsed() < Duration::from_secs(30) {
+                    return (info.0.clone(), info.1.clone());
                 }
             }
         }
 
-        let brand_out = create_cmd("adb")
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("getprop")
-            .arg("ro.product.brand")
-            .output();
-        
-        let model_out = create_cmd("adb")
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("getprop")
-            .arg("ro.product.model")
-            .output();
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s", serial, "shell", "getprop ro.product.brand; echo; getprop ro.product.model"]);
+        let output = cmd.output();
 
-        let brand = match brand_out {
+        let (brand, model) = match output {
             Ok(o) => {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if s.is_empty() { "Android".to_string() } else { s }
+                let s = String::from_utf8_lossy(&o.stdout);
+                let lines: Vec<&str> = s.lines().collect();
+                let brand = lines.first().map(|l| l.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or("Android".to_string());
+                let model = lines.get(1).map(|l| l.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or("Smartphone".to_string());
+                (brand, model)
             }
-            Err(_) => "Android".to_string(),
+            Err(_) => ("Android".to_string(), "Smartphone".to_string()),
         };
 
-        let model = match model_out {
-            Ok(o) => {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if s.is_empty() { "Smartphone".to_string() } else { s }
-            }
-            Err(_) => "Smartphone".to_string(),
-        };
-
-        let res = (brand, model);
         if let Ok(mut cache) = DEVICE_INFO_CACHE.write() {
-            cache.insert(serial.to_string(), res.clone());
+            cache.insert(serial.to_string(), (brand.clone(), model.clone(), Instant::now()));
         }
 
-        res
+        (brand, model)
     }
 
     /// Lança o Scrcpy H.264 nativo em 60 FPS com aceleração por hardware
@@ -891,6 +888,7 @@ impl AdbManager {
              settings put global wifi_sleep_policy 2; \
              settings put global wifi_scan_always_enabled 1; \
              settings put global stay_on_while_plugged_in 7; \
+             device_config put activity_manager max_phantom_processes 2147483647; \
              dumpsys deviceidle disable; \
              dumpsys deviceidle whitelist +com.mouldybread.adbautoenable; \
              dumpsys deviceidle whitelist +com.android.shell",
@@ -971,7 +969,7 @@ impl AdbManager {
     }
 
     /// Thread leve e eficiente (0.0% CPU) para manter conexões Wi-Fi ativas sem travar o sistema
-    pub fn start_auto_reconnect_daemon(db_conn: std::sync::Arc<std::sync::Mutex<crate::db::Database>>) {
+    pub fn start_auto_reconnect_daemon(db_conn: std::sync::Arc<crate::db::Database>) {
         use std::collections::HashSet;
         let injected: std::sync::Arc<std::sync::Mutex<HashSet<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
@@ -979,28 +977,26 @@ impl AdbManager {
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(25));
 
-            if let Ok(db) = db_conn.lock() {
-                let devices = db.get_devices(1);
-                for dev in devices {
-                    let target = if !dev.ip.is_empty() {
-                        format!("{}:{}", dev.ip, dev.port)
-                    } else if dev.serial.contains(':') {
-                        dev.serial.clone()
-                    } else {
-                        "".to_string()
-                    };
+            let devices = db_conn.get_devices(1);
+            for dev in devices {
+                let target = if !dev.ip.is_empty() {
+                    format!("{}:{}", dev.ip, dev.port)
+                } else if dev.serial.contains(':') {
+                    dev.serial.clone()
+                } else {
+                    "".to_string()
+                };
 
-                    if !target.is_empty() && target.contains('.') {
-                        let _ = create_cmd("adb").arg("connect").arg(&target).output();
+                if !target.is_empty() && target.contains('.') {
+                    let _ = create_cmd("adb").arg("connect").arg(&target).output();
 
-                        let already = injected.lock()
-                            .map(|s| s.contains(&target))
-                            .unwrap_or(false);
-                        if !already {
-                            let pid = format!("ESFERA_DEV_{:03}", dev.device_number);
-                            if Self::inject_device_immunity(&target, Some(&pid)).is_ok() {
-                                let _ = injected.lock().map(|mut s| { s.insert(target.clone()); });
-                            }
+                    let already = injected.lock()
+                        .map(|s| s.contains(&target))
+                        .unwrap_or(false);
+                    if !already {
+                        let pid = format!("ESFERA_DEV_{:03}", dev.device_number);
+                        if Self::inject_device_immunity(&target, Some(&pid)).is_ok() {
+                            let _ = injected.lock().map(|mut s| { s.insert(target.clone()); });
                         }
                     }
                 }

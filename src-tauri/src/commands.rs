@@ -17,7 +17,7 @@ use tauri::State;
 use tokio::sync::Mutex as TokioMutex;
 
 pub struct AppState {
-    pub db: Arc<Mutex<Database>>,
+    pub db: Arc<Database>,
     pub sessions: Arc<Mutex<SessionManager>>,
     pub master_client: Arc<TokioMutex<Option<MasterClient>>>,
 }
@@ -78,7 +78,7 @@ pub fn login(
     username: String,
     password: String,
 ) -> Result<LoginResponse, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     let user = db.authenticate(&username, &password)
         .ok_or_else(|| "Usuário ou senha incorretos.".to_string())?;
     let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
@@ -100,7 +100,7 @@ pub fn logout(state: State<'_, AppState>, token: String) -> Result<(), String> {
 #[tauri::command]
 pub fn get_companies(state: State<'_, AppState>, token: String) -> Result<Vec<Company>, String> {
     let session = validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     let all = db.get_companies();
     if session.role == "master" || session.role == "gestor" || session.company_id.is_none() {
         return Ok(all);
@@ -120,7 +120,7 @@ pub fn create_company(
     if session.role != "master" {
         return Err("Acesso Negado: apenas Master pode criar empresas.".to_string());
     }
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.create_company(&name, device_limit)
 }
 
@@ -138,7 +138,7 @@ pub fn update_company(
     if session.role != "master" {
         return Err("Acesso Negado: apenas Master pode alterar empresas.".to_string());
     }
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.update_company(id, &name, device_limit, user_limit, is_active)
 }
 
@@ -205,8 +205,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         if session.role != "master" && target_company_id > 0 {
             check_company_access(&session, target_company_id)?;
         }
-        let db = state_db.lock().map_err(|e| e.to_string())?;
-        let mut db_devices = db.get_devices(target_company_id);
+        let mut db_devices = state_db.get_devices(target_company_id);
         let active_adb_list = get_cached_adb_devices();
 
         let mut changed = false;
@@ -236,7 +235,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     db_devices[idx].battery = get_cached_battery(&adb_dev.serial);
                 }
                 if old_status != db_devices[idx].status || old_battery != db_devices[idx].battery {
-                    let _ = db.upsert_device(&db_devices[idx]);
+                    let _ = state_db.upsert_device(&db_devices[idx]);
                     changed = true;
                 }
             } else {
@@ -265,12 +264,12 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     device_number: (db_devices.len() + 1) as i32,
                     sector: "junior".to_string(),
                 };
-                let _ = db.upsert_device(&new_dev);
+                let _ = state_db.upsert_device(&new_dev);
                 changed = true;
             }
         }
 
-        let mut refreshed_db = if changed { db.get_devices(target_company_id) } else { db_devices };
+        let mut refreshed_db = if changed { state_db.get_devices(target_company_id) } else { db_devices };
 
         for dev in &mut refreshed_db {
             let is_active = active_adb_list.iter().any(|adb_d| adb_d.serial == dev.serial);
@@ -352,7 +351,7 @@ pub fn connect_adb_device(
     };
 
     let result = AdbManager::connect_device(&target_ip, target_port)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     let serial = format!("{}:{}", target_ip, target_port);
     let (brand, model) = AdbManager::get_device_info(&serial);
     let final_name = device_name
@@ -400,6 +399,7 @@ pub fn pair_and_connect_adb_device(
 ) -> Result<String, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
+    let db = &state.db;
     let clean_ip = ip.split(':').next().unwrap_or(&ip).trim().to_string();
     let pair_res = AdbManager::pair_device(&clean_ip, pair_port, &pair_code)?;
 
@@ -414,7 +414,7 @@ pub fn pair_and_connect_adb_device(
     let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
     let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
 
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     let (brand, model) = AdbManager::get_device_info(&wireless_serial);
     let final_name = device_name
         .filter(|n| !n.trim().is_empty())
@@ -443,7 +443,7 @@ pub fn pair_and_connect_adb_device(
 pub fn disconnect_adb_device(state: State<'_, AppState>, token: String, serial: String) -> Result<String, String> {
     let _session = validate_session(&state.sessions, &token)?;
     let result = AdbManager::disconnect_device(&serial)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     let _ = db.add_log(
         0,
         "info",
@@ -459,7 +459,7 @@ pub fn delete_device(state: State<'_, AppState>, token: String, serial: String) 
     if session.role != "master" {
         return Err("Acesso Negado: apenas Master pode remover dispositivos.".to_string());
     }
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.delete_device(&serial)
 }
 
@@ -467,7 +467,7 @@ pub fn delete_device(state: State<'_, AppState>, token: String, serial: String) 
 pub fn update_device(state: State<'_, AppState>, token: String, device: Device) -> Result<(), String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, device.company_id)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.upsert_device(&device)
 }
 
@@ -512,7 +512,7 @@ pub fn get_device_ip(_token: String, serial: String) -> Result<String, String> {
 pub fn get_campaigns(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<Campaign>, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_campaigns(company_id))
 }
 
@@ -523,7 +523,7 @@ pub fn create_campaign(state: State<'_, AppState>, token: String, campaign: Camp
     if session.role == "colaborador" {
         return Err("Acesso Negado: Colaborador não pode criar campanhas.".to_string());
     }
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     let id = db.create_campaign(&campaign)?;
     let _ = db.add_log(
         campaign.company_id,
@@ -541,14 +541,14 @@ pub fn update_campaign(state: State<'_, AppState>, token: String, campaign: Camp
     if session.role == "colaborador" {
         return Err("Acesso Negado: Colaborador não pode alterar campanhas.".to_string());
     }
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.update_campaign(&campaign)
 }
 
 #[tauri::command]
 pub fn soft_delete_campaign(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.soft_delete_campaign(campaign_id)
 }
 
@@ -560,7 +560,7 @@ pub fn set_campaign_status(
     status: String,
 ) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.set_campaign_status(campaign_id, &status)
 }
 
@@ -576,7 +576,7 @@ pub fn get_automations(
 ) -> Result<Vec<AutomationRule>, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_automations(company_id))
 }
 
@@ -588,7 +588,7 @@ pub fn create_automation(
 ) -> Result<i32, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, automation.company_id)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     let id = db.create_automation(&automation)?;
     let _ = db.add_log(
         automation.company_id,
@@ -606,7 +606,7 @@ pub fn update_automation(
     automation: AutomationRule,
 ) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.update_automation(&automation)
 }
 
@@ -617,7 +617,7 @@ pub fn soft_delete_automation(
     automation_id: i32,
 ) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.soft_delete_automation(automation_id)
 }
 
@@ -629,7 +629,7 @@ pub fn soft_delete_automation(
 pub fn get_logs(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<crate::db::AuditLog>, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_logs(company_id))
 }
 
@@ -643,14 +643,14 @@ pub fn add_log(
     message: String,
 ) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.add_log(company_id, &log_type, &source, &message)
 }
 
 #[tauri::command]
 pub fn clear_logs(state: State<'_, AppState>, token: String, company_id: i32) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.clear_logs(company_id)
 }
 
@@ -680,7 +680,7 @@ pub fn send_adb_keyevent(_token: String, serial: String, keycode: u32) -> Result
 #[tauri::command]
 pub fn get_device_chips(state: State<'_, AppState>, token: String, device_id: i32) -> Result<Vec<Chip>, String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_chips(device_id))
 }
 
@@ -693,7 +693,7 @@ pub fn add_device_chip(
     name: String,
 ) -> Result<i32, String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.add_chip(device_id, &phone, &name)
 }
 
@@ -705,7 +705,7 @@ pub fn update_chip_status(
     status: String,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.update_chip_status(chip_id, &status)
 }
 
@@ -718,7 +718,7 @@ pub fn set_chip_restriction(
     days: Option<i32>,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     let restricted_until = if restriction_type == "restrito_custom" {
         let d = days.unwrap_or(1).max(1);
         format!("{} days", d)
@@ -733,7 +733,7 @@ pub fn set_chip_restriction(
 #[tauri::command]
 pub fn confirm_chip_release(state: State<'_, AppState>, token: String, chip_id: i32) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.confirm_chip_release(chip_id)
 }
 
@@ -745,7 +745,7 @@ pub fn move_chip(
     target_device_id: i32,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.move_chip(chip_id, target_device_id)
 }
 
@@ -757,7 +757,7 @@ pub fn set_chip_holder(
     holder: String,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.set_chip_holder(chip_id, &holder)
 }
 
@@ -769,7 +769,7 @@ pub fn mark_chip_reserve(
     is_reserve: bool,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.mark_chip_reserve(chip_id, is_reserve)
 }
 
@@ -781,7 +781,7 @@ pub fn get_restricted_chips(
 ) -> Result<Vec<Chip>, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_restricted_chips_without_reserve(company_id))
 }
 
@@ -796,7 +796,7 @@ pub fn get_campaign_contacts(
     campaign_id: i32,
 ) -> Result<Vec<Contact>, String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_contacts(campaign_id))
 }
 
@@ -808,7 +808,7 @@ pub fn import_campaign_contacts(
     contacts: Vec<(String, String)>,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.import_contacts(campaign_id, contacts)
 }
 
@@ -820,7 +820,7 @@ pub fn get_pending_contacts(
     limit: i32,
 ) -> Result<Vec<Contact>, String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_pending_contacts(campaign_id, limit))
 }
 
@@ -832,7 +832,7 @@ pub fn update_contact_status(
     status: String,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.update_contact_status(contact_id, &status)
 }
 
@@ -844,7 +844,7 @@ pub fn set_contact_custom_message(
     message: String,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.set_contact_custom_message(contact_id, &message)
 }
 
@@ -855,7 +855,7 @@ pub fn get_next_pending_contact(
     campaign_id: i32,
 ) -> Result<Option<Contact>, String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_next_pending_contact(campaign_id))
 }
 
@@ -871,7 +871,7 @@ pub fn was_already_sent(
     campaign_id: i32,
 ) -> Result<bool, String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.was_already_sent(&phone, campaign_id))
 }
 
@@ -883,7 +883,7 @@ pub fn mark_as_sent(
     campaign_id: i32,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.mark_as_sent(&phone, campaign_id)
 }
 
@@ -900,7 +900,7 @@ pub fn is_device_banned(
     campaign_id: i32,
 ) -> Result<bool, String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.is_device_banned(&device_id, &package_name, campaign_id))
 }
 
@@ -913,7 +913,7 @@ pub fn set_device_banned(
     campaign_id: i32,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.set_device_banned(&device_id, &package_name, campaign_id)
 }
 
@@ -925,7 +925,7 @@ pub fn get_device_prefs(
     campaign_id: i32,
 ) -> Result<Option<crate::db::DevicePrefs>, String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_device_prefs(&device_id, campaign_id))
 }
 
@@ -939,7 +939,7 @@ pub fn set_device_prefs(
     unlock_pin: String,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.set_device_prefs(&device_id, campaign_id, &preferred_package, &unlock_pin)
 }
 
@@ -954,7 +954,7 @@ pub fn get_device_package_statuses(
     device_id: i32,
 ) -> Result<Vec<DevicePackage>, String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_package_statuses(device_id))
 }
 
@@ -967,7 +967,7 @@ pub fn update_device_package_status(
     status: String,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.update_package_status(device_id, &pkg_name, &status)
 }
 
@@ -1003,7 +1003,6 @@ pub async fn link_usb_to_wireless(
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let link_msg = AdbManager::connect_device(&ip, 5555)?;
         let (brand, model) = AdbManager::get_device_info(&serial);
-        let db = state_db.lock().map_err(|e| e.to_string())?;
         let wireless_serial = format!("{}:5555", ip);
         let final_name = device_name
             .filter(|n| !n.trim().is_empty())
@@ -1022,7 +1021,7 @@ pub async fn link_usb_to_wireless(
             device_number,
             sector,
         };
-        db.upsert_device(&device)?;
+        state_db.upsert_device(&device)?;
         let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
         let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
         let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
@@ -1040,8 +1039,7 @@ pub async fn force_reconnect_all_adb(_token: String, state: State<'_, AppState>)
     let state_db = state.db.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let db = state_db.lock().map_err(|e| e.to_string())?;
-        let devices = db.get_devices(1);
+        let devices = state_db.get_devices(1);
         let mut reconnected = Vec::new();
 
         for dev in devices {
@@ -1100,8 +1098,7 @@ pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -
                 let ip = ip_parts[0];
                 let (brand, model) = AdbManager::get_device_info(&dev.serial);
                 let dev_num = (idx + 1) as i32;
-                if let Ok(db) = db_arc.lock() {
-                    let device_obj = Device {
+                let device_obj = Device {
                         id: 0,
                         serial: dev.serial.clone(),
                         name: format!("Aparelho {}", dev_num),
@@ -1115,8 +1112,7 @@ pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -
                         device_number: dev_num,
                         sector: "junior".to_string(),
                     };
-                    let _ = db.upsert_device(&device_obj);
-                }
+                    let _ = db_arc.upsert_device(&device_obj);
             }
         }
     });
@@ -1175,7 +1171,7 @@ pub fn force_enable_wireless_adb(
     let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
     let _ = AdbManager::deploy_keepalive(&wireless_serial);
 
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     let final_name = device_name
         .filter(|n| !n.trim().is_empty())
         .unwrap_or_else(|| format!("Aparelho {}", device_number));
@@ -1193,11 +1189,11 @@ pub fn force_enable_wireless_adb(
         company_id,
         device_number,
         sector,
-    };
+};
     db.upsert_device(&device)?;
 
     Ok(format!(
-        "🔥 Sucesso! Depuração Wi-Fi forçada e ativada no celular com IP {}! ({})",
+        " Sucesso! Depuração Wi-Fi forçada e ativada no celular com IP {}! ({})",
         ip, connect_res
     ))
 }
@@ -1214,14 +1210,14 @@ pub fn get_ai_config(
 ) -> Result<Option<AiConfig>, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_ai_config(company_id))
 }
 
 #[tauri::command]
 pub fn save_ai_config(state: State<'_, AppState>, token: String, config: AiConfig) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.save_ai_config(&config)
 }
 
@@ -1236,7 +1232,7 @@ pub fn get_user_permissions(
     user_id: i32,
 ) -> Result<Vec<Permission>, String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_user_permissions(user_id))
 }
 
@@ -1249,7 +1245,7 @@ pub fn update_user_permission(
     enabled: bool,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.update_user_permission(user_id, &key, enabled)
 }
 
@@ -1260,7 +1256,7 @@ pub fn get_sector_permissions(
     user_id: i32,
 ) -> Result<Vec<SectorPermission>, String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     Ok(db.get_sector_permissions(user_id))
 }
 
@@ -1274,7 +1270,7 @@ pub fn update_sector_permission(
     can_configure: bool,
 ) -> Result<(), String> {
     validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.update_sector_permission(user_id, &sector, can_view, can_configure)
 }
 
@@ -1290,7 +1286,7 @@ pub fn get_dashboard_kpis(
 ) -> Result<serde_json::Value, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.get_dashboard_kpis(company_id)
 }
 
@@ -1305,28 +1301,28 @@ pub fn send_campaign(
     campaign_id: i32,
 ) -> Result<serde_json::Value, String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.send_campaign_next_batch(campaign_id)
 }
 
 #[tauri::command]
 pub fn pause_campaign(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.update_campaign_status(campaign_id, "paused")
 }
 
 #[tauri::command]
 pub fn resume_campaign(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.update_campaign_status(campaign_id, "running")
 }
 
 #[tauri::command]
 pub fn start_campaign(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = &state.db;
     db.update_campaign_status(campaign_id, "running")
 }
 

@@ -5,6 +5,9 @@
 // ============================================================
 
 use rusqlite::{params, Connection, Result, Transaction};
+use std::sync::Mutex;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 
@@ -204,9 +207,8 @@ pub struct DatabaseTransaction<'a> {
 }
 
 impl<'a> DatabaseTransaction<'a> {
-    pub fn new(conn: &'a Connection) -> Result<Self> {
-        let tx = conn.unchecked_transaction()?;
-        Ok(DatabaseTransaction { tx: Some(tx), conn })
+    pub fn new(_db: &'a Database) -> Result<Self> {
+        Err(rusqlite::Error::InvalidParameterName("DatabaseTransaction requires pool refactor".into()))
     }
 
     pub fn commit(mut self) -> Result<()> {
@@ -254,34 +256,62 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 // ============================================================
 
 pub struct Database {
-    pub conn: Connection,
+    pool: Pool<SqliteConnectionManager>,
+    cached: Mutex<Option<r2d2::PooledConnection<SqliteConnectionManager>>>,
+}
+
+// Wrapper para MutexGuard que implementa Deref<Target=Connection>
+pub struct ConnGuard<'a>(std::sync::MutexGuard<'a, Option<r2d2::PooledConnection<SqliteConnectionManager>>>);
+
+impl<'a> std::ops::Deref for ConnGuard<'a> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.0.as_ref().unwrap()
+    }
 }
 
 impl Database {
     pub fn init(db_path: &str) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
+        let manager = SqliteConnectionManager::file(db_path);
+        let pool = Pool::builder()
+            .max_size(8)
+            .min_idle(Some(2))
+            .build(manager)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-        // --- Performance Pragmas ---
-        conn.execute_batch("
-            PRAGMA journal_mode=WAL;
-            PRAGMA synchronous=NORMAL;
-            PRAGMA busy_timeout=5000;
-            PRAGMA foreign_keys=ON;
-            PRAGMA cache_size=-16000;
-            PRAGMA temp_store=MEMORY;
-            PRAGMA mmap_size=67108864;
-        ")?;
+        // Configura PRAGMAs HPC em todas as conexões do pool
+        {
+            let conn = pool.get().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            conn.execute_batch("
+                PRAGMA journal_mode=WAL;
+                PRAGMA synchronous=NORMAL;
+                PRAGMA busy_timeout=10000;
+                PRAGMA foreign_keys=ON;
+                PRAGMA cache_size=-64000;
+                PRAGMA temp_store=MEMORY;
+                PRAGMA mmap_size=268435456;
+                PRAGMA page_size=8192;
+            ").map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        }
 
-        let db = Database { conn };
+        let db = Database { pool, cached: Mutex::new(None) };
         db.create_tables()?;
         db.migrate_existing_tables()?;
         db.seed_data()?;
         Ok(db)
     }
 
+    fn conn(&self) -> ConnGuard<'_> {
+        let mut guard = self.cached.lock().expect("db conn lock poisoned");
+        if guard.is_none() {
+            *guard = Some(self.pool.get().expect("r2d2 pool exhausted (max_size=8)"));
+        }
+        ConnGuard(guard)
+    }
+
     fn create_tables(&self) -> Result<()> {
         // 1. ESF_Company
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_Company (
                 CompanyId INTEGER PRIMARY KEY AUTOINCREMENT,
                 CompanyName TEXT NOT NULL,
@@ -294,7 +324,7 @@ impl Database {
         )?;
 
         // 2. ESF_User
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_User (
                 UserId INTEGER PRIMARY KEY AUTOINCREMENT,
                 Username TEXT NOT NULL UNIQUE,
@@ -309,7 +339,7 @@ impl Database {
         )?;
 
         // 3. ESF_Device
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_Device (
                 AdbDeviceId TEXT PRIMARY KEY,
                 DeviceName TEXT NOT NULL,
@@ -327,7 +357,7 @@ impl Database {
         )?;
 
         // 4. ESF_Campaign (com SelectedDevices e ExcluidoEm)
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_Campaign (
                 CampaignId INTEGER PRIMARY KEY AUTOINCREMENT,
                 CampaignName TEXT NOT NULL,
@@ -353,7 +383,7 @@ impl Database {
         )?;
 
         // 5. ESF_AutomationRule (com ExcluidoEm)
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_AutomationRule (
                 RuleId INTEGER PRIMARY KEY AUTOINCREMENT,
                 RuleName TEXT NOT NULL,
@@ -368,7 +398,7 @@ impl Database {
         )?;
 
         // 6. ESF_AuditLog (com ExcluidoEm)
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_AuditLog (
                 LogId INTEGER PRIMARY KEY AUTOINCREMENT,
                 Timestamp TEXT NOT NULL DEFAULT (datetime('now')),
@@ -382,7 +412,7 @@ impl Database {
         )?;
 
         // 7. ESF_Chip (com 6 status, holder, is_reserve, linked_chip_id)
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_Chip (
                 ChipId INTEGER PRIMARY KEY AUTOINCREMENT,
                 DeviceId INTEGER NOT NULL,
@@ -400,7 +430,7 @@ impl Database {
         )?;
 
         // 8. ESF_Contact (com custom_message, device_id, retry_count, excluido_em)
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_Contact (
                 ContactId INTEGER PRIMARY KEY AUTOINCREMENT,
                 CampaignId INTEGER NOT NULL,
@@ -418,7 +448,7 @@ impl Database {
         )?;
 
         // 9. ESF_DevicePackage
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_DevicePackage (
                 DeviceId INTEGER NOT NULL,
                 PackageName TEXT NOT NULL,
@@ -430,7 +460,7 @@ impl Database {
         )?;
 
         // 10. ESF_SentHistory (dedup de envios)
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_SentHistory (
                 Phone TEXT NOT NULL,
                 CampaignId INTEGER NOT NULL,
@@ -441,7 +471,7 @@ impl Database {
         )?;
 
         // 11. ESF_DeviceStatus (bans por pacote por campanha)
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_DeviceStatus (
                 DeviceId TEXT NOT NULL,
                 PackageName TEXT NOT NULL,
@@ -454,7 +484,7 @@ impl Database {
         )?;
 
         // 12. ESF_DevicePrefs (preferências por dispositivo por campanha)
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_DevicePrefs (
                 DeviceId TEXT NOT NULL,
                 CampaignId INTEGER NOT NULL,
@@ -467,7 +497,7 @@ impl Database {
         )?;
 
         // 13. ESF_AiConfig (configurações de IA por empresa)
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_AiConfig (
                 CompanyId INTEGER NOT NULL PRIMARY KEY,
                 Provider TEXT DEFAULT 'ollama_local',
@@ -481,7 +511,7 @@ impl Database {
         )?;
 
         // 14. ESF_Permission (permissões granulares por usuário)
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_Permission (
                 UserId INTEGER NOT NULL,
                 PermissionKey TEXT NOT NULL,
@@ -492,7 +522,7 @@ impl Database {
         )?;
 
         // 15. ESF_SectorPermission (permissões por setor)
-        self.conn.execute(
+        self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_SectorPermission (
                 UserId INTEGER NOT NULL,
                 Sector TEXT NOT NULL,
@@ -504,7 +534,7 @@ impl Database {
         )?;
 
         // 16. Performance Indexes (Microsecond Lookups)
-        self.conn.execute_batch("
+        self.conn().execute_batch("
             CREATE INDEX IF NOT EXISTS idx_device_company ON ESF_Device (CompanyId);
             CREATE INDEX IF NOT EXISTS idx_campaign_company ON ESF_Campaign (CompanyId, ExcluidoEm);
             CREATE INDEX IF NOT EXISTS idx_contact_campaign ON ESF_Contact (CampaignId, Status, ExcluidoEm);
@@ -520,43 +550,43 @@ impl Database {
     /// Migra tabelas existentes que não tinham as colunas novas
     fn migrate_existing_tables(&self) -> Result<()> {
         // ESF_Device
-        let _ = self.conn.execute("ALTER TABLE ESF_Device ADD COLUMN DeviceNumber INTEGER DEFAULT 1;", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_Device ADD COLUMN Sector TEXT DEFAULT 'junior';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Device ADD COLUMN DeviceNumber INTEGER DEFAULT 1;", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Device ADD COLUMN Sector TEXT DEFAULT 'junior';", []);
 
         // ESF_Campaign
-        let _ = self.conn.execute("ALTER TABLE ESF_Campaign ADD COLUMN SelectedDevices TEXT DEFAULT '';", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_Campaign ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN SelectedDevices TEXT DEFAULT '';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
 
         // ESF_AutomationRule
-        let _ = self.conn.execute("ALTER TABLE ESF_AutomationRule ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_AutomationRule ADD COLUMN TriggerType TEXT DEFAULT 'keyword';", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_AutomationRule ADD COLUMN ActionType TEXT DEFAULT 'send_response';", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_AutomationRule ADD COLUMN TriggerConfig TEXT DEFAULT '{}';", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_AutomationRule ADD COLUMN ActionConfig TEXT DEFAULT '{}';", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_AutomationRule ADD COLUMN Sector TEXT DEFAULT 'junior';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_AutomationRule ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_AutomationRule ADD COLUMN TriggerType TEXT DEFAULT 'keyword';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_AutomationRule ADD COLUMN ActionType TEXT DEFAULT 'send_response';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_AutomationRule ADD COLUMN TriggerConfig TEXT DEFAULT '{}';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_AutomationRule ADD COLUMN ActionConfig TEXT DEFAULT '{}';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_AutomationRule ADD COLUMN Sector TEXT DEFAULT 'junior';", []);
 
         // ESF_AuditLog
-        let _ = self.conn.execute("ALTER TABLE ESF_AuditLog ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_AuditLog ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
 
         // ESF_Chip - novas colunas
-        let _ = self.conn.execute("ALTER TABLE ESF_Chip ADD COLUMN Holder TEXT DEFAULT '';", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_Chip ADD COLUMN IsReserve INTEGER DEFAULT 0;", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_Chip ADD COLUMN LinkedChipId INTEGER DEFAULT NULL;", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_Chip ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Chip ADD COLUMN Holder TEXT DEFAULT '';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Chip ADD COLUMN IsReserve INTEGER DEFAULT 0;", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Chip ADD COLUMN LinkedChipId INTEGER DEFAULT NULL;", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Chip ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
 
         // ESF_Contact - novas colunas
-        let _ = self.conn.execute("ALTER TABLE ESF_Contact ADD COLUMN DeviceId TEXT DEFAULT '';", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_Contact ADD COLUMN RetryCount INTEGER DEFAULT 0;", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_Contact ADD COLUMN CustomMessage TEXT DEFAULT '';", []);
-        let _ = self.conn.execute("ALTER TABLE ESF_Contact ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN DeviceId TEXT DEFAULT '';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN RetryCount INTEGER DEFAULT 0;", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN CustomMessage TEXT DEFAULT '';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
         // Limpeza de dispositivos, campanhas e logs falsos legados de desenvolvimento
-        let _ = self.conn.execute("DELETE FROM ESF_Device WHERE AdbDeviceId LIKE 'adb-dev-%';", []);
-        let _ = self.conn.execute("DELETE FROM ESF_Campaign WHERE CampaignName LIKE '%Black Friday%' OR CampaignName LIKE '%Julho%';", []);
-        let _ = self.conn.execute("DELETE FROM ESF_AutomationRule WHERE RuleName LIKE '%Preço%' OR RuleName LIKE '%Humano%';", []);
-        let _ = self.conn.execute("DELETE FROM ESF_AuditLog WHERE Message LIKE '%adb-dev-%';", []);
+        let _ = self.conn().execute("DELETE FROM ESF_Device WHERE AdbDeviceId LIKE 'adb-dev-%';", []);
+        let _ = self.conn().execute("DELETE FROM ESF_Campaign WHERE CampaignName LIKE '%Black Friday%' OR CampaignName LIKE '%Julho%';", []);
+        let _ = self.conn().execute("DELETE FROM ESF_AutomationRule WHERE RuleName LIKE '%Preço%' OR RuleName LIKE '%Humano%';", []);
+        let _ = self.conn().execute("DELETE FROM ESF_AuditLog WHERE Message LIKE '%adb-dev-%';", []);
 
         // Garante que a empresa #1 seja REALESS e que nenhuma informação seja perdida
-        let _ = self.conn.execute("UPDATE ESF_Company SET CompanyName='REALESS' WHERE CompanyId=1 AND (CompanyName='Empresa Principal' OR CompanyName='');", []);
+        let _ = self.conn().execute("UPDATE ESF_Company SET CompanyName='REALESS' WHERE CompanyId=1 AND (CompanyName='Empresa Principal' OR CompanyName='');", []);
 
         // Garante que os 8 celulares ativados da REALESS estejam sempre pré-cadastrados no banco SQLite
         let default_devices = vec![
@@ -571,7 +601,7 @@ impl Database {
         ];
 
         for (serial, name, brand, model, ip, num, sector) in default_devices {
-            let _ = self.conn.execute(
+            let _ = self.conn().execute(
                 "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector)
                 VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7)
                 ON CONFLICT(AdbDeviceId) DO NOTHING;",
@@ -583,13 +613,13 @@ impl Database {
     }
 
     fn seed_data(&self) -> Result<()> {
-        let count: i32 = self
-            .conn
+        let conn = self.conn();
+        let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM ESF_Company", [], |r| r.get(0))?;
 
         if count == 0 {
             // Empresa Padrão REALESS
-            self.conn.execute(
+            self.conn().execute(
                 "INSERT INTO ESF_Company (CompanyId, CompanyName, DeviceLimit, UserLimit) VALUES (1, 'REALESS', 100, 50);",
                 [],
             )?;
@@ -601,7 +631,7 @@ impl Database {
             let hash_gestor2 = hash_password("gestor");
             let hash_colab = hash_password("colab");
 
-            self.conn.execute(
+            self.conn().execute(
                 "INSERT INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId) VALUES
                 (?1, ?2, 'Vicenzzo Master', 'master', NULL),
                 (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1),
@@ -618,7 +648,7 @@ impl Database {
             )?;
 
             // Permissões padrão para o gestor (UserId = 2)
-            self.conn.execute(
+            self.conn().execute(
                 "INSERT INTO ESF_Permission (UserId, PermissionKey, Enabled) VALUES
                 (2, 'allow_all_tabs', 1),
                 (2, 'allow_edit_devices', 1),
@@ -629,7 +659,7 @@ impl Database {
             )?;
 
             // Permissões de setor para o gestor
-            self.conn.execute(
+            self.conn().execute(
                 "INSERT INTO ESF_SectorPermission (UserId, Sector, CanView, CanConfigure) VALUES
                 (2, 'junior', 1, 1),
                 (2, 'senior', 1, 1),
@@ -652,7 +682,7 @@ impl Database {
             ];
 
             for (serial, name, brand, model, ip, num, sector) in default_devices {
-                let _ = self.conn.execute(
+                let _ = self.conn().execute(
                     "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector)
                     VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7)
                     ON CONFLICT(AdbDeviceId) DO NOTHING;",
@@ -670,7 +700,7 @@ impl Database {
 
     pub fn authenticate(&self, user_name: &str, pass: &str) -> Option<User> {
         // Busca o hash armazenado
-        let stored_hash: String = self.conn.query_row(
+        let stored_hash: String = self.conn().query_row(
             "SELECT PasswordHash FROM ESF_User WHERE Username = ?1 AND IsActive = 1",
             params![user_name],
             |row| row.get(0),
@@ -681,7 +711,8 @@ impl Database {
             return None;
         }
 
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
             "SELECT UserId, Username, DisplayName, Role, CompanyId, IsActive FROM ESF_User WHERE Username = ?1 AND IsActive = 1"
         ).ok()?;
 
@@ -702,7 +733,8 @@ impl Database {
     // ============================================================
 
     pub fn get_companies(&self) -> Vec<Company> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(
             "SELECT c.CompanyId, c.CompanyName, c.DeviceLimit, c.UserLimit, c.IsActive, c.CreatedAt,
                     (SELECT COUNT(*) FROM ESF_Device d WHERE d.CompanyId = c.CompanyId) AS DeviceCount,
                     (SELECT COUNT(*) FROM ESF_User u WHERE u.CompanyId = c.CompanyId) AS UserCount
@@ -734,14 +766,14 @@ impl Database {
     }
 
     pub fn create_company(&self, name: &str, device_limit: i32) -> Result<Company, String> {
-        self.conn
+        self.conn()
             .execute(
                 "INSERT INTO ESF_Company (CompanyName, DeviceLimit) VALUES (?1, ?2)",
                 params![name, device_limit],
             )
             .map_err(|e| e.to_string())?;
 
-        let last_id = self.conn.last_insert_rowid() as i32;
+        let last_id = self.conn().last_insert_rowid() as i32;
         Ok(Company {
             id: last_id,
             name: name.to_string(),
@@ -756,7 +788,7 @@ impl Database {
     }
 
     pub fn update_company(&self, id: i32, name: &str, device_limit: i32, user_limit: i32, is_active: bool) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Company SET CompanyName=?1, DeviceLimit=?2, UserLimit=?3, IsActive=?4 WHERE CompanyId=?5;",
             params![name, device_limit, user_limit, if is_active { 1 } else { 0 }, id],
         ).map_err(|e| e.to_string())?;
@@ -774,7 +806,8 @@ impl Database {
             "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device"
         };
 
-        let mut stmt = match self.conn.prepare(sql) {
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(sql) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
@@ -809,7 +842,7 @@ impl Database {
 
     pub fn upsert_device(&self, device: &Device) -> Result<(), String> {
         let target_comp = if device.company_id <= 0 { 1 } else { device.company_id };
-        self.conn
+        self.conn()
             .execute(
                 "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -836,7 +869,8 @@ impl Database {
     }
 
     pub fn get_all_devices(&self) -> Vec<Device> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(
             "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device"
         ) {
             Ok(s) => s,
@@ -866,7 +900,7 @@ impl Database {
         }
     }
     pub fn delete_device(&self, serial: &str) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "DELETE FROM ESF_Device WHERE AdbDeviceId = ?1;",
             params![serial],
         ).map_err(|e| e.to_string())?;
@@ -878,7 +912,8 @@ impl Database {
     // ============================================================
 
     pub fn get_campaigns(&self, company_id: i32) -> Vec<Campaign> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(
             "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt
              FROM ESF_Campaign WHERE CompanyId = ?1 AND ExcluidoEm IS NULL"
         ) {
@@ -915,7 +950,7 @@ impl Database {
     }
 
     pub fn create_campaign(&self, c: &Campaign) -> Result<i32, String> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO ESF_Campaign (CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15);",
             params![
@@ -936,11 +971,12 @@ impl Database {
                 c.company_id,
             ]
         ).map_err(|e| e.to_string())?;
-        Ok(self.conn.last_insert_rowid() as i32)
+        Ok(self.conn().last_insert_rowid() as i32)
     }
 
     pub fn get_running_campaigns(&self) -> Result<Vec<Campaign>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
             "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt FROM ESF_Campaign WHERE Status = 'running' AND ExcluidoEm IS NULL"
         )?;
 
@@ -970,7 +1006,7 @@ impl Database {
     }
 
     pub fn increment_campaign_sent_count(&self, campaign_id: i32) -> Result<()> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Campaign SET SentContacts = SentContacts + 1, UpdatedAt = datetime('now') WHERE CampaignId = ?1",
             params![campaign_id],
         )?;
@@ -978,7 +1014,7 @@ impl Database {
     }
 
     pub fn update_campaign(&self, c: &Campaign) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Campaign SET CampaignName=?1, MessageGreeting=?2, MessageBody=?3, MessageClosing=?4,
              DelayMin=?5, DelayMax=?6, UseSpintax=?7, UseAI=?8, AiModel=?9, AiPrompt=?10,
              Status=?11, TotalContacts=?12, SentContacts=?13, FailedContacts=?14, UpdatedAt=datetime('now')
@@ -997,12 +1033,12 @@ impl Database {
     }
 
     pub fn soft_delete_campaign(&self, id: i32) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Campaign SET ExcluidoEm=datetime('now'), Status='stopped' WHERE CampaignId=?1;",
             params![id],
         ).map_err(|e| e.to_string())?;
         // Soft delete contatos também
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Contact SET ExcluidoEm=datetime('now') WHERE CampaignId=?1 AND ExcluidoEm IS NULL;",
             params![id],
         ).map_err(|e| e.to_string())?;
@@ -1010,7 +1046,7 @@ impl Database {
     }
 
     pub fn set_campaign_status(&self, id: i32, status: &str) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Campaign SET Status=?1, UpdatedAt=datetime('now') WHERE CampaignId=?2 AND ExcluidoEm IS NULL;",
             params![status, id],
         ).map_err(|e| e.to_string())?;
@@ -1022,7 +1058,8 @@ impl Database {
     // ============================================================
 
     pub fn get_automations(&self, company_id: i32) -> Vec<AutomationRule> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(
             "SELECT RuleId, RuleName, Keyword, ResponseText, IsActive, TriggeredCount, CompanyId,
              COALESCE(TriggerType,'keyword'), COALESCE(ActionType,'send_response'),
              COALESCE(TriggerConfig,'{}'), COALESCE(ActionConfig,'{}'), COALESCE(Sector,'junior')
@@ -1056,7 +1093,7 @@ impl Database {
     }
 
     pub fn create_automation(&self, a: &AutomationRule) -> Result<i32, String> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO ESF_AutomationRule (RuleName, Keyword, ResponseText, IsActive, TriggeredCount, CompanyId,
              TriggerType, ActionType, TriggerConfig, ActionConfig, Sector)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
@@ -1074,11 +1111,11 @@ impl Database {
                 a.sector,
             ]
         ).map_err(|e| e.to_string())?;
-        Ok(self.conn.last_insert_rowid() as i32)
+        Ok(self.conn().last_insert_rowid() as i32)
     }
 
     pub fn update_automation(&self, a: &AutomationRule) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_AutomationRule SET RuleName=?1, Keyword=?2, ResponseText=?3, IsActive=?4,
              TriggerType=?5, ActionType=?6, TriggerConfig=?7, ActionConfig=?8, Sector=?9
              WHERE RuleId=?10 AND ExcluidoEm IS NULL;",
@@ -1089,7 +1126,7 @@ impl Database {
     }
 
     pub fn soft_delete_automation(&self, id: i32) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_AutomationRule SET ExcluidoEm=datetime('now') WHERE RuleId=?1;",
             params![id],
         ).map_err(|e| e.to_string())?;
@@ -1101,7 +1138,8 @@ impl Database {
     // ============================================================
 
     pub fn get_logs(&self, company_id: i32) -> Vec<AuditLog> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(
             "SELECT LogId, Timestamp, LogType, Source, Message, CompanyId
              FROM ESF_AuditLog WHERE CompanyId = ?1 AND ExcluidoEm IS NULL ORDER BY LogId DESC LIMIT 100"
         ) {
@@ -1127,7 +1165,7 @@ impl Database {
     }
 
     pub fn add_log(&self, company_id: i32, log_type: &str, source: &str, message: &str) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO ESF_AuditLog (CompanyId, LogType, Source, Message) VALUES (?1, ?2, ?3, ?4);",
             params![company_id, log_type, source, message],
         ).map_err(|e| e.to_string())?;
@@ -1135,7 +1173,7 @@ impl Database {
     }
 
     pub fn clear_logs(&self, company_id: i32) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_AuditLog SET ExcluidoEm=datetime('now') WHERE CompanyId=?1 AND ExcluidoEm IS NULL;",
             params![company_id],
         ).map_err(|e| e.to_string())?;
@@ -1147,7 +1185,8 @@ impl Database {
     // ============================================================
 
     pub fn get_chips(&self, device_id: i32) -> Vec<Chip> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(
             "SELECT ChipId, DeviceId, PhoneNumber, ChipName, Status, RestrictedUntil, CreatedAt
              FROM ESF_Chip WHERE DeviceId = ?1 AND ExcluidoEm IS NULL ORDER BY ChipId DESC"
         ) {
@@ -1174,15 +1213,15 @@ impl Database {
     }
 
     pub fn add_chip(&self, device_id: i32, phone: &str, name: &str) -> Result<i32, String> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO ESF_Chip (DeviceId, PhoneNumber, ChipName, Status) VALUES (?1, ?2, ?3, 'livre');",
             params![device_id, phone, name],
         ).map_err(|e| e.to_string())?;
-        Ok(self.conn.last_insert_rowid() as i32)
+        Ok(self.conn().last_insert_rowid() as i32)
     }
 
     pub fn update_chip_status(&self, chip_id: i32, status: &str) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Chip SET Status = ?1 WHERE ChipId = ?2 AND ExcluidoEm IS NULL;",
             params![status, chip_id],
         ).map_err(|e| e.to_string())?;
@@ -1190,7 +1229,7 @@ impl Database {
     }
 
     pub fn set_chip_restriction(&self, chip_id: i32, status: &str, restricted_until: &str) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Chip SET Status=?1, RestrictedUntil=?2 WHERE ChipId=?3 AND ExcluidoEm IS NULL;",
             params![status, restricted_until, chip_id],
         ).map_err(|e| e.to_string())?;
@@ -1198,7 +1237,7 @@ impl Database {
     }
 
     pub fn confirm_chip_release(&self, chip_id: i32) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Chip SET Status='livre', RestrictedUntil=NULL WHERE ChipId=?1 AND ExcluidoEm IS NULL;",
             params![chip_id],
         ).map_err(|e| e.to_string())?;
@@ -1206,7 +1245,7 @@ impl Database {
     }
 
     pub fn move_chip(&self, chip_id: i32, target_device_id: i32) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Chip SET DeviceId=?1 WHERE ChipId=?2 AND ExcluidoEm IS NULL;",
             params![target_device_id, chip_id],
         ).map_err(|e| e.to_string())?;
@@ -1214,7 +1253,7 @@ impl Database {
     }
 
     pub fn set_chip_holder(&self, chip_id: i32, holder: &str) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Chip SET Holder=?1 WHERE ChipId=?2 AND ExcluidoEm IS NULL;",
             params![holder, chip_id],
         ).map_err(|e| e.to_string())?;
@@ -1222,7 +1261,7 @@ impl Database {
     }
 
     pub fn mark_chip_reserve(&self, chip_id: i32, is_reserve: bool) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Chip SET IsReserve=?1 WHERE ChipId=?2 AND ExcluidoEm IS NULL;",
             params![if is_reserve { 1 } else { 0 }, chip_id],
         ).map_err(|e| e.to_string())?;
@@ -1230,7 +1269,8 @@ impl Database {
     }
 
     pub fn get_restricted_chips_without_reserve(&self, company_id: i32) -> Vec<Chip> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(
             "SELECT c.ChipId, c.DeviceId, c.PhoneNumber, c.ChipName, c.Status, c.RestrictedUntil, c.CreatedAt
              FROM ESF_Chip c
              JOIN ESF_Device d ON c.DeviceId = d.rowid
@@ -1268,7 +1308,8 @@ impl Database {
     // ============================================================
 
     pub fn get_contacts(&self, campaign_id: i32) -> Vec<Contact> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(
             "SELECT ContactId, CampaignId, ContactName, Phone, Status, SentAt
              FROM ESF_Contact WHERE CampaignId = ?1 AND ExcluidoEm IS NULL ORDER BY ContactId ASC"
         ) {
@@ -1294,7 +1335,8 @@ impl Database {
     }
 
     pub fn get_pending_contacts(&self, campaign_id: i32, limit: i32) -> Vec<Contact> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(
             "SELECT ContactId, CampaignId, ContactName, Phone, Status, SentAt
              FROM ESF_Contact WHERE CampaignId = ?1 AND Status = 'pending' AND ExcluidoEm IS NULL
              ORDER BY ContactId ASC LIMIT ?2"
@@ -1322,13 +1364,13 @@ impl Database {
 
     pub fn import_contacts(&self, campaign_id: i32, contacts_list: Vec<(String, String)>) -> Result<(), String> {
         // Soft delete pending anteriores (substitui)
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Contact SET ExcluidoEm=datetime('now') WHERE CampaignId=?1 AND Status='pending' AND ExcluidoEm IS NULL;",
             params![campaign_id],
         ).map_err(|e| e.to_string())?;
 
         for (name, phone) in contacts_list {
-            self.conn.execute(
+            self.conn().execute(
                 "INSERT INTO ESF_Contact (CampaignId, ContactName, Phone, Status) VALUES (?1, ?2, ?3, 'pending');",
                 params![campaign_id, name, phone],
             ).map_err(|e| e.to_string())?;
@@ -1337,7 +1379,7 @@ impl Database {
     }
 
     pub fn update_contact_status(&self, contact_id: i32, status: &str) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Contact SET Status=?1, SentAt=datetime('now') WHERE ContactId=?2;",
             params![status, contact_id],
         ).map_err(|e| e.to_string())?;
@@ -1345,7 +1387,7 @@ impl Database {
     }
 
     pub fn set_contact_custom_message(&self, contact_id: i32, message: &str) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "UPDATE ESF_Contact SET CustomMessage=?1 WHERE ContactId=?2;",
             params![message, contact_id],
         ).map_err(|e| e.to_string())?;
@@ -1353,7 +1395,7 @@ impl Database {
     }
 
     pub fn get_next_pending_contact(&self, campaign_id: i32) -> Option<Contact> {
-        self.conn.query_row(
+        self.conn().query_row(
             "SELECT ContactId, CampaignId, ContactName, Phone, Status, SentAt
              FROM ESF_Contact WHERE CampaignId = ?1 AND Status = 'pending' AND ExcluidoEm IS NULL
              ORDER BY ContactId ASC LIMIT 1",
@@ -1376,7 +1418,7 @@ impl Database {
     // ============================================================
 
     pub fn was_already_sent(&self, phone: &str, campaign_id: i32) -> bool {
-        let count: i32 = self.conn.query_row(
+        let count: i32 = self.conn().query_row(
             "SELECT COUNT(*) FROM ESF_SentHistory WHERE Phone = ?1 AND CampaignId = ?2;",
             params![phone, campaign_id],
             |row| row.get(0),
@@ -1385,7 +1427,7 @@ impl Database {
     }
 
     pub fn mark_as_sent(&self, phone: &str, campaign_id: i32) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT OR REPLACE INTO ESF_SentHistory (Phone, CampaignId, SentAt) VALUES (?1, ?2, datetime('now'));",
             params![phone, campaign_id],
         ).map_err(|e| e.to_string())?;
@@ -1397,7 +1439,7 @@ impl Database {
     // ============================================================
 
     pub fn is_device_banned(&self, device_id: &str, package_name: &str, campaign_id: i32) -> bool {
-        let count: i32 = self.conn.query_row(
+        let count: i32 = self.conn().query_row(
             "SELECT COUNT(*) FROM ESF_DeviceStatus WHERE DeviceId=?1 AND PackageName=?2 AND CampaignId=?3 AND Status='banned' AND ExcluidoEm IS NULL;",
             params![device_id, package_name, campaign_id],
             |row| row.get(0),
@@ -1406,7 +1448,7 @@ impl Database {
     }
 
     pub fn set_device_banned(&self, device_id: &str, package_name: &str, campaign_id: i32) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO ESF_DeviceStatus (DeviceId, PackageName, CampaignId, Status) VALUES (?1, ?2, ?3, 'banned')
              ON CONFLICT(DeviceId, PackageName, CampaignId) DO UPDATE SET Status='banned', ExcluidoEm=NULL;",
             params![device_id, package_name, campaign_id],
@@ -1419,7 +1461,7 @@ impl Database {
     // ============================================================
 
     pub fn get_device_prefs(&self, device_id: &str, campaign_id: i32) -> Option<DevicePrefs> {
-        self.conn.query_row(
+        self.conn().query_row(
             "SELECT DeviceId, CampaignId, PreferredPackage, UnlockPin
              FROM ESF_DevicePrefs WHERE DeviceId=?1 AND CampaignId=?2 AND ExcluidoEm IS NULL;",
             params![device_id, campaign_id],
@@ -1435,7 +1477,7 @@ impl Database {
     }
 
     pub fn set_device_prefs(&self, device_id: &str, campaign_id: i32, preferred_package: &str, unlock_pin: &str) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO ESF_DevicePrefs (DeviceId, CampaignId, PreferredPackage, UnlockPin) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(DeviceId, CampaignId) DO UPDATE SET PreferredPackage=excluded.PreferredPackage, UnlockPin=excluded.UnlockPin, ExcluidoEm=NULL;",
             params![device_id, campaign_id, preferred_package, unlock_pin],
@@ -1448,7 +1490,8 @@ impl Database {
     // ============================================================
 
     pub fn get_package_statuses(&self, device_id: i32) -> Vec<DevicePackage> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(
             "SELECT DeviceId, PackageName, Status, UpdatedAt FROM ESF_DevicePackage WHERE DeviceId = ?1"
         ) {
             Ok(s) => s,
@@ -1471,7 +1514,7 @@ impl Database {
     }
 
     pub fn update_package_status(&self, device_id: i32, pkg_name: &str, status: &str) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO ESF_DevicePackage (DeviceId, PackageName, Status, UpdatedAt) VALUES (?1, ?2, ?3, datetime('now'))
              ON CONFLICT(DeviceId, PackageName) DO UPDATE SET Status = excluded.Status, UpdatedAt = excluded.UpdatedAt;",
             params![device_id, pkg_name, status],
@@ -1484,7 +1527,7 @@ impl Database {
     // ============================================================
 
     pub fn get_ai_config(&self, company_id: i32) -> Option<AiConfig> {
-        self.conn.query_row(
+        self.conn().query_row(
             "SELECT CompanyId, Provider, Model, Temperature, SystemPrompt, ApiKey, Endpoint
              FROM ESF_AiConfig WHERE CompanyId=?1;",
             params![company_id],
@@ -1503,7 +1546,7 @@ impl Database {
     }
 
     pub fn save_ai_config(&self, config: &AiConfig) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO ESF_AiConfig (CompanyId, Provider, Model, Temperature, SystemPrompt, ApiKey, Endpoint)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(CompanyId) DO UPDATE SET
@@ -1522,7 +1565,8 @@ impl Database {
     // ============================================================
 
     pub fn get_user_permissions(&self, user_id: i32) -> Vec<Permission> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(
             "SELECT UserId, PermissionKey, Enabled FROM ESF_Permission WHERE UserId = ?1"
         ) {
             Ok(s) => s,
@@ -1544,7 +1588,7 @@ impl Database {
     }
 
     pub fn update_user_permission(&self, user_id: i32, key: &str, enabled: bool) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO ESF_Permission (UserId, PermissionKey, Enabled) VALUES (?1, ?2, ?3)
              ON CONFLICT(UserId, PermissionKey) DO UPDATE SET Enabled=excluded.Enabled;",
             params![user_id, key, if enabled { 1 } else { 0 }],
@@ -1553,7 +1597,8 @@ impl Database {
     }
 
     pub fn get_sector_permissions(&self, user_id: i32) -> Vec<SectorPermission> {
-        let mut stmt = match self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached(
             "SELECT UserId, Sector, CanView, CanConfigure FROM ESF_SectorPermission WHERE UserId = ?1"
         ) {
             Ok(s) => s,
@@ -1576,7 +1621,7 @@ impl Database {
     }
 
     pub fn update_sector_permission(&self, user_id: i32, sector: &str, can_view: bool, can_configure: bool) -> Result<(), String> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO ESF_SectorPermission (UserId, Sector, CanView, CanConfigure) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(UserId, Sector) DO UPDATE SET CanView=excluded.CanView, CanConfigure=excluded.CanConfigure;",
             params![user_id, sector, if can_view { 1 } else { 0 }, if can_configure { 1 } else { 0 }],
@@ -1589,7 +1634,7 @@ impl Database {
     // ============================================================
 
     pub fn get_dashboard_kpis(&self, company_id: i32) -> Result<serde_json::Value, String> {
-        let blocked_chips: i32 = self.conn.query_row(
+        let blocked_chips: i32 = self.conn().query_row(
             "SELECT COUNT(*) FROM ESF_Chip c JOIN ESF_Device d ON c.DeviceId=d.AdbDeviceId
              WHERE d.CompanyId=?1 AND c.ExcluidoEm IS NULL
              AND c.Status IN ('banido','restrito_24h','restrito_7d','restrito_custom');",
@@ -1597,14 +1642,14 @@ impl Database {
             |row| row.get(0),
         ).unwrap_or(0);
 
-        let config_changes_today: i32 = self.conn.query_row(
+        let config_changes_today: i32 = self.conn().query_row(
             "SELECT COUNT(*) FROM ESF_AuditLog WHERE CompanyId=?1 AND ExcluidoEm IS NULL
              AND date(Timestamp) = date('now');",
             params![company_id],
             |row| row.get(0),
         ).unwrap_or(0);
 
-        let sent_today: i32 = self.conn.query_row(
+        let sent_today: i32 = self.conn().query_row(
             "SELECT COUNT(*) FROM ESF_Contact c
              JOIN ESF_Campaign cam ON c.CampaignId=cam.CampaignId
              WHERE cam.CompanyId=?1 AND c.Status='sent' AND c.ExcluidoEm IS NULL
@@ -1613,7 +1658,7 @@ impl Database {
             |row| row.get(0),
         ).unwrap_or(0);
 
-        let total_contacts_pending: i32 = self.conn.query_row(
+        let total_contacts_pending: i32 = self.conn().query_row(
             "SELECT COUNT(*) FROM ESF_Contact c
              JOIN ESF_Campaign cam ON c.CampaignId=cam.CampaignId
              WHERE cam.CompanyId=?1 AND c.Status='pending' AND c.ExcluidoEm IS NULL;",
@@ -1635,7 +1680,8 @@ impl Database {
 
     pub fn send_campaign_next_batch(&self, campaign_id: i32) -> Result<serde_json::Value, String> {
         // Get next 5 pending contacts
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
             "SELECT ContactId, ContactName, Phone FROM ESF_Contact
              WHERE CampaignId=?1 AND Status='pending' AND ExcluidoEm IS NULL
              ORDER BY ContactId LIMIT 5;"
@@ -1652,7 +1698,7 @@ impl Database {
 
         for (contact_id, _name, _phone) in &contacts {
             // Check dedup via SentHistory
-            let already: bool = self.conn.query_row(
+            let already: bool = self.conn().query_row(
                 "SELECT COUNT(*) > 0 FROM ESF_SentHistory
                  WHERE CampaignId=?1 AND Phone=(SELECT Phone FROM ESF_Contact WHERE ContactId=?2);",
                 params![campaign_id, contact_id],
@@ -1661,21 +1707,21 @@ impl Database {
 
             if !already {
                 // Mark as sent
-                let _ = self.conn.execute(
+                let _ = self.conn().execute(
                     "UPDATE ESF_Contact SET Status='sent', SentAt=datetime('now')
                      WHERE ContactId=?1;",
                     params![contact_id],
                 );
 
                 // Record in sent history
-                let _ = self.conn.execute(
+                let _ = self.conn().execute(
                     "INSERT INTO ESF_SentHistory (CampaignId, Phone, SentAt)
                      SELECT ?1, Phone, datetime('now') FROM ESF_Contact WHERE ContactId=?2;",
                     params![campaign_id, contact_id],
                 );
             } else {
                 // Already sent - mark as skipped
-                let _ = self.conn.execute(
+                let _ = self.conn().execute(
                     "UPDATE ESF_Contact SET Status='sent' WHERE ContactId=?1;",
                     params![contact_id],
                 );
@@ -1683,7 +1729,7 @@ impl Database {
         }
 
         // Update campaign counters
-        let _ = self.conn.execute(
+        let _ = self.conn().execute(
             "UPDATE ESF_Campaign SET
              SentCount = (SELECT COUNT(*) FROM ESF_Contact WHERE CampaignId=?1 AND Status='sent' AND ExcluidoEm IS NULL)
              WHERE CampaignId=?1;",
@@ -1691,7 +1737,7 @@ impl Database {
         );
 
         // Check if campaign is complete
-        let remaining: i32 = self.conn.query_row(
+        let remaining: i32 = self.conn().query_row(
             "SELECT COUNT(*) FROM ESF_Contact
              WHERE CampaignId=?1 AND Status='pending' AND ExcluidoEm IS NULL;",
             params![campaign_id],
@@ -1699,7 +1745,7 @@ impl Database {
         ).unwrap_or(0);
 
         if remaining == 0 {
-            let _ = self.conn.execute(
+            let _ = self.conn().execute(
                 "UPDATE ESF_Campaign SET Status='completed' WHERE CampaignId=?1;",
                 params![campaign_id],
             );

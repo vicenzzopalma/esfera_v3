@@ -1,14 +1,15 @@
 use crate::db::Database;
 use crate::protocol::*;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
+use tokio::task::spawn_blocking;
 use tokio::time::{timeout, Duration};
 
 pub struct EmpresaServer;
 
 impl EmpresaServer {
-    pub async fn start(db: Arc<Mutex<Database>>, port: u16) -> Result<(), String> {
+    pub async fn start(db: Arc<Database>, port: u16) -> Result<(), String> {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
             .await
             .map_err(|e| format!("Falha ao iniciar Empresa Server na porta {}: {}", port, e))?;
@@ -28,7 +29,7 @@ impl EmpresaServer {
 }
 
 async fn handle_lan_client(
-    db: Arc<Mutex<Database>>,
+    db: Arc<Database>,
     stream: tokio::net::TcpStream,
     addr: std::net::SocketAddr,
 ) -> Result<(), String> {
@@ -74,29 +75,32 @@ async fn handle_lan_client(
 }
 
 async fn execute_command_locally(
-    db: &Arc<Mutex<Database>>,
+    db: &Arc<Database>,
     cmd: &str,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let db = db.lock().map_err(|e| e.to_string())?;
     match cmd {
         "get_companies" => {
-            let companies = db.get_companies();
+            let db = db.clone();
+            let companies = spawn_blocking(move || db.get_companies()).await.map_err(|e| e.to_string())?;
             serde_json::to_value(companies).map_err(|e| e.to_string())
         }
         "get_devices" => {
             let company_id = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            let devices = db.get_devices(company_id);
+            let db = db.clone();
+            let devices = spawn_blocking(move || db.get_devices(company_id)).await.map_err(|e| e.to_string())?;
             serde_json::to_value(devices).map_err(|e| e.to_string())
         }
         "get_campaigns" => {
             let company_id = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            let campaigns = db.get_campaigns(company_id);
+            let db = db.clone();
+            let campaigns = spawn_blocking(move || db.get_campaigns(company_id)).await.map_err(|e| e.to_string())?;
             serde_json::to_value(campaigns).map_err(|e| e.to_string())
         }
         "get_dashboard_kpis" => {
             let company_id = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            let kpis = db.get_dashboard_kpis(company_id);
+            let db = db.clone();
+            let kpis = spawn_blocking(move || db.get_dashboard_kpis(company_id)).await.map_err(|e| e.to_string())?;
             serde_json::to_value(kpis).map_err(|e| e.to_string())
         }
         _ => Err(format!("Comando '{}' não disponível via Empresa Server", cmd)),
