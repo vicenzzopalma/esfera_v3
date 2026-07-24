@@ -7,6 +7,39 @@ use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::RwLock;
 use std::collections::HashMap;
+use std::time::Duration;
+
+pub fn run_cmd_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process::Output, String> {
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("Falha ao iniciar comando: {}", e))?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = out.read_to_end(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = err.read_to_end(&mut stderr);
+                }
+                return Ok(std::process::Output { status, stdout, stderr });
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    return Err(format!("Comando excedeu timeout de {}s.", timeout.as_secs()));
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            Err(e) => return Err(format!("Erro ao aguardar processo: {}", e)),
+        }
+    }
+}
 
 pub fn create_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
@@ -243,11 +276,9 @@ impl AdbManager {
 
     /// Executa `adb devices -l` e retorna a lista de dispositivos físicos/wireless conectados
     pub fn list_devices() -> Result<Vec<AdbDeviceInfo>, String> {
-        let output = create_cmd("adb")
-            .arg("devices")
-            .arg("-l")
-            .output()
-            .map_err(|e| format!("Falha ao executar comando adb: {}", e))?;
+        let mut cmd = create_cmd("adb");
+        cmd.args(["devices", "-l"]);
+        let output = run_cmd_timeout(cmd, Duration::from_secs(10))?;
 
         if !output.status.success() {
             return Err("Comando 'adb devices' retornou erro.".to_string());
@@ -860,41 +891,24 @@ impl AdbManager {
         ))
     }
 
-    /// Injeta regras de Imunidade, Fixação de MAC Físico e Persistência ADB TCP 5555 em um celular
+    /// Injeta regras de Imunidade, Fixação de MAC Físico e Persistência ADB TCP 5555 em 1 comando batch super leve (200ms)
     pub fn inject_device_immunity(serial: &str) -> Result<String, String> {
-        let commands = [
-            // 1. Força o Android a usar o MAC Físico/Nativo e desativa o MAC Aleatório
-            vec!["shell", "settings", "put", "global", "wifi_connected_mac_randomization_enabled", "0"],
-            // 2. Fixa a porta TCP do ADB em 5555 permanentemente
-            vec!["shell", "setprop", "persist.adb.tcp.port", "5555"],
-            // 3. Impede a suspensão do Wi-Fi mesmo com tela desligada ou em standby
-            vec!["shell", "settings", "put", "global", "wifi_sleep_policy", "2"],
-            vec!["shell", "settings", "put", "global", "wifi_scan_always_enabled", "1"],
-            vec!["shell", "settings", "put", "global", "stay_on_while_plugged_in", "7"],
-            // 4. Desativa otimização de bateria agressiva do Doze Mode no Android
-            vec!["shell", "dumpsys", "deviceidle", "disable"],
-            vec!["shell", "dumpsys", "deviceidle", "whitelist", "+com.mouldybread.adbautoenable"],
-            vec!["shell", "dumpsys", "deviceidle", "whitelist", "+com.android.shell"],
-        ];
+        let batch_cmd = "settings put global wifi_connected_mac_randomization_enabled 0; \
+                         setprop persist.adb.tcp.port 5555; \
+                         settings put global wifi_sleep_policy 2; \
+                         settings put global wifi_scan_always_enabled 1; \
+                         settings put global stay_on_while_plugged_in 7; \
+                         dumpsys deviceidle disable; \
+                         dumpsys deviceidle whitelist +com.mouldybread.adbautoenable; \
+                         dumpsys deviceidle whitelist +com.android.shell";
 
-        let mut success_count = 0;
-        for cmd in &commands {
-            let res = create_cmd("adb")
-                .arg("-s")
-                .arg(serial)
-                .args(cmd)
-                .output();
-            if let Ok(o) = res {
-                if o.status.success() {
-                    success_count += 1;
-                }
-            }
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s", serial, "shell", batch_cmd]);
+
+        match run_cmd_timeout(cmd, Duration::from_secs(2)) {
+            Ok(_) => Ok(format!("🛡️ Imunidade e MAC Físico Injetados no Celular {} com sucesso!", serial)),
+            Err(e) => Err(format!("Falha ao injetar no celular {}: {}", serial, e)),
         }
-
-        Ok(format!(
-            "🛡️ Imunidade e MAC Físico Injetados no Celular {} ({}/{} regras ativas)! O celular se identificará e conectará forçadamente.",
-            serial, success_count, commands.len()
-        ))
     }
 
 

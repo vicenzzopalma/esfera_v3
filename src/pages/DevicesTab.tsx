@@ -103,10 +103,8 @@ export default function DevicesTab() {
 
   // Busca dispositivos ADB nativos em tempo real do Tauri
   const refreshDevices = useCallback(() => {
-    let mounted = true;
     api<Device[]>("get_devices", { companyId: effectiveCompanyId })
       .then((data) => {
-        if (!mounted) return;
         if (data && Array.isArray(data) && data.length > 0) {
           setDevicesList(data);
         } else if (data && Array.isArray(data)) {
@@ -114,41 +112,33 @@ export default function DevicesTab() {
         }
       })
       .catch((err) => {
-        if (mounted) console.warn("Retorno temporário de IPC para get_devices:", err);
+        console.warn("Retorno temporário de IPC para get_devices:", err);
       });
-    return () => { mounted = false; };
   }, [effectiveCompanyId]);
 
   useEffect(() => {
-    let mounted = true;
     refreshDevices();
-    const interval = setInterval(() => { if (mounted) refreshDevices(); }, 5000);
-    return () => { mounted = false; clearInterval(interval); };
+    const interval = setInterval(refreshDevices, 5000);
+    return () => clearInterval(interval);
   }, [refreshDevices]);
 
   const fetchUsbDevices = async () => {
-    let mounted = true;
     setLoadingUsb(true);
     setLinkingStatus(null);
     try {
       const data = await api<any[]>("list_usb_devices");
-      if (mounted) setUsbDevices(data || []);
+      setUsbDevices(data || []);
     } catch (err) {
-      if (mounted) {
-        console.warn("Falha ao buscar dispositivos ADB nativos:", err);
-        setUsbDevices([]);
-      }
+      console.warn("Falha ao buscar dispositivos ADB nativos:", err);
+      setUsbDevices([]);
     } finally {
-      if (mounted) setLoadingUsb(false);
+      setLoadingUsb(false);
     }
-    return () => { mounted = false; };
   };
 
   useEffect(() => {
     if (!connectModalOpen || connectTab !== "usb") return;
-    let mounted = true;
     fetchUsbDevices();
-    return () => { mounted = false; };
   }, [connectModalOpen, connectTab]);
 
   const handleForceWirelessAdb = async (serial: string, deviceNumber: number, sector: string, deviceName: string) => {

@@ -1077,7 +1077,7 @@ pub fn inject_all_devices_immunity() -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn inject_single_device_immunity(serial: String) -> Result<String, String> {
+pub fn inject_single_device_immunity(_token: String, serial: String) -> Result<String, String> {
     let s = serial.clone();
     std::thread::spawn(move || {
         let _ = AdbManager::inject_device_immunity(&s);
