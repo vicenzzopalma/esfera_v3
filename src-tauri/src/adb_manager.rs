@@ -891,22 +891,70 @@ impl AdbManager {
         ))
     }
 
-    /// Injeta regras de Imunidade, Fixação de MAC Físico e Persistência ADB TCP 5555 em 1 comando batch super leve (200ms)
-    pub fn inject_device_immunity(serial: &str) -> Result<String, String> {
-        let batch_cmd = "settings put global wifi_connected_mac_randomization_enabled 0; \
-                         setprop persist.adb.tcp.port 5555; \
-                         settings put global wifi_sleep_policy 2; \
-                         settings put global wifi_scan_always_enabled 1; \
-                         settings put global stay_on_while_plugged_in 7; \
-                         dumpsys deviceidle disable; \
-                         dumpsys deviceidle whitelist +com.mouldybread.adbautoenable; \
-                         dumpsys deviceidle whitelist +com.android.shell";
+    /// Lê a identificação persistente gravada no Kernel/OS do celular (persist.esfera.device_id ou /sdcard/.esfera_device_id)
+    pub fn get_persistent_device_id(serial: &str) -> Option<String> {
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s", serial, "shell", "getprop persist.esfera.device_id"]);
+        if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(2)) {
+            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !val.is_empty() && val.starts_with("ESFERA_") {
+                return Some(val);
+            }
+        }
+
+        let mut cmd2 = create_cmd("adb");
+        cmd2.args(["-s", serial, "shell", "cat /sdcard/.esfera_device_id"]);
+        if let Ok(out) = run_cmd_timeout(cmd2, Duration::from_secs(2)) {
+            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !val.is_empty() && val.starts_with("ESFERA_") {
+                return Some(val);
+            }
+        }
+
+        None
+    }
+
+    /// Injeta permanentemente a identificação no Kernel/OS e Armazenamento do Celular
+    pub fn inject_persistent_device_id(serial: &str, persistent_id: &str) -> Result<String, String> {
+        let batch_cmd = format!(
+            "setprop persist.esfera.device_id {}; echo '{}' > /sdcard/.esfera_device_id",
+            persistent_id, persistent_id
+        );
 
         let mut cmd = create_cmd("adb");
-        cmd.args(["-s", serial, "shell", batch_cmd]);
+        cmd.args(["-s", serial, "shell", &batch_cmd]);
 
-        match run_cmd_timeout(cmd, Duration::from_secs(2)) {
-            Ok(_) => Ok(format!("🛡️ Imunidade e MAC Físico Injetados no Celular {} com sucesso!", serial)),
+        match run_cmd_timeout(cmd, Duration::from_secs(3)) {
+            Ok(_) => Ok(format!("🏷️ ID permanente '{}' injetada no celular {}", persistent_id, serial)),
+            Err(e) => Err(format!("Falha ao injetar ID no celular {}: {}", serial, e)),
+        }
+    }
+
+    /// Injeta regras de Imunidade, Fixação de MAC Físico, Persistência ADB TCP 5555 e ID permanente no Kernel
+    pub fn inject_device_immunity(serial: &str, persistent_id: Option<&str>) -> Result<String, String> {
+        let id_cmd = if let Some(pid) = persistent_id {
+            format!("setprop persist.esfera.device_id {}; echo '{}' > /sdcard/.esfera_device_id; ", pid, pid)
+        } else {
+            "".to_string()
+        };
+
+        let batch_cmd = format!(
+            "{}settings put global wifi_connected_mac_randomization_enabled 0; \
+             setprop persist.adb.tcp.port 5555; \
+             settings put global wifi_sleep_policy 2; \
+             settings put global wifi_scan_always_enabled 1; \
+             settings put global stay_on_while_plugged_in 7; \
+             dumpsys deviceidle disable; \
+             dumpsys deviceidle whitelist +com.mouldybread.adbautoenable; \
+             dumpsys deviceidle whitelist +com.android.shell",
+            id_cmd
+        );
+
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s", serial, "shell", &batch_cmd]);
+
+        match run_cmd_timeout(cmd, Duration::from_secs(5)) {
+            Ok(_) => Ok(format!("🛡️ Imunidade, MAC Físico e Kernel ID Injetados no Celular {} com sucesso!", serial)),
             Err(e) => Err(format!("Falha ao injetar no celular {}: {}", serial, e)),
         }
     }
@@ -964,6 +1012,7 @@ impl AdbManager {
                 .output();
 
             let _ = Self::deploy_keepalive(serial);
+            let _ = Self::inject_device_immunity(serial, None);
 
             Ok(format!("📱 App Agente Esfera v3 instalado e ativado no celular {} com sucesso!", serial))
         } else {
@@ -976,6 +1025,10 @@ impl AdbManager {
 
     /// Thread leve e eficiente (0.0% CPU) para manter conexões Wi-Fi ativas sem travar o sistema
     pub fn start_auto_reconnect_daemon(db_conn: std::sync::Arc<std::sync::Mutex<crate::db::Database>>) {
+        use std::collections::HashSet;
+        let injected: std::sync::Arc<std::sync::Mutex<HashSet<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
+
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(12));
 
@@ -992,6 +1045,16 @@ impl AdbManager {
 
                     if !target.is_empty() && target.contains('.') {
                         let _ = create_cmd("adb").arg("connect").arg(&target).output();
+
+                        let already = injected.lock()
+                            .map(|s| s.contains(&target))
+                            .unwrap_or(false);
+                        if !already {
+                            let pid = format!("ESFERA_DEV_{:03}", dev.device_number);
+                            if Self::inject_device_immunity(&target, Some(&pid)).is_ok() {
+                                let _ = injected.lock().map(|mut s| { s.insert(target.clone()); });
+                            }
+                        }
                     }
                 }
             }
