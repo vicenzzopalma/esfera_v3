@@ -317,41 +317,32 @@ impl AdbManager {
     }
 
     /// Obtém o endereço IP do wlan0 do dispositivo para conexão Wireless
+    /// Obtém o endereço IP do wlan0 do dispositivo para conexão Wireless com timeout seguro de 2s
     pub fn get_device_wifi_ip(serial: &str) -> Result<String, String> {
         // Método 1: getprop dhcp.wlan0.ipaddress
-        let output = create_cmd("adb")
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("getprop")
-            .arg("dhcp.wlan0.ipaddress")
-            .output()
-            .map_err(|e| e.to_string())?;
-        
-        let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !ip.is_empty() && ip.contains('.') {
-            return Ok(ip);
+        let mut cmd1 = create_cmd("adb");
+        cmd1.args(["-s", serial, "shell", "getprop", "dhcp.wlan0.ipaddress"]);
+        if let Ok(output) = run_cmd_timeout(cmd1, Duration::from_secs(2)) {
+            let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !ip.is_empty() && ip.contains('.') && !ip.starts_with("127.") {
+                return Ok(ip);
+            }
         }
 
         // Método 2: ip route
-        let output = create_cmd("adb")
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("ip")
-            .arg("route")
-            .output()
-            .map_err(|e| e.to_string())?;
-
-        let route_out = String::from_utf8_lossy(&output.stdout);
-        for line in route_out.lines() {
-            if line.contains("wlan0") && line.contains("src") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if let Some(src_idx) = parts.iter().position(|&x| x == "src") {
-                    if src_idx + 1 < parts.len() {
-                        let parsed_ip = parts[src_idx + 1].trim().to_string();
-                        if parsed_ip.contains('.') {
-                            return Ok(parsed_ip);
+        let mut cmd2 = create_cmd("adb");
+        cmd2.args(["-s", serial, "shell", "ip", "route"]);
+        if let Ok(output) = run_cmd_timeout(cmd2, Duration::from_secs(2)) {
+            let route_out = String::from_utf8_lossy(&output.stdout);
+            for line in route_out.lines() {
+                if line.contains("wlan0") && line.contains("src") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if let Some(src_idx) = parts.iter().position(|&x| x == "src") {
+                        if src_idx + 1 < parts.len() {
+                            let parsed_ip = parts[src_idx + 1].trim().to_string();
+                            if parsed_ip.contains('.') && !parsed_ip.starts_with("127.") {
+                                return Ok(parsed_ip);
+                            }
                         }
                     }
                 }
@@ -359,60 +350,21 @@ impl AdbManager {
         }
 
         // Método 3: ip addr show wlan0
-        let output = create_cmd("adb")
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("ip")
-            .arg("addr")
-            .arg("show")
-            .arg("wlan0")
-            .output()
-            .map_err(|e| e.to_string())?;
-
-        let addr_out = String::from_utf8_lossy(&output.stdout);
-        for line in addr_out.lines() {
-            if line.trim().starts_with("inet ") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() > 1 {
-                    let ip_mask = parts[1];
-                    let ip_only: Vec<&str> = ip_mask.split('/').collect();
-                    if !ip_only.is_empty() {
-                        let parsed_ip = ip_only[0].trim().to_string();
-                        if parsed_ip.contains('.') {
-                            return Ok(parsed_ip);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Método 4: ifconfig wlan0
-        if let Ok(output) = create_cmd("adb").args(["-s", serial, "shell", "ifconfig", "wlan0"]).output() {
-            let out = String::from_utf8_lossy(&output.stdout);
-            for line in out.lines() {
-                if line.contains("inet addr:") {
-                    let parts: Vec<&str> = line.split("inet addr:").collect();
+        let mut cmd3 = create_cmd("adb");
+        cmd3.args(["-s", serial, "shell", "ip", "addr", "show", "wlan0"]);
+        if let Ok(output) = run_cmd_timeout(cmd3, Duration::from_secs(2)) {
+            let addr_out = String::from_utf8_lossy(&output.stdout);
+            for line in addr_out.lines() {
+                if line.trim().starts_with("inet ") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() > 1 {
-                        let ip = parts[1].split_whitespace().next().unwrap_or("").trim().to_string();
-                        if ip.contains('.') {
-                            return Ok(ip);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Método 5: dumpsys wifi
-        if let Ok(output) = create_cmd("adb").args(["-s", serial, "shell", "dumpsys", "wifi"]).output() {
-            let out = String::from_utf8_lossy(&output.stdout);
-            for line in out.lines() {
-                if line.contains("ip_address=") {
-                    let parts: Vec<&str> = line.split("ip_address=").collect();
-                    if parts.len() > 1 {
-                        let ip = parts[1].split_whitespace().next().unwrap_or("").trim().to_string();
-                        if ip.contains('.') && !ip.starts_with("0.0.0.0") {
-                            return Ok(ip);
+                        let ip_mask = parts[1];
+                        let ip_only: Vec<&str> = ip_mask.split('/').collect();
+                        if !ip_only.is_empty() {
+                            let parsed_ip = ip_only[0].trim().to_string();
+                            if parsed_ip.contains('.') && !parsed_ip.starts_with("127.") {
+                                return Ok(parsed_ip);
+                            }
                         }
                     }
                 }
@@ -424,24 +376,20 @@ impl AdbManager {
 
     /// Habilita porta TCP no dispositivo
     pub fn enable_tcpip(serial: &str, port: i32) -> Result<(), String> {
-        let _ = create_cmd("adb")
-            .arg("-s")
-            .arg(serial)
-            .arg("tcpip")
-            .arg(port.to_string())
-            .output()
-            .map_err(|e| format!("Falha ao colocar em modo TCP/IP: {}", e))?;
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s", serial, "tcpip", &port.to_string()]);
+        let _ = run_cmd_timeout(cmd, Duration::from_secs(3));
         Ok(())
     }
 
-    /// Conecta a um dispositivo via IP:Porta usando `adb connect ip:port`
+    /// Conecta a um dispositivo via IP:Porta usando `adb connect ip:port` com timeout seguro de 4s
     pub fn connect_device(ip: &str, port: i32) -> Result<String, String> {
         let target = format!("{}:{}", ip, port);
-        let output = create_cmd("adb")
-            .arg("connect")
-            .arg(&target)
-            .output()
-            .map_err(|e| format!("Falha ao executar 'adb connect': {}", e))?;
+        let mut cmd = create_cmd("adb");
+        cmd.args(["connect", &target]);
+
+        let output = run_cmd_timeout(cmd, Duration::from_secs(4))
+            .map_err(|e| format!("Falha ao conectar a {}: {}", target, e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -458,12 +406,11 @@ impl AdbManager {
     /// Executa `adb pair <ip>:<port> <code>` para parear celular Android 11+ via Wi-Fi sem cabo
     pub fn pair_device(ip: &str, port: u16, code: &str) -> Result<String, String> {
         let target = format!("{}:{}", ip, port);
-        let output = create_cmd("adb")
-            .arg("pair")
-            .arg(&target)
-            .arg(code)
-            .output()
-            .map_err(|e| format!("Falha ao executar 'adb pair': {}", e))?;
+        let mut cmd = create_cmd("adb");
+        cmd.args(["pair", &target, code]);
+
+        let output = run_cmd_timeout(cmd, Duration::from_secs(6))
+            .map_err(|e| format!("Falha ao parear com {}: {}", target, e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
