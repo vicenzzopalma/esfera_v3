@@ -1019,23 +1019,15 @@ pub fn link_usb_to_wireless(
 }
 
 #[tauri::command]
-pub fn force_reconnect_all_adb() -> Result<String, String> {
-    let static_ips = vec![
-        "192.168.1.185:5555",
-        "192.168.1.35:5555",
-        "192.168.1.54:5555",
-        "192.168.1.57:5555",
-        "192.168.1.92:5555",
-        "192.168.1.93:5555",
-        "192.168.1.94:5555",
-        "192.168.1.95:5555",
-    ];
-
+pub fn force_reconnect_all_adb(state: State<'_, AppState>) -> Result<String, String> {
+    let discovered_ips = AdbManager::scan_subnet("192.168.1");
     let mut reconnected = Vec::new();
-    for target in &static_ips {
+
+    for ip in &discovered_ips {
+        let target = format!("{}:5555", ip);
         let output = crate::adb_manager::create_cmd("adb")
             .arg("connect")
-            .arg(target)
+            .arg(&target)
             .output();
         if let Ok(out) = output {
             let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1045,10 +1037,45 @@ pub fn force_reconnect_all_adb() -> Result<String, String> {
         }
     }
 
+    // Atualiza o banco de dados com a lista de dispositivos ativos detectados
+    if let Ok(db) = state.db.lock() {
+        let active_devices = AdbManager::list_devices().unwrap_or_default();
+        for dev in active_devices {
+            if dev.serial.contains(':') {
+                let ip_parts: Vec<&str> = dev.serial.split(':').collect();
+                if ip_parts.len() >= 2 {
+                    let ip = ip_parts[0];
+                    let (brand, model) = AdbManager::get_device_info(&dev.serial);
+                    let device_obj = Device {
+                        id: 0,
+                        serial: dev.serial.clone(),
+                        name: format!("Aparelho {}", model),
+                        brand,
+                        model,
+                        ip: ip.to_string(),
+                        port: 5555,
+                        status: "online".to_string(),
+                        battery: 100,
+                        company_id: 1,
+                        device_number: 1,
+                        sector: "junior".to_string(),
+                    };
+                    let _ = db.upsert_device(&device_obj);
+                }
+            }
+        }
+    }
+
     if reconnected.is_empty() {
-        Ok("Comando de reconexão em lote disparado via Wi-Fi para todos os 8 celulares!".to_string())
+        Ok(format!(
+            "Varredura de rede (192.168.1.x) concluída! {} IPs encontrados com ADB ativo.",
+            discovered_ips.len()
+        ))
     } else {
-        Ok(format!("⚡ Reconexão Wi-Fi Forçada em Lote Concluída:\n{}", reconnected.join("\n")))
+        Ok(format!(
+            "⚡ Varredura e Reconexão Wi-Fi com Auto-Cura de IP Concluída:\n{}",
+            reconnected.join("\n")
+        ))
     }
 }
 

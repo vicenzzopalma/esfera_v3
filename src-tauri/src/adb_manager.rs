@@ -895,25 +895,14 @@ impl AdbManager {
         }
     }
 
-    /// Inicializa a Thread de Reconexão Automática Contínua para que NENHUM celular seja perdido após reinício do servidor
+    /// Inicializa a Thread de Reconexão Automática Contínua com Varredura de Sub-Rede Nativas em Rust
     pub fn start_auto_reconnect_daemon(db_conn: std::sync::Arc<std::sync::Mutex<crate::db::Database>>) {
         std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(4));
-
-            // Lista de IPs Wi-Fi conhecidos para reconexão nativa em lote
-            let static_ips = vec![
-                "192.168.1.185:5555",
-                "192.168.1.35:5555",
-                "192.168.1.54:5555",
-                "192.168.1.57:5555",
-                "192.168.1.92:5555",
-                "192.168.1.93:5555",
-                "192.168.1.94:5555",
-                "192.168.1.95:5555",
-            ];
-
-            for target in &static_ips {
-                let _ = create_cmd("adb").arg("connect").arg(target).output();
+            // Varredura multithread paralela em 150ms de toda a sub-rede 192.168.1.x na porta 5555
+            let discovered_ips = Self::scan_subnet("192.168.1");
+            for ip in &discovered_ips {
+                let target = format!("{}:5555", ip);
+                let _ = create_cmd("adb").arg("connect").arg(&target).output();
             }
 
             if let Ok(db) = db_conn.lock() {
@@ -933,6 +922,8 @@ impl AdbManager {
                     }
                 }
             }
+
+            std::thread::sleep(std::time::Duration::from_secs(5));
         });
     }
 }
