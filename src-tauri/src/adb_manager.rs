@@ -552,7 +552,18 @@ impl AdbManager {
         Ok(())
     }
 
+static DEVICE_INFO_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (String, String)>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
     pub fn get_device_info(serial: &str) -> (String, String) {
+        if let Ok(cache) = DEVICE_INFO_CACHE.read() {
+            if let Some(info) = cache.get(serial) {
+                if !info.0.is_empty() && !info.1.is_empty() {
+                    return info.clone();
+                }
+            }
+        }
+
         let brand_out = create_cmd("adb")
             .arg("-s")
             .arg(serial)
@@ -570,16 +581,27 @@ impl AdbManager {
             .output();
 
         let brand = match brand_out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if s.is_empty() { "Android".to_string() } else { s }
+            }
             Err(_) => "Android".to_string(),
         };
 
         let model = match model_out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            Err(_) => "Generic Device".to_string(),
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if s.is_empty() { "Smartphone".to_string() } else { s }
+            }
+            Err(_) => "Smartphone".to_string(),
         };
 
-        (brand, model)
+        let res = (brand, model);
+        if let Ok(mut cache) = DEVICE_INFO_CACHE.write() {
+            cache.insert(serial.to_string(), res.clone());
+        }
+
+        res
     }
 
     /// Lança o Scrcpy H.264 nativo em 60 FPS com aceleração por hardware

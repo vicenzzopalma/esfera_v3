@@ -104,11 +104,14 @@ export default function DevicesTab() {
   const refreshDevices = useCallback(() => {
     api<Device[]>("get_devices", { companyId: effectiveCompanyId })
       .then((data) => {
-        setDevicesList(data || []);
+        if (data && Array.isArray(data) && data.length > 0) {
+          setDevicesList(data);
+        } else if (data && Array.isArray(data)) {
+          setDevicesList((prev) => (prev.length > 0 ? prev : []));
+        }
       })
       .catch((err) => {
-        console.warn("Nenhum dispositivo ADB retornado via IPC:", err);
-        setDevicesList([]);
+        console.warn("Retorno temporário de IPC para get_devices:", err);
       });
   }, [effectiveCompanyId]);
 
