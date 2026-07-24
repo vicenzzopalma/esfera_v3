@@ -832,6 +832,43 @@ impl AdbManager {
         ))
     }
 
+    /// Injeta regras de Imunidade, Fixação de MAC Físico e Persistência ADB TCP 5555 em um celular
+    pub fn inject_device_immunity(serial: &str) -> Result<String, String> {
+        let commands = [
+            // 1. Força o Android a usar o MAC Físico/Nativo e desativa o MAC Aleatório
+            vec!["shell", "settings", "put", "global", "wifi_connected_mac_randomization_enabled", "0"],
+            // 2. Fixa a porta TCP do ADB em 5555 permanentemente
+            vec!["shell", "setprop", "persist.adb.tcp.port", "5555"],
+            // 3. Impede a suspensão do Wi-Fi mesmo com tela desligada ou em standby
+            vec!["shell", "settings", "put", "global", "wifi_sleep_policy", "2"],
+            vec!["shell", "settings", "put", "global", "wifi_scan_always_enabled", "1"],
+            vec!["shell", "settings", "put", "global", "stay_on_while_plugged_in", "7"],
+            // 4. Desativa otimização de bateria agressiva do Doze Mode no Android
+            vec!["shell", "dumpsys", "deviceidle", "disable"],
+            vec!["shell", "dumpsys", "deviceidle", "whitelist", "+com.mouldybread.adbautoenable"],
+            vec!["shell", "dumpsys", "deviceidle", "whitelist", "+com.android.shell"],
+        ];
+
+        let mut success_count = 0;
+        for cmd in &commands {
+            let res = create_cmd("adb")
+                .arg("-s")
+                .arg(serial)
+                .args(cmd)
+                .output();
+            if let Ok(o) = res {
+                if o.status.success() {
+                    success_count += 1;
+                }
+            }
+        }
+
+        Ok(format!(
+            "🛡️ Imunidade e MAC Físico Injetados no Celular {} ({}/{} regras ativas)! O celular se identificará e conectará forçadamente.",
+            serial, success_count, commands.len()
+        ))
+    }
+
 
 
     fn find_agent_apk_path() -> Result<std::path::PathBuf, String> {
