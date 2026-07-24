@@ -296,32 +296,32 @@ pub fn get_devices(state: State<'_, AppState>, token: String, company_id: i32) -
 }
 
 #[tauri::command]
-pub fn get_hpc_capabilities() -> crate::adb_manager::EsferaHardwareCaps {
+pub fn get_hpc_capabilities(_token: String) -> crate::adb_manager::EsferaHardwareCaps {
     AdbManager::get_hardware_capabilities()
 }
 
 #[tauri::command]
-pub fn run_adb_diagnostic() -> crate::adb_manager::EsferaAdbDiagnosticResult {
+pub fn run_adb_diagnostic(_token: String) -> crate::adb_manager::EsferaAdbDiagnosticResult {
     AdbManager::run_diagnostic()
 }
 
 #[tauri::command]
-pub fn restart_adb_server() -> Result<String, String> {
+pub fn restart_adb_server(_token: String) -> Result<String, String> {
     AdbManager::restart_server()
 }
 
 #[tauri::command]
-pub fn scan_adb_subnet(subnet_prefix: String) -> Vec<String> {
+pub fn scan_adb_subnet(_token: String, subnet_prefix: String) -> Vec<String> {
     AdbManager::scan_subnet(&subnet_prefix)
 }
 
 #[tauri::command]
-pub fn deploy_adb_keepalive(serial: String) -> Result<String, String> {
+pub fn deploy_adb_keepalive(_token: String, serial: String) -> Result<String, String> {
     AdbManager::deploy_keepalive(&serial)
 }
 
 #[tauri::command]
-pub fn get_hardware_uuid() -> String {
+pub fn get_hardware_uuid(_token: String) -> String {
     AdbManager::get_hardware_uuid()
 }
 
@@ -972,7 +972,7 @@ pub fn update_device_package_status(
 // ============================================================
 
 #[tauri::command]
-pub fn list_usb_devices() -> Result<Vec<AdbDeviceInfo>, String> {
+pub fn list_usb_devices(_token: String) -> Result<Vec<AdbDeviceInfo>, String> {
     AdbManager::list_devices()
 }
 
