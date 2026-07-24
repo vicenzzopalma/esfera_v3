@@ -1349,15 +1349,46 @@ function ScreenMirrorModal({
               <button
                 onClick={async () => {
                   try {
-                    const msg = await api<string>("launch_scrcpy_stream", { serial: device.serial });
+                    const msg = await api<string>("launch_scrcpy_stream", { serial: device.serial, turnScreenOff: false });
                     alert(msg);
                   } catch (err: any) {
                     alert(typeof err === "string" ? err : err?.message || "Erro ao iniciar Scrcpy.");
                   }
                 }}
                 className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 text-white text-xs font-bold shadow-lg hover:from-emerald-500 hover:to-teal-500 transition-all cursor-pointer flex items-center gap-1.5"
+                title="Transmite a tela em 60 FPS com a tela física do celular ligada"
               >
-                ⚡ Scrcpy (60 FPS Tela)
+                ⚡ Scrcpy (Tela Ligada)
+              </button>
+
+              <button
+                onClick={async () => {
+                  try {
+                    const msg = await api<string>("launch_scrcpy_stream", { serial: device.serial, turnScreenOff: true });
+                    alert(msg);
+                  } catch (err: any) {
+                    alert(typeof err === "string" ? err : err?.message || "Erro ao iniciar Scrcpy.");
+                  }
+                }}
+                className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 text-white text-xs font-bold shadow-lg hover:from-purple-500 hover:to-indigo-500 transition-all cursor-pointer flex items-center gap-1.5"
+                title="Transmite 60 FPS no PC mantendo a tela física do celular 100% desligada (Economiza bateria e evita aquecimento)"
+              >
+                🌙 Scrcpy (Tela Apagada)
+              </button>
+
+              <button
+                onClick={async () => {
+                  try {
+                    const msg = await api<string>("launch_virtual_display_stream", { serial: device.serial });
+                    alert(msg);
+                  } catch (err: any) {
+                    alert(typeof err === "string" ? err : err?.message || "Erro ao iniciar Display Virtual.");
+                  }
+                }}
+                className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 text-white text-xs font-extrabold shadow-lg hover:from-cyan-500 hover:to-blue-500 transition-all cursor-pointer flex items-center gap-1.5 border border-cyan-400/30"
+                title="Cria uma Área de Trabalho #2 independente no celular. O bot dispara no Display #1 enquanto o supervisor usa a tela física livremente."
+              >
+                🖥️ Área #2 (Display Virtual Disparos)
               </button>
 
               <button
