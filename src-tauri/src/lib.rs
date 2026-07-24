@@ -48,7 +48,7 @@ pub fn run() {
             std::process::exit(1);
         }
     };
-    let db_arc = Arc::new(Mutex::new(db));
+    let db_arc = Arc::new(db);
 
     let db_arc_clone = Arc::clone(&db_arc);
     let sessions = Arc::new(Mutex::new(SessionManager::new()));
@@ -56,18 +56,14 @@ pub fn run() {
 
     let app_config = config::load_config();
 
+    // Runtime de fundo único para servidores e clients (LAN, Hub, Master)
+    let bg_runtime = tokio::runtime::Runtime::new().expect("Falha ao criar background runtime");
+
     if app_config.empresa_server_enabled {
         let db_for_server = db_arc.clone();
         let port = app_config.empresa_server_port;
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("Falha ao criar runtime tokio para empresa server: {}", e);
-                    return;
-                }
-            };
-            if let Err(e) = rt.block_on(empresa_server::EmpresaServer::start(db_for_server, port)) {
+        bg_runtime.spawn(async move {
+            if let Err(e) = empresa_server::EmpresaServer::start(db_for_server, port).await {
                 eprintln!("Empresa Server error: {}", e);
             }
         });
@@ -78,58 +74,45 @@ pub fn run() {
     if app_config.mode == "empresa" && app_config.hub_enabled && !app_config.hub_address.is_empty() {
         let db_for_hub = db_arc.clone();
         let hub_addr = app_config.hub_address.clone();
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("Falha ao criar runtime tokio para hub empresa: {}", e);
-                    return;
-                }
-            };
-            rt.block_on(async move {
-                let company_id = {
-                    if let Ok(db) = db_for_hub.lock() {
-                        db.get_companies().first().map(|c| c.id).unwrap_or(1)
-                    } else {
-                        1
-                    }
-                };
-                let company_name = format!("Empresa_{}", company_id);
-                let mut backoff = 1;
-                loop {
-                    match hub_client::HubClient::connect(&hub_addr, company_id, &company_name).await {
-                        Ok(client) => {
-                            println!("Conectado ao Hub {} como empresa '{}'", hub_addr, company_name);
-                            backoff = 1;
-                            let _ = client.listen(|cmd, args, id| {
-                                let db = db_for_hub.lock().map_err(|e| e.to_string())?;
-                                match cmd.as_str() {
-                                    "get_companies" => serde_json::to_value(db.get_companies()).map_err(|e| e.to_string()),
-                                    "get_devices" => {
-                                        let cid = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                                        serde_json::to_value(db.get_devices(cid)).map_err(|e| e.to_string())
-                                    }
-                                    "get_campaigns" => {
-                                        let cid = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                                        serde_json::to_value(db.get_campaigns(cid)).map_err(|e| e.to_string())
-                                    }
-                                    "get_dashboard_kpis" => {
-                                        let cid = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                                        serde_json::to_value(db.get_dashboard_kpis(cid)).map_err(|e| e.to_string())
-                                    }
-                                    _ => Err(format!("Comando remoto '{}' não implementado", cmd)),
+        bg_runtime.spawn(async move {
+            let company_id = db_for_hub.get_companies().first().map(|c| c.id).unwrap_or(1);
+            let company_name = format!("Empresa_{}", company_id);
+            let mut backoff = 1;
+            loop {
+                match hub_client::HubClient::connect(&hub_addr, company_id, &company_name).await {
+                    Ok(client) => {
+                        println!("Conectado ao Hub {} como empresa '{}'", hub_addr, company_name);
+                        backoff = 1;
+                        let _ = client.listen(|cmd, args, _id| {
+                            let db = db_for_hub.clone();
+                            let res = match cmd.as_str() {
+                                "get_companies" => serde_json::to_value(db.get_companies()).map_err(|e| e.to_string()),
+                                "get_devices" => {
+                                    let cid = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                                    serde_json::to_value(db.get_devices(cid)).map_err(|e| e.to_string())
                                 }
-                            }).await;
-                            eprintln!("Conexão com Hub perdida. Reconectando em {}s...", backoff);
-                        }
-                        Err(e) => {
-                            eprintln!("Falha ao conectar ao Hub (tentativa em {}s): {}", backoff, e);
-                        }
+                                "get_campaigns" => {
+                                    let cid = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                                    serde_json::to_value(db.get_campaigns(cid)).map_err(|e| e.to_string())
+                                }
+                                "get_dashboard_kpis" => {
+                                    let cid = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                                    serde_json::to_value(db.get_dashboard_kpis(cid)).map_err(|e| e.to_string())
+                                }
+                                _ => Err(format!("Comando remoto '{}' não implementado", cmd)),
+                            };
+                            // Offload sync DB calls via std thread para não bloquear runtime async
+                            std::thread::spawn(move || res).join().unwrap_or(Err("thread panicked".to_string()))
+                        }).await;
+                        eprintln!("Conexão com Hub perdida. Reconectando em {}s...", backoff);
                     }
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(60);
+                    Err(e) => {
+                        eprintln!("Falha ao conectar ao Hub (tentativa em {}s): {}", backoff, e);
+                    }
                 }
-            });
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+            }
         });
     }
 
@@ -137,35 +120,26 @@ pub fn run() {
     if app_config.mode == "master" && app_config.hub_enabled && !app_config.hub_address.is_empty() {
         let hub_addr = app_config.hub_address.clone();
         let mc = master_client.clone();
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("Falha ao criar runtime tokio para master client: {}", e);
-                    return;
-                }
-            };
-            rt.block_on(async move {
-                let mut backoff = 1;
-                loop {
-                    match MasterClient::connect(&hub_addr).await {
-                        Ok(client) => {
-                            println!("Conectado ao Hub {} como Master", hub_addr);
-                            *mc.lock().await = Some(client);
-                            backoff = 1;
-                            loop {
-                                tokio::time::sleep(Duration::from_secs(10)).await;
-                                if mc.lock().await.is_none() { break; }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Falha Master ao conectar ao Hub (tentativa em {}s): {}", backoff, e);
+        bg_runtime.spawn(async move {
+            let mut backoff = 1;
+            loop {
+                match MasterClient::connect(&hub_addr).await {
+                    Ok(client) => {
+                        println!("Conectado ao Hub {} como Master", hub_addr);
+                        *mc.lock().await = Some(client);
+                        backoff = 1;
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            if mc.lock().await.is_none() { break; }
                         }
                     }
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(60);
+                    Err(e) => {
+                        eprintln!("Falha Master ao conectar ao Hub (tentativa em {}s): {}", backoff, e);
+                    }
                 }
-            });
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+            }
         });
         println!("Master Client conectando a {}...", app_config.hub_address);
     }
