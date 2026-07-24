@@ -227,8 +227,8 @@ impl<'a> DatabaseTransaction<'a> {
 
 impl<'a> Drop for DatabaseTransaction<'a> {
     fn drop(&mut self) {
-        if self.tx.is_some() {
-            let _ = self.tx.take().unwrap().rollback();
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.rollback();
         }
     }
 }
@@ -767,8 +767,12 @@ impl Database {
     // DISPOSITIVOS
     // ============================================================
 
-    pub fn get_devices(&self, _company_id: i32) -> Vec<Device> {
-        let sql = "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device";
+    pub fn get_devices(&self, company_id: i32) -> Vec<Device> {
+        let sql = if company_id > 0 {
+            "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device WHERE CompanyId = ?1"
+        } else {
+            "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device"
+        };
 
         let mut stmt = match self.conn.prepare(sql) {
             Ok(s) => s,
@@ -792,7 +796,11 @@ impl Database {
             })
         };
 
-        let rows = stmt.query_map([], mapper);
+        let rows = if company_id > 0 {
+            stmt.query_map(params![company_id], mapper)
+        } else {
+            stmt.query_map([], mapper)
+        };
         match rows {
             Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
             Err(_) => vec![],

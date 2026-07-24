@@ -3,6 +3,7 @@ use crate::protocol::*;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
+use tokio::time::{timeout, Duration};
 
 pub struct EmpresaServer;
 
@@ -38,9 +39,9 @@ async fn handle_lan_client(
 
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
+        match timeout(Duration::from_secs(300), reader.read_line(&mut line)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(_)) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() { continue; }
                 if let Ok(msg) = deserialize_msg(trimmed.as_bytes()) {

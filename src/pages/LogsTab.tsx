@@ -3,7 +3,7 @@
 // Console de logs com filtros avançados, exportação CSV e auto-refresh
 // ============================================================
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 import { useAuth } from "../context/AuthContext";
 import Card from "../components/ui/Card";
 import Badge from "../components/ui/Badge";
@@ -56,34 +56,50 @@ export default function LogsTab() {
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [lastRefresh, setLastRefresh] = useState(new Date());
 
-  const fetchLogs = useCallback(async () => {
-    if (!selectedCompanyId) return;
-    try {
-      const data = await api<LogEntry[]>("get_logs", { companyId: selectedCompanyId });
-      setLogsList(data);
-    } catch {
-      setLogsList([]);
-    }
-    setLastRefresh(new Date());
+  useEffect(() => {
+    let mounted = true;
+    const doFetch = async () => {
+      if (!selectedCompanyId) return;
+      try {
+        const data = await api<LogEntry[]>("get_logs", { companyId: selectedCompanyId });
+        if (!mounted) return;
+        setLogsList(data);
+      } catch {
+        if (mounted) setLogsList([]);
+      }
+      if (mounted) setLastRefresh(new Date());
+    };
+    doFetch();
+    return () => { mounted = false; };
   }, [selectedCompanyId]);
-
-  useEffect(() => { fetchLogs(); }, [fetchLogs]);
 
   // Auto-refresh every 5s
   useEffect(() => {
     if (!autoRefresh) return;
-    const interval = setInterval(fetchLogs, 5000);
-    return () => clearInterval(interval);
-  }, [autoRefresh, fetchLogs]);
+    let mounted = true;
+    const doFetch = async () => {
+      if (!selectedCompanyId) return;
+      try {
+        const data = await api<LogEntry[]>("get_logs", { companyId: selectedCompanyId });
+        if (mounted) setLogsList(data);
+      } catch {
+        if (mounted) setLogsList([]);
+      }
+      if (mounted) setLastRefresh(new Date());
+    };
+    const interval = setInterval(doFetch, 5000);
+    return () => { mounted = false; clearInterval(interval); };
+  }, [autoRefresh, selectedCompanyId]);
 
   const filteredLogs = logsList
     .filter((l) => typeFilter === "all" || l.type === typeFilter)
     .filter((l) => sourceFilter === "all" || l.source === sourceFilter)
     .filter((l) => {
       if (!dateFrom && !dateTo) return true;
-      const logDate = new Date(l.timestamp).getTime();
-      if (dateFrom && logDate < new Date(dateFrom).getTime()) return false;
-      if (dateTo && logDate > new Date(dateTo + "T23:59:59").getTime()) return false;
+      const logTs = new Date(l.timestamp).getTime();
+      if (isNaN(logTs)) return true;
+      if (dateFrom && logTs < new Date(dateFrom).getTime()) return false;
+      if (dateTo && logTs > new Date(dateTo + "T23:59:59").getTime()) return false;
       return true;
     })
     .filter(

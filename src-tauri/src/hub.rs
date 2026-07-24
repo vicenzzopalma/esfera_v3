@@ -1,11 +1,12 @@
 use crate::protocol::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 struct HubConnection {
     writer: Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
@@ -65,12 +66,16 @@ async fn handle_connection(
     let writer_lock = Arc::new(Mutex::new(writer));
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    let session_id = format!("sess_{}_{}", addr.port(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
+    let session_id = format!("sess_{}_{}", addr.port(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis());
     let mut authenticated = false;
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await.map_err(|e| e.to_string())?;
+        let n = match timeout(Duration::from_secs(300), reader.read_line(&mut line)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_) => return Err("Timeout de leitura no Hub".to_string()),
+        };
         if n == 0 {
             break;
         }
@@ -147,7 +152,7 @@ async fn handle_connection(
                     .map(|c| EmpresaInfo {
                         company_id: c.company_id.unwrap(),
                         company_name: c.company_name.clone().unwrap_or_default(),
-                        connected_since: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+                        connected_since: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
                     })
                     .collect();
                 let resp = HubMessage::EmpresaList { empresas };

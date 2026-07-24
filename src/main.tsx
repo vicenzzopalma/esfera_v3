@@ -5,7 +5,9 @@ import { AuthProvider } from "./context/AuthContext";
 import { ThemeProvider } from "./context/ThemeContext";
 import "./index.css";
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+const rootEl = document.getElementById("root");
+if (!rootEl) throw new Error("Elemento #root nao encontrado no DOM");
+ReactDOM.createRoot(rootEl).render(
   <React.StrictMode>
     <ThemeProvider>
       <AuthProvider>

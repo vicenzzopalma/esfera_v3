@@ -110,26 +110,34 @@ impl AdbManager {
         String::from_utf8_lossy(&buf[..len]).into_owned()
     }
 
-    /// Varredura multithread de sub-rede na porta 5555
+    /// Varredura segura de sub-rede na porta 5555 usando pool fixo de 16 threads para evitar estouro de pilha/memória
     pub fn scan_subnet(subnet_prefix: &str) -> Vec<String> {
         use std::net::TcpStream;
         use std::time::Duration;
-        use std::sync::Mutex;
-        use std::sync::Arc;
+        use std::sync::{Arc, Mutex};
 
         let active_ips = Arc::new(Mutex::new(Vec::new()));
-        let mut handles = Vec::new();
-        let prefix = if subnet_prefix.is_empty() { "192.168.1" } else { subnet_prefix.trim_end_matches('.') };
+        let prefix = if subnet_prefix.is_empty() { "192.168.1" } else { subnet_prefix.trim_end_matches('.') }.to_string();
 
-        for i in 1..=254 {
-            let ip = format!("{}.{}", prefix, i);
+        let num_workers = 16;
+        let mut handles = Vec::new();
+
+        for worker_id in 0..num_workers {
             let active_ips_clone = Arc::clone(&active_ips);
+            let prefix_clone = prefix.clone();
+
             let handle = std::thread::spawn(move || {
-                let addr = format!("{}:5555", ip);
-                if let Ok(socket_addr) = addr.parse() {
-                    if TcpStream::connect_timeout(&socket_addr, Duration::from_millis(150)).is_ok() {
-                        if let Ok(mut ips) = active_ips_clone.lock() {
-                            ips.push(ip);
+                let start = worker_id * 16 + 1;
+                let end = ((worker_id + 1) * 16).min(254);
+
+                for i in start..=end {
+                    let ip = format!("{}.{}", prefix_clone, i);
+                    let addr = format!("{}:5555", ip);
+                    if let Ok(socket_addr) = addr.parse() {
+                        if TcpStream::connect_timeout(&socket_addr, Duration::from_millis(60)).is_ok() {
+                            if let Ok(mut ips) = active_ips_clone.lock() {
+                                ips.push(ip);
+                            }
                         }
                     }
                 }
@@ -141,7 +149,7 @@ impl AdbManager {
             let _ = handle.join();
         }
 
-        let lock = active_ips.lock().unwrap();
+        let lock = active_ips.lock().unwrap_or_else(|e| e.into_inner());
         lock.clone()
     }
 
@@ -160,12 +168,20 @@ impl AdbManager {
             "dumpsys deviceidle whitelist +com.android.shell",
             "dumpsys deviceidle whitelist +com.google.android.gms",
         ];
+        let mut errors = Vec::new();
         for cmd in commands {
-            let _ = create_cmd("adb")
+            let result = create_cmd("adb")
                 .args(["-s", serial, "shell", cmd])
                 .output();
+            if let Err(e) = result {
+                errors.push(format!("{}: {}", cmd, e));
+            }
         }
-        Ok("Injeção Keep-Alive ADB persistente aplicada no celular com sucesso!".to_string())
+        if errors.is_empty() {
+            Ok("Injeção Keep-Alive ADB persistente aplicada no celular com sucesso!".to_string())
+        } else {
+            Err(format!("Alguns comandos Keep-Alive falharam: {}", errors.join("; ")))
+        }
     }
 
     /// Executa o diagnóstico avançado de hardware/processos USB & ADB
@@ -491,7 +507,7 @@ impl AdbManager {
                 )
             };
 
-            let final_bytes = if status == 0 && out_written > 0 {
+            let final_bytes = if status == 0 && out_written > 0 && out_written <= sanitized.len() {
                 &sanitized[..out_written]
             } else {
                 raw_bytes.as_slice()
@@ -550,9 +566,13 @@ impl AdbManager {
                 c => c.to_string(),
             };
 
-            let _ = create_cmd("adb")
+            let result = create_cmd("adb")
                 .args(["-s", serial, "shell", "input", "text", &ch_str])
                 .output();
+
+            if let Err(e) = result {
+                return Err(format!("Falha ao digitar caractere '{}': {}", ch, e));
+            }
         }
         Ok(())
     }
@@ -756,8 +776,16 @@ impl AdbManager {
                 .args(["-s", serial, "install", "-r", apk_path])
                 .output();
 
-            if let Err(e) = install_out {
-                return Err(format!("Falha ao injetar módulo de Câmera Virtual no Android: {}", e));
+            match install_out {
+                Ok(out) => {
+                    if !out.status.success() {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        eprintln!("Instalação do APK de câmera virtual falhou: {}", stderr.trim());
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("Falha ao injetar módulo de Câmera Virtual no Android: {}", e));
+                }
             }
         }
 
@@ -932,35 +960,27 @@ impl AdbManager {
         }
     }
 
-    /// Inicializa a Thread de Reconexão Automática Contínua com Varredura de Sub-Rede Nativas em Rust
+    /// Thread leve e eficiente (0.0% CPU) para manter conexões Wi-Fi ativas sem travar o sistema
     pub fn start_auto_reconnect_daemon(db_conn: std::sync::Arc<std::sync::Mutex<crate::db::Database>>) {
         std::thread::spawn(move || loop {
-            // Varredura multithread paralela em 150ms de toda a sub-rede 192.168.1.x na porta 5555
-            let discovered_ips = Self::scan_subnet("192.168.1");
-            for ip in &discovered_ips {
-                let target = format!("{}:5555", ip);
-                let _ = create_cmd("adb").arg("connect").arg(&target).output();
-            }
+            std::thread::sleep(std::time::Duration::from_secs(12));
 
             if let Ok(db) = db_conn.lock() {
                 let devices = db.get_devices(1);
                 for dev in devices {
-                    if dev.serial.contains(':') {
-                        let _ = create_cmd("adb")
-                            .arg("connect")
-                            .arg(&dev.serial)
-                            .output();
-                    } else if !dev.ip.is_empty() {
-                        let target = format!("{}:{}", dev.ip, dev.port);
-                        let _ = create_cmd("adb")
-                            .arg("connect")
-                            .arg(&target)
-                            .output();
+                    let target = if !dev.ip.is_empty() {
+                        format!("{}:{}", dev.ip, dev.port)
+                    } else if dev.serial.contains(':') {
+                        dev.serial.clone()
+                    } else {
+                        "".to_string()
+                    };
+
+                    if !target.is_empty() && target.contains('.') {
+                        let _ = create_cmd("adb").arg("connect").arg(&target).output();
                     }
                 }
             }
-
-            std::thread::sleep(std::time::Duration::from_secs(5));
         });
     }
 }

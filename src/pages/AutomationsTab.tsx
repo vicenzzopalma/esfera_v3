@@ -98,34 +98,43 @@ export default function AutomationsTab() {
   const [chipTargetStatus, setChipTargetStatus] = useState("restrito_24h");
 
   useEffect(() => {
-    if (!selectedCompanyId) return;
+    let mounted = true;
+    if (!selectedCompanyId) { if (mounted) setAutomationsList([]); return; }
     api<Automation[]>("get_automations", { companyId: selectedCompanyId })
-      .then((data) => setAutomationsList(data))
-      .catch(() => setAutomationsList(MOCK_AUTOMATIONS.filter((a) => a.companyId === selectedCompanyId)));
+      .then((data) => { if (mounted) setAutomationsList(data); })
+      .catch(() => { if (mounted) setAutomationsList(MOCK_AUTOMATIONS.filter((a) => a.companyId === selectedCompanyId)); });
+    return () => { mounted = false; };
   }, [selectedCompanyId]);
 
   useEffect(() => {
+    let mounted = true;
     if (selectedAutomation) {
-      setRuleName(selectedAutomation.name);
-      setTriggerType(selectedAutomation.triggerType || "keyword");
-      setActionType(selectedAutomation.actionType || "send_response");
-      setRuleKeyword(selectedAutomation.keyword);
-      setRuleResponse(selectedAutomation.response);
-      setRuleSector(selectedAutomation.sector || "junior");
-      // Parse config JSONs
+      if (mounted) {
+        setRuleName(selectedAutomation.name);
+        setTriggerType(selectedAutomation.triggerType || "keyword");
+        setActionType(selectedAutomation.actionType || "send_response");
+        setRuleKeyword(selectedAutomation.keyword);
+        setRuleResponse(selectedAutomation.response);
+        setRuleSector(selectedAutomation.sector || "junior");
+      }
       try {
         const tc = JSON.parse(selectedAutomation.triggerConfig || "{}");
-        if (tc.time) setScheduleTime(tc.time);
-        if (tc.days) setScheduleDays(tc.days);
+        if (mounted) {
+          if (tc.time) setScheduleTime(tc.time);
+          if (tc.days) setScheduleDays(tc.days);
+        }
       } catch { /* noop */ }
       try {
         const ac = JSON.parse(selectedAutomation.actionConfig || "{}");
-        if (ac.campaignId) setTargetCampaignId(String(ac.campaignId));
-        if (ac.chipStatus) setChipTargetStatus(ac.chipStatus);
+        if (mounted) {
+          if (ac.campaignId) setTargetCampaignId(String(ac.campaignId));
+          if (ac.chipStatus) setChipTargetStatus(ac.chipStatus);
+        }
       } catch { /* noop */ }
     } else {
-      resetForm();
+      if (mounted) resetForm();
     }
+    return () => { mounted = false; };
   }, [selectedAutomation, editModalOpen]);
 
   const resetForm = () => {
@@ -214,8 +223,10 @@ export default function AutomationsTab() {
       prev.map((a) => (a.id === id ? { ...a, active: newActive } : a))
     );
     try {
+      const automation = automationsList.find((a) => a.id === id);
+      if (!automation) return;
       await api("update_automation", {
-        automation: automationsList.find((a) => a.id === id),
+        automation,
       });
     } catch { /* noop */ }
   };

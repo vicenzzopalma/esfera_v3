@@ -97,10 +97,12 @@ export default function PermissionsTab() {
   }, []);
 
   useEffect(() => {
+    let mounted = true;
     if (selectedUserId) {
       loadUserPermissions(Number(selectedUserId));
-      setSaved(false);
+      if (mounted) setSaved(false);
     }
+    return () => { mounted = false; };
   }, [selectedUserId, loadUserPermissions]);
 
   const togglePermission = (key: string) => {

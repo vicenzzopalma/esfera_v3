@@ -60,10 +60,12 @@ export default function CampaignsTab() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (!selectedCompanyId) return;
+    let mounted = true;
+    if (!selectedCompanyId) { if (mounted) setCampaignsList([]); return; }
     api<Campaign[]>("get_campaigns", { companyId: selectedCompanyId })
-      .then((data) => setCampaignsList(data))
-      .catch(() => setCampaignsList(MOCK_CAMPAIGNS.filter((c) => c.companyId === selectedCompanyId)));
+      .then((data) => { if (mounted) setCampaignsList(data); })
+      .catch(() => { if (mounted) setCampaignsList(MOCK_CAMPAIGNS.filter((c) => c.companyId === selectedCompanyId)); });
+    return () => { mounted = false; };
   }, [selectedCompanyId]);
 
   const filteredCampaigns = campaignsList.filter((c) => {
@@ -645,7 +647,6 @@ function CampaignEditModal({
       delayMax: parseInt(String(delayMaxVal), 10) || 90,
       useSpintax,
       useAi: useAI,
-      useAI,
       aiModel: aiModelVal,
       aiPrompt: aiPromptVal,
       status: campaign?.status || "draft",
@@ -696,7 +697,8 @@ function CampaignEditModal({
       let resolved = text;
       const spintaxRegex = /\{([^{}]+)\}/g;
       let match;
-      while ((match = spintaxRegex.exec(resolved)) !== null) {
+      let maxIterations = 100;
+      while ((match = spintaxRegex.exec(resolved)) !== null && maxIterations-- > 0) {
         const options = match[1].split("|");
         const chosen = options[Math.floor(Math.random() * options.length)];
         resolved = resolved.replace(match[0], chosen);
@@ -874,27 +876,31 @@ function ContactsModal({
   const [contacts, setContacts] = useState<Contact[]>([]);
 
   useEffect(() => {
-    if (!isOpen || !campaign) return;
+    let mounted = true;
+    if (!isOpen || !campaign) { if (mounted) setContacts([]); return; }
     api<Contact[]>("get_campaign_contacts", { campaignId: campaign.id })
-      .then((data) => setContacts(data))
+      .then((data) => { if (mounted) setContacts(data); })
       .catch(() => {
-        setContacts([
-          {
-            id: 1,
-            name: "Maria Silva",
-            phone: "+5511999991111",
-            status: "pending" as any,
-            campaignId: campaign.id,
-          },
-          {
-            id: 2,
-            name: "João Souza",
-            phone: "+5511988882222",
-            status: "sent" as any,
-            campaignId: campaign.id,
-          },
-        ]);
+        if (mounted) {
+          setContacts([
+            {
+              id: 1,
+              name: "Maria Silva",
+              phone: "+5511999991111",
+              status: "pending" as any,
+              campaignId: campaign.id,
+            },
+            {
+              id: 2,
+              name: "João Souza",
+              phone: "+5511988882222",
+              status: "sent" as any,
+              campaignId: campaign.id,
+            },
+          ]);
+        }
       });
+    return () => { mounted = false; };
   }, [isOpen, campaign]);
 
   const pendingCount = contacts.filter((c) => c.status === "pending").length;

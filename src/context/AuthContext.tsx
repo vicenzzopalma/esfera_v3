@@ -112,6 +112,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     try {
       const res = await api<{ token: string; user: User }>("login", { username, password });
+      if (!res || !res.token || !res.user) {
+        setError("Resposta inválida do servidor");
+        return false;
+      }
       setToken(res.token);
       saveToStorage(STORAGE_KEY_TOKEN, res.token);
       setUser(res.user);

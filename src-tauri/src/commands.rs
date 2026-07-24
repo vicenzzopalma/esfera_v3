@@ -1020,99 +1020,69 @@ pub fn link_usb_to_wireless(
 
 #[tauri::command]
 pub fn force_reconnect_all_adb(state: State<'_, AppState>) -> Result<String, String> {
-    let discovered_ips = AdbManager::scan_subnet("192.168.1");
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let devices = db.get_devices(1);
     let mut reconnected = Vec::new();
 
-    for ip in &discovered_ips {
-        let target = format!("{}:5555", ip);
-        let output = crate::adb_manager::create_cmd("adb")
-            .arg("connect")
-            .arg(&target)
-            .output();
-        if let Ok(out) = output {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if s.contains("connected") {
-                reconnected.push(format!("✓ {}", target));
-            }
-        }
-    }
+    for dev in devices {
+        let target = if !dev.ip.is_empty() {
+            format!("{}:5555", dev.ip)
+        } else if dev.serial.contains(':') {
+            dev.serial.clone()
+        } else {
+            "".to_string()
+        };
 
-    // Atualiza o banco de dados com a lista de dispositivos ativos detectados
-    if let Ok(db) = state.db.lock() {
-        let active_devices = AdbManager::list_devices().unwrap_or_default();
-        for dev in active_devices {
-            if dev.serial.contains(':') {
-                let ip_parts: Vec<&str> = dev.serial.split(':').collect();
-                if ip_parts.len() >= 2 {
-                    let ip = ip_parts[0];
-                    let (brand, model) = AdbManager::get_device_info(&dev.serial);
-                    let device_obj = Device {
-                        id: 0,
-                        serial: dev.serial.clone(),
-                        name: format!("Aparelho {}", model),
-                        brand,
-                        model,
-                        ip: ip.to_string(),
-                        port: 5555,
-                        status: "online".to_string(),
-                        battery: 100,
-                        company_id: 1,
-                        device_number: 1,
-                        sector: "junior".to_string(),
-                    };
-                    let _ = db.upsert_device(&device_obj);
+        if !target.is_empty() && target.contains('.') {
+            let output = crate::adb_manager::create_cmd("adb")
+                .arg("connect")
+                .arg(&target)
+                .output();
+            if let Ok(out) = output {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if s.contains("connected") {
+                    reconnected.push(format!("✓ {} ({})", dev.model, target));
                 }
             }
         }
     }
 
     if reconnected.is_empty() {
-        Ok(format!(
-            "Varredura de rede (192.168.1.x) concluída! {} IPs encontrados com ADB ativo.",
-            discovered_ips.len()
-        ))
+        Ok("Disparada reconexão via Wi-Fi para todos os celulares salvos!".to_string())
     } else {
-        Ok(format!(
-            "⚡ Varredura e Reconexão Wi-Fi com Auto-Cura de IP Concluída:\n{}",
-            reconnected.join("\n")
-        ))
+        Ok(format!("⚡ Reconexão Wi-Fi Concluída:\n{}", reconnected.join("\n")))
     }
 }
 
 #[tauri::command]
-pub fn inject_all_devices_immunity(state: State<'_, AppState>) -> Result<String, String> {
-    let mut results = Vec::new();
-
+pub fn inject_all_devices_immunity() -> Result<String, String> {
     let active_devices = AdbManager::list_devices().unwrap_or_default();
-    for dev in active_devices {
-        if let Ok(_) = AdbManager::inject_device_immunity(&dev.serial) {
-            results.push(format!("✓ {}", dev.serial));
-        }
+    let online_devices: Vec<_> = active_devices.into_iter().filter(|d| d.state == "device").collect();
+    let count = online_devices.len();
+
+    if count == 0 {
+        return Ok("Nenhum celular online detectado via ADB no momento. Conecte via cabo USB ou Wi-Fi e tente novamente.".to_string());
     }
 
-    if let Ok(db) = state.db.lock() {
-        let db_devs = db.get_devices(1);
-        for dev in db_devs {
-            if !dev.serial.is_empty() && !results.iter().any(|r| r.contains(&dev.serial)) {
-                let _ = AdbManager::inject_device_immunity(&dev.serial);
-                results.push(format!("✓ {} ({})", dev.model, dev.serial));
-            }
+    std::thread::spawn(move || {
+        for dev in online_devices {
+            let _ = AdbManager::inject_device_immunity(&dev.serial);
         }
-    }
+    });
 
-    if results.is_empty() {
-        Ok("Nenhum celular ativo detectado no momento para injeção. Conecte via cabo USB ou Wi-Fi e tente novamente.".to_string())
-    } else {
-        Ok(format!(
-            "🛡️ INJEÇÃO GERAL DE IMUNIDADE & MAC FÍSICO CONCLUÍDA!\nForçada a identificação nativa e porta 5555 fixa em {} celulares.",
-            results.len()
-        ))
-    }
+    Ok(format!(
+        "🛡️ Injeção de Imunidade e MAC Físico iniciada em segundo plano para {} celulares online!",
+        count
+    ))
 }
 
 #[tauri::command]
 pub fn inject_single_device_immunity(serial: String) -> Result<String, String> {
-    AdbManager::inject_device_immunity(&serial)
+    let s = serial.clone();
+    std::thread::spawn(move || {
+        let _ = AdbManager::inject_device_immunity(&s);
+    });
+    Ok(format!("🛡️ Injeção de Imunidade enviada em segundo plano para {}!", serial))
 }
 
 #[tauri::command]
@@ -1305,7 +1275,7 @@ pub fn rewrite_message_ai(message: String, contact_name: String) -> Result<Strin
     use std::time::{SystemTime, UNIX_EPOCH};
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as usize;
 
     let hour_text = {

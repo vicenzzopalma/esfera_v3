@@ -103,8 +103,10 @@ export default function DevicesTab() {
 
   // Busca dispositivos ADB nativos em tempo real do Tauri
   const refreshDevices = useCallback(() => {
+    let mounted = true;
     api<Device[]>("get_devices", { companyId: effectiveCompanyId })
       .then((data) => {
+        if (!mounted) return;
         if (data && Array.isArray(data) && data.length > 0) {
           setDevicesList(data);
         } else if (data && Array.isArray(data)) {
@@ -112,34 +114,41 @@ export default function DevicesTab() {
         }
       })
       .catch((err) => {
-        console.warn("Retorno temporário de IPC para get_devices:", err);
+        if (mounted) console.warn("Retorno temporário de IPC para get_devices:", err);
       });
+    return () => { mounted = false; };
   }, [effectiveCompanyId]);
 
   useEffect(() => {
+    let mounted = true;
     refreshDevices();
-    const interval = setInterval(refreshDevices, 5000);
-    return () => clearInterval(interval);
+    const interval = setInterval(() => { if (mounted) refreshDevices(); }, 5000);
+    return () => { mounted = false; clearInterval(interval); };
   }, [refreshDevices]);
 
   const fetchUsbDevices = async () => {
+    let mounted = true;
     setLoadingUsb(true);
     setLinkingStatus(null);
     try {
       const data = await api<any[]>("list_usb_devices");
-      setUsbDevices(data || []);
+      if (mounted) setUsbDevices(data || []);
     } catch (err) {
-      console.warn("Falha ao buscar dispositivos ADB nativos:", err);
-      setUsbDevices([]);
+      if (mounted) {
+        console.warn("Falha ao buscar dispositivos ADB nativos:", err);
+        setUsbDevices([]);
+      }
     } finally {
-      setLoadingUsb(false);
+      if (mounted) setLoadingUsb(false);
     }
+    return () => { mounted = false; };
   };
 
   useEffect(() => {
-    if (connectModalOpen && connectTab === "usb") {
-      fetchUsbDevices();
-    }
+    if (!connectModalOpen || connectTab !== "usb") return;
+    let mounted = true;
+    fetchUsbDevices();
+    return () => { mounted = false; };
   }, [connectModalOpen, connectTab]);
 
   const handleForceWirelessAdb = async (serial: string, deviceNumber: number, sector: string, deviceName: string) => {
@@ -817,30 +826,35 @@ export default function DevicesTab() {
                   </div>
                 ) : (
                   <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
-                    {usbDevices.map((dev) => (
-                      <div key={dev.serial} className="flex items-center justify-between p-3.5 rounded-xl bg-white/5 border border-border">
+                    {usbDevices.map((dev) => {
+                      const safeSerial = String(dev.serial || '');
+                      const safeModel = String(dev.model || 'Aparelho Android');
+                      const safeState = String(dev.state || '');
+                      return (
+                      <div key={safeSerial} className="flex items-center justify-between p-3.5 rounded-xl bg-white/5 border border-border">
                         <div>
-                          <p className="font-semibold text-primary">{dev.model || "Aparelho Android"}</p>
+                          <p className="font-semibold text-primary">{safeModel}</p>
                           <p className="text-[10px] text-tertiary font-mono">
-                            {dev.serial.includes(":") ? "🟢 IP Wi-Fi: " : "🔌 Cabo USB: "}
-                            {dev.serial} | Estado: {dev.state}
+                            {safeSerial.includes(":") ? "🟢 IP Wi-Fi: " : "🔌 Cabo USB: "}
+                            {safeSerial} | Estado: {safeState}
                           </p>
                         </div>
                         <Button
                           size="sm"
                           onClick={() => {
-                            if (dev.serial.includes(":")) {
-                              const ipOnly = dev.serial.split(":")[0];
+                            if (safeSerial.includes(":")) {
+                              const ipOnly = safeSerial.split(":")[0];
                               prepareDeviceSetup({ ip: ipOnly, port: 5555 });
                             } else {
-                              prepareDeviceSetup({ serial: dev.serial });
+                              prepareDeviceSetup({ serial: safeSerial });
                             }
                           }}
                         >
-                          {dev.serial.includes(":") ? "Sincronizar" : "Vincular via Wi-Fi"}
+                          {safeSerial.includes(":") ? "Sincronizar" : "Vincular via Wi-Fi"}
                         </Button>
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>

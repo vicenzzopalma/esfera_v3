@@ -16,27 +16,29 @@ export default function StatusBar() {
   const [totalCount, setTotalCount] = useState(0);
 
   useEffect(() => {
+    let mounted = true;
     if (!selectedCompanyId) {
-      setCompany(null);
-      setOnlineCount(0);
-      setTotalCount(0);
+      if (mounted) { setCompany(null); setOnlineCount(0); setTotalCount(0); }
       return;
     }
 
     api<Company[]>("get_companies")
       .then((data) => {
+        if (!mounted) return;
         const found = (data || []).find((c) => c.id === selectedCompanyId);
         setCompany(found || null);
       })
-      .catch(() => setCompany(null));
+      .catch(() => { if (mounted) setCompany(null); });
 
     api<Device[]>("get_devices", { companyId: selectedCompanyId })
       .then((data) => {
+        if (!mounted) return;
         const devices = data || [];
         setTotalCount(devices.length);
         setOnlineCount(devices.filter((d) => d.status === "online").length);
       })
-      .catch(() => { setOnlineCount(0); setTotalCount(0); });
+      .catch(() => { if (mounted) { setOnlineCount(0); setTotalCount(0); } });
+    return () => { mounted = false; };
   }, [selectedCompanyId]);
 
   return (

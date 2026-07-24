@@ -54,22 +54,24 @@ export default function Header() {
 
   const selectedCompany = companies.find((c) => c.id === selectedCompanyId);
 
-  // Carregar empresas do backend
   useEffect(() => {
+    let mounted = true;
     api<Company[]>("get_companies")
-      .then((data) => setCompanies(data || []))
-      .catch(() => setCompanies([]));
+      .then((data) => { if (mounted) setCompanies(data || []); })
+      .catch(() => { if (mounted) setCompanies([]); });
+    return () => { mounted = false; };
   }, []);
 
-  // Carregar contagem de dispositivos online
   useEffect(() => {
-    if (!selectedCompanyId) { setOnlineDevicesCount(0); return; }
+    let mounted = true;
+    if (!selectedCompanyId) { if (mounted) setOnlineDevicesCount(0); return; }
     api<Device[]>("get_devices", { companyId: selectedCompanyId })
       .then((data) => {
         const online = (data || []).filter((d) => d.status === "online").length;
-        setOnlineDevicesCount(online);
+        if (mounted) setOnlineDevicesCount(online);
       })
-      .catch(() => setOnlineDevicesCount(0));
+      .catch(() => { if (mounted) setOnlineDevicesCount(0); });
+    return () => { mounted = false; };
   }, [selectedCompanyId]);
 
   // Bug 7: Fechar dropdowns ao clicar fora
