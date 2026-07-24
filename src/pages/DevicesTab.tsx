@@ -383,6 +383,24 @@ export default function DevicesTab() {
 
           <Button
             variant="secondary"
+            onClick={async () => {
+              try {
+                const msg = await api<string>("force_reconnect_all_adb", {});
+                alert(msg);
+                refreshDevices();
+              } catch (e: any) {
+                alert(typeof e === "string" ? e : e?.message || "Erro ao forçar reconexão.");
+              }
+            }}
+            icon={<Zap size={14} className="text-amber-400" />}
+            className="bg-amber-950/60 hover:bg-amber-900 border-amber-600/50 text-amber-200 rounded-xl text-xs font-extrabold shadow-lg"
+            title="Dispara comando de reconexão forçada Wi-Fi para todos os 8 celulares ativados"
+          >
+            ⚡ Forçar Reconexão Wi-Fi
+          </Button>
+
+          <Button
+            variant="secondary"
             onClick={refreshDevices}
             icon={<RefreshCw size={14} className="text-emerald-400" />}
             className="bg-slate-900 hover:bg-slate-800 border-slate-700 text-slate-200 rounded-xl text-xs font-bold"

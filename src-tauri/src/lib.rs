@@ -222,6 +222,7 @@ pub fn run() {
             list_usb_devices,
             link_usb_to_wireless,
             force_enable_wireless_adb,
+            force_reconnect_all_adb,
             pair_and_connect_adb_device,
             run_adb_diagnostic,
             restart_adb_server,
