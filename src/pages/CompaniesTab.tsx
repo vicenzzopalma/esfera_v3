@@ -40,15 +40,18 @@ export default function CompaniesTab() {
   const [editActive, setEditActive] = useState(true);
 
   useEffect(() => {
+    let mounted = true;
     api<Company[]>("get_companies")
       .then((data) => {
+        if (!mounted) return;
         if (data && data.length > 0) {
           setCompaniesList(data);
         } else {
           setCompaniesList(MOCK_COMPANIES);
         }
       })
-      .catch(() => setCompaniesList(MOCK_COMPANIES));
+      .catch(() => { if (mounted) setCompaniesList(MOCK_COMPANIES); });
+    return () => { mounted = false; };
   }, []);
 
   const filteredCompanies = companiesList.filter((c) =>

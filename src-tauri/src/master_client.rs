@@ -3,6 +3,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
 
 pub struct MasterClient {
     writer: Mutex<tokio::io::BufWriter<OwnedWriteHalf>>,
@@ -61,7 +62,11 @@ impl MasterClient {
     pub async fn read_one(&self) -> Result<HubMessage, String> {
         let mut reader = self.reader.lock().await;
         let mut line = String::new();
-        reader.read_line(&mut line).await.map_err(|e| e.to_string())?;
+        match timeout(Duration::from_secs(300), reader.read_line(&mut line)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_) => return Err("Timeout de leitura no MasterClient".to_string()),
+        }
         if line.trim().is_empty() {
             return Err("Conexão com Hub perdida.".to_string());
         }
@@ -89,7 +94,7 @@ impl MasterClient {
             args,
             id: format!("cmd_{}", std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis()),
         };
         self.send_raw(&msg).await?;

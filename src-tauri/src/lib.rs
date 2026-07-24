@@ -29,7 +29,9 @@ use tokio::sync::Mutex as TokioMutex;
 fn get_db_path() -> String {
     if let Some(mut dir) = std::env::var_os("APPDATA").map(PathBuf::from) {
         dir.push("esfera_v3");
-        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("Aviso: nao foi possivel criar diretorio do banco: {}", e);
+        }
         dir.push("esfera_v3.db");
         return dir.to_string_lossy().to_string();
     }
@@ -39,7 +41,13 @@ fn get_db_path() -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let db_path = get_db_path();
-    let db = Database::init(&db_path).expect("Falha ao inicializar banco SQLite esfera_v3.db");
+    let db = match Database::init(&db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("FATAL: Nao foi possivel abrir o banco SQLite: {}", e);
+            std::process::exit(1);
+        }
+    };
     let db_arc = Arc::new(Mutex::new(db));
 
     let db_arc_clone = Arc::clone(&db_arc);
@@ -52,7 +60,13 @@ pub fn run() {
         let db_for_server = db_arc.clone();
         let port = app_config.empresa_server_port;
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Falha ao criar runtime tokio para empresa server: {}", e);
+                    return;
+                }
+            };
             if let Err(e) = rt.block_on(empresa_server::EmpresaServer::start(db_for_server, port)) {
                 eprintln!("Empresa Server error: {}", e);
             }
@@ -65,11 +79,20 @@ pub fn run() {
         let db_for_hub = db_arc.clone();
         let hub_addr = app_config.hub_address.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Falha ao criar runtime tokio para hub empresa: {}", e);
+                    return;
+                }
+            };
             rt.block_on(async move {
                 let company_id = {
-                    let db = db_for_hub.lock().unwrap();
-                    db.get_companies().first().map(|c| c.id).unwrap_or(1)
+                    if let Ok(db) = db_for_hub.lock() {
+                        db.get_companies().first().map(|c| c.id).unwrap_or(1)
+                    } else {
+                        1
+                    }
                 };
                 let company_name = format!("Empresa_{}", company_id);
                 let mut backoff = 1;
@@ -115,7 +138,13 @@ pub fn run() {
         let hub_addr = app_config.hub_address.clone();
         let mc = master_client.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Falha ao criar runtime tokio para master client: {}", e);
+                    return;
+                }
+            };
             rt.block_on(async move {
                 let mut backoff = 1;
                 loop {
@@ -141,7 +170,7 @@ pub fn run() {
         println!("Master Client conectando a {}...", app_config.hub_address);
     }
 
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             let caps = adb_manager::AdbManager::get_hardware_capabilities();
@@ -260,6 +289,8 @@ pub fn run() {
             get_app_config,
             save_app_config,
         ])
-        .run(tauri::generate_context!())
-        .expect("Erro ao iniciar aplicação Esfera v3");
+        .run(tauri::generate_context!());
+    if let Err(e) = result {
+        eprintln!("Erro ao iniciar aplicação Esfera v3: {}", e);
+    }
 }

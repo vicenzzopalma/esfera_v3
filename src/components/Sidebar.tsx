@@ -131,9 +131,11 @@ export default function Sidebar() {
 
   const [companies, setCompanies] = useState<Company[]>([]);
   useEffect(() => {
+    let mounted = true;
     api<Company[]>("get_companies")
-      .then((data) => setCompanies(data || []))
-      .catch(() => setCompanies([]));
+      .then((data) => { if (mounted) setCompanies(data || []); })
+      .catch(() => { if (mounted) setCompanies([]); });
+    return () => { mounted = false; };
   }, []);
 
   const selectedCompany = companies.find((c) => c.id === selectedCompanyId);

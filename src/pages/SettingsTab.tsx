@@ -75,25 +75,28 @@ export default function SettingsTab() {
 
   // Load AI config
   useEffect(() => {
-    if (!selectedCompanyId) return;
+    let mounted = true;
+    if (!selectedCompanyId) { if (mounted) return; return; }
     api<AiConfig>("get_ai_config", { companyId: selectedCompanyId })
       .then((cfg) => {
-        if (cfg) {
-          setAiProvider(cfg.provider || "ollama_local");
-          setAiEndpoint(cfg.endpoint || "http://localhost:11434");
-          setAiModel(cfg.model || "llama3.2");
-          setAiTemperature(cfg.temperature || 0.7);
-          setAiApiKey(cfg.apiKey || "");
-          setAiSystemPrompt(cfg.systemPrompt || "");
-        }
+        if (!mounted || !cfg) return;
+        setAiProvider(cfg.provider || "ollama_local");
+        setAiEndpoint(cfg.endpoint || "http://localhost:11434");
+        setAiModel(cfg.model || "llama3.2");
+        setAiTemperature(cfg.temperature || 0.7);
+        setAiApiKey(cfg.apiKey || "");
+        setAiSystemPrompt(cfg.systemPrompt || "");
       })
       .catch(() => {});
+    return () => { mounted = false; };
   }, [selectedCompanyId]);
 
   // Load app config
   useEffect(() => {
+    let mounted = true;
     api<AppConfig>("get_app_config")
       .then((cfg) => {
+        if (!mounted || !cfg) return;
         setHubEnabled(cfg.hub_enabled);
         setHubAddress(cfg.hub_address);
         setEmpresaServerEnabled(cfg.empresa_server_enabled);
@@ -101,6 +104,7 @@ export default function SettingsTab() {
         setAppMode(cfg.mode);
       })
       .catch(() => {});
+    return () => { mounted = false; };
   }, []);
 
   const handleSaveAll = async () => {
