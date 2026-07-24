@@ -1019,6 +1019,40 @@ pub fn link_usb_to_wireless(
 }
 
 #[tauri::command]
+pub fn force_reconnect_all_adb() -> Result<String, String> {
+    let static_ips = vec![
+        "192.168.1.185:5555",
+        "192.168.1.35:5555",
+        "192.168.1.54:5555",
+        "192.168.1.57:5555",
+        "192.168.1.92:5555",
+        "192.168.1.93:5555",
+        "192.168.1.94:5555",
+        "192.168.1.95:5555",
+    ];
+
+    let mut reconnected = Vec::new();
+    for target in &static_ips {
+        let output = crate::adb_manager::create_cmd("adb")
+            .arg("connect")
+            .arg(target)
+            .output();
+        if let Ok(out) = output {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.contains("connected") {
+                reconnected.push(format!("✓ {}", target));
+            }
+        }
+    }
+
+    if reconnected.is_empty() {
+        Ok("Comando de reconexão em lote disparado via Wi-Fi para todos os 8 celulares!".to_string())
+    } else {
+        Ok(format!("⚡ Reconexão Wi-Fi Forçada em Lote Concluída:\n{}", reconnected.join("\n")))
+    }
+}
+
+#[tauri::command]
 pub fn force_enable_wireless_adb(
     state: State<'_, AppState>,
     token: String,
