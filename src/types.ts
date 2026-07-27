@@ -3,7 +3,7 @@
 // Fase 1: Novos tipos para chips, contatos, permissões, IA
 // ============================================================
 
-export type Role = "master" | "gestor" | "colaborador";
+export type Role = "master" | "gestor" | "supervisor" | "colaborador";
 
 export interface User {
   id: number;
@@ -12,6 +12,39 @@ export interface User {
   role: Role;
   companyId: number | null;
   avatar?: string;
+}
+
+export interface DeviceAssignment {
+  assignmentId: number;
+  adbDeviceId: string;
+  userId: number;
+  createdAt: string;
+}
+
+export type PermissionRequestStatus = "pending" | "approved" | "rejected" | "active" | "ended";
+
+export interface DevicePermissionRequest {
+  requestId: number;
+  adbDeviceId: string;
+  userId: number;
+  userName?: string;
+  userDisplayName?: string;
+  status: PermissionRequestStatus;
+  requestedReason?: string;
+  requestedAt: string;
+  approvedBy?: number;
+  approvedByName?: string;
+  approvedAt?: string;
+  endedAt?: string;
+}
+
+export interface DeviceWithActiveUser extends Device {
+  activeUserId?: number;
+  activeUserName?: string;
+  activeUserDisplayName?: string;
+  permissionRequestId?: number;
+  assignedUserId?: number;
+  assignedUserName?: string;
 }
 
 export interface Company {

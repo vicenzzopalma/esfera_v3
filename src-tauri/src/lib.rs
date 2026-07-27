@@ -6,6 +6,7 @@
 
 mod adb_manager;
 mod ai_engine;
+mod checkin_server;
 mod commands;
 pub mod config;
 mod db;
@@ -152,6 +153,15 @@ pub fn run() {
             println!("[Esfera v3 HPC Engine] HWID: {}", hwid);
             println!("[Esfera v3 HPC Engine] CPU Hardware Dispatch -> AVX2: {}, AVX-512: {}, SSE4.2: {}", caps.supports_avx2, caps.supports_avx512, caps.supports_sse42);
 
+            let handle = app.handle().clone();
+            if app_config.checkin_server_enabled {
+                let db = db_arc_clone.clone();
+                let port = app_config.checkin_server_port;
+                tauri::async_runtime::spawn(async move {
+                    checkin_server::start(db, port, handle).await;
+                });
+            }
+
             dispatcher::Dispatcher::start_worker(db_arc_clone.clone(), Some(app.handle().clone()));
             dispatcher::Dispatcher::start_persistent_adb_keepalive_loop(db_arc_clone.clone());
             adb_manager::AdbManager::start_auto_reconnect_daemon(db_arc_clone);
@@ -259,6 +269,19 @@ pub fn run() {
             rewrite_message_ai,
             // Hub / Master
             hub_invoke,
+            // Users & Roles
+            get_users,
+            create_user,
+            // Device Assignments & Permissions
+            assign_device_to_user,
+            unassign_device_from_user,
+            get_assigned_devices_for_user,
+            request_device_access,
+            get_device_permission_requests,
+            approve_device_access,
+            reject_device_access,
+            end_device_access,
+            get_devices_with_active_user_map,
             // Config
             get_app_config,
             save_app_config,

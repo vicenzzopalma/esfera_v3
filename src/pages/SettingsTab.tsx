@@ -1,6 +1,7 @@
 // ============================================================
-// Esfera v3 — Settings Tab Completo
+// Esfera v3 — Settings Tab (UI/UX Refatorado)
 // Configurações da Empresa, IA, Dispatch, ADB e Segurança
+// Layout com Menu Lateral Interno e Espaçamento Aprimorado
 // ============================================================
 
 import { useState, useEffect } from "react";
@@ -24,8 +25,13 @@ import {
   Wifi,
 } from "lucide-react";
 
+type SettingsSection = "geral" | "notificacoes" | "adb" | "dispatch" | "ia" | "hub" | "seguranca";
+
 export default function SettingsTab() {
   const { selectedCompanyId } = useAuth();
+  
+  // Controle de Navegação Interna
+  const [activeSection, setActiveSection] = useState<SettingsSection>("geral");
 
   // General
   const [companyName, setCompanyName] = useState("REALESS RM COBRANÇAS");
@@ -128,7 +134,7 @@ export default function SettingsTab() {
         empresa_server_port: empresaServerPort,
         mode: appMode,
       });
-      setHubStatus("Configurações salvas. Reinicie o app para aplicar alterações de rede.");
+      setHubStatus("Configurações salvas. Reinicie o app para aplicar alterações.");
     } catch { /* noop */ }
   };
 
@@ -145,219 +151,279 @@ export default function SettingsTab() {
     }
   };
 
+  const menuItems = [
+    { id: "geral", label: "Informações Gerais", icon: <Globe size={18} /> },
+    { id: "notificacoes", label: "Notificações", icon: <Bell size={18} /> },
+    { id: "adb", label: "Rede & ADB", icon: <Smartphone size={18} /> },
+    { id: "dispatch", label: "Motor de Disparos", icon: <Zap size={18} /> },
+    { id: "ia", label: "Inteligência Artificial", icon: <Brain size={18} /> },
+    { id: "hub", label: "Conexão Hub", icon: <Wifi size={18} /> },
+    { id: "seguranca", label: "Segurança", icon: <Shield size={18} /> },
+  ] as const;
+
   return (
-    <div className="space-y-6 animate-fade-in max-w-4xl">
-      {/* Header */}
+    <div className="flex flex-col h-full space-y-6 animate-fade-in max-w-6xl mx-auto">
+      {/* Header Superior */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl font-bold text-primary tracking-tight">Configurações</h2>
-          <p className="text-xs text-tertiary mt-0.5">
-            Preferências da empresa, IA, dispatch e segurança.
+          <h2 className="text-2xl font-bold text-primary tracking-tight">Configurações do Sistema</h2>
+          <p className="text-sm text-tertiary mt-1">
+            Personalize preferências, parâmetros de envio, IA e segurança.
           </p>
         </div>
-        <Button icon={<Save size={16} />} onClick={handleSaveAll}>
-          Salvar Tudo
+        <Button icon={<Save size={18} />} onClick={handleSaveAll} className="px-6 py-2.5">
+          Salvar Alterações
         </Button>
       </div>
 
-      {/* === GERAL === */}
-      <Card>
-        <SectionHeader icon={<Globe size={18} />} color="violet" title="Informações Gerais" subtitle="Identificação da empresa e fuso horário" />
-        <div className="space-y-4 text-xs">
-          <div>
-            <label className="block font-semibold text-secondary mb-1">Nome da Empresa</label>
-            <input type="text" value={companyName} onChange={(e) => setCompanyName(e.target.value)} className="w-full input-setting" />
-          </div>
-          <div>
-            <label className="block font-semibold text-secondary mb-1">Fuso Horário</label>
-            <select value={timezone} onChange={(e) => setTimezone(e.target.value)} className="w-full input-setting">
-              <option value="America/Sao_Paulo">América/São Paulo (GMT-3)</option>
-              <option value="America/Manaus">América/Manaus (GMT-4)</option>
-              <option value="America/Fortaleza">América/Fortaleza (GMT-3)</option>
-            </select>
-          </div>
-        </div>
-      </Card>
+      <div className="flex flex-col md:flex-row gap-8 items-start">
+        {/* Menu Lateral Esquerdo */}
+        <aside className="w-full md:w-64 shrink-0 glass-panel p-4 rounded-2xl flex flex-col gap-1">
+          {menuItems.map((item) => (
+            <button
+              key={item.id}
+              onClick={() => setActiveSection(item.id as SettingsSection)}
+              className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium transition-all ${
+                activeSection === item.id
+                  ? "bg-violet-600/20 text-violet-400 border border-violet-500/30"
+                  : "text-tertiary hover:bg-white/5 hover:text-primary"
+              }`}
+            >
+              {item.icon}
+              {item.label}
+            </button>
+          ))}
+        </aside>
 
-      {/* === NOTIFICAÇÕES === */}
-      <Card>
-        <SectionHeader icon={<Bell size={18} />} color="blue" title="Notificações & Alertas" subtitle="Alertas em tempo real do sistema" />
-        <div className="space-y-3">
-          <ToggleRow label="Alertas do Sistema" desc="Avisos quando dispositivo desconectar" checked={notifications} onChange={setNotifications} />
-          <ToggleRow label="Alerta de Bateria Baixa" desc="Avisar se bateria < 20%" checked={batteryAlert} onChange={setBatteryAlert} />
-          <ToggleRow label="Alerta de Ban Detectado" desc="Notificar quando chip for banido" checked={banAlert} onChange={setBanAlert} />
-          <ToggleRow label="Alerta de Disparo" desc="Notificar ao completar lote de envio" checked={dispatchAlert} onChange={setDispatchAlert} />
-        </div>
-      </Card>
-
-      {/* === ADB & REDE === */}
-      <Card>
-        <SectionHeader icon={<Smartphone size={18} />} color="emerald" title="Conexão ADB & Redes" subtitle="Parâmetros de comunicação wireless" />
-        <div className="space-y-4 text-xs">
-          <ToggleRow label="Reconexão Automática" desc="Tentar reconectar aparelhos offline" checked={autoReconnect} onChange={setAutoReconnect} />
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block font-semibold text-secondary mb-1">Intervalo de Ping (seg)</label>
-              <input type="number" value={pingInterval} onChange={(e) => setPingInterval(parseInt(e.target.value) || 30)} min={5} max={300} className="w-full input-setting font-mono" />
-            </div>
-            <div>
-              <label className="block font-semibold text-secondary mb-1">Max Tentativas (device)</label>
-              <input type="number" value={maxRetries} onChange={(e) => setMaxRetries(parseInt(e.target.value) || 3)} min={1} max={10} className="w-full input-setting font-mono" />
-            </div>
-          </div>
-          <div>
-            <label className="block font-semibold text-secondary mb-1">PIN de Desbloqueio (opcional)</label>
-            <input type="password" value={unlockPin} onChange={(e) => setUnlockPin(e.target.value)} placeholder="Ex: 1234" className="w-full input-setting font-mono" />
-          </div>
-        </div>
-      </Card>
-
-      {/* === DISPATCH === */}
-      <Card>
-        <SectionHeader icon={<Zap size={18} />} color="amber" title="Motor de Disparos" subtitle="Delays, retry e humanização dos envios" />
-        <div className="space-y-4 text-xs">
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block font-semibold text-secondary mb-1">Delay Mínimo (seg)</label>
-              <input type="number" value={delayMin} onChange={(e) => setDelayMin(parseInt(e.target.value) || 30)} min={5} max={300} className="w-full input-setting font-mono" />
-            </div>
-            <div>
-              <label className="block font-semibold text-secondary mb-1">Delay Máximo (seg)</label>
-              <input type="number" value={delayMax} onChange={(e) => setDelayMax(parseInt(e.target.value) || 90)} min={10} max={600} className="w-full input-setting font-mono" />
-            </div>
-          </div>
-          <div>
-            <label className="block font-semibold text-secondary mb-1">Tamanho do Lote (contatos por vez)</label>
-            <input type="number" value={batchSize} onChange={(e) => setBatchSize(parseInt(e.target.value) || 5)} min={1} max={50} className="w-full input-setting font-mono" />
-          </div>
-          <ToggleRow label="Humanização de Delay" desc="Usar distribuição Gaussiana ao invés de delay fixo" checked={humanizeDelay} onChange={setHumanizeDelay} />
-          <ToggleRow label="Retry em Falha" desc="Tentar novamente contato que falhou" checked={retryOnFail} onChange={setRetryOnFail} />
-          {retryOnFail && (
-            <div className="pl-4 border-l-2 border-amber-500/30">
-              <label className="block font-semibold text-secondary mb-1">Máximo de Retries por Contato</label>
-              <input type="number" value={maxRetriesDispatch} onChange={(e) => setMaxRetriesDispatch(parseInt(e.target.value) || 2)} min={1} max={5} className="w-32 input-setting font-mono" />
-            </div>
-          )}
-        </div>
-      </Card>
-
-      {/* === IA === */}
-      <Card>
-        <SectionHeader icon={<Brain size={18} />} color="violet" title="Configuração de IA" subtitle="Provedor, modelo e parâmetros de geração" />
-        <div className="space-y-4 text-xs">
-          <div>
-            <label className="block font-semibold text-secondary mb-1">Provedor</label>
-            <select value={aiProvider} onChange={(e) => setAiProvider(e.target.value)} className="w-full input-setting">
-              <option value="ollama_local">Ollama Local</option>
-              <option value="ollama_cloud">Ollama Cloud</option>
-              <option value="openai">OpenAI (GPT)</option>
-              <option value="anthropic">Anthropic (Claude)</option>
-            </select>
-          </div>
-          <div>
-            <label className="block font-semibold text-secondary mb-1">Endpoint</label>
-            <input type="text" value={aiEndpoint} onChange={(e) => setAiEndpoint(e.target.value)} className="w-full input-setting font-mono" />
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block font-semibold text-secondary mb-1">Modelo</label>
-              <input type="text" value={aiModel} onChange={(e) => setAiModel(e.target.value)} className="w-full input-setting font-mono" />
-            </div>
-            <div>
-              <label className="block font-semibold text-secondary mb-1">Temperatura ({aiTemperature})</label>
-              <input type="range" min="0" max="1" step="0.1" value={aiTemperature} onChange={(e) => setAiTemperature(parseFloat(e.target.value))} className="w-full mt-2 accent-violet-500" />
-            </div>
-          </div>
-          <div>
-            <label className="block font-semibold text-secondary mb-1">API Key (opcional para local)</label>
-            <input type="password" value={aiApiKey} onChange={(e) => setAiApiKey(e.target.value)} placeholder="sk-..." className="w-full input-setting font-mono" />
-          </div>
-          <div>
-            <label className="block font-semibold text-secondary mb-1">System Prompt</label>
-            <textarea value={aiSystemPrompt} onChange={(e) => setAiSystemPrompt(e.target.value)} rows={3} className="w-full input-setting resize-none" />
-          </div>
-          <div className="flex items-center gap-3 pt-1">
-            <Button size="sm" variant="secondary" icon={<RotateCcw size={13} />} onClick={handleTestAI}>
-              Testar IA
-            </Button>
-            {aiTestResult && (
-              <div className="flex-1 p-2.5 rounded-xl bg-violet-600/10 border border-violet-500/20 text-violet-200 text-xs font-mono">
-                {aiTestResult}
+        {/* Área de Conteúdo (Direita) */}
+        <main className="flex-1 w-full">
+          <Card className="p-8">
+            {activeSection === "geral" && (
+              <div className="space-y-8 animate-fade-in">
+                <SectionHeader icon={<Globe size={24} />} color="violet" title="Informações Gerais" subtitle="Identificação da empresa e fuso horário" />
+                <div className="space-y-6 text-sm max-w-2xl">
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">Nome da Empresa</label>
+                    <input type="text" value={companyName} onChange={(e) => setCompanyName(e.target.value)} className="w-full input-setting" />
+                  </div>
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">Fuso Horário</label>
+                    <select value={timezone} onChange={(e) => setTimezone(e.target.value)} className="w-full input-setting">
+                      <option value="America/Sao_Paulo">América/São Paulo (GMT-3)</option>
+                      <option value="America/Manaus">América/Manaus (GMT-4)</option>
+                      <option value="America/Fortaleza">América/Fortaleza (GMT-3)</option>
+                    </select>
+                  </div>
+                </div>
               </div>
             )}
-          </div>
-        </div>
-      </Card>
 
-      {/* === HUB / DISTRIBUÍDO === */}
-      <Card>
-        <SectionHeader icon={<Wifi size={18} />} color="blue" title="Conexão Distribuída (Hub)" subtitle="Conecte esta instância ao Hub central ou sirva na LAN" />
-        <div className="space-y-4 text-xs">
-          <div>
-            <label className="block font-semibold text-secondary mb-1">Modo de Operação</label>
-            <select value={appMode} onChange={(e) => setAppMode(e.target.value as "local" | "empresa" | "master")} className="w-full input-setting">
-              <option value="local">Local (standalone, sem Hub)</option>
-              <option value="empresa">Empresa (conecta ao Hub + serve LAN)</option>
-              <option value="master">Master (controle remoto via Hub)</option>
-            </select>
-          </div>
-          {appMode !== "local" && (
-            <>
-              <div>
-                <label className="block font-semibold text-secondary mb-1">Endereço do Hub (IP:Porta)</label>
-                <input type="text" value={hubAddress} onChange={(e) => setHubAddress(e.target.value)} placeholder="192.168.1.100:8888" className="w-full input-setting font-mono" />
-              </div>
-              <ToggleRow label="Habilitar Conexão com Hub" desc="Mantém conexão persistente com o servidor central" checked={hubEnabled} onChange={setHubEnabled} />
-            </>
-          )}
-          {appMode === "empresa" && (
-            <>
-              <ToggleRow label="Servidor LAN (Empresa Server)" desc="Aceita conexões de Gestores/Colaboradores na rede local" checked={empresaServerEnabled} onChange={setEmpresaServerEnabled} />
-              {empresaServerEnabled && (
-                <div>
-                  <label className="block font-semibold text-secondary mb-1">Porta do Servidor LAN</label>
-                  <input type="number" value={empresaServerPort} onChange={(e) => setEmpresaServerPort(parseInt(e.target.value) || 7777)} min={1024} max={65535} className="w-32 input-setting font-mono" />
+            {activeSection === "notificacoes" && (
+              <div className="space-y-8 animate-fade-in">
+                <SectionHeader icon={<Bell size={24} />} color="blue" title="Notificações & Alertas" subtitle="Alertas visuais e sonoros do sistema" />
+                <div className="space-y-6 max-w-2xl">
+                  <ToggleRow label="Alertas do Sistema" desc="Receber avisos quando dispositivos desconectarem ou apresentarem falhas" checked={notifications} onChange={setNotifications} />
+                  <ToggleRow label="Alerta de Bateria Baixa" desc="Notificar visualmente caso a bateria do celular fique abaixo de 20%" checked={batteryAlert} onChange={setBatteryAlert} />
+                  <ToggleRow label="Alerta de Ban Detectado" desc="Sinalizar imediatamente quando a operadora banir o chip" checked={banAlert} onChange={setBanAlert} />
+                  <ToggleRow label="Alerta de Conclusão de Disparo" desc="Avisar assim que a fila de envios de uma campanha for zerada" checked={dispatchAlert} onChange={setDispatchAlert} />
                 </div>
-              )}
-            </>
-          )}
-          {hubStatus && (
-            <p className="text-xs text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded-lg p-2">{hubStatus}</p>
-          )}
-        </div>
-      </Card>
+              </div>
+            )}
 
-      {/* === SEGURANÇA === */}
-      <Card>
-        <SectionHeader icon={<Shield size={18} />} color="amber" title="Segurança & Retenção" subtitle="Backup, retenção de logs e sessão" />
-        <div className="space-y-4 text-xs">
-          <ToggleRow label="Backup Automático Diário" desc="Snapshot local de campanhas e contatos" checked={autoBackup} onChange={setAutoBackup} />
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block font-semibold text-secondary mb-1">Retenção de Logs</label>
-              <select value={logRetention} onChange={(e) => setLogRetention(e.target.value)} className="w-full input-setting">
-                <option value="7">7 dias</option>
-                <option value="15">15 dias</option>
-                <option value="30">30 dias (Recomendado)</option>
-                <option value="60">60 dias</option>
-                <option value="90">90 dias</option>
-              </select>
-            </div>
-            <div>
-              <label className="block font-semibold text-secondary mb-1">Timeout de Sessão (min)</label>
-              <input type="number" value={sessionTimeout} onChange={(e) => setSessionTimeout(e.target.value)} min={15} max={480} className="w-full input-setting font-mono" />
-            </div>
-          </div>
-          <div className="flex items-center gap-3 pt-2">
-            <Button variant="secondary" size="sm" icon={<Database size={14} />}>
-              Exportar Snapshot
-            </Button>
-            <Button variant="danger" size="sm" icon={<RefreshCw size={14} />}>
-              Restaurar Padrão
-            </Button>
-          </div>
-        </div>
-      </Card>
+            {activeSection === "adb" && (
+              <div className="space-y-8 animate-fade-in">
+                <SectionHeader icon={<Smartphone size={24} />} color="emerald" title="Conexão ADB & Redes" subtitle="Parâmetros de comunicação wireless com celulares" />
+                <div className="space-y-6 text-sm max-w-2xl">
+                  <ToggleRow label="Reconexão Automática" desc="O servidor tentará reconectar aparelhos caídos em segundo plano" checked={autoReconnect} onChange={setAutoReconnect} />
+                  
+                  <div className="flex gap-8">
+                    <div className="w-40">
+                      <label className="block font-semibold text-secondary mb-2 text-sm">Intervalo Ping (s)</label>
+                      <input type="number" value={pingInterval} onChange={(e) => setPingInterval(parseInt(e.target.value) || 30)} min={5} max={300} className="w-full input-setting font-mono text-lg text-center" />
+                    </div>
+                    <div className="w-40">
+                      <label className="block font-semibold text-secondary mb-2 text-sm">Max Tentativas</label>
+                      <input type="number" value={maxRetries} onChange={(e) => setMaxRetries(parseInt(e.target.value) || 3)} min={1} max={10} className="w-full input-setting font-mono text-lg text-center" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">PIN de Desbloqueio (opcional)</label>
+                    <input type="password" value={unlockPin} onChange={(e) => setUnlockPin(e.target.value)} placeholder="Ex: 1234" className="w-48 input-setting font-mono text-lg tracking-widest" />
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeSection === "dispatch" && (
+              <div className="space-y-8 animate-fade-in">
+                <SectionHeader icon={<Zap size={24} />} color="amber" title="Motor de Disparos" subtitle="Regras, delays e humanização dos envios" />
+                <div className="space-y-6 text-sm max-w-2xl">
+                  <div className="flex gap-8 p-4 bg-amber-500/5 rounded-xl border border-amber-500/10">
+                    <div className="flex-1">
+                      <label className="block font-semibold text-secondary mb-2 text-sm">Delay Mínimo (segundos)</label>
+                      <input type="number" value={delayMin} onChange={(e) => setDelayMin(parseInt(e.target.value) || 30)} min={5} max={300} className="w-32 input-setting font-mono text-center text-lg" />
+                    </div>
+                    <div className="flex-1">
+                      <label className="block font-semibold text-secondary mb-2 text-sm">Delay Máximo (segundos)</label>
+                      <input type="number" value={delayMax} onChange={(e) => setDelayMax(parseInt(e.target.value) || 90)} min={10} max={600} className="w-32 input-setting font-mono text-center text-lg" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">Contatos por Lote (Batch Size)</label>
+                    <input type="number" value={batchSize} onChange={(e) => setBatchSize(parseInt(e.target.value) || 5)} min={1} max={50} className="w-32 input-setting font-mono text-center text-lg" />
+                  </div>
+
+                  <div className="pt-4 space-y-6 border-t border-border">
+                    <ToggleRow label="Humanização de Delay" desc="Usar distribuição Gaussiana em vez de atrasos lineares para evitar bloqueios" checked={humanizeDelay} onChange={setHumanizeDelay} />
+                    <ToggleRow label="Retry Automático em Falha" desc="Se o ADB falhar no toque da tela, tentar o mesmo contato novamente" checked={retryOnFail} onChange={setRetryOnFail} />
+                    
+                    {retryOnFail && (
+                      <div className="pl-6 ml-4 border-l-2 border-amber-500/30">
+                        <label className="block font-semibold text-secondary mb-2 text-sm">Máximo de Retries por Contato</label>
+                        <input type="number" value={maxRetriesDispatch} onChange={(e) => setMaxRetriesDispatch(parseInt(e.target.value) || 2)} min={1} max={5} className="w-24 input-setting font-mono text-center" />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeSection === "ia" && (
+              <div className="space-y-8 animate-fade-in">
+                <SectionHeader icon={<Brain size={24} />} color="violet" title="Inteligência Artificial" subtitle="Modelos, prompts e personalização do LLM" />
+                <div className="space-y-6 text-sm max-w-3xl">
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">Provedor de LLM</label>
+                    <select value={aiProvider} onChange={(e) => setAiProvider(e.target.value)} className="w-64 input-setting">
+                      <option value="ollama_local">Ollama Local (Offline)</option>
+                      <option value="ollama_cloud">Ollama Servidor Nuvem</option>
+                      <option value="openai">OpenAI (ChatGPT)</option>
+                      <option value="anthropic">Anthropic (Claude)</option>
+                    </select>
+                  </div>
+                  
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">Endpoint URL</label>
+                    <input type="text" value={aiEndpoint} onChange={(e) => setAiEndpoint(e.target.value)} className="w-full input-setting font-mono" />
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row gap-6">
+                    <div className="flex-1">
+                      <label className="block font-semibold text-secondary mb-2 text-sm">Modelo Desejado</label>
+                      <input type="text" value={aiModel} onChange={(e) => setAiModel(e.target.value)} placeholder="llama3.2" className="w-full input-setting font-mono" />
+                    </div>
+                    <div className="w-48 shrink-0">
+                      <label className="block font-semibold text-secondary mb-2 text-sm">Temperatura ({aiTemperature})</label>
+                      <input type="range" min="0" max="1" step="0.1" value={aiTemperature} onChange={(e) => setAiTemperature(parseFloat(e.target.value))} className="w-full mt-3 accent-violet-500 cursor-pointer" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">API Key (Token de Autorização)</label>
+                    <input type="password" value={aiApiKey} onChange={(e) => setAiApiKey(e.target.value)} placeholder="sk-..." className="w-full input-setting font-mono tracking-widest" />
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">System Prompt Base</label>
+                    <textarea value={aiSystemPrompt} onChange={(e) => setAiSystemPrompt(e.target.value)} rows={5} className="w-full input-setting resize-none leading-relaxed" />
+                  </div>
+
+                  <div className="flex items-center gap-4 pt-4 border-t border-border">
+                    <Button size="md" variant="secondary" icon={<RotateCcw size={16} />} onClick={handleTestAI}>
+                      Testar Comunicação IA
+                    </Button>
+                    {aiTestResult && (
+                      <div className="flex-1 p-3 rounded-xl bg-violet-600/10 border border-violet-500/20 text-violet-200 text-sm font-mono break-words leading-relaxed">
+                        {aiTestResult}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeSection === "hub" && (
+              <div className="space-y-8 animate-fade-in">
+                <SectionHeader icon={<Wifi size={24} />} color="blue" title="Conexão Hub & Cluster" subtitle="Topologia de rede local e remota" />
+                <div className="space-y-6 text-sm max-w-2xl">
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">Modo de Operação</label>
+                    <select value={appMode} onChange={(e) => setAppMode(e.target.value as "local" | "empresa" | "master")} className="w-full input-setting">
+                      <option value="local">Modo Standalone (Offline / Local apenas)</option>
+                      <option value="empresa">Modo Empresa (Conecta ao Hub + LAN)</option>
+                      <option value="master">Modo Master (Controle Administrativo Remoto)</option>
+                    </select>
+                  </div>
+
+                  {appMode !== "local" && (
+                    <div className="space-y-6 pt-4 border-t border-border">
+                      <div>
+                        <label className="block font-semibold text-secondary mb-2 text-sm">Endereço do Servidor Hub (IP:Porta)</label>
+                        <input type="text" value={hubAddress} onChange={(e) => setHubAddress(e.target.value)} placeholder="192.168.1.100:8888" className="w-full max-w-sm input-setting font-mono" />
+                      </div>
+                      <ToggleRow label="Habilitar Conexão Contínua" desc="Manter heartbeat em tempo real com o servidor central" checked={hubEnabled} onChange={setHubEnabled} />
+                    </div>
+                  )}
+
+                  {appMode === "empresa" && (
+                    <div className="space-y-6 pt-4 border-t border-border">
+                      <ToggleRow label="Ativar Servidor LAN Interno" desc="Permite que colaboradores na rede Wi-Fi local acessem o painel via navegador web" checked={empresaServerEnabled} onChange={setEmpresaServerEnabled} />
+                      {empresaServerEnabled && (
+                        <div className="pl-6 ml-4 border-l-2 border-blue-500/30">
+                          <label className="block font-semibold text-secondary mb-2 text-sm">Porta de Acesso (Servidor Web)</label>
+                          <input type="number" value={empresaServerPort} onChange={(e) => setEmpresaServerPort(parseInt(e.target.value) || 7777)} min={1024} max={65535} className="w-32 input-setting font-mono text-center" />
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {hubStatus && (
+                    <div className="p-4 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl text-sm font-medium mt-6">
+                      {hubStatus}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {activeSection === "seguranca" && (
+              <div className="space-y-8 animate-fade-in">
+                <SectionHeader icon={<Shield size={24} />} color="emerald" title="Segurança & Backup" subtitle="Proteção de dados e retenção de registros" />
+                <div className="space-y-6 text-sm max-w-2xl">
+                  <ToggleRow label="Backup Automático Diário" desc="Salvar cópia de segurança (snapshot) local do banco de dados todo fim de dia" checked={autoBackup} onChange={setAutoBackup} />
+                  
+                  <div className="flex gap-8">
+                    <div className="w-48">
+                      <label className="block font-semibold text-secondary mb-2 text-sm">Retenção de Logs (Dias)</label>
+                      <select value={logRetention} onChange={(e) => setLogRetention(e.target.value)} className="w-full input-setting">
+                        <option value="7">7 dias (Mais Leve)</option>
+                        <option value="15">15 dias</option>
+                        <option value="30">30 dias (Padrão)</option>
+                        <option value="90">90 dias</option>
+                      </select>
+                    </div>
+                    <div className="w-48">
+                      <label className="block font-semibold text-secondary mb-2 text-sm">Timeout de Sessão (min)</label>
+                      <input type="number" value={sessionTimeout} onChange={(e) => setSessionTimeout(e.target.value)} min={15} max={480} className="w-full input-setting text-center font-mono" />
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-4 pt-6 mt-4 border-t border-border">
+                    <Button variant="secondary" size="md" icon={<Database size={16} />}>
+                      Exportar Backup Agora
+                    </Button>
+                    <Button variant="danger" size="md" icon={<RefreshCw size={16} />}>
+                      Restaurar de Padrão
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </Card>
+        </main>
+      </div>
     </div>
   );
 }
@@ -382,13 +448,13 @@ function SectionHeader({
     red: "bg-red-600/20 border-red-500/30 text-red-400",
   };
   return (
-    <div className="flex items-center gap-3 mb-5 border-b border-border pb-4">
-      <div className={`flex items-center justify-center w-9 h-9 rounded-xl border ${colorMap[color] || colorMap.violet}`}>
+    <div className="flex items-center gap-4 mb-2 pb-4">
+      <div className={`flex items-center justify-center w-12 h-12 rounded-xl border ${colorMap[color] || colorMap.violet}`}>
         {icon}
       </div>
       <div>
-        <h3 className="font-bold text-sm text-primary">{title}</h3>
-        <p className="text-xs text-tertiary">{subtitle}</p>
+        <h3 className="text-xl font-bold text-primary">{title}</h3>
+        <p className="text-sm text-tertiary mt-0.5">{subtitle}</p>
       </div>
     </div>
   );
@@ -406,12 +472,14 @@ function ToggleRow({
   onChange: (v: boolean) => void;
 }) {
   return (
-    <div className="flex items-center justify-between py-1">
-      <div>
-        <p className="text-xs font-semibold text-primary">{label}</p>
-        <p className="text-[11px] text-tertiary">{desc}</p>
+    <div className="flex items-center justify-between py-2 border-b border-white/5 last:border-0 hover:bg-white/[0.02] -mx-4 px-4 rounded-xl transition-colors">
+      <div className="pr-6">
+        <p className="text-base font-semibold text-primary mb-1">{label}</p>
+        <p className="text-sm text-tertiary leading-snug">{desc}</p>
       </div>
-      <Toggle checked={checked} onChange={onChange} />
+      <div className="shrink-0 scale-110">
+        <Toggle checked={checked} onChange={onChange} />
+      </div>
     </div>
   );
 }

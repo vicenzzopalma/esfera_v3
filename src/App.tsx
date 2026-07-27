@@ -106,22 +106,22 @@ function AppRoutes() {
           }
         />
 
-        {/* Permissions (Master only) */}
+        {/* Permissions (Master & Gestor) */}
         <Route
           path="/permissions"
           element={
-            <RoleGate roles={["master"]}>
+            <RoleGate roles={["master", "gestor"]}>
               <PermissionsTab />
             </RoleGate>
           }
         />
 
-        {/* Dashboard (requer empresa + master/gestor) */}
+        {/* Dashboard (requer empresa + master/gestor/supervisor) */}
         <Route
           path="/dashboard"
           element={
             <CompanyGate>
-              <RoleGate roles={["master", "gestor"]}>
+              <RoleGate roles={["master", "gestor", "supervisor"]}>
                 <DashboardTab />
               </RoleGate>
             </CompanyGate>

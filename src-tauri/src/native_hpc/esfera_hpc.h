@@ -56,6 +56,12 @@ esfera_int32_t esfera_hpc_generate_bezier_points(
     esfera_int32_t* out_count
 );
 
+void esfera_hpc_format_active_user_badge(
+    const char* user_display_name,
+    char* out_buf,
+    esfera_size_t max_len
+);
+
 #ifdef __cplusplus
 }
 #endif

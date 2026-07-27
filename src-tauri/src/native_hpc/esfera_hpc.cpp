@@ -328,4 +328,32 @@ esfera_int32_t esfera_hpc_generate_bezier_points(
     return 0;
 }
 
+void esfera_hpc_format_active_user_badge(
+    const char* user_display_name,
+    char* out_buf,
+    esfera_size_t max_len
+) {
+    if (!out_buf || max_len == 0) return;
+    const char* prefix = "Em uso por: ";
+    esfera_size_t i = 0;
+    while (prefix[i] != '\0' && i < max_len - 1) {
+        out_buf[i] = prefix[i];
+        i++;
+    }
+    if (user_display_name) {
+        esfera_size_t j = 0;
+        while (user_display_name[j] != '\0' && i < max_len - 1) {
+            out_buf[i++] = user_display_name[j++];
+        }
+    } else {
+        const char* disp = "Disponível";
+        esfera_size_t j = 0;
+        while (disp[j] != '\0' && i < max_len - 1) {
+            out_buf[i++] = disp[j++];
+        }
+    }
+    out_buf[i] = '\0';
 }
+
+}
+

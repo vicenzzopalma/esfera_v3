@@ -21,6 +21,9 @@ import {
   Zap,
   Shield,
   BarChart3,
+  ClipboardList,
+  Users,
+  ShieldAlert,
 } from "lucide-react";
 
 interface NavGroup {
@@ -39,6 +42,35 @@ interface NavGroup {
 
 const NAV_GROUPS: NavGroup[] = [
   {
+    groupName: "ACESSO",
+    items: [
+      {
+        id: "my-requests",
+        path: "/devices",
+        label: "Minhas Solicitações",
+        icon: <ClipboardList size={18} />,
+        roles: ["colaborador"],
+        requiresCompany: true,
+      },
+      {
+        id: "supervisor",
+        path: "/devices",
+        label: "Supervisão",
+        icon: <ShieldAlert size={18} />,
+        roles: ["supervisor"],
+        requiresCompany: true,
+      },
+      {
+        id: "users",
+        path: "/permissions",
+        label: "Usuários",
+        icon: <Users size={18} />,
+        roles: ["master", "gestor"],
+        requiresCompany: false,
+      },
+    ],
+  },
+  {
     groupName: "GERENCIAMENTO",
     items: [
       {
@@ -52,9 +84,9 @@ const NAV_GROUPS: NavGroup[] = [
       {
         id: "permissions",
         path: "/permissions",
-        label: "Permissões",
+        label: "Central de Controle",
         icon: <Shield size={18} />,
-        roles: ["master"],
+        roles: ["master", "gestor"],
         requiresCompany: false,
       },
     ],
@@ -67,7 +99,7 @@ const NAV_GROUPS: NavGroup[] = [
         path: "/dashboard",
         label: "Dashboard",
         icon: <BarChart3 size={18} />,
-        roles: ["master", "gestor"],
+        roles: ["master", "gestor", "supervisor"],
         requiresCompany: true,
       },
       {
@@ -75,7 +107,7 @@ const NAV_GROUPS: NavGroup[] = [
         path: "/devices",
         label: "Dispositivos ADB",
         icon: <Smartphone size={18} />,
-        roles: ["master", "gestor", "colaborador"],
+        roles: ["master", "gestor", "supervisor", "colaborador"],
         requiresCompany: true,
       },
       {
@@ -104,7 +136,7 @@ const NAV_GROUPS: NavGroup[] = [
         path: "/logs",
         label: "Logs do Engine",
         icon: <ScrollText size={18} />,
-        roles: ["master", "gestor", "colaborador"],
+        roles: ["master", "gestor", "supervisor", "colaborador"],
         requiresCompany: true,
       },
       {
