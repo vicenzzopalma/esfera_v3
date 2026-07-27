@@ -1,371 +1,668 @@
 // ============================================================
-// Esfera v3 — Painel de Permissões Granulares (Master Only)
-// Gerencia permissões por usuário e por setor
+// Esfera v3 — Central de Gestão de Usuários, Permissões e Celulares
+// (Gestor / Master Control Center)
+// Gerencia criação de usuários com papéis (Colaborador, Supervisor, Gestor),
+// vínculo de celulares e concessão de permissões de uso.
 // ============================================================
 
 import { useState, useEffect, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
 import { api } from "../tauri";
-import { MOCK_USERS } from "../mock-data";
-import { Shield, Users, Save, RotateCcw, Check, Info } from "lucide-react";
+import type { User, Role, Device, DevicePermissionRequest } from "../types";
+import {
+  Shield,
+  Users,
+  UserPlus,
+  Check,
+  X,
+  Clock,
+  Zap,
+  Power,
+  RefreshCw,
+  CheckCircle2,
+  AlertCircle,
+  Eye,
+  ShieldCheck,
+  Link,
+} from "lucide-react";
 import Button from "../components/ui/Button";
 import Badge from "../components/ui/Badge";
-import Toggle from "../components/ui/Toggle";
 import Card from "../components/ui/Card";
-import type { Permission, SectorPermission } from "../types";
-
-const PERMISSION_LABELS: Record<string, string> = {
-  allow_all_tabs: "Acessar todas as abas",
-  allow_edit_devices: "Editar dispositivos",
-  allow_manage_users: "Gerenciar usuários",
-  allow_dashboard: "Ver dashboard",
-  is_active: "Conta ativa",
-};
-
-const PERMISSION_DESCRIPTIONS: Record<string, string> = {
-  allow_edit_devices: "Pode adicionar, remover e gerenciar chips nos dispositivos",
-  allow_manage_users: "Pode criar, editar e configurar outros usuários",
-  allow_dashboard: "Pode acessar o painel de indicadores",
-  allow_all_tabs: "Pode acessar todas as abas do sistema",
-  is_active: "Status da conta do usuário",
-};
-
-const SECTOR_LABELS: Record<string, string> = {
-  junior: "Junior",
-  senior: "Senior",
-  pesquisa: "Pesquisa",
-  pa_fixa_1: "PA Fixa 1",
-  pa_fixa_2: "PA Fixa 2",
-  comercial: "Comercial",
-};
-
-const SECTOR_COLORS: Record<string, string> = {
-  junior: "bg-blue-500/20 text-blue-300 border-blue-500/30",
-  senior: "bg-purple-500/20 text-purple-300 border-purple-500/30",
-  pesquisa: "bg-green-500/20 text-green-300 border-green-500/30",
-  pa_fixa_1: "bg-yellow-500/20 text-yellow-300 border-yellow-500/30",
-  pa_fixa_2: "bg-orange-500/20 text-orange-300 border-orange-500/30",
-  comercial: "bg-pink-500/20 text-pink-300 border-pink-500/30",
-};
-
-const DEFAULT_PERMISSIONS: Permission[] = [
-  { userId: 0, permissionKey: "allow_all_tabs", enabled: true },
-  { userId: 0, permissionKey: "allow_edit_devices", enabled: true },
-  { userId: 0, permissionKey: "allow_manage_users", enabled: false },
-  { userId: 0, permissionKey: "allow_dashboard", enabled: true },
-  { userId: 0, permissionKey: "is_active", enabled: true },
-];
-
-const DEFAULT_SECTOR_PERMISSIONS: SectorPermission[] = [
-  { userId: 0, sector: "junior", canView: true, canConfigure: false },
-  { userId: 0, sector: "senior", canView: true, canConfigure: false },
-  { userId: 0, sector: "pesquisa", canView: true, canConfigure: false },
-  { userId: 0, sector: "pa_fixa_1", canView: true, canConfigure: false },
-  { userId: 0, sector: "pa_fixa_2", canView: true, canConfigure: false },
-  { userId: 0, sector: "comercial", canView: true, canConfigure: false },
-];
 
 export default function PermissionsTab() {
-  const { user: currentUser, hasPermission } = useAuth();
-  const [selectedUserId, setSelectedUserId] = useState<string>("");
-  const [activeTab, setActiveTab] = useState<"user" | "sectors">("user");
-  const [permissions, setPermissions] = useState<Permission[]>([]);
-  const [sectorPermissions, setSectorPermissions] = useState<SectorPermission[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const { user: currentUser, selectedCompanyId } = useAuth();
+  const companyId = selectedCompanyId || currentUser?.companyId || 1;
 
-  const manageableUsers = MOCK_USERS.filter(
-    (u) => u.id !== currentUser?.id && u.role !== "master"
-  );
+  const [activeSubTab, setActiveSubTab] = useState<"requests" | "users" | "assignments">("requests");
+  const [usersList, setUsersList] = useState<User[]>([]);
+  const [permissionRequests, setPermissionRequests] = useState<DevicePermissionRequest[]>([]);
+  const [companyDevices, setCompanyDevices] = useState<Device[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const loadUserPermissions = useCallback(async (userId: number) => {
+  // Formulário de Criação de Usuário
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [newUsername, setNewUsername] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [newDisplayName, setNewDisplayName] = useState("");
+  const [newRole, setNewRole] = useState<Role>("colaborador");
+  const [creatingUser, setCreatingUser] = useState(false);
+
+  // Vínculo de Celular
+  const [selectedUserForAssign, setSelectedUserForAssign] = useState<number | "">("");
+  const [selectedDeviceForAssign, setSelectedDeviceForAssign] = useState<string>("");
+  const [assigning, setAssigning] = useState(false);
+
+  const [feedbackMsg, setFeedbackMsg] = useState<{ type: "success" | "error"; text: string } | null>(null);
+
+  const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const [perms, sectorPerms] = await Promise.all([
-        api<Permission[]>("get_user_permissions", { userId }),
-        api<SectorPermission[]>("get_sector_permissions", { userId }),
+      const [usersData, reqsData, devsData] = await Promise.all([
+        api<User[]>("get_users", { companyId }),
+        api<DevicePermissionRequest[]>("get_device_permission_requests", { companyId }),
+        api<Device[]>("get_devices", { companyId }),
       ]);
-      setPermissions(perms.length > 0 ? perms : DEFAULT_PERMISSIONS.map((p) => ({ ...p, userId })));
-      setSectorPermissions(sectorPerms.length > 0 ? sectorPerms : DEFAULT_SECTOR_PERMISSIONS.map((sp) => ({ ...sp, userId })));
-    } catch {
-      setPermissions(DEFAULT_PERMISSIONS.map((p) => ({ ...p, userId })));
-      setSectorPermissions(DEFAULT_SECTOR_PERMISSIONS.map((sp) => ({ ...sp, userId })));
+      setUsersList(usersData || []);
+      setPermissionRequests(reqsData || []);
+      setCompanyDevices(devsData || []);
+    } catch (err) {
+      console.error("Erro ao carregar dados de permissões:", err);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [companyId]);
 
   useEffect(() => {
-    let mounted = true;
-    if (selectedUserId) {
-      loadUserPermissions(Number(selectedUserId));
-      if (mounted) setSaved(false);
+    loadData();
+    const interval = setInterval(loadData, 5000);
+    return () => clearInterval(interval);
+  }, [loadData]);
+
+  const handleCreateUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newUsername || !newPassword || !newDisplayName) {
+      setFeedbackMsg({ type: "error", text: "Preencha todos os campos obrigatórios." });
+      return;
     }
-    return () => { mounted = false; };
-  }, [selectedUserId, loadUserPermissions]);
-
-  const togglePermission = (key: string) => {
-    setPermissions((prev) =>
-      prev.map((p) => (p.permissionKey === key ? { ...p, enabled: !p.enabled } : p))
-    );
-    setSaved(false);
-  };
-
-  const toggleSectorPermission = (sector: string, type: "canView" | "canConfigure") => {
-    setSectorPermissions((prev) =>
-      prev.map((sp) => (sp.sector === sector ? { ...sp, [type]: !sp[type] } : sp))
-    );
-    setSaved(false);
-  };
-
-  const handleSave = async () => {
-    if (!selectedUserId) return;
-    setSaving(true);
+    setCreatingUser(true);
+    setFeedbackMsg(null);
     try {
-      for (const perm of permissions) {
-        await api("update_user_permission", {
-          userId: Number(selectedUserId),
-          permissionKey: perm.permissionKey,
-          enabled: perm.enabled,
-        });
-      }
-      for (const sp of sectorPermissions) {
-        await api("update_sector_permission", {
-          userId: Number(selectedUserId),
-          sector: sp.sector,
-          canView: sp.canView,
-          canConfigure: sp.canConfigure,
-        });
-      }
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-    } catch (err) {
-      console.error("Erro ao salvar permissões:", err);
+      await api("create_user", {
+        username: newUsername,
+        password: newPassword,
+        displayName: newDisplayName,
+        role: newRole,
+        companyId,
+      });
+      setFeedbackMsg({ type: "success", text: `Usuário '${newDisplayName}' criado como ${newRole.toUpperCase()} com sucesso!` });
+      setShowCreateModal(false);
+      setNewUsername("");
+      setNewPassword("");
+      setNewDisplayName("");
+      setNewRole("colaborador");
+      await loadData();
+    } catch (err: any) {
+      setFeedbackMsg({ type: "error", text: err.toString() || "Falha ao criar usuário." });
     } finally {
-      setSaving(false);
+      setCreatingUser(false);
     }
   };
 
-  const handleReset = () => {
-    if (selectedUserId) loadUserPermissions(Number(selectedUserId));
+  const handleApproveRequest = async (requestId: number) => {
+    try {
+      await api("approve_device_access", { requestId });
+      setFeedbackMsg({ type: "success", text: "Permissão concedida ao colaborador!" });
+      await loadData();
+    } catch (err: any) {
+      setFeedbackMsg({ type: "error", text: err.toString() || "Erro ao aprovar solicitação." });
+    }
   };
 
-  const selectedUser = manageableUsers.find((u) => u.id === Number(selectedUserId));
+  const handleRejectRequest = async (requestId: number) => {
+    try {
+      await api("reject_device_access", { requestId });
+      setFeedbackMsg({ type: "success", text: "Solicitação recusada." });
+      await loadData();
+    } catch (err: any) {
+      setFeedbackMsg({ type: "error", text: err.toString() || "Erro ao rejeitar solicitação." });
+    }
+  };
 
-  if (!hasPermission("allow_manage_users")) {
-    return (
-      <div className="flex flex-col items-center justify-center h-96 gap-4">
-        <div className="flex items-center justify-center w-16 h-16 rounded-2xl bg-red-500/10 border border-red-500/20">
-          <Shield size={32} className="text-red-400" />
-        </div>
-        <h2 className="text-lg font-bold text-primary">Acesso Restrito</h2>
-        <p className="text-sm text-tertiary text-center max-w-sm">
-          Você não tem permissão para gerenciar permissões de outros usuários.
-        </p>
-      </div>
-    );
-  }
+  const handleEndSession = async (requestId: number) => {
+    try {
+      await api("end_device_access", { requestId });
+      setFeedbackMsg({ type: "success", text: "Sessão de uso do celular encerrada." });
+      await loadData();
+    } catch (err: any) {
+      setFeedbackMsg({ type: "error", text: err.toString() || "Erro ao encerrar sessão." });
+    }
+  };
+
+  const handleAssignDevice = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedUserForAssign || !selectedDeviceForAssign) return;
+    setAssigning(true);
+    try {
+      await api("assign_device_to_user", {
+        deviceSerial: selectedDeviceForAssign,
+        userId: Number(selectedUserForAssign),
+      });
+      setFeedbackMsg({ type: "success", text: "Celular vinculado ao colaborador com sucesso!" });
+      setSelectedDeviceForAssign("");
+      await loadData();
+    } catch (err: any) {
+      setFeedbackMsg({ type: "error", text: err.toString() || "Erro ao vincular celular." });
+    } finally {
+      setAssigning(false);
+    }
+  };
+
+  const pendingRequests = permissionRequests.filter((r) => r.status === "pending");
 
   return (
-    <div className="space-y-6 animate-fade-in">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-2xl font-extrabold text-primary tracking-tight">Gerenciar Permissões</h2>
-          <p className="text-sm text-tertiary mt-1">Controle granular de acesso por usuário e por setor</p>
+    <div className="space-y-6">
+      {/* Cabeçalho do Painel do Gestor */}
+      <div className="bg-gradient-to-r from-emerald-900/40 via-teal-900/30 to-slate-900 border border-emerald-500/30 rounded-2xl p-6 shadow-xl backdrop-blur-md">
+        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+          <div className="flex items-center gap-4">
+            <div className="p-3 bg-emerald-500/20 border border-emerald-500/40 rounded-xl text-emerald-400">
+              <Shield size={32} />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                  Central do Gestor
+                </span>
+                <span className="text-xs text-slate-400">| Concessão de Acesso & Usuários</span>
+              </div>
+              <h1 className="text-2xl font-bold text-white mt-1">Gestão de Usuários e Permissões</h1>
+              <p className="text-slate-300 text-sm">
+                Cadastre colaboradores, supervisores e gestores, vincule celulares e gerencie solicitações de acesso.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <Button
+              variant="primary"
+              onClick={() => setShowCreateModal(true)}
+              className="flex items-center gap-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-lg shadow-emerald-900/30 font-semibold"
+            >
+              <UserPlus size={18} />
+              Criar Novo Usuário
+            </Button>
+
+            <Button
+              variant="ghost"
+              onClick={loadData}
+              disabled={loading}
+              className="p-2.5 text-slate-300 border border-slate-700 hover:text-white"
+            >
+              <RefreshCw size={18} className={loading ? "animate-spin" : ""} />
+            </Button>
+          </div>
         </div>
-        <Badge variant="purple" className="gap-1">
-          <Shield size={12} />
-          Master
-        </Badge>
       </div>
 
-      {/* Seleção de Usuário */}
-      <Card padding="md">
-        <h3 className="text-sm font-semibold text-primary flex items-center gap-2 mb-3">
-          <Users size={16} className="text-violet-400" />
-          Selecionar Usuário
-        </h3>
-        <p className="text-xs text-tertiary mb-3">Escolha o usuário para configurar permissões</p>
-        <select
-          value={selectedUserId}
-          onChange={(e) => setSelectedUserId(e.target.value)}
-          className="w-full max-w-md px-3 py-2 rounded-xl bg-white/[0.03] border border-border text-sm text-primary focus:outline-none focus:border-violet-500/50"
+      {feedbackMsg && (
+        <div
+          className={`p-4 rounded-xl border flex items-center justify-between text-sm font-medium ${
+            feedbackMsg.type === "success"
+              ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-300"
+              : "bg-red-500/15 border-red-500/30 text-red-300"
+          }`}
         >
-          <option value="">Selecione um usuário...</option>
-          {manageableUsers.map((u) => (
-            <option key={u.id} value={String(u.id)}>
-              {u.displayName} — {u.role === "gestor" ? "Gestor" : "Colaborador"}
-            </option>
-          ))}
-        </select>
-      </Card>
+          <div className="flex items-center gap-3">
+            {feedbackMsg.type === "success" ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}
+            <span>{feedbackMsg.text}</span>
+          </div>
+          <button onClick={() => setFeedbackMsg(null)} className="text-slate-400 hover:text-white">
+            <X size={16} />
+          </button>
+        </div>
+      )}
 
-      {/* Configurações */}
-      {selectedUserId && (
-        <>
-          {/* Tabs */}
-          <div className="flex gap-2 p-1 rounded-xl bg-white/[0.03] border border-border w-fit">
-            <button
-              onClick={() => setActiveTab("user")}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium transition-all cursor-pointer ${
-                activeTab === "user"
-                  ? "bg-gradient-to-r from-violet-600/20 to-indigo-600/20 text-violet-300 border border-violet-500/30"
-                  : "text-secondary hover:text-primary hover:bg-white/5"
-              }`}
-            >
-              <Shield size={14} />
-              Permissões de Usuário
-            </button>
-            <button
-              onClick={() => setActiveTab("sectors")}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium transition-all cursor-pointer ${
-                activeTab === "sectors"
-                  ? "bg-gradient-to-r from-violet-600/20 to-indigo-600/20 text-violet-300 border border-violet-500/30"
-                  : "text-secondary hover:text-primary hover:bg-white/5"
-              }`}
-            >
-              <Users size={14} />
-              Permissões por Setor
-            </button>
+      {/* Navegação entre Sub-Abas do Gestor */}
+      <div className="flex items-center gap-2 border-b border-slate-800 pb-2">
+        <button
+          onClick={() => setActiveSubTab("requests")}
+          className={`px-4 py-2.5 rounded-xl font-semibold text-sm flex items-center gap-2 transition-all ${
+            activeSubTab === "requests"
+              ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
+              : "text-slate-400 hover:text-white hover:bg-slate-800/50"
+          }`}
+        >
+          <Zap size={16} />
+          Solicitações de Acesso
+          {pendingRequests.length > 0 && (
+            <span className="px-2 py-0.5 text-xs font-bold rounded-full bg-amber-500 text-slate-950">
+              {pendingRequests.length}
+            </span>
+          )}
+        </button>
+
+        <button
+          onClick={() => setActiveSubTab("users")}
+          className={`px-4 py-2.5 rounded-xl font-semibold text-sm flex items-center gap-2 transition-all ${
+            activeSubTab === "users"
+              ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
+              : "text-slate-400 hover:text-white hover:bg-slate-800/50"
+          }`}
+        >
+          <Users size={16} />
+          Usuários do Sistema ({usersList.length})
+        </button>
+
+        <button
+          onClick={() => setActiveSubTab("assignments")}
+          className={`px-4 py-2.5 rounded-xl font-semibold text-sm flex items-center gap-2 transition-all ${
+            activeSubTab === "assignments"
+              ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
+              : "text-slate-400 hover:text-white hover:bg-slate-800/50"
+          }`}
+        >
+          <Link size={16} />
+          Vínculo de Celulares
+        </button>
+      </div>
+
+      {/* CONTEÚDO 1: Solicitações de Acesso dos Colaboradores */}
+      {activeSubTab === "requests" && (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-bold text-white flex items-center gap-2">
+              <Clock size={20} className="text-emerald-400" />
+              Solicitações de Permissão Enviadas pelos Colaboradores
+            </h2>
+            <span className="text-xs text-slate-400">Total: {permissionRequests.length} solicitações</span>
           </div>
 
-          {/* Tab: Permissões de Usuário */}
-          {activeTab === "user" && (
-            <Card padding="md">
-              <h3 className="text-sm font-semibold text-primary mb-1">
-                Permissões Gerais — {selectedUser?.displayName}
-              </h3>
-              <p className="text-xs text-tertiary mb-4">Controle o acesso às funcionalidades do sistema</p>
-
-              {loading ? (
-                <div className="flex items-center justify-center py-8">
-                  <div className="w-6 h-6 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {permissions.map((perm) => (
-                    <div
-                      key={perm.permissionKey}
-                      className="flex items-center justify-between p-3 rounded-xl bg-white/[0.02] border border-border hover:bg-white/[0.04] transition-colors"
-                    >
-                      <div className="flex items-center gap-3">
-                        <div className={`w-2 h-2 rounded-full ${perm.enabled ? "bg-green-400" : "bg-gray-500"}`} />
-                        <div>
-                          <p className="text-sm font-medium text-primary">
-                            {PERMISSION_LABELS[perm.permissionKey] || perm.permissionKey}
-                          </p>
-                          <p className="text-xs text-tertiary">
-                            {PERMISSION_DESCRIPTIONS[perm.permissionKey] || ""}
-                          </p>
-                        </div>
-                      </div>
-                      <Toggle
-                        checked={perm.enabled}
-                        onChange={() => togglePermission(perm.permissionKey)}
-                        disabled={perm.permissionKey === "is_active"}
-                        size="sm"
-                      />
-                    </div>
-                  ))}
-                </div>
-              )}
+          {permissionRequests.length === 0 ? (
+            <Card className="p-8 text-center bg-slate-900/60 border border-slate-800">
+              <ShieldCheck size={48} className="mx-auto text-slate-600 mb-3" />
+              <h3 className="text-base font-semibold text-white">Nenhuma solicitação no momento</h3>
+              <p className="text-xs text-slate-400 mt-1">
+                Quando colaboradores pedirem permissão para usar seus celulares vinculados, elas aparecerão aqui em tempo real.
+              </p>
             </Card>
-          )}
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {permissionRequests.map((req) => {
+                const isPending = req.status === "pending";
+                const isApproved = req.status === "approved";
 
-          {/* Tab: Permissões por Setor */}
-          {activeTab === "sectors" && (
-            <Card padding="md">
-              <h3 className="text-sm font-semibold text-primary mb-1">
-                Permissões por Setor — {selectedUser?.displayName}
-              </h3>
-              <p className="text-xs text-tertiary mb-4">Controle a visualização e configuração de cada setor</p>
+                return (
+                  <Card
+                    key={req.requestId}
+                    className={`p-5 space-y-4 border transition-all ${
+                      isPending
+                        ? "border-amber-500/50 bg-amber-950/20 shadow-lg shadow-amber-950/30"
+                        : isApproved
+                        ? "border-emerald-500/40 bg-emerald-950/20"
+                        : "border-slate-800 bg-slate-900/60 opacity-80"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between">
+                      <div>
+                        <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                          Colaborador Pedinte
+                        </span>
+                        <h4 className="text-base font-bold text-white mt-0.5">
+                          {req.userDisplayName || req.userName}
+                        </h4>
+                        <p className="text-xs text-emerald-400 font-mono mt-0.5">
+                          Celular: {req.adbDeviceId}
+                        </p>
+                      </div>
 
-              {loading ? (
-                <div className="flex items-center justify-center py-8">
-                  <div className="w-6 h-6 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {/* Header */}
-                  <div className="grid grid-cols-[1fr_100px_100px] gap-2 px-3 text-xs font-semibold text-tertiary uppercase">
-                    <span>Setor</span>
-                    <span className="text-center">Visualizar</span>
-                    <span className="text-center">Configurar</span>
-                  </div>
-                  <div className="h-px bg-border" />
-
-                  {sectorPermissions.map((sp) => (
-                    <div
-                      key={sp.sector}
-                      className="grid grid-cols-[1fr_100px_100px] gap-2 items-center p-3 rounded-xl bg-white/[0.02] border border-border hover:bg-white/[0.04] transition-colors"
-                    >
                       <Badge
-                        variant="neutral"
-                        className={`text-xs w-fit ${SECTOR_COLORS[sp.sector] || ""}`}
+                        variant={
+                          isApproved ? "success" : isPending ? "warning" : "danger"
+                        }
+                        className="capitalize"
                       >
-                        {SECTOR_LABELS[sp.sector] || sp.sector}
+                        {req.status}
                       </Badge>
-                      <div className="flex justify-center">
-                        <Toggle
-                          checked={sp.canView}
-                          onChange={() => toggleSectorPermission(sp.sector, "canView")}
-                          size="sm"
-                        />
-                      </div>
-                      <div className="flex justify-center">
-                        <Toggle
-                          checked={sp.canConfigure}
-                          onChange={() => toggleSectorPermission(sp.sector, "canConfigure")}
-                          size="sm"
-                        />
-                      </div>
                     </div>
-                  ))}
-                </div>
-              )}
 
-              <div className="flex items-start gap-2 p-3 rounded-xl bg-violet-500/10 border border-violet-500/20 mt-4">
-                <Info size={16} className="text-violet-400 mt-0.5 shrink-0" />
-                <p className="text-xs text-violet-300">
-                  <strong>Visualizar</strong> permite ver os dispositivos e dados do setor.{" "}
-                  <strong>Configurar</strong> permite editar configurações, campanhas e automações do setor.
-                </p>
-              </div>
-            </Card>
+                    <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800/80 text-xs space-y-1">
+                      <span className="text-slate-400 font-medium block">Motivo Informado:</span>
+                      <p className="text-slate-200 italic">
+                        "{req.requestedReason || "Sem observações adicionais"}"
+                      </p>
+                      <p className="text-[10px] text-slate-500 pt-1">
+                        Solicitado em: {new Date(req.requestedAt).toLocaleString("pt-BR")}
+                      </p>
+                    </div>
+
+                    {/* Botões de Decisão do Gestor */}
+                    <div className="pt-1">
+                      {isPending ? (
+                        <div className="grid grid-cols-2 gap-2">
+                          <Button
+                            variant="primary"
+                            onClick={() => handleApproveRequest(req.requestId)}
+                            className="bg-emerald-600 hover:bg-emerald-500 text-xs py-2 flex items-center justify-center gap-1 font-semibold"
+                          >
+                            <Check size={16} />
+                            Aprovar
+                          </Button>
+
+                          <Button
+                            variant="danger"
+                            onClick={() => handleRejectRequest(req.requestId)}
+                            className="text-xs py-2 flex items-center justify-center gap-1"
+                          >
+                            <X size={16} />
+                            Recusar
+                          </Button>
+                        </div>
+                      ) : isApproved ? (
+                        <div className="space-y-2">
+                          <p className="text-xs text-emerald-400 font-medium text-center">
+                            Aprovado por: {req.approvedByName || "Gestor"}
+                          </p>
+                          <Button
+                            variant="danger"
+                            onClick={() => handleEndSession(req.requestId)}
+                            className="w-full text-xs py-2 flex items-center justify-center gap-1"
+                          >
+                            <Power size={14} />
+                            Revogar / Encerrar Permissão
+                          </Button>
+                        </div>
+                      ) : (
+                        <p className="text-xs text-red-400 text-center font-medium">
+                          Solicitação Recusada
+                        </p>
+                      )}
+                    </div>
+                  </Card>
+                );
+              })}
+            </div>
           )}
+        </div>
+      )}
 
-          {/* Botões de Ação */}
-          <div className="flex items-center justify-between p-4 rounded-2xl bg-white/[0.02] border border-border">
-            <div className="flex items-center gap-2 text-xs text-tertiary">
-              {saved ? (
-                <>
-                  <Check size={14} className="text-green-400" />
-                  <span className="text-green-400 font-medium">Salvo com sucesso!</span>
-                </>
-              ) : (
-                <>
-                  <RotateCcw size={14} />
-                  <span>Alterações não salvas</span>
-                </>
-              )}
-            </div>
-            <div className="flex items-center gap-2">
-              <Button variant="secondary" size="sm" onClick={handleReset}>
-                <RotateCcw size={14} />
-                Reverter
-              </Button>
-              <Button
-                size="sm"
-                onClick={handleSave}
-                loading={saving}
-              >
-                <Save size={14} />
-                {saving ? "Salvando..." : "Salvar"}
-              </Button>
-            </div>
+      {/* CONTEÚDO 2: Lista e Cadastro de Usuários por Role */}
+      {activeSubTab === "users" && (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-bold text-white flex items-center gap-2">
+              <Users size={20} className="text-emerald-400" />
+              Usuários Cadastrados na Empresa
+            </h2>
           </div>
-        </>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {usersList.map((u) => (
+              <Card key={u.id} className="p-5 border border-slate-800 bg-slate-900/80 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={`p-2.5 rounded-xl border ${
+                        u.role === "gestor" || u.role === "master"
+                          ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-400"
+                          : u.role === "supervisor"
+                          ? "bg-purple-500/20 border-purple-500/40 text-purple-400"
+                          : "bg-blue-500/20 border-blue-500/40 text-blue-400"
+                      }`}
+                    >
+                      {u.role === "gestor" || u.role === "master" ? (
+                        <Shield size={20} />
+                      ) : u.role === "supervisor" ? (
+                        <Eye size={20} />
+                      ) : (
+                        <Users size={20} />
+                      )}
+                    </div>
+                    <div>
+                      <h4 className="text-base font-bold text-white">{u.displayName}</h4>
+                      <p className="text-xs text-slate-400">@{u.username}</p>
+                    </div>
+                  </div>
+
+                  <span
+                    className={`text-xs font-bold uppercase tracking-wider px-2.5 py-1 rounded-lg border ${
+                      u.role === "gestor" || u.role === "master"
+                        ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                        : u.role === "supervisor"
+                        ? "bg-purple-500/15 text-purple-300 border-purple-500/30"
+                        : "bg-blue-500/15 text-blue-300 border-blue-500/30"
+                    }`}
+                  >
+                    {u.role}
+                  </span>
+                </div>
+
+                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800/80 text-xs space-y-1">
+                  <span className="text-slate-400 block font-medium">Permissões de Tela:</span>
+                  <p className="text-slate-300">
+                    {u.role === "colaborador"
+                      ? "Acesso restrito para solicitar uso dos celulares atribuídos."
+                      : u.role === "supervisor"
+                      ? "Visualiza todos os celulares e monitora colaborador ativo."
+                      : "Acesso total ao sistema e central de aprovação do Gestor."}
+                  </p>
+                </div>
+              </Card>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* CONTEÚDO 3: Vínculo de Celulares aos Colaboradores */}
+      {activeSubTab === "assignments" && (
+        <div className="space-y-6">
+          <Card className="p-6 border border-slate-800 bg-slate-900/80 space-y-4">
+            <h3 className="text-base font-bold text-white flex items-center gap-2">
+              <Link size={18} className="text-emerald-400" />
+              Vincular Celular a um Colaborador Responsável
+            </h3>
+            <p className="text-xs text-slate-400">
+              Selecione o colaborador e o celular para tornar o colaborador responsável por aquele aparelho.
+            </p>
+
+            <form onSubmit={handleAssignDevice} className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1.5">
+                  Colaborador:
+                </label>
+                <select
+                  value={selectedUserForAssign}
+                  onChange={(e) => setSelectedUserForAssign(e.target.value ? Number(e.target.value) : "")}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500"
+                >
+                  <option value="">Selecione um usuário...</option>
+                  {usersList.map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.displayName} ({u.role})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1.5">
+                  Celular ADB:
+                </label>
+                <select
+                  value={selectedDeviceForAssign}
+                  onChange={(e) => setSelectedDeviceForAssign(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500"
+                >
+                  <option value="">Selecione o aparelho...</option>
+                  {companyDevices.map((d) => (
+                    <option key={d.serial} value={d.serial}>
+                      {d.name || d.model} ({d.serial})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex items-end">
+                <Button
+                  type="submit"
+                  variant="primary"
+                  disabled={assigning || !selectedUserForAssign || !selectedDeviceForAssign}
+                  className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 font-semibold text-xs flex items-center justify-center gap-2"
+                >
+                  <Link size={14} />
+                  {assigning ? "Vinculando..." : "Confirmar Vínculo"}
+                </Button>
+              </div>
+            </form>
+          </Card>
+        </div>
+      )}
+
+      {/* MODAL: Criação de Usuário com Seleção de Tipo (Role Selector) */}
+      {showCreateModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-lg shadow-2xl space-y-6">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-4">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 bg-emerald-500/20 border border-emerald-500/40 rounded-xl text-emerald-400">
+                  <UserPlus size={24} />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white">Criar Novo Usuário</h3>
+                  <p className="text-xs text-slate-400">Escolha a função e credenciais do usuário</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowCreateModal(false)}
+                className="text-slate-400 hover:text-white p-1"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateUser} className="space-y-4">
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1">
+                  Nome de Exibição (Ex: João Silva):
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={newDisplayName}
+                  onChange={(e) => setNewDisplayName(e.target.value)}
+                  placeholder="Nome completo do usuário"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-semibold text-slate-300 block mb-1">
+                    Usuário de Login (Username):
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={newUsername}
+                    onChange={(e) => setNewUsername(e.target.value)}
+                    placeholder="joao.silva"
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-xs font-semibold text-slate-300 block mb-1">
+                    Senha:
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+              </div>
+
+              {/* SELETOR VISUAL DO TIPO DE USUÁRIO / ROLE */}
+              <div className="space-y-2 pt-2">
+                <label className="text-xs font-semibold text-slate-300 block">
+                  Selecione o Tipo de Login / Função:
+                </label>
+
+                <div className="grid grid-cols-3 gap-3">
+                  {/* Card Colaborador */}
+                  <div
+                    onClick={() => setNewRole("colaborador")}
+                    className={`p-3 rounded-xl border cursor-pointer transition-all space-y-1 ${
+                      newRole === "colaborador"
+                        ? "bg-blue-500/20 border-blue-500 text-blue-300 shadow-md shadow-blue-950/50"
+                        : "bg-slate-950/60 border-slate-800 text-slate-400 hover:border-slate-700"
+                    }`}
+                  >
+                    <Users size={20} className={newRole === "colaborador" ? "text-blue-400" : "text-slate-500"} />
+                    <h5 className="text-xs font-bold text-white">Colaborador</h5>
+                    <p className="text-[10px] leading-tight text-slate-400">
+                      Pede permissão para celulares vinculados.
+                    </p>
+                  </div>
+
+                  {/* Card Supervisor */}
+                  <div
+                    onClick={() => setNewRole("supervisor")}
+                    className={`p-3 rounded-xl border cursor-pointer transition-all space-y-1 ${
+                      newRole === "supervisor"
+                        ? "bg-purple-500/20 border-purple-500 text-purple-300 shadow-md shadow-purple-950/50"
+                        : "bg-slate-950/60 border-slate-800 text-slate-400 hover:border-slate-700"
+                    }`}
+                  >
+                    <Eye size={20} className={newRole === "supervisor" ? "text-purple-400" : "text-slate-500"} />
+                    <h5 className="text-xs font-bold text-white">Supervisor</h5>
+                    <p className="text-[10px] leading-tight text-slate-400">
+                      Monitora todos os celulares e quem opera.
+                    </p>
+                  </div>
+
+                  {/* Card Gestor */}
+                  <div
+                    onClick={() => setNewRole("gestor")}
+                    className={`p-3 rounded-xl border cursor-pointer transition-all space-y-1 ${
+                      newRole === "gestor"
+                        ? "bg-emerald-500/20 border-emerald-500 text-emerald-300 shadow-md shadow-emerald-950/50"
+                        : "bg-slate-950/60 border-slate-800 text-slate-400 hover:border-slate-700"
+                    }`}
+                  >
+                    <Shield size={20} className={newRole === "gestor" ? "text-emerald-400" : "text-slate-500"} />
+                    <h5 className="text-xs font-bold text-white">Gestor</h5>
+                    <p className="text-[10px] leading-tight text-slate-400">
+                      Acesso total + Aprova permissões.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3 pt-4 border-t border-slate-800">
+                <Button
+                  type="submit"
+                  variant="primary"
+                  disabled={creatingUser}
+                  className="flex-1 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 font-semibold text-xs flex items-center justify-center gap-2"
+                >
+                  <UserPlus size={16} />
+                  {creatingUser ? "Criando Usuário..." : "Concluir Cadastro"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => setShowCreateModal(false)}
+                  className="py-2.5 text-xs text-slate-400"
+                >
+                  Cancelar
+                </Button>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -263,6 +263,9 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     company_id: target_company_id,
                     device_number: (db_devices.len() + 1) as i32,
                     sector: "junior".to_string(),
+                    esfera_device_id: None,
+                    current_adb_address: None,
+                    last_seen_utc: None,
                 };
                 let _ = state_db.upsert_device(&new_dev);
                 changed = true;
@@ -370,6 +373,9 @@ pub fn connect_adb_device(
         company_id,
         device_number,
         sector,
+        esfera_device_id: None,
+        current_adb_address: None,
+        last_seen_utc: None,
     };
     db.upsert_device(&dev)?;
     let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
@@ -433,6 +439,9 @@ pub fn pair_and_connect_adb_device(
         company_id,
         device_number,
         sector,
+        esfera_device_id: None,
+        current_adb_address: None,
+        last_seen_utc: None,
     };
     db.upsert_device(&device)?;
 
@@ -1020,6 +1029,9 @@ pub async fn link_usb_to_wireless(
             company_id,
             device_number,
             sector,
+            esfera_device_id: None,
+            current_adb_address: None,
+            last_seen_utc: None,
         };
         state_db.upsert_device(&device)?;
         let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
@@ -1111,6 +1123,9 @@ pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -
                         company_id: 1,
                         device_number: dev_num,
                         sector: "junior".to_string(),
+                        esfera_device_id: None,
+                        current_adb_address: None,
+                        last_seen_utc: None,
                     };
                     let _ = db_arc.upsert_device(&device_obj);
             }
@@ -1189,7 +1204,10 @@ pub fn force_enable_wireless_adb(
         company_id,
         device_number,
         sector,
-};
+        esfera_device_id: None,
+        current_adb_address: None,
+        last_seen_utc: None,
+    };
     db.upsert_device(&device)?;
 
     Ok(format!(
@@ -1405,8 +1423,10 @@ pub fn optimize_device_hpc(_token: String, serial: String) -> Result<String, Str
 }
 
 #[tauri::command]
-pub fn install_agent_apk(_token: String, serial: String) -> Result<String, String> {
-    AdbManager::install_agent_apk(&serial)
+pub async fn install_agent_apk(_token: String, serial: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::install_agent_apk(&serial)
+    }).await.map_err(|e| e.to_string())?
 }
 
 // ============================================================
@@ -1440,3 +1460,151 @@ pub async fn hub_invoke(
     let client = mc.as_ref().ok_or_else(|| "Hub não conectado. Verifique configurações.".to_string())?;
     client.send_command(company_id, &cmd, args).await
 }
+
+// ============================================================
+// GESTÃO DE USUÁRIOS E NÍVEIS (Colaborador, Supervisor, Gestor)
+// ============================================================
+
+#[tauri::command]
+pub fn get_users(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<Vec<crate::db::User>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let target_company = if session.role == "master" { company_id } else { session.company_id.unwrap_or(company_id) };
+    Ok(state.db.get_users_by_company(target_company))
+}
+
+#[tauri::command]
+pub fn create_user(
+    state: State<'_, AppState>,
+    token: String,
+    username: String,
+    password: String,
+    display_name: String,
+    role: String,
+    company_id: i32,
+) -> Result<crate::db::User, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Acesso Negado: apenas Gestores ou Master podem criar usuários.".to_string());
+    }
+    let target_company = if session.role == "master" { company_id } else { session.company_id.unwrap_or(company_id) };
+    state.db.create_user_with_role(&username, &password, &display_name, &role, target_company)
+}
+
+// ============================================================
+// PERMISSÕES DE CELULARES (Colaborador, Supervisor, Gestor)
+// ============================================================
+
+#[tauri::command]
+pub fn assign_device_to_user(
+    state: State<'_, AppState>,
+    token: String,
+    device_serial: String,
+    user_id: i32,
+) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Acesso Negado: apenas Gestores podem vincular celulares.".to_string());
+    }
+    state.db.assign_device_to_user(&device_serial, user_id)
+}
+
+#[tauri::command]
+pub fn unassign_device_from_user(
+    state: State<'_, AppState>,
+    token: String,
+    device_serial: String,
+    user_id: i32,
+) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Acesso Negado: apenas Gestores podem desvincular celulares.".to_string());
+    }
+    state.db.unassign_device_from_user(&device_serial, user_id)
+}
+
+#[tauri::command]
+pub fn get_assigned_devices_for_user(
+    state: State<'_, AppState>,
+    token: String,
+    user_id: i32,
+    company_id: i32,
+) -> Result<Vec<crate::db::Device>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let target_user = if session.role == "colaborador" { session.user_id } else { user_id };
+    let target_company = session.company_id.unwrap_or(company_id);
+    Ok(state.db.get_assigned_devices_for_user(target_user, target_company))
+}
+
+#[tauri::command]
+pub fn request_device_access(
+    state: State<'_, AppState>,
+    token: String,
+    device_serial: String,
+    reason: String,
+) -> Result<i32, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    state.db.request_device_permission(session.user_id, &device_serial, &reason)
+}
+
+#[tauri::command]
+pub fn get_device_permission_requests(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<Vec<crate::db::DevicePermissionRequest>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let target_company = session.company_id.unwrap_or(company_id);
+    Ok(state.db.get_permission_requests(target_company))
+}
+
+#[tauri::command]
+pub fn approve_device_access(
+    state: State<'_, AppState>,
+    token: String,
+    request_id: i32,
+) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Acesso Negado: apenas Gestores podem aprovar solicitações.".to_string());
+    }
+    state.db.approve_permission_request(request_id, session.user_id)
+}
+
+#[tauri::command]
+pub fn reject_device_access(
+    state: State<'_, AppState>,
+    token: String,
+    request_id: i32,
+) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Acesso Negado: apenas Gestores podem rejeitar solicitações.".to_string());
+    }
+    state.db.reject_permission_request(request_id)
+}
+
+#[tauri::command]
+pub fn end_device_access(
+    state: State<'_, AppState>,
+    token: String,
+    request_id: i32,
+) -> Result<(), String> {
+    let _session = validate_session(&state.sessions, &token)?;
+    state.db.end_permission_session(request_id)
+}
+
+#[tauri::command]
+pub fn get_devices_with_active_user_map(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<Vec<crate::db::DeviceWithActiveUser>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let target_company = session.company_id.unwrap_or(company_id);
+    Ok(state.db.get_devices_with_active_user_map(target_company))
+}
+

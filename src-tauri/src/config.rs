@@ -7,6 +7,8 @@ pub struct AppConfig {
     pub hub_address: String,
     pub empresa_server_enabled: bool,
     pub empresa_server_port: u16,
+    pub checkin_server_enabled: bool,
+    pub checkin_server_port: u16,
     pub mode: String,
 }
 
@@ -17,6 +19,8 @@ impl Default for AppConfig {
             hub_address: String::new(),
             empresa_server_enabled: false,
             empresa_server_port: 7777,
+            checkin_server_enabled: true,
+            checkin_server_port: 8080,
             mode: "local".to_string(),
         }
     }

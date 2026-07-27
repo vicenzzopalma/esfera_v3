@@ -55,6 +55,9 @@ pub struct Device {
     pub company_id: i32,
     pub device_number: i32,
     pub sector: String,
+    pub esfera_device_id: Option<String>,
+    pub current_adb_address: Option<String>,
+    pub last_seen_utc: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -195,6 +198,58 @@ pub struct SectorPermission {
     pub sector: String,
     pub can_view: bool,
     pub can_configure: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceAssignment {
+    pub assignment_id: i32,
+    pub adb_device_id: String,
+    pub user_id: i32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DevicePermissionRequest {
+    pub request_id: i32,
+    pub adb_device_id: String,
+    pub user_id: i32,
+    pub user_name: Option<String>,
+    pub user_display_name: Option<String>,
+    pub status: String,
+    pub requested_reason: Option<String>,
+    pub requested_at: String,
+    pub approved_by: Option<i32>,
+    pub approved_by_name: Option<String>,
+    pub approved_at: Option<String>,
+    pub ended_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceWithActiveUser {
+    pub id: i32,
+    pub serial: String,
+    pub name: String,
+    pub brand: String,
+    pub model: String,
+    pub ip: String,
+    pub port: i32,
+    pub status: String,
+    pub battery: i32,
+    pub company_id: i32,
+    pub device_number: i32,
+    pub sector: String,
+    pub esfera_device_id: Option<String>,
+    pub current_adb_address: Option<String>,
+    pub last_seen_utc: Option<String>,
+    pub active_user_id: Option<i32>,
+    pub active_user_name: Option<String>,
+    pub active_user_display_name: Option<String>,
+    pub permission_request_id: Option<i32>,
+    pub assigned_user_id: Option<i32>,
+    pub assigned_user_name: Option<String>,
 }
 
 // ============================================================
@@ -533,7 +588,35 @@ impl Database {
             [],
         )?;
 
-        // 16. Performance Indexes (Microsecond Lookups)
+        // 16. ESF_DeviceAssignment (vínculo celular-colaborador)
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_DeviceAssignment (
+                AssignmentId INTEGER PRIMARY KEY AUTOINCREMENT,
+                AdbDeviceId TEXT NOT NULL,
+                UserId INTEGER NOT NULL,
+                CreatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(AdbDeviceId, UserId)
+            );",
+            [],
+        )?;
+
+        // 17. ESF_DevicePermissionRequest (pedidos de permissão para celulares)
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_DevicePermissionRequest (
+                RequestId INTEGER PRIMARY KEY AUTOINCREMENT,
+                AdbDeviceId TEXT NOT NULL,
+                UserId INTEGER NOT NULL,
+                Status TEXT NOT NULL DEFAULT 'pending',
+                RequestedReason TEXT DEFAULT '',
+                RequestedAt TEXT NOT NULL DEFAULT (datetime('now')),
+                ApprovedBy INTEGER DEFAULT NULL,
+                ApprovedAt TEXT DEFAULT NULL,
+                EndedAt TEXT DEFAULT NULL
+            );",
+            [],
+        )?;
+
+        // 18. Performance Indexes (Microsecond Lookups)
         self.conn().execute_batch("
             CREATE INDEX IF NOT EXISTS idx_device_company ON ESF_Device (CompanyId);
             CREATE INDEX IF NOT EXISTS idx_campaign_company ON ESF_Campaign (CompanyId, ExcluidoEm);
@@ -542,6 +625,9 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_audit_log_company ON ESF_AuditLog (CompanyId, LogId DESC);
             CREATE INDEX IF NOT EXISTS idx_automation_company ON ESF_AutomationRule (CompanyId, ExcluidoEm);
             CREATE INDEX IF NOT EXISTS idx_sent_history ON ESF_SentHistory (Phone, CampaignId);
+            CREATE INDEX IF NOT EXISTS idx_dev_perm_user ON ESF_DevicePermissionRequest (UserId, Status);
+            CREATE INDEX IF NOT EXISTS idx_dev_perm_device ON ESF_DevicePermissionRequest (AdbDeviceId, Status);
+            CREATE INDEX IF NOT EXISTS idx_dev_assign_user ON ESF_DeviceAssignment (UserId, AdbDeviceId);
         ")?;
 
         Ok(())
@@ -552,6 +638,19 @@ impl Database {
         // ESF_Device
         let _ = self.conn().execute("ALTER TABLE ESF_Device ADD COLUMN DeviceNumber INTEGER DEFAULT 1;", []);
         let _ = self.conn().execute("ALTER TABLE ESF_Device ADD COLUMN Sector TEXT DEFAULT 'junior';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Device ADD COLUMN EsferaDeviceId TEXT;", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Device ADD COLUMN CurrentAdbAddress TEXT;", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Device ADD COLUMN LastSeenUTC TEXT;", []);
+        // Popula EsferaDeviceId para devices existentes com ID determinístico baseado no DeviceNumber
+        let _ = self.conn().execute(
+            "UPDATE ESF_Device SET EsferaDeviceId = 'ESF-LEGACY-' || DeviceNumber WHERE EsferaDeviceId IS NULL;",
+            [],
+        );
+        // Índice único para EsferaDeviceId
+        let _ = self.conn().execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_device_esfera_id ON ESF_Device(EsferaDeviceId);",
+            [],
+        );
 
         // ESF_Campaign
         let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN SelectedDevices TEXT DEFAULT '';", []);
@@ -601,11 +700,12 @@ impl Database {
         ];
 
         for (serial, name, brand, model, ip, num, sector) in default_devices {
+            let esfera_id = format!("ESF-LEGACY-{}", num);
             let _ = self.conn().execute(
-                "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector)
-                VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7)
+                "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId)
+                VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7, ?8)
                 ON CONFLICT(AdbDeviceId) DO NOTHING;",
-                params![serial, name, brand, model, ip, num, sector],
+                params![serial, name, brand, model, ip, num, sector, esfera_id],
             );
         }
 
@@ -682,11 +782,12 @@ impl Database {
             ];
 
             for (serial, name, brand, model, ip, num, sector) in default_devices {
+                let esfera_id = format!("ESF-LEGACY-{}", num);
                 let _ = self.conn().execute(
-                    "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector)
-                    VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7)
+                    "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId)
+                    VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7, ?8)
                     ON CONFLICT(AdbDeviceId) DO NOTHING;",
-                    params![serial, name, brand, model, ip, num, sector],
+                    params![serial, name, brand, model, ip, num, sector, esfera_id],
                 );
             }
         }
@@ -801,9 +902,9 @@ impl Database {
 
     pub fn get_devices(&self, company_id: i32) -> Vec<Device> {
         let sql = if company_id > 0 {
-            "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device WHERE CompanyId = ?1"
+            "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC FROM ESF_Device WHERE CompanyId = ?1"
         } else {
-            "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device"
+            "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC FROM ESF_Device"
         };
 
         let conn = self.conn();
@@ -826,6 +927,9 @@ impl Database {
                 company_id: row.get(9)?,
                 device_number: row.get(10)?,
                 sector: row.get(11)?,
+                esfera_device_id: row.get(12)?,
+                current_adb_address: row.get(13)?,
+                last_seen_utc: row.get(14)?,
             })
         };
 
@@ -844,12 +948,14 @@ impl Database {
         let target_comp = if device.company_id <= 0 { 1 } else { device.company_id };
         self.conn()
             .execute(
-                "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                 ON CONFLICT(AdbDeviceId) DO UPDATE SET
                 DeviceName=excluded.DeviceName, Brand=excluded.Brand, Model=excluded.Model,
                 DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
-                BatteryLevel=excluded.BatteryLevel, DeviceNumber=excluded.DeviceNumber, Sector=excluded.Sector;",
+                BatteryLevel=excluded.BatteryLevel, DeviceNumber=excluded.DeviceNumber, Sector=excluded.Sector,
+                EsferaDeviceId=COALESCE(excluded.EsferaDeviceId, ESF_Device.EsferaDeviceId),
+                CurrentAdbAddress=excluded.CurrentAdbAddress, LastSeenUTC=excluded.LastSeenUTC;",
                 params![
                     device.serial,
                     device.name,
@@ -862,6 +968,9 @@ impl Database {
                     target_comp,
                     device.device_number,
                     device.sector,
+                    device.esfera_device_id,
+                    device.current_adb_address,
+                    device.last_seen_utc,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -871,7 +980,7 @@ impl Database {
     pub fn get_all_devices(&self) -> Vec<Device> {
         let conn = self.conn();
         let mut stmt = match conn.prepare_cached(
-            "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector FROM ESF_Device"
+            "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC FROM ESF_Device"
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -891,6 +1000,9 @@ impl Database {
                 company_id: row.get(9)?,
                 device_number: row.get(10)?,
                 sector: row.get(11)?,
+                esfera_device_id: row.get(12)?,
+                current_adb_address: row.get(13)?,
+                last_seen_utc: row.get(14)?,
             })
         });
 
@@ -905,6 +1017,30 @@ impl Database {
             params![serial],
         ).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn process_checkin(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
+        self.conn().execute(
+            "UPDATE ESF_Device SET
+                CurrentAdbAddress = ?1,
+                Status = 'online',
+                LastSeenUTC = ?2,
+                DeviceIp = ?3,
+                DevicePort = ?4
+             WHERE EsferaDeviceId = ?5",
+            params![adb_address, now, ip, port, device_id],
+        ).map_err(|e| e.to_string())
+    }
+
+    pub fn insert_unknown_device(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
+        self.conn().execute(
+            "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
+             VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, 1, 0, 'junior', ?5, ?6)
+             ON CONFLICT(EsferaDeviceId) DO UPDATE SET
+             CurrentAdbAddress=excluded.CurrentAdbAddress, Status='online', LastSeenUTC=excluded.LastSeenUTC,
+             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort",
+            params![format!("agent-{}", device_id), device_id, ip, port, adb_address, now],
+        ).map_err(|e| e.to_string())
     }
 
     // ============================================================
@@ -1760,5 +1896,290 @@ impl Database {
 
     pub fn update_campaign_status(&self, campaign_id: i32, status: &str) -> Result<(), String> {
         self.set_campaign_status(campaign_id, status)
+    }
+
+    // ============================================================
+    // GESTÃO DE USUÁRIOS E ROLES (Colaborador, Supervisor, Gestor)
+    // ============================================================
+
+    pub fn get_users_by_company(&self, company_id: i32) -> Vec<User> {
+        let conn = self.conn();
+        let sql = if company_id > 0 {
+            "SELECT UserId, Username, DisplayName, Role, CompanyId, IsActive FROM ESF_User WHERE CompanyId = ?1 AND IsActive = 1 ORDER BY DisplayName ASC"
+        } else {
+            "SELECT UserId, Username, DisplayName, Role, CompanyId, IsActive FROM ESF_User WHERE IsActive = 1 ORDER BY DisplayName ASC"
+        };
+
+        let mut stmt = match conn.prepare_cached(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        let mapper = |row: &rusqlite::Row| {
+            Ok(User {
+                id: row.get(0)?,
+                username: row.get(1)?,
+                display_name: row.get(2)?,
+                role: row.get(3)?,
+                company_id: row.get(4)?,
+                is_active: row.get(5)?,
+            })
+        };
+
+        let rows = if company_id > 0 {
+            stmt.query_map(params![company_id], mapper)
+        } else {
+            stmt.query_map([], mapper)
+        };
+
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    pub fn create_user_with_role(
+        &self,
+        user_name: &str,
+        pass: &str,
+        display_name: &str,
+        role: &str,
+        company_id: i32,
+    ) -> Result<User, String> {
+        let valid_role = match role.to_lowercase().as_str() {
+            "master" => "master",
+            "gestor" => "gestor",
+            "supervisor" => "supervisor",
+            _ => "colaborador",
+        };
+
+        let hash = hash_password(pass);
+        self.conn().execute(
+            "INSERT INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId, IsActive)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1);",
+            params![user_name, hash, display_name, valid_role, company_id],
+        ).map_err(|e| format!("Erro ao criar usuário: {}", e))?;
+
+        let user_id = self.conn().last_insert_rowid() as i32;
+
+        Ok(User {
+            id: user_id,
+            username: user_name.to_string(),
+            display_name: display_name.to_string(),
+            role: valid_role.to_string(),
+            company_id: Some(company_id),
+            is_active: true,
+        })
+    }
+
+    // ============================================================
+    // VÍNCULO E PERMISSÃO DE CELULARES (Colaborador, Supervisor, Gestor)
+    // ============================================================
+
+    pub fn assign_device_to_user(&self, device_serial: &str, user_id: i32) -> Result<(), String> {
+        self.conn().execute(
+            "INSERT INTO ESF_DeviceAssignment (AdbDeviceId, UserId)
+             VALUES (?1, ?2)
+             ON CONFLICT(AdbDeviceId, UserId) DO NOTHING;",
+            params![device_serial, user_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn unassign_device_from_user(&self, device_serial: &str, user_id: i32) -> Result<(), String> {
+        self.conn().execute(
+            "DELETE FROM ESF_DeviceAssignment WHERE AdbDeviceId = ?1 AND UserId = ?2;",
+            params![device_serial, user_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_assigned_devices_for_user(&self, user_id: i32, company_id: i32) -> Vec<Device> {
+        let conn = self.conn();
+        let sql = "SELECT rowid, d.AdbDeviceId, d.DeviceName, d.Brand, d.Model, d.DeviceIp, d.DevicePort, d.Status, d.BatteryLevel, d.CompanyId, d.DeviceNumber, d.Sector,
+                          d.EsferaDeviceId, d.CurrentAdbAddress, d.LastSeenUTC
+                   FROM ESF_Device d
+                   INNER JOIN ESF_DeviceAssignment da ON d.AdbDeviceId = da.AdbDeviceId
+                   WHERE da.UserId = ?1 AND (d.CompanyId = ?2 OR ?2 <= 0);";
+
+        let mut stmt = match conn.prepare_cached(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        let rows = stmt.query_map(params![user_id, company_id], |row| {
+            Ok(Device {
+                id: row.get(0)?,
+                serial: row.get(1)?,
+                name: row.get(2)?,
+                brand: row.get(3)?,
+                model: row.get(4)?,
+                ip: row.get(5)?,
+                port: row.get(6)?,
+                status: row.get(7)?,
+                battery: row.get(8)?,
+                company_id: row.get(9)?,
+                device_number: row.get(10)?,
+                sector: row.get(11)?,
+                esfera_device_id: row.get(12)?,
+                current_adb_address: row.get(13)?,
+                last_seen_utc: row.get(14)?,
+            })
+        });
+
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    pub fn request_device_permission(
+        &self,
+        user_id: i32,
+        device_serial: &str,
+        reason: &str,
+    ) -> Result<i32, String> {
+        // Cancela qualquer pedido pendente anterior deste mesmo usuário/dispositivo
+        let _ = self.conn().execute(
+            "UPDATE ESF_DevicePermissionRequest SET Status = 'ended', EndedAt = datetime('now')
+             WHERE UserId = ?1 AND AdbDeviceId = ?2 AND Status IN ('pending', 'approved', 'active');",
+            params![user_id, device_serial],
+        );
+
+        self.conn().execute(
+            "INSERT INTO ESF_DevicePermissionRequest (AdbDeviceId, UserId, Status, RequestedReason, RequestedAt)
+             VALUES (?1, ?2, 'pending', ?3, datetime('now'));",
+            params![device_serial, user_id, reason],
+        ).map_err(|e| format!("Erro ao registrar pedido de permissão: {}", e))?;
+
+        Ok(self.conn().last_insert_rowid() as i32)
+    }
+
+    pub fn get_permission_requests(&self, company_id: i32) -> Vec<DevicePermissionRequest> {
+        let conn = self.conn();
+        let sql = "SELECT pr.RequestId, pr.AdbDeviceId, pr.UserId, u.Username, u.DisplayName, pr.Status, pr.RequestedReason, pr.RequestedAt, pr.ApprovedBy, ab.DisplayName, pr.ApprovedAt, pr.EndedAt
+                   FROM ESF_DevicePermissionRequest pr
+                   JOIN ESF_User u ON pr.UserId = u.UserId
+                   LEFT JOIN ESF_User ab ON pr.ApprovedBy = ab.UserId
+                   WHERE (u.CompanyId = ?1 OR ?1 <= 0)
+                   ORDER BY pr.RequestId DESC LIMIT 100;";
+
+        let mut stmt = match conn.prepare_cached(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        let rows = stmt.query_map(params![company_id], |row| {
+            Ok(DevicePermissionRequest {
+                request_id: row.get(0)?,
+                adb_device_id: row.get(1)?,
+                user_id: row.get(2)?,
+                user_name: row.get(3)?,
+                user_display_name: row.get(4)?,
+                status: row.get(5)?,
+                requested_reason: row.get(6)?,
+                requested_at: row.get(7)?,
+                approved_by: row.get(8)?,
+                approved_by_name: row.get(9)?,
+                approved_at: row.get(10)?,
+                ended_at: row.get(11)?,
+            })
+        });
+
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    pub fn approve_permission_request(&self, request_id: i32, approved_by: i32) -> Result<(), String> {
+        // Encerra qualquer outra sessão ativa para este mesmo celular
+        let target_device: String = self.conn().query_row(
+            "SELECT AdbDeviceId FROM ESF_DevicePermissionRequest WHERE RequestId = ?1;",
+            params![request_id],
+            |row| row.get(0),
+        ).map_err(|_| "Solicitação não encontrada.".to_string())?;
+
+        let _ = self.conn().execute(
+            "UPDATE ESF_DevicePermissionRequest SET Status = 'ended', EndedAt = datetime('now')
+             WHERE AdbDeviceId = ?1 AND Status IN ('approved', 'active') AND RequestId != ?2;",
+            params![target_device, request_id],
+        );
+
+        self.conn().execute(
+            "UPDATE ESF_DevicePermissionRequest SET Status = 'approved', ApprovedBy = ?1, ApprovedAt = datetime('now')
+             WHERE RequestId = ?2;",
+            params![approved_by, request_id],
+        ).map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    pub fn reject_permission_request(&self, request_id: i32) -> Result<(), String> {
+        self.conn().execute(
+            "UPDATE ESF_DevicePermissionRequest SET Status = 'rejected', EndedAt = datetime('now')
+             WHERE RequestId = ?1;",
+            params![request_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn end_permission_session(&self, request_id: i32) -> Result<(), String> {
+        self.conn().execute(
+            "UPDATE ESF_DevicePermissionRequest SET Status = 'ended', EndedAt = datetime('now')
+             WHERE RequestId = ?1;",
+            params![request_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_devices_with_active_user_map(&self, company_id: i32) -> Vec<DeviceWithActiveUser> {
+        let conn = self.conn();
+        let sql = "SELECT d.rowid, d.AdbDeviceId, d.DeviceName, d.Brand, d.Model, d.DeviceIp, d.DevicePort, d.Status, d.BatteryLevel, d.CompanyId, d.DeviceNumber, d.Sector,
+                          d.EsferaDeviceId, d.CurrentAdbAddress, d.LastSeenUTC,
+                          pr.UserId, u.Username, u.DisplayName, pr.RequestId,
+                          da.UserId, au.DisplayName
+                   FROM ESF_Device d
+                   LEFT JOIN ESF_DevicePermissionRequest pr ON d.AdbDeviceId = pr.AdbDeviceId AND pr.Status IN ('approved', 'active')
+                   LEFT JOIN ESF_User u ON pr.UserId = u.UserId
+                   LEFT JOIN ESF_DeviceAssignment da ON d.AdbDeviceId = da.AdbDeviceId
+                   LEFT JOIN ESF_User au ON da.UserId = au.UserId
+                   WHERE (d.CompanyId = ?1 OR ?1 <= 0);";
+
+        let mut stmt = match conn.prepare_cached(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        let rows = stmt.query_map(params![company_id], |row| {
+            Ok(DeviceWithActiveUser {
+                id: row.get(0)?,
+                serial: row.get(1)?,
+                name: row.get(2)?,
+                brand: row.get(3)?,
+                model: row.get(4)?,
+                ip: row.get(5)?,
+                port: row.get(6)?,
+                status: row.get(7)?,
+                battery: row.get(8)?,
+                company_id: row.get(9)?,
+                device_number: row.get(10)?,
+                sector: row.get(11)?,
+                esfera_device_id: row.get(12)?,
+                current_adb_address: row.get(13)?,
+                last_seen_utc: row.get(14)?,
+                active_user_id: row.get(15)?,
+                active_user_name: row.get(16)?,
+                active_user_display_name: row.get(17)?,
+                permission_request_id: row.get(18)?,
+                assigned_user_id: row.get(19)?,
+                assigned_user_name: row.get(20)?,
+            })
+        });
+
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
     }
 }

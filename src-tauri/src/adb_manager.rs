@@ -930,20 +930,30 @@ impl AdbManager {
         Err("Arquivo 'Esfera_Agent_ADB.apk' não encontrado. Certifique-se de que o APK está presente na pasta 'public'.".to_string())
     }
 
-    /// Instala silenciosamente o aplicativo Agente Esfera v3 (.APK) no celular via ADB e ativa as permissões de segundo plano
+    /// Instala silenciosamente o aplicativo Agente Esfera v3 (.APK) no celular via ADB com auto-reconexão e tratamento de 'device offline'
     pub fn install_agent_apk(serial: &str) -> Result<String, String> {
         let apk_path_buf = Self::find_agent_apk_path()?;
         let apk_str = apk_path_buf.to_str().ok_or("Caminho do arquivo APK inválido.")?;
 
-        let output = create_cmd("adb")
-            .args(["-s", serial, "install", "-r", "-g", apk_str])
-            .output()
+        // Se for conexão Wi-Fi, garante reconexão preventiva antes de tentar a instalação
+        if serial.contains(':') || serial.contains('.') {
+            let parts: Vec<&str> = serial.split(':').collect();
+            let ip = parts[0];
+            let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
+            let _ = Self::connect_device(ip, port);
+            std::thread::sleep(Duration::from_millis(800));
+        }
+
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s", serial, "install", "-r", "-g", apk_str]);
+
+        let output = run_cmd_timeout(cmd, Duration::from_secs(25))
             .map_err(|e| format!("Falha ao executar 'adb install': {}", e))?;
 
         if output.status.success() {
-            let _ = create_cmd("adb")
-                .args(["-s", serial, "shell", "am", "start", "-n", "com.mouldybread.adbautoenable/.MainActivity"])
-                .output();
+            let mut cmd_start = create_cmd("adb");
+            cmd_start.args(["-s", serial, "shell", "am", "start", "-n", "com.mouldybread.adbautoenable/.MainActivity"]);
+            let _ = run_cmd_timeout(cmd_start, Duration::from_secs(4));
 
             let _ = Self::deploy_keepalive(serial);
             let _ = Self::inject_device_immunity(serial, None);
@@ -952,6 +962,31 @@ impl AdbManager {
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
+            let combined = format!("{} {}", stdout, stderr);
+
+            // Se o erro indicar 'device offline', executa reconexão de emergência e tenta a instalação novamente!
+            if combined.to_lowercase().contains("offline") && (serial.contains(':') || serial.contains('.')) {
+                let parts: Vec<&str> = serial.split(':').collect();
+                let ip = parts[0];
+                let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
+                let _ = Self::connect_device(ip, port);
+                std::thread::sleep(Duration::from_millis(1500));
+
+                let mut retry_cmd = create_cmd("adb");
+                retry_cmd.args(["-s", serial, "install", "-r", "-g", apk_str]);
+                if let Ok(retry_out) = run_cmd_timeout(retry_cmd, Duration::from_secs(25)) {
+                    if retry_out.status.success() {
+                        let mut cmd_start = create_cmd("adb");
+                        cmd_start.args(["-s", serial, "shell", "am", "start", "-n", "com.mouldybread.adbautoenable/.MainActivity"]);
+                        let _ = run_cmd_timeout(cmd_start, Duration::from_secs(4));
+
+                        let _ = Self::deploy_keepalive(serial);
+                        let _ = Self::inject_device_immunity(serial, None);
+                        return Ok(format!("📱 App Agente Esfera v3 instalado e ativado no celular {} com sucesso após auto-reconexão!", serial));
+                    }
+                }
+            }
+
             let err_msg = if !stderr.trim().is_empty() { stderr.trim() } else { stdout.trim() };
             Err(format!("Falha na instalação do APK no celular {}: {}", serial, err_msg))
         }

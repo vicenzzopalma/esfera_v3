@@ -149,6 +149,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           pass: "colab",
           user: { id: 3, username: "colab", displayName: "Ana Operadora", role: "colaborador", companyId: 1 },
         },
+        "supervisor": {
+          pass: "sup123",
+          user: { id: 4, username: "supervisor", displayName: "Supervisor Carlos", role: "supervisor", companyId: 1 },
+        },
       };
 
       const account = SYSTEM_USERS[username];

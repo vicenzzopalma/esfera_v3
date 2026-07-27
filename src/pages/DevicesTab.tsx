@@ -7,11 +7,13 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
 import { useAuth } from "../context/AuthContext";
+import CollaboratorView from "../components/CollaboratorView";
+import SupervisorView from "../components/SupervisorView";
 import Card from "../components/ui/Card";
 import Badge from "../components/ui/Badge";
 import Button from "../components/ui/Button";
 import Modal from "../components/ui/Modal";
-import type { Device, DeviceStatus } from "../types";
+import type { Device, DeviceStatus, DeviceWithActiveUser } from "../types";
 import { api } from "../tauri";
 import {
   Smartphone,
@@ -54,7 +56,17 @@ const statusConfig: Record<
 };
 
 export default function DevicesTab() {
-  const { selectedCompanyId } = useAuth();
+  const { user, selectedCompanyId } = useAuth();
+
+  // Roteamento de Tela por Tipo de Usuário (Role)
+  if (user?.role === "colaborador") {
+    return <CollaboratorView />;
+  }
+
+  if (user?.role === "supervisor") {
+    return <SupervisorView />;
+  }
+
   const [searchQuery, setSearchQuery] = useState("");
   const [sectorTab, setSectorTab] = useState<string>("all");
   const [statusFilter, setStatusFilter] = useState<string>("all");
@@ -62,6 +74,9 @@ export default function DevicesTab() {
 
   // Lista APENAS de celulares conectados/adicionados pelo usuário
   const [devicesList, setDevicesList] = useState<Device[]>([]);
+
+  // Mapa de usuários ativos por dispositivo (para gestor/master ver quem está usando)
+  const [activeUserMap, setActiveUserMap] = useState<Record<string, { activeUserId?: number; activeUserDisplayName?: string }>>({});
 
   // Modais de Conexão e Diagnóstico
   const [connectModalOpen, setConnectModalOpen] = useState(false);
@@ -114,6 +129,20 @@ export default function DevicesTab() {
       .catch((err) => {
         console.warn("Retorno temporário de IPC para get_devices:", err);
       });
+
+    api<DeviceWithActiveUser[]>("get_devices_with_active_user_map", { companyId: effectiveCompanyId })
+      .then((data) => {
+        if (data && Array.isArray(data)) {
+          const map: Record<string, { activeUserId?: number; activeUserDisplayName?: string }> = {};
+          for (const d of data) {
+            if (d.activeUserId && d.activeUserDisplayName) {
+              map[d.serial] = { activeUserId: d.activeUserId, activeUserDisplayName: d.activeUserDisplayName };
+            }
+          }
+          setActiveUserMap(map);
+        }
+      })
+      .catch(() => {});
   }, [effectiveCompanyId]);
 
   useEffect(() => {
@@ -512,6 +541,7 @@ export default function DevicesTab() {
               <MobileDeviceCardItem
                 key={device.serial}
                 device={device}
+                activeUserDisplayName={activeUserMap[device.serial]?.activeUserDisplayName}
                 onRemove={() => handleRemoveDevice(device.serial)}
                 onOpenMirror={() => {
                   setSelectedDeviceForMirror(device);
@@ -1011,12 +1041,14 @@ export default function DevicesTab() {
 // ============================================================
 const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
   device,
+  activeUserDisplayName,
   onRemove,
   onOpenMirror,
   onOpenConfig,
   onForceWireless,
 }: {
   device: Device;
+  activeUserDisplayName?: string;
   onRemove: () => void;
   onOpenMirror: () => void;
   onOpenConfig: () => void;
@@ -1088,6 +1120,16 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
           </button>
         </div>
       </div>
+
+      {/* Em uso por banner - apenas para gestor/master quando alguém está usando */}
+      {activeUserDisplayName && (
+        <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30">
+          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+          <span className="text-xs font-semibold text-emerald-300">
+            Em uso por: <span className="font-bold">{activeUserDisplayName}</span>
+          </span>
+        </div>
+      )}
 
       {/* Connection IP / Serial */}
       <div className="bg-slate-900/80 border border-slate-800 px-2.5 py-1.5 rounded-xl flex items-center justify-between text-[11px] font-mono">
