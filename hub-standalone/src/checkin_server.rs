@@ -8,9 +8,8 @@ use crate::db::Database;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckInPayload {
-    pub device_id: String,
-    pub ip_address: String,
-    pub adb_port: u16,
+    pub esfera_device_id: String,
+    pub current_adb_address: String,
 }
 
 pub async fn start(db: Arc<Database>, port: u16) {
@@ -30,13 +29,18 @@ async fn handle_checkin(
     Json(payload): Json<CheckInPayload>,
 ) -> &'static str {
     let now = Utc::now().to_rfc3339();
-    let adb_address = format!("{}:{}", payload.ip_address, payload.adb_port);
+    let adb_address = &payload.current_adb_address;
 
-    let updated = db.process_checkin(&payload.device_id, &adb_address, &payload.ip_address, payload.adb_port, &now);
+    let (ip, port) = match adb_address.rsplit_once(':') {
+        Some((ip_str, port_str)) => (ip_str.to_string(), port_str.parse::<u16>().unwrap_or(5555)),
+        None => (adb_address.clone(), 5555),
+    };
+
+    let updated = db.process_checkin(&payload.esfera_device_id, adb_address, &ip, port, &now);
 
     match updated {
         Ok(0) => {
-            let _ = db.insert_unknown_device(&payload.device_id, &adb_address, &payload.ip_address, payload.adb_port, &now);
+            let _ = db.insert_unknown_device(&payload.esfera_device_id, adb_address, &ip, port, &now);
         }
         Ok(_) => {}
         Err(e) => {
