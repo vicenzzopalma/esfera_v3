@@ -14,7 +14,7 @@ pub struct CheckInPayload {
     pub adb_port: u16,
 }
 
-pub async fn start(db: Arc<Database>, port: u16, app_handle: AppHandle) {
+pub async fn start(db: Arc<Database>, port: u16, app_handle: Option<AppHandle>) {
     let state = (db, app_handle);
     let app = Router::new()
         .route("/api/devices/check-in", post(handle_checkin))
@@ -28,7 +28,7 @@ pub async fn start(db: Arc<Database>, port: u16, app_handle: AppHandle) {
 }
 
 async fn handle_checkin(
-    State((db, app_handle)): State<(Arc<Database>, AppHandle)>,
+    State((db, app_handle)): State<(Arc<Database>, Option<AppHandle>)>,
     Json(payload): Json<CheckInPayload>,
 ) -> &'static str {
     let now = Utc::now().to_rfc3339();
@@ -47,12 +47,14 @@ async fn handle_checkin(
         }
     }
 
-    let _ = app_handle.emit("device-updated", serde_json::json!({
-        "esferaDeviceId": payload.device_id,
-        "currentAdbAddress": adb_address,
-        "status": "online",
-        "lastSeenUtc": now,
-    }));
+    if let Some(app) = app_handle {
+        let _ = app.emit("device-updated", serde_json::json!({
+            "esferaDeviceId": payload.device_id,
+            "currentAdbAddress": adb_address,
+            "status": "online",
+            "lastSeenUtc": now,
+        }));
+    }
 
     "ok"
 }

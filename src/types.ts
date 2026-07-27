@@ -58,7 +58,7 @@ export interface Company {
   createdAt: string;
 }
 
-export type DeviceStatus = "online" | "offline" | "connecting" | "error";
+export type DeviceStatus = "online" | "offline" | "connecting" | "error" | "online_agent";
 
 export interface Device {
   id: number;
@@ -74,6 +74,9 @@ export interface Device {
   lastSeen?: string;
   deviceNumber: number;
   sector: string;
+  esferaDeviceId?: string | null;
+  currentAdbAddress?: string | null;
+  lastSeenUtc?: string | null;
 }
 
 export type CampaignStatus = "running" | "paused" | "completed" | "draft" | "error";
@@ -270,6 +273,8 @@ export interface AppConfig {
   hub_address: string;
   empresa_server_enabled: boolean;
   empresa_server_port: number;
+  checkin_server_enabled: boolean;
+  checkin_server_port: number;
   mode: "local" | "empresa" | "master";
 }
 

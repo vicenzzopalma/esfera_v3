@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 // Esfera v3 — Hub de Gestão de Dispositivos ADB Celulares
 // Exibe EXCLUSIVAMENTE celulares ativamente conectados/adicionados.
 // Sem quadros vazios ou slots fictícios. Com suporte a setores,
@@ -7,6 +7,7 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
 import { useAuth } from "../context/AuthContext";
+import { listen } from "@tauri-apps/api/event";
 import CollaboratorView from "../components/CollaboratorView";
 import SupervisorView from "../components/SupervisorView";
 import Card from "../components/ui/Card";
@@ -47,9 +48,10 @@ export type SectorType = "junior" | "senior" | "pa_fixa" | "pesquisa";
 
 const statusConfig: Record<
   DeviceStatus,
-  { variant: "success" | "danger" | "warning" | "neutral"; label: string; pulse: boolean }
+  { variant: "success" | "danger" | "warning" | "neutral" | "info"; label: string; pulse: boolean }
 > = {
   online: { variant: "success", label: "Online", pulse: true },
+  online_agent: { variant: "info", label: "Agente", pulse: true },
   offline: { variant: "danger", label: "Offline", pulse: false },
   connecting: { variant: "warning", label: "Conectando", pulse: true },
   error: { variant: "danger", label: "Erro", pulse: false },
@@ -100,7 +102,6 @@ export default function DevicesTab() {
   const [loadingUsb, setLoadingUsb] = useState(false);
   const [linkingSerial, setLinkingSerial] = useState<string | null>(null);
   const [linkingStatus, setLinkingStatus] = useState<string | null>(null);
-  const [installingApk, setInstallingApk] = useState(false);
 
   const [setupDeviceData, setSetupDeviceData] = useState<{ serial?: string; ip?: string; port?: number } | null>(null);
   const [deviceNumberInput, setDeviceNumberInput] = useState("1");
@@ -154,6 +155,23 @@ export default function DevicesTab() {
     }, 7000);
     return () => clearInterval(interval);
   }, [refreshDevices]);
+
+  // Realtime updates from check-in server via Tauri event
+  useEffect(() => {
+    const unlisten = listen<{ esferaDeviceId: string; currentAdbAddress: string; status: string; lastSeenUtc: string }>(
+      "device-updated",
+      (event) => {
+        setDevicesList((prev) =>
+          prev.map((d) =>
+            d.esferaDeviceId === event.payload.esferaDeviceId
+              ? { ...d, currentAdbAddress: event.payload.currentAdbAddress, status: event.payload.status as DeviceStatus, lastSeenUtc: event.payload.lastSeenUtc }
+              : d
+          )
+        );
+      }
+    );
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
 
   const fetchUsbDevices = async () => {
     setLoadingUsb(true);
@@ -373,45 +391,35 @@ export default function DevicesTab() {
           </div>
 
           <Button
-            disabled={installingApk}
-            onClick={async () => {
-              const onlineDevs = devicesList.filter((d) => d.status === "online");
-              if (onlineDevs.length === 0) {
-                alert("Nenhum celular online detectado para instalação remota.");
-                return;
-              }
-              setInstallingApk(true);
-              let ok = 0;
-              let errors: string[] = [];
-              for (const dev of onlineDevs) {
-                try {
-                  await api("install_agent_apk", { serial: dev.serial });
-                  ok++;
-                } catch (e: any) {
-                  const msg = typeof e === "string" ? e : e?.message || "Erro desconhecido";
-                  errors.push(`${dev.model} (${dev.serial}): ${msg}`);
-                }
-              }
-              setInstallingApk(false);
-              if (errors.length > 0) {
-                alert(`📲 Instalação remota finalizada!\n✅ Sucesso em ${ok} de ${onlineDevs.length} celular(es).\n\n⚠️ Erros:\n${errors.join("\n")}`);
-              } else {
-                alert(`📲 Instalação remota concluída com sucesso!\nO Agente APK foi enviado e ativado em ${ok} de ${onlineDevs.length} celulares!`);
-              }
-            }}
-            icon={<Smartphone size={15} className={installingApk ? "animate-spin text-amber-300" : "text-emerald-300"} />}
-            className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold rounded-xl text-xs shadow-lg shadow-emerald-600/30 cursor-pointer disabled:opacity-50"
-            title="Transfere e instala silenciosamente o app Agente Esfera v3 no celular via ADB"
-          >
-            {installingApk ? "📲 Instalando APK..." : "📲 Auto-Instalar Agente APK"}
-          </Button>
-
-          <Button
             onClick={() => setConnectModalOpen(true)}
             icon={<Plus size={15} />}
             className="bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-xs shadow-lg shadow-blue-600/30"
           >
             + Conectar Celular
+          </Button>
+
+          <Button
+            onClick={async () => {
+              const unprovisioned = devicesList.filter(d => !d.esferaDeviceId);
+              if (unprovisioned.length === 0) {
+                alert("Todos os dispositivos ja estao provisionados.");
+                return;
+              }
+              if (!confirm(`Provisionar ${unprovisioned.length} dispositivo(s) sem ID permanente?`)) return;
+              for (const d of unprovisioned) {
+                try {
+                  await api<string>("provision_device", { serial: d.serial, server_url: null });
+                } catch (e: any) {
+                  alert(`Erro ao provisionar ${d.serial}: ${typeof e === "string" ? e : e?.message || "Erro"}`);
+                }
+              }
+              refreshDevices();
+            }}
+            icon={<Shield size={14} className="text-emerald-400" />}
+            className="bg-emerald-950/60 hover:bg-emerald-900 border-emerald-600/50 text-emerald-200 rounded-xl text-xs font-extrabold shadow-lg"
+            title="Provisiona todos os dispositivos sem ID permanente"
+          >
+            Provisionar Todos
           </Button>
 
           <Button
@@ -1076,6 +1084,12 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
             <span className="px-1.5 py-0.5 rounded-full bg-blue-950/80 text-blue-300 border border-blue-800/60 text-[9px] font-bold uppercase inline-block mt-0.5">
               {device.sector.replace("_", " ")}
             </span>
+            {device.esferaDeviceId && (
+              <span className="px-1.5 py-0.5 rounded-full bg-emerald-950/80 text-emerald-300 border border-emerald-800/60 text-[9px] font-mono inline-block mt-0.5 ml-1"
+                    title={`ID: ${device.esferaDeviceId}`}>
+                {device.esferaDeviceId.slice(0, 12)}...
+              </span>
+            )}
           </div>
         </div>
 
@@ -1084,20 +1098,39 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
             {status.label}
           </Badge>
 
-          <button
-            onClick={async () => {
-              try {
-                const msg = await api<string>("install_agent_apk", { serial: device.serial });
-                alert(msg);
-              } catch (err: any) {
-                alert(typeof err === "string" ? err : err?.message || "Erro ao instalar APK.");
-              }
-            }}
-            className="p-1 rounded-lg text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/20 transition-all cursor-pointer ml-1"
-            title="Instalar App Agente (.APK) no Celular via ADB"
-          >
-            <Smartphone size={14} />
-          </button>
+          {/* Provision indicator: checkmark if done, smartphone button if not */}
+          {device.esferaDeviceId ? (
+            <button
+              onClick={async () => {
+                if (!confirm("Dispositivo ja provisionado. Reprovisionar?")) return;
+                try {
+                  const msg = await api<string>("provision_device", { serial: device.serial, server_url: null });
+                  alert(`Reprovisionado: ${msg}`);
+                } catch (err: any) {
+                  alert(typeof err === "string" ? err : err?.message || "Erro ao reprovisionar.");
+                }
+              }}
+              className="p-1 rounded-lg text-emerald-500 hover:text-emerald-400 hover:bg-emerald-500/20 transition-all cursor-pointer ml-1"
+              title="Provisionado. Clique para reprovisionar."
+            >
+              <CheckCircle2 size={14} />
+            </button>
+          ) : (
+            <button
+              onClick={async () => {
+                try {
+                  const msg = await api<string>("provision_device", { serial: device.serial, server_url: null });
+                  alert(`Provisionado: ${msg}`);
+                } catch (err: any) {
+                  alert(typeof err === "string" ? err : err?.message || "Erro ao provisionar.");
+                }
+              }}
+              className="p-1 rounded-lg text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/20 transition-all cursor-pointer ml-1"
+              title="Provisionar dispositivo (ID permanente + agente)"
+            >
+              <Smartphone size={14} />
+            </button>
+          )}
 
           <button
             onClick={onOpenConfig}
@@ -1134,8 +1167,15 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
       {/* Connection IP / Serial */}
       <div className="bg-slate-900/80 border border-slate-800 px-2.5 py-1.5 rounded-xl flex items-center justify-between text-[11px] font-mono">
         <span className="text-slate-400">{isUsbOnly ? "Serial USB:" : "IP ADB:"}</span>
-        <span className="text-blue-300 font-bold">{device.serial}</span>
+        <span className="text-blue-300 font-bold">{device.currentAdbAddress || device.serial}</span>
       </div>
+
+      {/* Last seen from agent check-in */}
+      {device.lastSeenUtc && (
+        <div className="text-[10px] text-slate-500 text-center font-mono">
+          Último check-in: {new Date(device.lastSeenUtc).toLocaleTimeString()}
+        </div>
+      )}
 
       {/* Battery Level */}
       <div className="space-y-1">

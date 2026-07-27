@@ -1043,6 +1043,46 @@ impl Database {
         ).map_err(|e| e.to_string())
     }
 
+    pub fn mark_stale_devices_offline(&self, timeout_seconds: i32) -> Result<usize, String> {
+        let sql = format!(
+            "UPDATE ESF_Device SET Status = 'offline'
+             WHERE EsferaDeviceId IS NOT NULL
+             AND Status = 'online'
+             AND LastSeenUTC IS NOT NULL
+             AND datetime(LastSeenUTC) < datetime('now', '-{} seconds')",
+            timeout_seconds
+        );
+        self.conn().execute(&sql, []).map_err(|e| e.to_string())
+    }
+
+    pub fn get_device_by_esfera_id(&self, esfera_device_id: &str) -> Option<Device> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC
+             FROM ESF_Device WHERE EsferaDeviceId = ?1"
+        ).ok()?;
+
+        stmt.query_row(params![esfera_device_id], |row| {
+            Ok(Device {
+                id: row.get(0)?,
+                serial: row.get(1)?,
+                name: row.get(2)?,
+                brand: row.get(3)?,
+                model: row.get(4)?,
+                ip: row.get(5)?,
+                port: row.get(6)?,
+                status: row.get(7)?,
+                battery: row.get(8)?,
+                company_id: row.get(9)?,
+                device_number: row.get(10)?,
+                sector: row.get(11)?,
+                esfera_device_id: row.get(12)?,
+                current_adb_address: row.get(13)?,
+                last_seen_utc: row.get(14)?,
+            })
+        }).ok()
+    }
+
     // ============================================================
     // CAMPANHAS (com soft delete)
     // ============================================================

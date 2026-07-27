@@ -1429,6 +1429,23 @@ pub async fn install_agent_apk(_token: String, serial: String) -> Result<String,
     }).await.map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+pub async fn provision_device(
+    _token: String,
+    serial: String,
+    server_url: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::provision_device(&serial, server_url.as_deref())
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn get_device_by_esfera_id(state: State<'_, AppState>, _token: String, esfera_device_id: String) -> Result<Option<Device>, String> {
+    let db = &state.db;
+    Ok(db.get_device_by_esfera_id(&esfera_device_id))
+}
+
 // ============================================================
 // DISTRIBUTED CONFIG
 // ============================================================

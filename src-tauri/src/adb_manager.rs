@@ -8,7 +8,12 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::sync::RwLock;
 use std::collections::HashMap;
+use std::io::Write;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+/// Script shell embutido (fallback quando APK não está disponível)
+const AGENT_SCRIPT_CONTENT: &str = include_str!("../../src-agent/esfera_agent.sh");
 
 pub fn run_cmd_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process::Output, String> {
     cmd.stdout(std::process::Stdio::piped());
@@ -895,13 +900,168 @@ impl AdbManager {
 
 
 
+    /// Injeta a URL do servidor Esfera no dispositivo Android
+    pub fn inject_server_config(serial: &str, server_url: &str, device_id: &str) -> Result<String, String> {
+        let config_json = format!(
+            "{{\\\"serverUrl\\\":\\\"{}\\\",\\\"deviceId\\\":\\\"{}\\\",\\\"heartbeatIntervalSec\\\":30}}",
+            server_url, device_id
+        );
+        let batch_cmd = format!(
+            "setprop persist.esfera.server_address {}; echo '{}' > /sdcard/esfera_config.json",
+            server_url, config_json
+        );
+
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s", serial, "shell", &batch_cmd]);
+
+        match run_cmd_timeout(cmd, Duration::from_secs(3)) {
+            Ok(_) => Ok(format!("Configuração do servidor '{}' injetada", server_url)),
+            Err(e) => Err(format!("Falha ao injetar config: {}", e)),
+        }
+    }
+
+    /// Inicia o serviço do Agent Android via ADB
+    pub fn start_agent_service(serial: &str) -> Result<String, String> {
+        // Tenta iniciar o novo agente (v4), fallback para o antigo (mouldybread)
+        let result = (|| -> Result<String, String> {
+            // Tenta novo agente
+            let mut cmd = create_cmd("adb");
+            cmd.args(["-s", serial, "shell", "am", "start-foreground-service", "-n", "com.esfera.agent/.EsferaAgentService"]);
+            match run_cmd_timeout(cmd, Duration::from_secs(3)) {
+                Ok(_) => return Ok("Agente Esfera v4 iniciado".to_string()),
+                Err(_) => {}
+            }
+
+            // Fallback: agente antigo (mouldybread)
+            let mut cmd = create_cmd("adb");
+            cmd.args(["-s", serial, "shell", "am", "start", "-n", "com.mouldybread.adbautoenable/.MainActivity"]);
+            run_cmd_timeout(cmd, Duration::from_secs(3)).map(|_| "Agente ADB Auto Enable iniciado (fallback)".to_string())
+        })();
+
+        match result {
+            Ok(msg) => Ok(msg),
+            Err(e) => Err(format!("Falha ao iniciar serviço do agente: {}", e)),
+        }
+    }
+
+    /// Provisiona um dispositivo: gera UUID, injeta ID + config + imunidade, instala APK, inicia servi\u{e7}o
+    /// server_url \u{e9} opcional: se omitido, deriva automaticamente da config + IP local
+    pub fn provision_device(serial: &str, server_url: Option<&str>) -> Result<String, String> {
+        let uuid = Uuid::new_v4().to_string();
+        let device_id = format!("ESF-{}", uuid);
+        let config = crate::config::load_config();
+
+        let url = match server_url {
+            Some(url) => url.to_string(),
+            None => Self::resolve_server_url(serial, &config),
+        };
+
+        Self::inject_persistent_device_id(serial, &device_id)?;
+        Self::inject_server_config(serial, &url, &device_id)?;
+        Self::inject_device_immunity(serial, Some(&device_id))?;
+
+        // Para USB, faz adb reverse para o device alcan\u{e7}ar o servidor
+        let is_usb = !serial.contains(':');
+        if is_usb {
+            let _ = Self::reverse_port(serial, config.checkin_server_port);
+        }
+
+        let agent_result = Self::install_agent_apk(serial);
+        match agent_result {
+            Ok(msg) => {
+                let _ = Self::start_agent_service(serial);
+                Ok(format!("Provisionado: {} com ID {} ({})", serial, device_id, msg))
+            }
+            Err(e) => {
+                Self::push_agent_script(serial)?;
+                Self::start_agent_script(serial)?;
+                Ok(format!("Provisionado: {} com ID {} (fallback script: {})", serial, device_id, e))
+            }
+        }
+    }
+
+    fn resolve_server_url(serial: &str, config: &crate::config::AppConfig) -> String {
+        let port = config.checkin_server_port;
+        let is_usb = !serial.contains(':');
+        if is_usb {
+            return format!("http://localhost:{}", port);
+        }
+        // WiFi: extrai IP do serial (ex: "192.168.1.185:5555")
+        let ip = serial.split(':').next().unwrap_or("127.0.0.1");
+        format!("http://{}:{}", ip, port)
+    }
+
+    /// adb reverse tcp:{port} tcp:{port} — permite device USB alcan\u{e7}ar servidor local
+    fn reverse_port(serial: &str, port: u16) -> Result<String, String> {
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s", serial, "reverse", &format!("tcp:{}", port), &format!("tcp:{}", port)]);
+        let output = run_cmd_timeout(cmd, Duration::from_secs(3))
+            .map_err(|e| format!("Falha ao fazer reverse: {}", e))?;
+        if output.status.success() {
+            Ok(format!("Reverse tcp:{} ok", port))
+        } else {
+            Err(format!("Reverse tcp:{} falhou", port))
+        }
+    }
+
+    /// Push the shell agent script to device via adb
+    pub fn push_agent_script(serial: &str) -> Result<String, String> {
+        let tmp_dir = std::env::temp_dir();
+        let script_path = tmp_dir.join("esfera_agent.sh");
+        let mut file = std::fs::File::create(&script_path)
+            .map_err(|e| format!("Falha ao criar script temporario: {}", e))?;
+        file.write_all(AGENT_SCRIPT_CONTENT.as_bytes())
+            .map_err(|e| format!("Falha ao escrever script: {}", e))?;
+        drop(file);
+
+        let path_str = script_path.to_str()
+            .ok_or("Caminho temporario invalido")?;
+
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s", serial, "push", path_str, "/data/local/tmp/esfera_agent.sh"]);
+        let output = run_cmd_timeout(cmd, Duration::from_secs(5))
+            .map_err(|e| format!("Falha ao fazer push do script: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("adb push falhou: {}", stderr.trim()));
+        }
+
+        let mut chmod = create_cmd("adb");
+        chmod.args(["-s", serial, "shell", "chmod", "+x", "/data/local/tmp/esfera_agent.sh"]);
+        let _ = run_cmd_timeout(chmod, Duration::from_secs(3));
+
+        Ok("Script pushado com sucesso".to_string())
+    }
+
+    /// Start the shell agent script in background via nohup
+    pub fn start_agent_script(serial: &str) -> Result<String, String> {
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s", serial, "shell",
+            "nohup", "sh", "/data/local/tmp/esfera_agent.sh",
+            ">", "/dev/null", "2>&1", "&"]);
+        let output = run_cmd_timeout(cmd, Duration::from_secs(3))
+            .map_err(|e| format!("Falha ao iniciar script: {}", e))?;
+
+        if output.status.success() {
+            Ok("Script agente iniciado em background".to_string())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("Falha ao iniciar script: {}", stderr.trim()))
+        }
+    }
+
     fn find_agent_apk_path() -> Result<std::path::PathBuf, String> {
         let candidates = vec![
+            std::path::PathBuf::from("Esfera_Agent_v4.apk"),
+            std::path::PathBuf::from("public/Esfera_Agent_v4.apk"),
+            std::path::PathBuf::from("../public/Esfera_Agent_v4.apk"),
             std::path::PathBuf::from("Esfera_Agent_ADB.apk"),
             std::path::PathBuf::from("public/Esfera_Agent_ADB.apk"),
             std::path::PathBuf::from("../public/Esfera_Agent_ADB.apk"),
-            std::path::PathBuf::from("../../public/Esfera_Agent_ADB.apk"),
-            std::path::PathBuf::from("../../../public/Esfera_Agent_ADB.apk"),
+            std::path::PathBuf::from("../../src-tauri/binaries/Esfera_Agent_ADB.apk"),
+            std::path::PathBuf::from("../src-tauri/binaries/Esfera_Agent_ADB.apk"),
+            std::path::PathBuf::from("src-tauri/binaries/Esfera_Agent_ADB.apk"),
         ];
 
         for path in &candidates {
@@ -918,6 +1078,7 @@ impl AdbManager {
                     exe_dir.join("../public/Esfera_Agent_ADB.apk"),
                     exe_dir.join("../../public/Esfera_Agent_ADB.apk"),
                     exe_dir.join("../../../public/Esfera_Agent_ADB.apk"),
+                    exe_dir.join("../../src-tauri/binaries/Esfera_Agent_ADB.apk"),
                 ];
                 for path in exe_candidates {
                     if path.exists() {
@@ -927,7 +1088,7 @@ impl AdbManager {
             }
         }
 
-        Err("Arquivo 'Esfera_Agent_ADB.apk' não encontrado. Certifique-se de que o APK está presente na pasta 'public'.".to_string())
+        Err("Arquivo 'Esfera_Agent_ADB.apk' não encontrado.".to_string())
     }
 
     /// Instala silenciosamente o aplicativo Agente Esfera v3 (.APK) no celular via ADB com auto-reconexão e tratamento de 'device offline'
@@ -951,9 +1112,7 @@ impl AdbManager {
             .map_err(|e| format!("Falha ao executar 'adb install': {}", e))?;
 
         if output.status.success() {
-            let mut cmd_start = create_cmd("adb");
-            cmd_start.args(["-s", serial, "shell", "am", "start", "-n", "com.mouldybread.adbautoenable/.MainActivity"]);
-            let _ = run_cmd_timeout(cmd_start, Duration::from_secs(4));
+            let _ = Self::start_agent_service(serial);
 
             let _ = Self::deploy_keepalive(serial);
             let _ = Self::inject_device_immunity(serial, None);
@@ -976,9 +1135,7 @@ impl AdbManager {
                 retry_cmd.args(["-s", serial, "install", "-r", "-g", apk_str]);
                 if let Ok(retry_out) = run_cmd_timeout(retry_cmd, Duration::from_secs(25)) {
                     if retry_out.status.success() {
-                        let mut cmd_start = create_cmd("adb");
-                        cmd_start.args(["-s", serial, "shell", "am", "start", "-n", "com.mouldybread.adbautoenable/.MainActivity"]);
-                        let _ = run_cmd_timeout(cmd_start, Duration::from_secs(4));
+                        let _ = Self::start_agent_service(serial);
 
                         let _ = Self::deploy_keepalive(serial);
                         let _ = Self::inject_device_immunity(serial, None);
@@ -992,17 +1149,31 @@ impl AdbManager {
         }
     }
 
-    /// Thread leve e eficiente (0.0% CPU) para manter conexões Wi-Fi ativas sem travar o sistema
-    pub fn start_auto_reconnect_daemon(db_conn: std::sync::Arc<crate::db::Database>) {
+    /// Monitor de status: marca devices como offline se check-in expirou
+    /// Para devices legado (sem EsferaDeviceId), mantém reconnect via ADB
+    pub fn start_status_monitor(db_conn: std::sync::Arc<crate::db::Database>) {
         use std::collections::HashSet;
         let injected: std::sync::Arc<std::sync::Mutex<HashSet<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
 
         std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(25));
+            std::thread::sleep(std::time::Duration::from_secs(30));
 
+            // 1. Marca offline devices com check-in expirado (>120s sem heartbeat)
+            let _ = db_conn.mark_stale_devices_offline(120);
+
+            // 2. Para devices legado (nunca fizeram check-in), tenta reconnect via ADB
             let devices = db_conn.get_devices(1);
             for dev in devices {
+                let has_esfera_id = dev.esfera_device_id.is_some();
+                let has_checkin = dev.last_seen_utc.is_some();
+
+                if has_esfera_id && has_checkin {
+                    // Device com agent ativo — não precisa de reconnect cego
+                    continue;
+                }
+
+                // Device legado — tenta manter conexão ADB
                 let target = if !dev.ip.is_empty() {
                     format!("{}:{}", dev.ip, dev.port)
                 } else if dev.serial.contains(':') {
