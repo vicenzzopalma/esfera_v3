@@ -6,10 +6,10 @@
 
 mod adb_manager;
 mod ai_engine;
-mod checkin_server;
+pub mod checkin_server;
 mod commands;
 pub mod config;
-mod db;
+pub mod db;
 mod dispatcher;
 pub mod empresa_server;
 pub mod hub;
@@ -158,13 +158,13 @@ pub fn run() {
                 let db = db_arc_clone.clone();
                 let port = app_config.checkin_server_port;
                 tauri::async_runtime::spawn(async move {
-                    checkin_server::start(db, port, handle).await;
+                    checkin_server::start(db, port, Some(handle)).await;
                 });
             }
 
             dispatcher::Dispatcher::start_worker(db_arc_clone.clone(), Some(app.handle().clone()));
             dispatcher::Dispatcher::start_persistent_adb_keepalive_loop(db_arc_clone.clone());
-            adb_manager::AdbManager::start_auto_reconnect_daemon(db_arc_clone);
+            adb_manager::AdbManager::start_status_monitor(db_arc_clone);
             Ok(())
         })
         .manage(AppState { db: db_arc, sessions, master_client })
@@ -251,6 +251,8 @@ pub fn run() {
             inject_virtual_camera,
             optimize_device_hpc,
             install_agent_apk,
+            provision_device,
+            get_device_by_esfera_id,
             // AI Config
             get_ai_config,
             save_ai_config,
