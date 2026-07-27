@@ -1,9 +1,0 @@
-D:\Novo\Esfera v3\hub-standalone\target\debug\deps\futures_channel-a1baad68e6c33a92.d: C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\lib.rs C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\lock.rs C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\mpsc\mod.rs C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\mpsc\queue.rs C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\oneshot.rs
-
-D:\Novo\Esfera v3\hub-standalone\target\debug\deps\libfutures_channel-a1baad68e6c33a92.rmeta: C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\lib.rs C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\lock.rs C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\mpsc\mod.rs C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\mpsc\queue.rs C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\oneshot.rs
-
-C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\lib.rs:
-C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\lock.rs:
-C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\mpsc\mod.rs:
-C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\mpsc\queue.rs:
-C:\Users\vicenzzo.palma\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-channel-0.3.33\src\oneshot.rs:
