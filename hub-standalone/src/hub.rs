@@ -33,7 +33,14 @@ impl Hub {
         println!("Hub iniciado na porta {}", self.port);
 
         loop {
-            let (stream, addr) = listener.accept().await.map_err(|e| e.to_string())?;
+            let (stream, addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    println!("Aviso: erro ao aceitar conexão TCP: {}", e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let connections = self.connections.clone();
             let pending = self.pending.clone();
             tokio::spawn(async move {

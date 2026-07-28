@@ -465,8 +465,8 @@ pub fn disconnect_adb_device(state: State<'_, AppState>, token: String, serial: 
 #[tauri::command]
 pub fn delete_device(state: State<'_, AppState>, token: String, serial: String) -> Result<(), String> {
     let session = validate_session(&state.sessions, &token)?;
-    if session.role != "master" {
-        return Err("Acesso Negado: apenas Master pode remover dispositivos.".to_string());
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Acesso Negado: apenas Master ou Gestor podem remover dispositivos.".to_string());
     }
     let db = &state.db;
     db.delete_device(&serial)
@@ -1415,6 +1415,25 @@ pub fn launch_camera_stream(_token: String, serial: String, facing: Option<Strin
 #[tauri::command]
 pub fn inject_virtual_camera(_token: String, serial: String, target_type: String) -> Result<String, String> {
     AdbManager::inject_virtual_camera_feed(&serial, &target_type)
+}
+
+#[tauri::command]
+pub fn inject_virtual_camera_region(
+    serial: String,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<String, String> {
+    AdbManager::inject_virtual_camera_region(&serial, x, y, width, height)
+}
+
+#[tauri::command]
+pub fn inject_base64_frame(
+    serial: String,
+    frame_data: String,
+) -> Result<String, String> {
+    AdbManager::inject_base64_frame(&serial, &frame_data)
 }
 
 #[tauri::command]

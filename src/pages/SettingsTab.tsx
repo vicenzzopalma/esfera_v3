@@ -10,7 +10,7 @@ import Card from "../components/ui/Card";
 import Button from "../components/ui/Button";
 import Toggle from "../components/ui/Toggle";
 import { api } from "../tauri";
-import type { AiConfig, AppConfig } from "../types";
+import type { AppConfig } from "../types";
 import {
   Save,
   Globe,
@@ -19,17 +19,15 @@ import {
   Smartphone,
   Database,
   RefreshCw,
-  Zap,
-  RotateCcw,
-  Brain,
   Wifi,
 } from "lucide-react";
 
-type SettingsSection = "geral" | "notificacoes" | "adb" | "dispatch" | "ia" | "hub" | "seguranca";
+type SettingsSection = "geral" | "notificacoes" | "adb" | "hub" | "seguranca";
 
 export default function SettingsTab() {
-  const { selectedCompanyId } = useAuth();
-  
+  const { selectedCompanyId, user } = useAuth();
+  const isMasterUser = user?.role === "master";
+
   // Controle de Navegação Interna
   const [activeSection, setActiveSection] = useState<SettingsSection>("geral");
 
@@ -49,53 +47,19 @@ export default function SettingsTab() {
   const [maxRetries, setMaxRetries] = useState(3);
   const [unlockPin, setUnlockPin] = useState("");
 
-  // Dispatch
-  const [delayMin, setDelayMin] = useState(30);
-  const [delayMax, setDelayMax] = useState(90);
-  const [humanizeDelay, setHumanizeDelay] = useState(true);
-  const [batchSize, setBatchSize] = useState(5);
-  const [retryOnFail, setRetryOnFail] = useState(true);
-  const [maxRetriesDispatch, setMaxRetriesDispatch] = useState(2);
-
-  // AI
-  const [aiProvider, setAiProvider] = useState("ollama_local");
-  const [aiEndpoint, setAiEndpoint] = useState("http://localhost:11434");
-  const [aiModel, setAiModel] = useState("llama3.2");
-  const [aiTemperature, setAiTemperature] = useState(0.7);
-  const [aiApiKey, setAiApiKey] = useState("");
-  const [aiSystemPrompt, setAiSystemPrompt] = useState("Você é um assistente de cobrança. Seja profissional e gentil.");
-  const [aiTestResult, setAiTestResult] = useState("");
-
   // Security
   const [autoBackup, setAutoBackup] = useState(false);
   const [logRetention, setLogRetention] = useState("30");
   const [sessionTimeout, setSessionTimeout] = useState("60");
 
   // Hub config
-  const [hubEnabled, setHubEnabled] = useState(false);
-  const [hubAddress, setHubAddress] = useState("");
+  const [hubEnabled, setHubEnabled] = useState(true);
+  const [hubAddress, setHubAddress] = useState("34.29.70.113:8888");
+  const [customIpOverride, setCustomIpOverride] = useState(false);
   const [empresaServerEnabled, setEmpresaServerEnabled] = useState(false);
   const [empresaServerPort, setEmpresaServerPort] = useState(7777);
-  const [appMode, setAppMode] = useState<"local" | "empresa" | "master">("local");
+  const [appMode, setAppMode] = useState<"local" | "empresa" | "master">("empresa");
   const [hubStatus, setHubStatus] = useState("");
-
-  // Load AI config
-  useEffect(() => {
-    let mounted = true;
-    if (!selectedCompanyId) { if (mounted) return; return; }
-    api<AiConfig>("get_ai_config", { companyId: selectedCompanyId })
-      .then((cfg) => {
-        if (!mounted || !cfg) return;
-        setAiProvider(cfg.provider || "ollama_local");
-        setAiEndpoint(cfg.endpoint || "http://localhost:11434");
-        setAiModel(cfg.model || "llama3.2");
-        setAiTemperature(cfg.temperature || 0.7);
-        setAiApiKey(cfg.apiKey || "");
-        setAiSystemPrompt(cfg.systemPrompt || "");
-      })
-      .catch(() => {});
-    return () => { mounted = false; };
-  }, [selectedCompanyId]);
 
   // Load app config
   useEffect(() => {
@@ -104,29 +68,23 @@ export default function SettingsTab() {
       .then((cfg) => {
         if (!mounted || !cfg) return;
         setHubEnabled(cfg.hub_enabled);
-        setHubAddress(cfg.hub_address);
+        setHubAddress(cfg.hub_address || "34.29.70.113:8888");
         setEmpresaServerEnabled(cfg.empresa_server_enabled);
         setEmpresaServerPort(cfg.empresa_server_port);
-        setAppMode(cfg.mode);
+        // Garante que apenas master possa ter modo 'master'
+        if (cfg.mode === "master" && !isMasterUser) {
+          setAppMode("empresa");
+        } else {
+          setAppMode(cfg.mode);
+        }
       })
       .catch(() => {});
     return () => { mounted = false; };
-  }, []);
+  }, [isMasterUser]);
 
   const handleSaveAll = async () => {
     if (!selectedCompanyId) return;
     try {
-      await api("save_ai_config", {
-        companyId: selectedCompanyId,
-        config: {
-          provider: aiProvider,
-          model: aiModel,
-          temperature: aiTemperature,
-          systemPrompt: aiSystemPrompt,
-          apiKey: aiApiKey,
-          endpoint: aiEndpoint,
-        },
-      });
       await api("save_app_config", {
         hub_enabled: hubEnabled,
         hub_address: hubAddress,
@@ -134,30 +92,15 @@ export default function SettingsTab() {
         empresa_server_port: empresaServerPort,
         mode: appMode,
       });
-      setHubStatus("Configurações salvas. Reinicie o app para aplicar alterações.");
+      setHubStatus("Configurações salvas com sucesso!");
     } catch { /* noop */ }
-  };
-
-  const handleTestAI = async () => {
-    setAiTestResult("Testando...");
-    try {
-      const result = await api<string>("rewrite_message_ai", {
-        message: "Olá {nome}, sua fatura está pendente.",
-        contactName: "Maria",
-      });
-      setAiTestResult(result);
-    } catch {
-      setAiTestResult("[Mock] Bom dia Maria! Sua fatura está pendente. Att, Equipe REALESS");
-    }
   };
 
   const menuItems = [
     { id: "geral", label: "Informações Gerais", icon: <Globe size={18} /> },
     { id: "notificacoes", label: "Notificações", icon: <Bell size={18} /> },
     { id: "adb", label: "Rede & ADB", icon: <Smartphone size={18} /> },
-    { id: "dispatch", label: "Motor de Disparos", icon: <Zap size={18} /> },
-    { id: "ia", label: "Inteligência Artificial", icon: <Brain size={18} /> },
-    { id: "hub", label: "Conexão Hub", icon: <Wifi size={18} /> },
+    { id: "hub", label: "Conexão Hub Nuvem", icon: <Wifi size={18} /> },
     { id: "seguranca", label: "Segurança", icon: <Shield size={18} /> },
   ] as const;
 
@@ -255,113 +198,67 @@ export default function SettingsTab() {
               </div>
             )}
 
-            {activeSection === "dispatch" && (
-              <div className="space-y-8 animate-fade-in">
-                <SectionHeader icon={<Zap size={24} />} color="amber" title="Motor de Disparos" subtitle="Regras, delays e humanização dos envios" />
-                <div className="space-y-6 text-sm max-w-2xl">
-                  <div className="flex gap-8 p-4 bg-amber-500/5 rounded-xl border border-amber-500/10">
-                    <div className="flex-1">
-                      <label className="block font-semibold text-secondary mb-2 text-sm">Delay Mínimo (segundos)</label>
-                      <input type="number" value={delayMin} onChange={(e) => setDelayMin(parseInt(e.target.value) || 30)} min={5} max={300} className="w-32 input-setting font-mono text-center text-lg" />
-                    </div>
-                    <div className="flex-1">
-                      <label className="block font-semibold text-secondary mb-2 text-sm">Delay Máximo (segundos)</label>
-                      <input type="number" value={delayMax} onChange={(e) => setDelayMax(parseInt(e.target.value) || 90)} min={10} max={600} className="w-32 input-setting font-mono text-center text-lg" />
-                    </div>
-                  </div>
 
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">Contatos por Lote (Batch Size)</label>
-                    <input type="number" value={batchSize} onChange={(e) => setBatchSize(parseInt(e.target.value) || 5)} min={1} max={50} className="w-32 input-setting font-mono text-center text-lg" />
-                  </div>
-
-                  <div className="pt-4 space-y-6 border-t border-border">
-                    <ToggleRow label="Humanização de Delay" desc="Usar distribuição Gaussiana em vez de atrasos lineares para evitar bloqueios" checked={humanizeDelay} onChange={setHumanizeDelay} />
-                    <ToggleRow label="Retry Automático em Falha" desc="Se o ADB falhar no toque da tela, tentar o mesmo contato novamente" checked={retryOnFail} onChange={setRetryOnFail} />
-                    
-                    {retryOnFail && (
-                      <div className="pl-6 ml-4 border-l-2 border-amber-500/30">
-                        <label className="block font-semibold text-secondary mb-2 text-sm">Máximo de Retries por Contato</label>
-                        <input type="number" value={maxRetriesDispatch} onChange={(e) => setMaxRetriesDispatch(parseInt(e.target.value) || 2)} min={1} max={5} className="w-24 input-setting font-mono text-center" />
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {activeSection === "ia" && (
-              <div className="space-y-8 animate-fade-in">
-                <SectionHeader icon={<Brain size={24} />} color="violet" title="Inteligência Artificial" subtitle="Modelos, prompts e personalização do LLM" />
-                <div className="space-y-6 text-sm max-w-3xl">
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">Provedor de LLM</label>
-                    <select value={aiProvider} onChange={(e) => setAiProvider(e.target.value)} className="w-64 input-setting">
-                      <option value="ollama_local">Ollama Local (Offline)</option>
-                      <option value="ollama_cloud">Ollama Servidor Nuvem</option>
-                      <option value="openai">OpenAI (ChatGPT)</option>
-                      <option value="anthropic">Anthropic (Claude)</option>
-                    </select>
-                  </div>
-                  
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">Endpoint URL</label>
-                    <input type="text" value={aiEndpoint} onChange={(e) => setAiEndpoint(e.target.value)} className="w-full input-setting font-mono" />
-                  </div>
-
-                  <div className="flex flex-col sm:flex-row gap-6">
-                    <div className="flex-1">
-                      <label className="block font-semibold text-secondary mb-2 text-sm">Modelo Desejado</label>
-                      <input type="text" value={aiModel} onChange={(e) => setAiModel(e.target.value)} placeholder="llama3.2" className="w-full input-setting font-mono" />
-                    </div>
-                    <div className="w-48 shrink-0">
-                      <label className="block font-semibold text-secondary mb-2 text-sm">Temperatura ({aiTemperature})</label>
-                      <input type="range" min="0" max="1" step="0.1" value={aiTemperature} onChange={(e) => setAiTemperature(parseFloat(e.target.value))} className="w-full mt-3 accent-violet-500 cursor-pointer" />
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">API Key (Token de Autorização)</label>
-                    <input type="password" value={aiApiKey} onChange={(e) => setAiApiKey(e.target.value)} placeholder="sk-..." className="w-full input-setting font-mono tracking-widest" />
-                  </div>
-
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">System Prompt Base</label>
-                    <textarea value={aiSystemPrompt} onChange={(e) => setAiSystemPrompt(e.target.value)} rows={5} className="w-full input-setting resize-none leading-relaxed" />
-                  </div>
-
-                  <div className="flex items-center gap-4 pt-4 border-t border-border">
-                    <Button size="md" variant="secondary" icon={<RotateCcw size={16} />} onClick={handleTestAI}>
-                      Testar Comunicação IA
-                    </Button>
-                    {aiTestResult && (
-                      <div className="flex-1 p-3 rounded-xl bg-violet-600/10 border border-violet-500/20 text-violet-200 text-sm font-mono break-words leading-relaxed">
-                        {aiTestResult}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
 
             {activeSection === "hub" && (
               <div className="space-y-8 animate-fade-in">
-                <SectionHeader icon={<Wifi size={24} />} color="blue" title="Conexão Hub & Cluster" subtitle="Topologia de rede local e remota" />
+                <SectionHeader icon={<Wifi size={24} />} color="blue" title="Conexão Hub Nuvem" subtitle="Topologia de rede local e remota" />
                 <div className="space-y-6 text-sm max-w-2xl">
                   <div>
                     <label className="block font-semibold text-secondary mb-2 text-sm">Modo de Operação</label>
                     <select value={appMode} onChange={(e) => setAppMode(e.target.value as "local" | "empresa" | "master")} className="w-full input-setting">
+                      <option value="empresa">Modo Empresa (Conecta ao Hub Nuvem VPS)</option>
                       <option value="local">Modo Standalone (Offline / Local apenas)</option>
-                      <option value="empresa">Modo Empresa (Conecta ao Hub + LAN)</option>
-                      <option value="master">Modo Master (Controle Administrativo Remoto)</option>
+                      {isMasterUser && (
+                        <option value="master">Modo Master (Controle Administrativo Remoto)</option>
+                      )}
                     </select>
                   </div>
 
                   {appMode !== "local" && (
                     <div className="space-y-6 pt-4 border-t border-border">
                       <div>
-                        <label className="block font-semibold text-secondary mb-2 text-sm">Endereço do Servidor Hub (IP:Porta)</label>
-                        <input type="text" value={hubAddress} onChange={(e) => setHubAddress(e.target.value)} placeholder="192.168.1.100:8888" className="w-full max-w-sm input-setting font-mono" />
+                        <label className="block font-semibold text-secondary mb-2 text-sm">Servidor Hub Nuvem</label>
+                        {!customIpOverride ? (
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 bg-emerald-950/40 border border-emerald-500/30 rounded-xl">
+                            <div className="flex items-center gap-2.5 text-emerald-300 font-mono text-sm font-bold">
+                              <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                              34.29.70.113:8888 (VPS Oficial Fixa)
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setCustomIpOverride(true)}
+                              className="text-xs bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 px-3 py-1.5 rounded-lg transition-all font-medium cursor-pointer"
+                            >
+                              ⚠️ Alterar IP (Caso VPS Caia)
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="space-y-2">
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="text"
+                                value={hubAddress}
+                                onChange={(e) => setHubAddress(e.target.value)}
+                                placeholder="34.29.70.113:8888"
+                                className="flex-1 input-setting font-mono text-sm"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setHubAddress("34.29.70.113:8888");
+                                  setCustomIpOverride(false);
+                                }}
+                                className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-2.5 rounded-lg border border-slate-700 font-bold"
+                              >
+                                Restaurar VPS Oficial
+                              </button>
+                            </div>
+                            <p className="text-[11px] text-amber-400 font-medium">
+                              ⚠️ Altere este IP apenas se a VPS principal cair e for necessário redirecionar para um IP de contingência.
+                            </p>
+                          </div>
+                        )}
                       </div>
                       <ToggleRow label="Habilitar Conexão Contínua" desc="Manter heartbeat em tempo real com o servidor central" checked={hubEnabled} onChange={setHubEnabled} />
                     </div>

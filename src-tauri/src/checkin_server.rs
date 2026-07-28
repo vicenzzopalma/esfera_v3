@@ -9,9 +9,8 @@ use crate::db::Database;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckInPayload {
-    pub device_id: String,
-    pub ip_address: String,
-    pub adb_port: u16,
+    pub esfera_device_id: String,
+    pub current_adb_address: String,
 }
 
 pub async fn start(db: Arc<Database>, port: u16, app_handle: Option<AppHandle>) {
@@ -21,10 +20,17 @@ pub async fn start(db: Arc<Database>, port: u16, app_handle: Option<AppHandle>) 
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr).await
-        .expect("Falha ao bindar check-in server");
-    axum::serve(listener, app).await
-        .expect("Falha ao iniciar check-in server");
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("AVISO: Check-in server na porta {} ja em uso: {}", port, e);
+            return;
+        }
+    };
+
+    axum::serve(listener, app).await.unwrap_or_else(|e| {
+        eprintln!("AVISO: Check-in server encerrado: {}", e);
+    });
 }
 
 async fn handle_checkin(
@@ -32,13 +38,18 @@ async fn handle_checkin(
     Json(payload): Json<CheckInPayload>,
 ) -> &'static str {
     let now = Utc::now().to_rfc3339();
-    let adb_address = format!("{}:{}", payload.ip_address, payload.adb_port);
+    let adb_address = &payload.current_adb_address;
 
-    let updated = db.process_checkin(&payload.device_id, &adb_address, &payload.ip_address, payload.adb_port, &now);
+    let (ip, port) = match adb_address.rsplit_once(':') {
+        Some((ip_str, port_str)) => (ip_str.to_string(), port_str.parse::<u16>().unwrap_or(5555)),
+        None => (adb_address.clone(), 5555),
+    };
+
+    let updated = db.process_checkin(&payload.esfera_device_id, adb_address, &ip, port, &now);
 
     match updated {
         Ok(0) => {
-            let _ = db.insert_unknown_device(&payload.device_id, &adb_address, &payload.ip_address, payload.adb_port, &now);
+            let _ = db.insert_unknown_device(&payload.esfera_device_id, adb_address, &ip, port, &now);
         }
         Ok(_) => {}
         Err(e) => {
@@ -49,7 +60,7 @@ async fn handle_checkin(
 
     if let Some(app) = app_handle {
         let _ = app.emit("device-updated", serde_json::json!({
-            "esferaDeviceId": payload.device_id,
+            "esferaDeviceId": payload.esfera_device_id,
             "currentAdbAddress": adb_address,
             "status": "online",
             "lastSeenUtc": now,

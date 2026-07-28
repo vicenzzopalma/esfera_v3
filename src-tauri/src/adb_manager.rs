@@ -4,21 +4,26 @@
 // ============================================================
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::Write;
 use std::process::Command;
 use std::sync::mpsc;
 use std::sync::RwLock;
-use std::collections::HashMap;
-use std::io::Write;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Script shell embutido (fallback quando APK não está disponível)
 const AGENT_SCRIPT_CONTENT: &str = include_str!("../../src-agent/esfera_agent.sh");
 
-pub fn run_cmd_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process::Output, String> {
+pub fn run_cmd_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("Falha ao iniciar comando: {}", e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Falha ao iniciar comando: {}", e))?;
     let pid = child.id();
 
     let (tx, rx) = mpsc::channel();
@@ -35,7 +40,11 @@ pub fn run_cmd_timeout(mut cmd: Command, timeout: Duration) -> Result<std::proce
             let _ = err.read_to_end(&mut stderr);
         }
         let _ = tx.send(match status {
-            Ok(s) => Ok(std::process::Output { status: s, stdout, stderr }),
+            Ok(s) => Ok(std::process::Output {
+                status: s,
+                stdout,
+                stderr,
+            }),
             Err(e) => Err(format!("Erro no processo: {}", e)),
         });
     });
@@ -44,10 +53,21 @@ pub fn run_cmd_timeout(mut cmd: Command, timeout: Duration) -> Result<std::proce
         Ok(result) => result,
         Err(_) => {
             #[cfg(windows)]
-            { let _ = create_cmd("taskkill").args(["/F", "/PID", &pid.to_string()]).output(); }
+            {
+                let _ = create_cmd("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .output();
+            }
             #[cfg(unix)]
-            { let _ = std::process::Command::new("kill").arg(pid.to_string()).output(); }
-            Err(format!("Comando excedeu timeout de {}s.", timeout.as_secs()))
+            {
+                let _ = std::process::Command::new("kill")
+                    .arg(pid.to_string())
+                    .output();
+            }
+            Err(format!(
+                "Comando excedeu timeout de {}s.",
+                timeout.as_secs()
+            ))
         }
     }
 }
@@ -162,7 +182,12 @@ impl AdbManager {
         use std::net::TcpStream;
         use std::time::Duration;
 
-        let prefix = if subnet_prefix.is_empty() { "192.168.1" } else { subnet_prefix.trim_end_matches('.') }.to_string();
+        let prefix = if subnet_prefix.is_empty() {
+            "192.168.1"
+        } else {
+            subnet_prefix.trim_end_matches('.')
+        }
+        .to_string();
         let num_workers = 16;
         let active_ips = std::sync::Mutex::new(Vec::new());
 
@@ -176,7 +201,8 @@ impl AdbManager {
                     for i in start..=end {
                         let ip = format!("{}.{}", prefix_ref, i);
                         if let Ok(addr) = format!("{}:5555", ip).parse() {
-                            if TcpStream::connect_timeout(&addr, Duration::from_millis(60)).is_ok() {
+                            if TcpStream::connect_timeout(&addr, Duration::from_millis(60)).is_ok()
+                            {
                                 let mut ips = ips_ref.lock().unwrap();
                                 ips.push(ip);
                             }
@@ -216,7 +242,10 @@ impl AdbManager {
         if errors.is_empty() {
             Ok("Injeção Keep-Alive ADB persistente aplicada no celular com sucesso!".to_string())
         } else {
-            Err(format!("Alguns comandos Keep-Alive falharam: {}", errors.join("; ")))
+            Err(format!(
+                "Alguns comandos Keep-Alive falharam: {}",
+                errors.join("; ")
+            ))
         }
     }
 
@@ -232,8 +261,12 @@ impl AdbManager {
         unsafe {
             esfera_hpc_run_adb_diagnostic(&mut diag);
         }
-        
-        let len = diag.diagnostic_msg.iter().position(|&c| c == 0).unwrap_or(256);
+
+        let len = diag
+            .diagnostic_msg
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(256);
         let mut msg = String::from_utf8_lossy(&diag.diagnostic_msg[..len]).into_owned();
 
         // Checagem em tempo real no Windows PnP para falha física no cabo USB / descritor
@@ -258,9 +291,7 @@ impl AdbManager {
 
     /// Reinicia o servidor ADB (kill-server & start-server)
     pub fn restart_server() -> Result<String, String> {
-        let _ = create_cmd("adb")
-            .arg("kill-server")
-            .output();
+        let _ = create_cmd("adb").arg("kill-server").output();
 
         std::thread::sleep(std::time::Duration::from_millis(1000));
 
@@ -322,7 +353,12 @@ impl AdbManager {
     /// Obtém o endereço IP do wlan0 via shell único combinado (3 métodos em 1 chamada)
     pub fn get_device_wifi_ip(serial: &str) -> Result<String, String> {
         let mut cmd = create_cmd("adb");
-        cmd.args(["-s", serial, "shell", "getprop dhcp.wlan0.ipaddress; echo '---'; ip route; echo '---'; ip addr show wlan0"]);
+        cmd.args([
+            "-s",
+            serial,
+            "shell",
+            "getprop dhcp.wlan0.ipaddress; echo '---'; ip route; echo '---'; ip addr show wlan0",
+        ]);
         let output = run_cmd_timeout(cmd, Duration::from_secs(3))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -397,7 +433,11 @@ impl AdbManager {
         if lower.contains("connected to") || lower.contains("already connected") {
             Ok(format!("Dispositivo {} conectado com sucesso!", target))
         } else {
-            Err(format!("Não foi possível conectar a {}: {}", target, combined.trim()))
+            Err(format!(
+                "Não foi possível conectar a {}: {}",
+                target,
+                combined.trim()
+            ))
         }
     }
 
@@ -415,10 +455,20 @@ impl AdbManager {
         let combined = format!("{} {}", stdout, stderr);
         let lower = combined.to_lowercase();
 
-        if lower.contains("successfully paired") || lower.contains("success") || output.status.success() {
-            Ok(format!("Celular {} pareado com sucesso com o código {}!", target, code))
+        if lower.contains("successfully paired")
+            || lower.contains("success")
+            || output.status.success()
+        {
+            Ok(format!(
+                "Celular {} pareado com sucesso com o código {}!",
+                target, code
+            ))
         } else {
-            Err(format!("Falha no pareamento em {}: {}", target, combined.trim()))
+            Err(format!(
+                "Falha no pareamento em {}: {}",
+                target,
+                combined.trim()
+            ))
         }
     }
 
@@ -500,14 +550,25 @@ impl AdbManager {
             let b64 = base64::engine::general_purpose::STANDARD.encode(final_bytes);
             Ok(format!("data:image/png;base64,{}", b64))
         } else {
-            Err(format!("Não foi possível capturar o frame da tela do celular ({})", serial))
+            Err(format!(
+                "Não foi possível capturar o frame da tela do celular ({})",
+                serial
+            ))
         }
     }
 
     /// Envia um toque na tela via `adb -s <serial> shell input tap x y`
     pub fn tap_screen(serial: &str, x: u32, y: u32) -> Result<(), String> {
         let output = create_cmd("adb")
-            .args(["-s", serial, "shell", "input", "tap", &x.to_string(), &y.to_string()])
+            .args([
+                "-s",
+                serial,
+                "shell",
+                "input",
+                "tap",
+                &x.to_string(),
+                &y.to_string(),
+            ])
             .output()
             .map_err(|e| format!("Falha ao enviar toque ADB: {}", e))?;
 
@@ -521,7 +582,14 @@ impl AdbManager {
     /// Envia um evento de tecla via `adb -s <serial> shell input keyevent <keycode>`
     pub fn send_keyevent(serial: &str, keycode: u32) -> Result<(), String> {
         let output = create_cmd("adb")
-            .args(["-s", serial, "shell", "input", "keyevent", &keycode.to_string()])
+            .args([
+                "-s",
+                serial,
+                "shell",
+                "input",
+                "keyevent",
+                &keycode.to_string(),
+            ])
             .output()
             .map_err(|e| format!("Falha ao enviar keyevent ADB: {}", e))?;
 
@@ -547,7 +615,11 @@ impl AdbManager {
                 '|' => "\\|".to_string(),
                 c => c.to_string(),
             };
-            shell_cmds.push(format!("input text {}; sleep {}", escaped, delay_ms as f64 / 1000.0));
+            shell_cmds.push(format!(
+                "input text {}; sleep {}",
+                escaped,
+                delay_ms as f64 / 1000.0
+            ));
         }
         let full_cmd = shell_cmds.join(" ");
         let output = create_cmd("adb")
@@ -574,22 +646,38 @@ impl AdbManager {
         }
 
         let mut cmd = create_cmd("adb");
-        cmd.args(["-s", serial, "shell", "getprop ro.product.brand; echo; getprop ro.product.model"]);
+        cmd.args([
+            "-s",
+            serial,
+            "shell",
+            "getprop ro.product.brand; echo; getprop ro.product.model",
+        ]);
         let output = cmd.output();
 
         let (brand, model) = match output {
             Ok(o) => {
                 let s = String::from_utf8_lossy(&o.stdout);
                 let lines: Vec<&str> = s.lines().collect();
-                let brand = lines.first().map(|l| l.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or("Android".to_string());
-                let model = lines.get(1).map(|l| l.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or("Smartphone".to_string());
+                let brand = lines
+                    .first()
+                    .map(|l| l.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Android".to_string());
+                let model = lines
+                    .get(1)
+                    .map(|l| l.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Smartphone".to_string());
                 (brand, model)
             }
             Err(_) => ("Android".to_string(), "Smartphone".to_string()),
         };
 
         if let Ok(mut cache) = DEVICE_INFO_CACHE.write() {
-            cache.insert(serial.to_string(), (brand.clone(), model.clone(), Instant::now()));
+            cache.insert(
+                serial.to_string(),
+                (brand.clone(), model.clone(), Instant::now()),
+            );
         }
 
         (brand, model)
@@ -597,7 +685,11 @@ impl AdbManager {
 
     /// Lança o Scrcpy H.264 nativo em 60 FPS com aceleração por hardware
     pub fn launch_scrcpy(serial: &str, turn_screen_off: bool) -> Result<String, String> {
-        let mode_label = if turn_screen_off { " [Tela Desligada]" } else { "" };
+        let mode_label = if turn_screen_off {
+            " [Tela Desligada]"
+        } else {
+            ""
+        };
         let title = format!("Esfera v3 — Stream H.264 ({}){}", serial, mode_label);
         let mut cmd = create_cmd("scrcpy");
         cmd.args([
@@ -635,7 +727,12 @@ impl AdbManager {
 
     /// Lança uma segunda Área de Trabalho Virtual independente (Display #1) via Scrcpy.
     /// O bot opera na Área #1 enquanto o supervisor usa livremente a tela física principal (Display #0).
-    pub fn launch_scrcpy_virtual_display(serial: &str, width: u32, height: u32, dpi: u32) -> Result<String, String> {
+    pub fn launch_scrcpy_virtual_display(
+        serial: &str,
+        width: u32,
+        height: u32,
+        dpi: u32,
+    ) -> Result<String, String> {
         let display_spec = format!("{}x{}/{}", width, height, dpi);
         let title = format!("Esfera v3 — Área #2 [Disparos Isolados] ({})", serial);
 
@@ -668,7 +765,11 @@ impl AdbManager {
     }
 
     /// Executa um Intent do WhatsApp apontando para um Display específico (ex: Display ID 1)
-    pub fn launch_intent_on_display(serial: &str, url: &str, display_id: u32) -> Result<String, String> {
+    pub fn launch_intent_on_display(
+        serial: &str,
+        url: &str,
+        display_id: u32,
+    ) -> Result<String, String> {
         let output = create_cmd("adb")
             .args([
                 "-s",
@@ -687,17 +788,28 @@ impl AdbManager {
             .map_err(|e| format!("Falha ao executar intent em display secundário: {}", e))?;
 
         if output.status.success() {
-            Ok(format!("Intent aberto no Display #{} com sucesso no aparelho {}", display_id, serial))
+            Ok(format!(
+                "Intent aberto no Display #{} com sucesso no aparelho {}",
+                display_id, serial
+            ))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!("Erro ao abrir Intent no Display #{}: {}", display_id, stderr.trim()))
+            Err(format!(
+                "Erro ao abrir Intent no Display #{}: {}",
+                display_id,
+                stderr.trim()
+            ))
         }
     }
 
     /// Lança o fluxo de vídeo da Câmera (Traseira ou Frontal) do celular Android via Scrcpy
     pub fn launch_scrcpy_camera(serial: &str, facing: &str) -> Result<String, String> {
         let camera_arg = if facing == "front" { "front" } else { "back" };
-        let title = format!("Esfera v3 — Câmera Ao Vivo ({}) [{}]", serial, camera_arg.to_uppercase());
+        let title = format!(
+            "Esfera v3 — Câmera Ao Vivo ({}) [{}]",
+            serial,
+            camera_arg.to_uppercase()
+        );
 
         let result = create_cmd("scrcpy")
             .args([
@@ -713,7 +825,10 @@ impl AdbManager {
             .spawn();
 
         match result {
-            Ok(_) => Ok(format!("Transmissão de Câmera ({}) iniciada com sucesso para {}!", camera_arg, serial)),
+            Ok(_) => Ok(format!(
+                "Transmissão de Câmera ({}) iniciada com sucesso para {}!",
+                camera_arg, serial
+            )),
             Err(e) => {
                 let fallback = create_cmd("scrcpy")
                     .args(["-s", serial, "--window-title", &title])
@@ -727,95 +842,582 @@ impl AdbManager {
     }
 
     /// Injeta a imagem da tela do computador ou QR Code diretamente na Câmera Virtual do Celular
-    pub fn inject_virtual_camera_feed(serial: &str, target_type: &str) -> Result<String, String> {
-        // Passo 1: Executa a varredura ADB de pacotes de Câmera Virtual instalados no Android
-        let pm_out = create_cmd("adb")
-            .args(["-s", serial, "shell", "pm", "list", "packages"])
-            .output();
+    /// Captura a tela principal do computador do gestor para um arquivo PNG temporário
+    pub fn capture_pc_screen_to_temp_file() -> Result<std::path::PathBuf, String> {
+        let temp_dir = std::env::temp_dir();
+        let out_path = temp_dir.join("esfera_screen_capture.png");
+        let out_str = out_path.to_str().ok_or("Caminho temporário inválido")?;
 
-        let packages = match pm_out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-            Err(_) => "".to_string(),
+        let ps_script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             Add-Type -AssemblyName System.Drawing; \
+             $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
+             $bitmap = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height; \
+             $graphics = [System.Drawing.Graphics]::FromImage($bitmap); \
+             $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size); \
+             $bitmap.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png); \
+             $graphics.Dispose(); \
+             $bitmap.Dispose();",
+            out_str.replace('\\', "/")
+        );
+
+        let output = create_cmd("powershell")
+            .args(["-NoProfile", "-Command", &ps_script])
+            .output()
+            .map_err(|e| format!("Falha ao executar captura de tela via PowerShell: {}", e))?;
+
+        if output.status.success() && out_path.exists() {
+            Ok(out_path)
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("Falha na captura da tela do PC: {}", stderr.trim()))
+        }
+    }
+
+    /// Captura uma região delimitada (retângulo/área de enquadramento) da tela do computador do gestor
+    pub fn capture_pc_screen_region(
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> Result<std::path::PathBuf, String> {
+        let temp_dir = std::env::temp_dir();
+        let out_path = temp_dir.join("esfera_screen_cropped.png");
+        let out_str = out_path.to_str().ok_or("Caminho temporário inválido")?;
+
+        let ps_script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             Add-Type -AssemblyName System.Drawing; \
+             $bitmap = New-Object System.Drawing.Bitmap {}, {}; \
+             $graphics = [System.Drawing.Graphics]::FromImage($bitmap); \
+             $point = New-Object System.Drawing.Point {}, {}; \
+             $size = New-Object System.Drawing.Size {}, {}; \
+             $graphics.CopyFromScreen($point, [System.Drawing.Point]::Empty, $size); \
+             $bitmap.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png); \
+             $graphics.Dispose(); \
+             $bitmap.Dispose();",
+            width,
+            height,
+            x,
+            y,
+            width,
+            height,
+            out_str.replace('\\', "/")
+        );
+
+        let output = create_cmd("powershell")
+            .args(["-NoProfile", "-Command", &ps_script])
+            .output()
+            .map_err(|e| format!("Falha ao executar captura recortada da tela: {}", e))?;
+
+        if output.status.success() && out_path.exists() {
+            Ok(out_path)
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "Falha na captura recortada da tela do PC: {}",
+                stderr.trim()
+            ))
+        }
+    }
+
+    /// Injeta uma área/quadrado específico recortado do monitor diretamente na Câmera Virtual do Celular
+    pub fn inject_virtual_camera_region(
+        serial: &str,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> Result<String, String> {
+        let active_devices = Self::list_devices().unwrap_or_default();
+        let target_serial = if active_devices
+            .iter()
+            .any(|d| d.serial == serial && d.state == "device")
+        {
+            serial.to_string()
+        } else if let Some(active_dev) = active_devices.iter().find(|d| d.state == "device") {
+            active_dev.serial.clone()
+        } else {
+            serial.to_string()
         };
 
-        // Passo 2: Se o app de Câmera Virtual não estiver instalado, faz a instalação automatizada do APK Agente
-        if !packages.contains("com.esfera.virtualcamera") && !packages.contains("com.vcam") {
-            let apk_path = "public/Esfera_Agent_ADB.apk";
-            let install_out = create_cmd("adb")
-                .args(["-s", serial, "install", "-r", apk_path])
-                .output();
+        // Passo 1: Captura a área delimitada pelo quadrado movível na tela do PC
+        let captured_img = Self::capture_pc_screen_region(x, y, width, height)?;
+        let img_str = captured_img
+            .to_str()
+            .ok_or("Caminho da imagem recortada é inválido")?;
 
-            match install_out {
-                Ok(out) => {
-                    if !out.status.success() {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        eprintln!("Instalação do APK de câmera virtual falhou: {}", stderr.trim());
-                    }
-                }
-                Err(e) => {
-                    return Err(format!("Falha ao injetar módulo de Câmera Virtual no Android: {}", e));
+        // Passo 2: Cria diretórios VCam
+        let mkdir_dirs = [
+            "/sdcard/VCam",
+            "/sdcard/DCIM/Camera1",
+            "/sdcard/DCIM/Camera",
+        ];
+        for dir in &mkdir_dirs {
+            let mut mk_cmd = create_cmd("adb");
+            mk_cmd.args(["-s", &target_serial, "shell", "mkdir", "-p", dir]);
+            let _ = run_cmd_timeout(mk_cmd, Duration::from_secs(2));
+        }
+
+        // Passo 3: Faz push da imagem recortada
+        let push_targets = [
+            "/sdcard/virtual.png",
+            "/sdcard/virtual.jpg",
+            "/sdcard/VCam/virtual.png",
+            "/sdcard/VCam/virtual.jpg",
+            "/sdcard/DCIM/Camera1/virtual.png",
+            "/sdcard/DCIM/Camera1/virtual.jpg",
+            "/sdcard/DCIM/Camera/virtual.png",
+            "/sdcard/DCIM/Camera/virtual.jpg",
+            "/sdcard/DCIM/virtual.png",
+        ];
+
+        let mut push_count = 0;
+        for dest in &push_targets {
+            let mut cmd = create_cmd("adb");
+            cmd.args(["-s", &target_serial, "push", img_str, dest]);
+            if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(4)) {
+                if out.status.success() {
+                    push_count += 1;
                 }
             }
         }
 
-        // Passo 3: Envia Intent de broadcast via ADB IPC para substituir a alimentação de vídeo
+        // Passo 4: Notifica MediaScanner
+        for path in &[
+            "/sdcard/virtual.png",
+            "/sdcard/VCam/virtual.png",
+            "/sdcard/DCIM/Camera1/virtual.png",
+        ] {
+            let mut scan_cmd = create_cmd("adb");
+            scan_cmd.args([
+                "-s",
+                &target_serial,
+                "shell",
+                "am",
+                "broadcast",
+                "-a",
+                "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                "-d",
+                &format!("file://{}", path),
+            ]);
+            let _ = run_cmd_timeout(scan_cmd, Duration::from_secs(2));
+        }
+
+        // Passo 5: Envia Intents de broadcast via ADB IPC
+        let broadcasts = [
+            vec![
+                "-a",
+                "com.esfera.virtualcamera.INJECT_SCREEN",
+                "--es",
+                "source",
+                "desktop_pc_v3",
+                "--es",
+                "path",
+                "/sdcard/virtual.png",
+            ],
+            vec![
+                "-a",
+                "com.vcam.action.REFRESH",
+                "--es",
+                "path",
+                "/sdcard/virtual.png",
+            ],
+            vec![
+                "-a",
+                "com.vcam.action.REFRESH",
+                "--es",
+                "path",
+                "/sdcard/VCam/virtual.png",
+            ],
+            vec![
+                "-a",
+                "com.vcam.action.REFRESH",
+                "--es",
+                "path",
+                "/sdcard/DCIM/Camera1/virtual.png",
+            ],
+            vec!["-a", "com.vcam.action.CHANGE_VIDEO"],
+        ];
+
+        for b_args in &broadcasts {
+            let mut b_cmd = create_cmd("adb");
+            b_cmd
+                .arg("-s")
+                .arg(&target_serial)
+                .arg("shell")
+                .arg("am")
+                .arg("broadcast");
+            for a in b_args {
+                b_cmd.arg(a);
+            }
+            let _ = run_cmd_timeout(b_cmd, Duration::from_secs(2));
+        }
+
+        Ok(format!(
+            "🎯 Quadrado ({})x({}) capturado e injetado com sucesso no celular {}!\n({} locais atualizados)",
+            width, height, target_serial, push_count
+        ))
+    }
+
+    /// Injeta um frame base64 (gerado via canvas) diretamente no celular Android de forma rápida
+    pub fn inject_base64_frame(serial: &str, base64_data: &str) -> Result<String, String> {
+        use base64::{engine::general_purpose, Engine as _};
+
+        let active_devices = Self::list_devices().unwrap_or_default();
+        let target_serial = if active_devices
+            .iter()
+            .any(|d| d.serial == serial && d.state == "device")
+        {
+            serial.to_string()
+        } else if let Some(active_dev) = active_devices.iter().find(|d| d.state == "device") {
+            active_dev.serial.clone()
+        } else {
+            serial.to_string()
+        };
+
+        // Remove data URI prefix se presente
+        let b64 = if let Some(idx) = base64_data.find(',') {
+            &base64_data[idx + 1..]
+        } else {
+            base64_data
+        };
+
+        let img_data = general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("Falha ao decodificar base64: {}", e))?;
+
+        let temp_dir = std::env::temp_dir();
+        let out_path = temp_dir.join("esfera_frame.png");
+        std::fs::write(&out_path, img_data)
+            .map_err(|e| format!("Falha ao salvar frame temporário: {}", e))?;
+
+        let img_str = out_path.to_str().ok_or("Caminho temporário inválido")?;
+
+        let mkdir_dirs = [
+            "/sdcard/VCam",
+            "/sdcard/DCIM/Camera1",
+            "/sdcard/DCIM/Camera",
+        ];
+        for dir in &mkdir_dirs {
+            let mut mk_cmd = create_cmd("adb");
+            mk_cmd.args(["-s", &target_serial, "shell", "mkdir", "-p", dir]);
+            let _ = run_cmd_timeout(mk_cmd, Duration::from_millis(500));
+        }
+
+        let push_targets = [
+            "/sdcard/virtual.png",
+            "/sdcard/virtual.jpg",
+            "/sdcard/VCam/virtual.png",
+            "/sdcard/VCam/virtual.jpg",
+            "/sdcard/DCIM/Camera1/virtual.png",
+            "/sdcard/DCIM/Camera1/virtual.jpg",
+            "/sdcard/DCIM/Camera/virtual.png",
+            "/sdcard/DCIM/Camera/virtual.jpg",
+            "/sdcard/DCIM/virtual.png",
+        ];
+
+        let mut push_count = 0;
+        let temp_android_path = "/sdcard/esfera_temp_frame.png";
+        
+        // Push the image safely to a temp file on the device
+        let mut push_cmd = create_cmd("adb");
+        push_cmd.args(["-s", &target_serial, "push", img_str, temp_android_path]);
+        if let Ok(out) = run_cmd_timeout(push_cmd, Duration::from_secs(3)) {
+            if out.status.success() {
+                // Now atomically copy/move it to all targets to avoid partial reads by VCam
+                for dest in &push_targets {
+                    let mut cp_cmd = create_cmd("adb");
+                    cp_cmd.args(["-s", &target_serial, "shell", "cp", temp_android_path, dest]);
+                    if let Ok(cp_out) = run_cmd_timeout(cp_cmd, Duration::from_millis(500)) {
+                        if cp_out.status.success() {
+                            push_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Notifica MediaScanner
+        for path in &[
+            "/sdcard/virtual.png",
+            "/sdcard/VCam/virtual.png",
+            "/sdcard/DCIM/Camera1/virtual.png",
+        ] {
+            let mut scan_cmd = create_cmd("adb");
+            scan_cmd.args([
+                "-s",
+                &target_serial,
+                "shell",
+                "am",
+                "broadcast",
+                "-a",
+                "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                "-d",
+                &format!("file://{}", path),
+            ]);
+            let _ = run_cmd_timeout(scan_cmd, Duration::from_secs(2));
+        }
+
+        let broadcasts = [
+            vec![
+                "-a",
+                "com.esfera.virtualcamera.INJECT_SCREEN",
+                "--es",
+                "source",
+                "desktop_pc_v3",
+                "--es",
+                "path",
+                "/sdcard/virtual.png",
+            ],
+            vec![
+                "-a",
+                "com.vcam.action.REFRESH",
+                "--es",
+                "path",
+                "/sdcard/virtual.png",
+            ],
+            vec![
+                "-a",
+                "com.vcam.action.REFRESH",
+                "--es",
+                "path",
+                "/sdcard/VCam/virtual.png",
+            ],
+            vec![
+                "-a",
+                "com.vcam.action.REFRESH",
+                "--es",
+                "path",
+                "/sdcard/DCIM/Camera1/virtual.png",
+            ],
+            vec!["-a", "com.vcam.action.CHANGE_VIDEO"],
+        ];
+
+        for b_args in &broadcasts {
+            let mut b_cmd = create_cmd("adb");
+            b_cmd
+                .arg("-s")
+                .arg(&target_serial)
+                .arg("shell")
+                .arg("am")
+                .arg("broadcast");
+            for a in b_args {
+                b_cmd.arg(a);
+            }
+            let _ = run_cmd_timeout(b_cmd, Duration::from_secs(2));
+        }
+
+        Ok(format!("Frame base64 injetado! ({} locais)", push_count))
+    }
+
+    /// Injeta a imagem da tela do computador ou QR Code diretamente na Câmera Virtual do Celular
+    pub fn inject_virtual_camera_feed(serial: &str, target_type: &str) -> Result<String, String> {
+        let active_devices = Self::list_devices().unwrap_or_default();
+        let target_serial = if active_devices
+            .iter()
+            .any(|d| d.serial == serial && d.state == "device")
+        {
+            serial.to_string()
+        } else if let Some(active_dev) = active_devices.iter().find(|d| d.state == "device") {
+            active_dev.serial.clone()
+        } else {
+            serial.to_string()
+        };
+
+        // Passo 1: Captura em tempo real a tela do monitor do computador do gestor
+        let captured_img = Self::capture_pc_screen_to_temp_file()?;
+        let img_str = captured_img
+            .to_str()
+            .ok_or("Caminho da imagem capturada é inválido")?;
+
+        // Passo 2: Cria as pastas da Câmera Virtual no celular Android se não existirem
+        let mkdir_dirs = [
+            "/sdcard/VCam",
+            "/sdcard/DCIM/Camera1",
+            "/sdcard/DCIM/Camera",
+        ];
+        for dir in &mkdir_dirs {
+            let mut mk_cmd = create_cmd("adb");
+            mk_cmd.args(["-s", &target_serial, "shell", "mkdir", "-p", dir]);
+            let _ = run_cmd_timeout(mk_cmd, Duration::from_secs(2));
+        }
+
+        // Passo 3: Faz push da imagem capturada para TODOS os caminhos suportados por módulos VCam / HookCamera / VirtualCamera
+        let push_targets = [
+            "/sdcard/virtual.png",
+            "/sdcard/virtual.jpg",
+            "/sdcard/VCam/virtual.png",
+            "/sdcard/VCam/virtual.jpg",
+            "/sdcard/DCIM/Camera1/virtual.png",
+            "/sdcard/DCIM/Camera1/virtual.jpg",
+            "/sdcard/DCIM/Camera/virtual.png",
+            "/sdcard/DCIM/Camera/virtual.jpg",
+            "/sdcard/DCIM/virtual.png",
+        ];
+
+        let mut push_count = 0;
+        for dest in &push_targets {
+            let mut cmd = create_cmd("adb");
+            cmd.args(["-s", &target_serial, "push", img_str, dest]);
+            if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(4)) {
+                if out.status.success() {
+                    push_count += 1;
+                }
+            }
+        }
+
+        // Passo 4: Notifica o sistema Android via MediaScanner para forçar atualização do arquivo de mídia
+        for path in &[
+            "/sdcard/virtual.png",
+            "/sdcard/VCam/virtual.png",
+            "/sdcard/DCIM/Camera1/virtual.png",
+        ] {
+            let mut scan_cmd = create_cmd("adb");
+            scan_cmd.args([
+                "-s",
+                &target_serial,
+                "shell",
+                "am",
+                "broadcast",
+                "-a",
+                "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                "-d",
+                &format!("file://{}", path),
+            ]);
+            let _ = run_cmd_timeout(scan_cmd, Duration::from_secs(2));
+        }
+
+        // Passo 5: Envia Intents de broadcast via ADB IPC para atualizar os hooks da Câmera Virtual
         let intent_action = if target_type == "screen" {
             "com.esfera.virtualcamera.INJECT_SCREEN"
         } else {
             "com.esfera.virtualcamera.INJECT_QRCODE"
         };
 
-        let broadcast_out = create_cmd("adb")
-            .args([
-                "-s",
-                serial,
-                "shell",
-                "am",
-                "broadcast",
+        let broadcasts = [
+            vec![
                 "-a",
                 intent_action,
                 "--es",
                 "source",
                 "desktop_pc_v3",
-            ])
-            .output();
+                "--es",
+                "path",
+                "/sdcard/virtual.png",
+            ],
+            vec![
+                "-a",
+                "com.vcam.action.REFRESH",
+                "--es",
+                "path",
+                "/sdcard/virtual.png",
+            ],
+            vec![
+                "-a",
+                "com.vcam.action.REFRESH",
+                "--es",
+                "path",
+                "/sdcard/VCam/virtual.png",
+            ],
+            vec![
+                "-a",
+                "com.vcam.action.REFRESH",
+                "--es",
+                "path",
+                "/sdcard/DCIM/Camera1/virtual.png",
+            ],
+            vec!["-a", "com.vcam.action.CHANGE_VIDEO"],
+        ];
 
-        match broadcast_out {
-            Ok(o) => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                Ok(format!(
-                    "🎯 Injeção de Câmera Virtual ({}) ativada com sucesso no celular {}!\nIPC Status: {}",
-                    target_type, serial, stdout.trim()
-                ))
+        for b_args in &broadcasts {
+            let mut b_cmd = create_cmd("adb");
+            b_cmd
+                .arg("-s")
+                .arg(&target_serial)
+                .arg("shell")
+                .arg("am")
+                .arg("broadcast");
+            for a in b_args {
+                b_cmd.arg(a);
             }
-            Err(e) => Err(format!("Falha ao enviar sinal de Câmera Virtual via ADB IPC: {}", e)),
+            let _ = run_cmd_timeout(b_cmd, Duration::from_secs(2));
         }
+
+        Ok(format!(
+            "📸 Tela do PC do Gestor capturada e enviada para a Câmera Virtual no celular {}!\n(Enviado para {} diretórios da VCam e broadcasts disparados)",
+            target_serial, push_count
+        ))
     }
 
     /// Executa o pacote completo de otimização de alta performance (HPC Turbo Tuning) no celular via ADB
     pub fn optimize_device_performance(serial: &str) -> Result<String, String> {
         let commands = [
             // 1. Desativa animações do Android para resposta instantânea ao toque (0.0x)
-            vec!["shell", "settings", "put", "global", "window_animation_scale", "0.0"],
-            vec!["shell", "settings", "put", "global", "transition_animation_scale", "0.0"],
-            vec!["shell", "settings", "put", "global", "animator_duration_scale", "0.0"],
+            vec![
+                "shell",
+                "settings",
+                "put",
+                "global",
+                "window_animation_scale",
+                "0.0",
+            ],
+            vec![
+                "shell",
+                "settings",
+                "put",
+                "global",
+                "transition_animation_scale",
+                "0.0",
+            ],
+            vec![
+                "shell",
+                "settings",
+                "put",
+                "global",
+                "animator_duration_scale",
+                "0.0",
+            ],
             // 2. Força renderização por GPU e aceleração por Hardware
             vec!["shell", "setprop", "debug.sf.hw", "1"],
-            vec!["shell", "settings", "put", "global", "force_gpu_rendering", "1"],
+            vec![
+                "shell",
+                "settings",
+                "put",
+                "global",
+                "force_gpu_rendering",
+                "1",
+            ],
             // 3. Imuniza o WhatsApp no Doze Mode para evitar que o Android mate em segundo plano
-            vec!["shell", "dumpsys", "deviceidle", "whitelist", "+com.whatsapp"],
-            vec!["shell", "dumpsys", "deviceidle", "whitelist", "+com.whatsapp.w4b"],
+            vec![
+                "shell",
+                "dumpsys",
+                "deviceidle",
+                "whitelist",
+                "+com.whatsapp",
+            ],
+            vec![
+                "shell",
+                "dumpsys",
+                "deviceidle",
+                "whitelist",
+                "+com.whatsapp.w4b",
+            ],
             // 4. Libera memória RAM e otimiza compilação DEX AOT (Speed Profile)
-            vec!["shell", "cmd", "package", "compile", "-m", "speed-profile", "com.whatsapp"],
+            vec![
+                "shell",
+                "cmd",
+                "package",
+                "compile",
+                "-m",
+                "speed-profile",
+                "com.whatsapp",
+            ],
         ];
 
         let mut success_count = 0;
         for cmd in &commands {
-            let res = create_cmd("adb")
-                .arg("-s")
-                .arg(serial)
-                .args(cmd)
-                .output();
+            let res = create_cmd("adb").arg("-s").arg(serial).args(cmd).output();
             if let Ok(o) = res {
                 if o.status.success() {
                     success_count += 1;
@@ -825,7 +1427,9 @@ impl AdbManager {
 
         Ok(format!(
             "🚀 Otimização HPC aplicada com sucesso em {}! ({}/{} otimizações ativadas)",
-            serial, success_count, commands.len()
+            serial,
+            success_count,
+            commands.len()
         ))
     }
 
@@ -853,7 +1457,10 @@ impl AdbManager {
     }
 
     /// Injeta permanentemente a identificação no Kernel/OS e Armazenamento do Celular
-    pub fn inject_persistent_device_id(serial: &str, persistent_id: &str) -> Result<String, String> {
+    pub fn inject_persistent_device_id(
+        serial: &str,
+        persistent_id: &str,
+    ) -> Result<String, String> {
         let batch_cmd = format!(
             "setprop persist.esfera.device_id {}; echo '{}' > /sdcard/.esfera_device_id",
             persistent_id, persistent_id
@@ -863,15 +1470,24 @@ impl AdbManager {
         cmd.args(["-s", serial, "shell", &batch_cmd]);
 
         match run_cmd_timeout(cmd, Duration::from_secs(3)) {
-            Ok(_) => Ok(format!("🏷️ ID permanente '{}' injetada no celular {}", persistent_id, serial)),
+            Ok(_) => Ok(format!(
+                "🏷️ ID permanente '{}' injetada no celular {}",
+                persistent_id, serial
+            )),
             Err(e) => Err(format!("Falha ao injetar ID no celular {}: {}", serial, e)),
         }
     }
 
     /// Injeta regras de Imunidade, Fixação de MAC Físico, Persistência ADB TCP 5555 e ID permanente no Kernel
-    pub fn inject_device_immunity(serial: &str, persistent_id: Option<&str>) -> Result<String, String> {
+    pub fn inject_device_immunity(
+        serial: &str,
+        persistent_id: Option<&str>,
+    ) -> Result<String, String> {
         let id_cmd = if let Some(pid) = persistent_id {
-            format!("setprop persist.esfera.device_id {}; echo '{}' > /sdcard/.esfera_device_id; ", pid, pid)
+            format!(
+                "setprop persist.esfera.device_id {}; echo '{}' > /sdcard/.esfera_device_id; ",
+                pid, pid
+            )
         } else {
             "".to_string()
         };
@@ -893,15 +1509,20 @@ impl AdbManager {
         cmd.args(["-s", serial, "shell", &batch_cmd]);
 
         match run_cmd_timeout(cmd, Duration::from_secs(5)) {
-            Ok(_) => Ok(format!("🛡️ Imunidade, MAC Físico e Kernel ID Injetados no Celular {} com sucesso!", serial)),
+            Ok(_) => Ok(format!(
+                "🛡️ Imunidade, MAC Físico e Kernel ID Injetados no Celular {} com sucesso!",
+                serial
+            )),
             Err(e) => Err(format!("Falha ao injetar no celular {}: {}", serial, e)),
         }
     }
 
-
-
     /// Injeta a URL do servidor Esfera no dispositivo Android
-    pub fn inject_server_config(serial: &str, server_url: &str, device_id: &str) -> Result<String, String> {
+    pub fn inject_server_config(
+        serial: &str,
+        server_url: &str,
+        device_id: &str,
+    ) -> Result<String, String> {
         let config_json = format!(
             "{{\\\"serverUrl\\\":\\\"{}\\\",\\\"deviceId\\\":\\\"{}\\\",\\\"heartbeatIntervalSec\\\":30}}",
             server_url, device_id
@@ -915,7 +1536,10 @@ impl AdbManager {
         cmd.args(["-s", serial, "shell", &batch_cmd]);
 
         match run_cmd_timeout(cmd, Duration::from_secs(3)) {
-            Ok(_) => Ok(format!("Configuração do servidor '{}' injetada", server_url)),
+            Ok(_) => Ok(format!(
+                "Configuração do servidor '{}' injetada",
+                server_url
+            )),
             Err(e) => Err(format!("Falha ao injetar config: {}", e)),
         }
     }
@@ -926,7 +1550,15 @@ impl AdbManager {
         let result = (|| -> Result<String, String> {
             // Tenta novo agente
             let mut cmd = create_cmd("adb");
-            cmd.args(["-s", serial, "shell", "am", "start-foreground-service", "-n", "com.esfera.agent/.EsferaAgentService"]);
+            cmd.args([
+                "-s",
+                serial,
+                "shell",
+                "am",
+                "start-foreground-service",
+                "-n",
+                "com.esfera.agent/.EsferaAgentService",
+            ]);
             match run_cmd_timeout(cmd, Duration::from_secs(3)) {
                 Ok(_) => return Ok("Agente Esfera v4 iniciado".to_string()),
                 Err(_) => {}
@@ -934,8 +1566,17 @@ impl AdbManager {
 
             // Fallback: agente antigo (mouldybread)
             let mut cmd = create_cmd("adb");
-            cmd.args(["-s", serial, "shell", "am", "start", "-n", "com.mouldybread.adbautoenable/.MainActivity"]);
-            run_cmd_timeout(cmd, Duration::from_secs(3)).map(|_| "Agente ADB Auto Enable iniciado (fallback)".to_string())
+            cmd.args([
+                "-s",
+                serial,
+                "shell",
+                "am",
+                "start",
+                "-n",
+                "com.mouldybread.adbautoenable/.MainActivity",
+            ]);
+            run_cmd_timeout(cmd, Duration::from_secs(3))
+                .map(|_| "Agente ADB Auto Enable iniciado (fallback)".to_string())
         })();
 
         match result {
@@ -947,54 +1588,84 @@ impl AdbManager {
     /// Provisiona um dispositivo: gera UUID, injeta ID + config + imunidade, instala APK, inicia servi\u{e7}o
     /// server_url \u{e9} opcional: se omitido, deriva automaticamente da config + IP local
     pub fn provision_device(serial: &str, server_url: Option<&str>) -> Result<String, String> {
+        let active_devices = Self::list_devices().unwrap_or_default();
+        let target_serial = if active_devices
+            .iter()
+            .any(|d| d.serial == serial && d.state == "device")
+        {
+            serial.to_string()
+        } else if let Some(active_dev) = active_devices.iter().find(|d| d.state == "device") {
+            active_dev.serial.clone()
+        } else {
+            serial.to_string()
+        };
+
         let uuid = Uuid::new_v4().to_string();
         let device_id = format!("ESF-{}", uuid);
         let config = crate::config::load_config();
 
         let url = match server_url {
             Some(url) => url.to_string(),
-            None => Self::resolve_server_url(serial, &config),
+            None => Self::resolve_server_url(&target_serial, &config),
         };
 
-        Self::inject_persistent_device_id(serial, &device_id)?;
-        Self::inject_server_config(serial, &url, &device_id)?;
-        Self::inject_device_immunity(serial, Some(&device_id))?;
+        Self::inject_persistent_device_id(&target_serial, &device_id)?;
+        Self::inject_server_config(&target_serial, &url, &device_id)?;
+        Self::inject_device_immunity(&target_serial, Some(&device_id))?;
 
-        // Para USB, faz adb reverse para o device alcan\u{e7}ar o servidor
-        let is_usb = !serial.contains(':');
+        let is_usb = !target_serial.contains(':');
         if is_usb {
-            let _ = Self::reverse_port(serial, config.checkin_server_port);
+            let _ = Self::reverse_port(&target_serial, config.checkin_server_port);
         }
 
-        let agent_result = Self::install_agent_apk(serial);
+        let agent_result = Self::install_agent_apk(&target_serial);
         match agent_result {
             Ok(msg) => {
-                let _ = Self::start_agent_service(serial);
-                Ok(format!("Provisionado: {} com ID {} ({})", serial, device_id, msg))
+                let _ = Self::start_agent_service(&target_serial);
+                Ok(format!(
+                    "Provisionado: {} com ID {} ({})",
+                    target_serial, device_id, msg
+                ))
             }
             Err(e) => {
-                Self::push_agent_script(serial)?;
-                Self::start_agent_script(serial)?;
-                Ok(format!("Provisionado: {} com ID {} (fallback script: {})", serial, device_id, e))
+                Self::push_agent_script(&target_serial)?;
+                Self::start_agent_script(&target_serial)?;
+                Ok(format!(
+                    "Provisionado: {} com ID {} (fallback script: {})",
+                    target_serial, device_id, e
+                ))
             }
         }
     }
 
     fn resolve_server_url(serial: &str, config: &crate::config::AppConfig) -> String {
+        if !config.hub_address.is_empty() {
+            let host = config
+                .hub_address
+                .split(':')
+                .next()
+                .unwrap_or("34.29.70.113");
+            return format!("http://{}:{}", host, config.checkin_server_port);
+        }
         let port = config.checkin_server_port;
         let is_usb = !serial.contains(':');
         if is_usb {
             return format!("http://localhost:{}", port);
         }
-        // WiFi: extrai IP do serial (ex: "192.168.1.185:5555")
-        let ip = serial.split(':').next().unwrap_or("127.0.0.1");
+        let ip = serial.split(':').next().unwrap_or("34.29.70.113");
         format!("http://{}:{}", ip, port)
     }
 
     /// adb reverse tcp:{port} tcp:{port} — permite device USB alcan\u{e7}ar servidor local
     fn reverse_port(serial: &str, port: u16) -> Result<String, String> {
         let mut cmd = create_cmd("adb");
-        cmd.args(["-s", serial, "reverse", &format!("tcp:{}", port), &format!("tcp:{}", port)]);
+        cmd.args([
+            "-s",
+            serial,
+            "reverse",
+            &format!("tcp:{}", port),
+            &format!("tcp:{}", port),
+        ]);
         let output = run_cmd_timeout(cmd, Duration::from_secs(3))
             .map_err(|e| format!("Falha ao fazer reverse: {}", e))?;
         if output.status.success() {
@@ -1014,11 +1685,16 @@ impl AdbManager {
             .map_err(|e| format!("Falha ao escrever script: {}", e))?;
         drop(file);
 
-        let path_str = script_path.to_str()
-            .ok_or("Caminho temporario invalido")?;
+        let path_str = script_path.to_str().ok_or("Caminho temporario invalido")?;
 
         let mut cmd = create_cmd("adb");
-        cmd.args(["-s", serial, "push", path_str, "/data/local/tmp/esfera_agent.sh"]);
+        cmd.args([
+            "-s",
+            serial,
+            "push",
+            path_str,
+            "/data/local/tmp/esfera_agent.sh",
+        ]);
         let output = run_cmd_timeout(cmd, Duration::from_secs(5))
             .map_err(|e| format!("Falha ao fazer push do script: {}", e))?;
 
@@ -1028,7 +1704,14 @@ impl AdbManager {
         }
 
         let mut chmod = create_cmd("adb");
-        chmod.args(["-s", serial, "shell", "chmod", "+x", "/data/local/tmp/esfera_agent.sh"]);
+        chmod.args([
+            "-s",
+            serial,
+            "shell",
+            "chmod",
+            "+x",
+            "/data/local/tmp/esfera_agent.sh",
+        ]);
         let _ = run_cmd_timeout(chmod, Duration::from_secs(3));
 
         Ok("Script pushado com sucesso".to_string())
@@ -1037,9 +1720,18 @@ impl AdbManager {
     /// Start the shell agent script in background via nohup
     pub fn start_agent_script(serial: &str) -> Result<String, String> {
         let mut cmd = create_cmd("adb");
-        cmd.args(["-s", serial, "shell",
-            "nohup", "sh", "/data/local/tmp/esfera_agent.sh",
-            ">", "/dev/null", "2>&1", "&"]);
+        cmd.args([
+            "-s",
+            serial,
+            "shell",
+            "nohup",
+            "sh",
+            "/data/local/tmp/esfera_agent.sh",
+            ">",
+            "/dev/null",
+            "2>&1",
+            "&",
+        ]);
         let output = run_cmd_timeout(cmd, Duration::from_secs(3))
             .map_err(|e| format!("Falha ao iniciar script: {}", e))?;
 
@@ -1094,13 +1786,18 @@ impl AdbManager {
     /// Instala silenciosamente o aplicativo Agente Esfera v3 (.APK) no celular via ADB com auto-reconexão e tratamento de 'device offline'
     pub fn install_agent_apk(serial: &str) -> Result<String, String> {
         let apk_path_buf = Self::find_agent_apk_path()?;
-        let apk_str = apk_path_buf.to_str().ok_or("Caminho do arquivo APK inválido.")?;
+        let apk_str = apk_path_buf
+            .to_str()
+            .ok_or("Caminho do arquivo APK inválido.")?;
 
         // Se for conexão Wi-Fi, garante reconexão preventiva antes de tentar a instalação
         if serial.contains(':') || serial.contains('.') {
             let parts: Vec<&str> = serial.split(':').collect();
             let ip = parts[0];
-            let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
+            let port = parts
+                .get(1)
+                .and_then(|p| p.parse::<i32>().ok())
+                .unwrap_or(5555);
             let _ = Self::connect_device(ip, port);
             std::thread::sleep(Duration::from_millis(800));
         }
@@ -1117,17 +1814,25 @@ impl AdbManager {
             let _ = Self::deploy_keepalive(serial);
             let _ = Self::inject_device_immunity(serial, None);
 
-            Ok(format!("📱 App Agente Esfera v3 instalado e ativado no celular {} com sucesso!", serial))
+            Ok(format!(
+                "📱 App Agente Esfera v3 instalado e ativado no celular {} com sucesso!",
+                serial
+            ))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             let combined = format!("{} {}", stdout, stderr);
 
             // Se o erro indicar 'device offline', executa reconexão de emergência e tenta a instalação novamente!
-            if combined.to_lowercase().contains("offline") && (serial.contains(':') || serial.contains('.')) {
+            if combined.to_lowercase().contains("offline")
+                && (serial.contains(':') || serial.contains('.'))
+            {
                 let parts: Vec<&str> = serial.split(':').collect();
                 let ip = parts[0];
-                let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
+                let port = parts
+                    .get(1)
+                    .and_then(|p| p.parse::<i32>().ok())
+                    .unwrap_or(5555);
                 let _ = Self::connect_device(ip, port);
                 std::thread::sleep(Duration::from_millis(1500));
 
@@ -1144,8 +1849,15 @@ impl AdbManager {
                 }
             }
 
-            let err_msg = if !stderr.trim().is_empty() { stderr.trim() } else { stdout.trim() };
-            Err(format!("Falha na instalação do APK no celular {}: {}", serial, err_msg))
+            let err_msg = if !stderr.trim().is_empty() {
+                stderr.trim()
+            } else {
+                stdout.trim()
+            };
+            Err(format!(
+                "Falha na instalação do APK no celular {}: {}",
+                serial, err_msg
+            ))
         }
     }
 
@@ -1185,13 +1897,16 @@ impl AdbManager {
                 if !target.is_empty() && target.contains('.') {
                     let _ = create_cmd("adb").arg("connect").arg(&target).output();
 
-                    let already = injected.lock()
+                    let already = injected
+                        .lock()
                         .map(|s| s.contains(&target))
                         .unwrap_or(false);
                     if !already {
                         let pid = format!("ESFERA_DEV_{:03}", dev.device_number);
                         if Self::inject_device_immunity(&target, Some(&pid)).is_ok() {
-                            let _ = injected.lock().map(|mut s| { s.insert(target.clone()); });
+                            let _ = injected.lock().map(|mut s| {
+                                s.insert(target.clone());
+                            });
                         }
                     }
                 }

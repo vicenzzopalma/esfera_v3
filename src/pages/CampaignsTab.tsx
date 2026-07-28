@@ -11,7 +11,7 @@ import Badge from "../components/ui/Badge";
 import Button from "../components/ui/Button";
 import Modal from "../components/ui/Modal";
 import Toggle from "../components/ui/Toggle";
-import type { Campaign, CampaignStatus, Contact } from "../types";
+import type { Campaign, CampaignStatus, Contact, AiConfig } from "../types";
 import { api } from "../tauri";
 import {
   Megaphone,
@@ -50,6 +50,8 @@ export default function CampaignsTab() {
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [editModalOpen, setEditModalOpen] = useState(false);
   const [contactsModalOpen, setContactsModalOpen] = useState(false);
+  const [executionModalOpen, setExecutionModalOpen] = useState(false);
+  const [aiGlobalModalOpen, setAiGlobalModalOpen] = useState(false);
   const [selectedCampaign, setSelectedCampaign] = useState<Campaign | null>(null);
   const [campaignsList, setCampaignsList] = useState<Campaign[]>([]);
 
@@ -86,6 +88,11 @@ export default function CampaignsTab() {
   const openContactsModal = (campaign: Campaign) => {
     setSelectedCampaign(campaign);
     setContactsModalOpen(true);
+  };
+
+  const openExecutionModal = (campaign: Campaign) => {
+    setSelectedCampaign(campaign);
+    setExecutionModalOpen(true);
   };
 
   // Higieniza números no padrão REALESS / Esfera v3
@@ -177,44 +184,7 @@ export default function CampaignsTab() {
     setParsedContacts([]);
   };
 
-  // Campaign dispatch controls
-  const handleStartCampaign = async (campaign: Campaign) => {
-    try {
-      await api("start_campaign", { campaignId: campaign.id });
-    } catch { /* noop */ }
-    setCampaignsList((prev) =>
-      prev.map((c) => (c.id === campaign.id ? { ...c, status: "running" as const } : c))
-    );
-  };
 
-  const handlePauseCampaign = async (campaign: Campaign) => {
-    try {
-      await api("pause_campaign", { campaignId: campaign.id });
-    } catch { /* noop */ }
-    setCampaignsList((prev) =>
-      prev.map((c) => (c.id === campaign.id ? { ...c, status: "paused" as const } : c))
-    );
-  };
-
-  const handleSendBatch = async (campaign: Campaign) => {
-    try {
-      const result = await api<{ sent_in_batch: number; remaining: number; campaign_complete: boolean }>(
-        "send_campaign",
-        { campaignId: campaign.id }
-      );
-      setCampaignsList((prev) =>
-        prev.map((c) =>
-          c.id === campaign.id
-            ? {
-                ...c,
-                sentCount: (c.sentCount || 0) + result.sent_in_batch,
-                status: result.campaign_complete ? "completed" as const : c.status,
-              }
-            : c
-        )
-      );
-    } catch { /* noop */ }
-  };
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -230,14 +200,19 @@ export default function CampaignsTab() {
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl font-bold text-primary tracking-tight">Central de Campanhas</h2>
+          <h2 className="text-xl font-bold text-primary tracking-tight">Central de Campanhas & Disparos</h2>
           <p className="text-xs text-tertiary mt-0.5">
-            Crie disparos em massa, programe automações e personalize mensagens com IA.
+            Crie disparos em massa, programe automações e gerencie IA e hierarquias de celulares por campanha.
           </p>
         </div>
-        <Button icon={<Plus size={16} />} onClick={() => openEditModal()}>
-          Criar Nova Campanha
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="secondary" icon={<Brain size={16} />} onClick={() => setAiGlobalModalOpen(true)}>
+            🤖 IA & Envio Globais
+          </Button>
+          <Button icon={<Plus size={16} />} onClick={() => openEditModal()}>
+            Criar Nova Campanha
+          </Button>
+        </div>
       </div>
 
       {/* KPI Stats */}
@@ -319,18 +294,38 @@ export default function CampaignsTab() {
           <CampaignCard
             key={campaign.id}
             campaign={campaign}
+            onOpenExecution={() => openExecutionModal(campaign)}
             onEdit={() => openEditModal(campaign)}
             onContacts={() => openContactsModal(campaign)}
             onImport={() => {
               setSelectedCampaign(campaign);
               setImportModalOpen(true);
             }}
-            onStart={() => handleStartCampaign(campaign)}
-            onPause={() => handlePauseCampaign(campaign)}
-            onSendBatch={() => handleSendBatch(campaign)}
           />
         ))}
       </div>
+
+      {/* Janela Modal de Execução de Campanha Independente */}
+      {executionModalOpen && (
+        <CampaignExecutionModal
+          isOpen={executionModalOpen}
+          onClose={() => setExecutionModalOpen(false)}
+          campaign={selectedCampaign}
+          onUpdateCampaign={(updatedCamp) => {
+            setCampaignsList((prev) =>
+              prev.map((c) => (c.id === updatedCamp.id ? updatedCamp : c))
+            );
+          }}
+        />
+      )}
+
+      {/* Modal de Configurações Globais de IA & Disparo */}
+      {aiGlobalModalOpen && (
+        <GlobalAiConfigModal
+          isOpen={aiGlobalModalOpen}
+          onClose={() => setAiGlobalModalOpen(false)}
+        />
+      )}
 
       {/* Edit/Create Campaign Modal */}
       {editModalOpen && (
@@ -456,20 +451,16 @@ export default function CampaignsTab() {
 // ---- Campaign Card Component ----
 function CampaignCard({
   campaign,
+  onOpenExecution,
   onEdit,
   onContacts,
   onImport,
-  onStart,
-  onPause,
-  onSendBatch,
 }: {
   campaign: Campaign;
+  onOpenExecution: () => void;
   onEdit: () => void;
   onContacts: () => void;
   onImport: () => void;
-  onStart: () => void;
-  onPause: () => void;
-  onSendBatch: () => void;
 }) {
   const status = statusConfig[campaign.status as CampaignStatus] || statusConfig.draft;
   const contactsCount = campaign.contactsCount || 0;
@@ -545,39 +536,10 @@ function CampaignCard({
         </div>
       </div>
 
-      <div className="flex items-center gap-1.5 pt-2">
-        {campaign.status === "running" ? (
-          <>
-            <Button variant="danger" size="sm" icon={<Pause size={13} />} onClick={onPause}>
-              Pausar
-            </Button>
-            <Button variant="success" size="sm" icon={<Send size={13} />} onClick={onSendBatch}>
-              Enviar
-            </Button>
-          </>
-        ) : campaign.status === "paused" ? (
-          <>
-            <Button variant="primary" size="sm" icon={<Play size={13} />} onClick={onStart}>
-              Retomar
-            </Button>
-            <Button variant="success" size="sm" icon={<Send size={13} />} onClick={onSendBatch}>
-              Enviar
-            </Button>
-          </>
-        ) : campaign.status === "completed" ? (
-          <Badge variant="success" className="gap-1">
-            <CheckCircle2 size={12} /> Concluída
-          </Badge>
-        ) : (
-          <>
-            <Button variant="primary" size="sm" icon={<Play size={13} />} onClick={onStart}>
-              Iniciar
-            </Button>
-            <Button variant="success" size="sm" icon={<Send size={13} />} onClick={onSendBatch}>
-              Enviar
-            </Button>
-          </>
-        )}
+      <div className="flex items-center gap-1.5 pt-2 flex-wrap">
+        <Button variant="primary" size="sm" icon={<Play size={13} />} onClick={onOpenExecution}>
+          ⚡ Janela Independente
+        </Button>
         <Button variant="secondary" size="sm" icon={<Upload size={13} />} onClick={onImport}>
           Importar
         </Button>
@@ -963,6 +925,370 @@ function ContactsModal({
               ))}
             </tbody>
           </table>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+// ============================================================
+// JANELA MODAL DE EXECUÇÃO INDEPENDENTE DE CAMPANHA & HIERARQUIA
+// ============================================================
+function CampaignExecutionModal({
+  isOpen,
+  onClose,
+  campaign,
+  onUpdateCampaign,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  campaign: Campaign | null;
+  onUpdateCampaign: (updated: Campaign) => void;
+}) {
+  const [activeSubTab, setActiveSubTab] = useState<"execution" | "hierarchy" | "settings">("execution");
+  const [selectedSector, setSelectedSector] = useState<string>("all");
+  const [delayMin, setDelayMin] = useState<number>(campaign?.delayMin || 30);
+  const [delayMax, setDelayMax] = useState<number>(campaign?.delayMax || 90);
+  const [useAI, setUseAI] = useState<boolean>(campaign?.useAI || false);
+  const [aiPrompt, setAiPrompt] = useState<string>(campaign?.aiPrompt || "");
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [sendingBatch, setSendingBatch] = useState(false);
+  const [executionLogs, setExecutionLogs] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (isOpen && campaign) {
+      setDelayMin(campaign.delayMin || 30);
+      setDelayMax(campaign.delayMax || 90);
+      setUseAI(campaign.useAI || false);
+      setAiPrompt(campaign.aiPrompt || "");
+      api<Contact[]>("get_campaign_contacts", { campaignId: campaign.id })
+        .then((data) => setContacts(data))
+        .catch(() => {});
+    }
+  }, [isOpen, campaign]);
+
+  if (!campaign) return null;
+
+  const total = contacts.length || campaign.contactsCount || 0;
+  const sent = contacts.filter((c) => c.status === "sent").length || campaign.sentCount || 0;
+  const failed = contacts.filter((c) => c.status === "failed").length || campaign.failedCount || 0;
+  const pending = total - sent - failed;
+  const progress = total > 0 ? Math.round((sent / total) * 100) : 0;
+
+  const handleRunBatch = async () => {
+    setSendingBatch(true);
+    const ts = new Date().toLocaleTimeString("pt-BR");
+    setExecutionLogs((prev) => [
+      `[${ts}] 🚀 Iniciando disparo do lote para setor '${selectedSector.toUpperCase()}' (Delay: ${delayMin}-${delayMax}s, IA: ${useAI ? "Ativada" : "Desativada"})...`,
+      ...prev,
+    ]);
+
+    try {
+      const res = await api<{ sent_in_batch: number; remaining: number; campaign_complete: boolean }>(
+        "send_campaign",
+        { campaignId: campaign.id }
+      );
+      const updatedCamp: Campaign = {
+        ...campaign,
+        sentCount: (campaign.sentCount || 0) + res.sent_in_batch,
+        status: res.campaign_complete ? "completed" : "running",
+      };
+      onUpdateCampaign(updatedCamp);
+      setExecutionLogs((prev) => [
+        `[${new Date().toLocaleTimeString("pt-BR")}] ✅ Lote enviado com sucesso (+${res.sent_in_batch} mensagens). Restantes na fila: ${res.remaining}`,
+        ...prev,
+      ]);
+
+      // Atualiza lista de contatos local
+      const refreshed = await api<Contact[]>("get_campaign_contacts", { campaignId: campaign.id });
+      setContacts(refreshed);
+    } catch (e: any) {
+      setExecutionLogs((prev) => [
+        `[${new Date().toLocaleTimeString("pt-BR")}] ❌ Erro na execução: ${typeof e === "string" ? e : e?.message || "Erro desconhecido"}`,
+        ...prev,
+      ]);
+    } finally {
+      setSendingBatch(false);
+    }
+  };
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title={`🚀 Janela Independente: ${campaign.name}`}
+      size="xl"
+      footer={
+        <div className="flex items-center justify-between w-full">
+          <Badge variant={campaign.status === "running" ? "success" : "warning"}>
+            Status: {campaign.status.toUpperCase()}
+          </Badge>
+          <Button variant="secondary" onClick={onClose}>
+            Fechar Janela
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-4 text-xs">
+        {/* Navegação da Janela Independente */}
+        <div className="flex items-center gap-2 border-b border-border pb-2">
+          {[
+            { id: "execution", label: "⚡ Execução Ao Vivo", icon: <Play size={14} /> },
+            { id: "hierarchy", label: "📱 Hierarquia de Celulares", icon: <Smartphone size={14} /> },
+            { id: "settings", label: "🤖 IA & Delays Exclusivos", icon: <Brain size={14} /> },
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveSubTab(tab.id as any)}
+              className={`flex items-center gap-2 px-3 py-2 rounded-xl font-bold transition-all cursor-pointer ${
+                activeSubTab === tab.id
+                  ? "bg-violet-600 text-white shadow-md shadow-violet-600/30"
+                  : "bg-white/5 text-slate-400 hover:text-white"
+              }`}
+            >
+              {tab.icon}
+              {tab.label}
+            </button>
+          ))}
+        </div>
+
+        {/* SUBTAB 1: EXECUÇÃO AO VIVO */}
+        {activeSubTab === "execution" && (
+          <div className="space-y-4 animate-fade-in">
+            <div className="grid grid-cols-4 gap-3">
+              <div className="p-3 bg-white/[0.02] border border-border rounded-xl text-center">
+                <span className="text-[10px] text-tertiary uppercase block">Total Fila</span>
+                <span className="text-lg font-bold text-white font-mono">{total}</span>
+              </div>
+              <div className="p-3 bg-emerald-950/30 border border-emerald-500/30 rounded-xl text-center">
+                <span className="text-[10px] text-emerald-400 uppercase block">Enviados</span>
+                <span className="text-lg font-bold text-emerald-300 font-mono">{sent}</span>
+              </div>
+              <div className="p-3 bg-amber-950/30 border border-amber-500/30 rounded-xl text-center">
+                <span className="text-[10px] text-amber-400 uppercase block">Pendentes</span>
+                <span className="text-lg font-bold text-amber-300 font-mono">{pending}</span>
+              </div>
+              <div className="p-3 bg-red-950/30 border border-red-500/30 rounded-xl text-center">
+                <span className="text-[10px] text-red-400 uppercase block">Falhas</span>
+                <span className="text-lg font-bold text-red-300 font-mono">{failed}</span>
+              </div>
+            </div>
+
+            {/* Progresso */}
+            <div className="space-y-1">
+              <div className="flex justify-between font-bold text-slate-300 text-xs">
+                <span>Progresso Independente</span>
+                <span>{progress}%</span>
+              </div>
+              <div className="h-3 bg-slate-900 rounded-full overflow-hidden border border-slate-800">
+                <div className="h-full bg-gradient-to-r from-violet-600 to-emerald-400 transition-all duration-500" style={{ width: `${progress}%` }} />
+              </div>
+            </div>
+
+            {/* Ações de Controle Independente */}
+            <div className="flex items-center gap-3 pt-2">
+              <Button
+                variant="success"
+                onClick={handleRunBatch}
+                disabled={sendingBatch || pending === 0}
+                icon={<Send size={15} />}
+                className="flex-1 py-2.5 font-bold shadow-lg shadow-emerald-600/30"
+              >
+                {sendingBatch ? "Disparando Lote..." : `Disparar Próximo Lote (${selectedSector.toUpperCase()})`}
+              </Button>
+            </div>
+
+            {/* Logs de Envio ao Vivo */}
+            <div className="space-y-1.5 pt-2">
+              <label className="font-bold text-slate-300 text-xs">Log de Envio em Tempo Real (Janela Isolada):</label>
+              <div className="h-36 bg-[#090d16] border border-slate-800 rounded-xl p-3 font-mono text-[11px] text-emerald-400 overflow-y-auto space-y-1 custom-scrollbar">
+                {executionLogs.length === 0 ? (
+                  <p className="text-slate-600 italic">Nenhum log gravado nesta sessão de disparo.</p>
+                ) : (
+                  executionLogs.map((log, idx) => <p key={idx}>{log}</p>)
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* SUBTAB 2: HIERARQUIA DE CELULARES */}
+        {activeSubTab === "hierarchy" && (
+          <div className="space-y-4 animate-fade-in">
+            <div className="p-4 bg-violet-950/30 border border-violet-500/30 rounded-xl space-y-2">
+              <h4 className="font-bold text-violet-300 text-sm">Respeito à Hierarquia de Setores de Celulares</h4>
+              <p className="text-slate-400 text-xs">
+                Selecione qual setor de celulares será alocado para os disparos desta campanha específica. Cada campanha executa em sua fila isolada.
+              </p>
+            </div>
+
+            <div>
+              <label className="block font-bold text-slate-300 mb-2">Setor de Destino dos Celulares:</label>
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                {[
+                  { id: "all", label: "Todos os Setores" },
+                  { id: "junior", label: "Junior" },
+                  { id: "senior", label: "Senior" },
+                  { id: "pa_fixa", label: "PA FIXA" },
+                  { id: "pesquisa", label: "Pesquisa" },
+                ].map((sec) => (
+                  <button
+                    key={sec.id}
+                    onClick={() => setSelectedSector(sec.id)}
+                    className={`p-3 rounded-xl border font-bold text-xs transition-all cursor-pointer text-center ${
+                      selectedSector === sec.id
+                        ? "bg-violet-600 text-white border-violet-400 shadow-lg shadow-violet-600/40"
+                        : "bg-slate-900 text-slate-400 border-slate-800 hover:text-white"
+                    }`}
+                  >
+                    {sec.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* SUBTAB 3: IA & DELAYS EXCLUSIVOS */}
+        {activeSubTab === "settings" && (
+          <div className="space-y-4 animate-fade-in">
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block font-bold text-slate-300 mb-1">Delay Mínimo (segundos)</label>
+                <input
+                  type="number"
+                  value={delayMin}
+                  onChange={(e) => setDelayMin(parseInt(e.target.value) || 10)}
+                  className="w-full input-setting text-center font-mono"
+                />
+              </div>
+              <div>
+                <label className="block font-bold text-slate-300 mb-1">Delay Máximo (segundos)</label>
+                <input
+                  type="number"
+                  value={delayMax}
+                  onChange={(e) => setDelayMax(parseInt(e.target.value) || 60)}
+                  className="w-full input-setting text-center font-mono"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-3 pt-2">
+              <Toggle checked={useAI} onChange={setUseAI} label="Ativar Personalização de Mensagens via IA nesta Campanha" />
+              {useAI && (
+                <div>
+                  <label className="block font-bold text-slate-300 mb-1">System Prompt / Instrução da IA para esta Campanha:</label>
+                  <textarea
+                    value={aiPrompt}
+                    onChange={(e) => setAiPrompt(e.target.value)}
+                    rows={3}
+                    placeholder="Ex: Reescreva a mensagem mantendo o tom amigável e oferecendo 10% de desconto adicional."
+                    className="w-full input-setting resize-none"
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+// ============================================================
+// MODAL DE CONFIGURAÇÕES GLOBAIS DE IA & DISPARO (NA ABA DE DISPARO)
+// ============================================================
+function GlobalAiConfigModal({
+  isOpen,
+  onClose,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+}) {
+  const { selectedCompanyId } = useAuth();
+  const [provider, setProvider] = useState("ollama_local");
+  const [endpoint, setEndpoint] = useState("http://localhost:11434");
+  const [model, setModel] = useState("llama3.2");
+  const [temperature, setTemperature] = useState(0.7);
+  const [apiKey, setApiKey] = useState("");
+  const [systemPrompt, setSystemPrompt] = useState("Você é um assistente de cobrança. Seja profissional e gentil.");
+  const [statusMsg, setStatusMsg] = useState("");
+
+  useEffect(() => {
+    if (isOpen && selectedCompanyId) {
+      api<AiConfig>("get_ai_config", { companyId: selectedCompanyId })
+        .then((cfg) => {
+          if (!cfg) return;
+          setProvider(cfg.provider || "ollama_local");
+          setEndpoint(cfg.endpoint || "http://localhost:11434");
+          setModel(cfg.model || "llama3.2");
+          setTemperature(cfg.temperature || 0.7);
+          setApiKey(cfg.apiKey || "");
+          setSystemPrompt(cfg.systemPrompt || "");
+        })
+        .catch(() => {});
+    }
+  }, [isOpen, selectedCompanyId]);
+
+  const handleSave = async () => {
+    if (!selectedCompanyId) return;
+    try {
+      await api("save_ai_config", {
+        companyId: selectedCompanyId,
+        config: { provider, model, temperature, systemPrompt, apiKey, endpoint },
+      });
+      setStatusMsg("✅ Parâmetros globais de IA e Envio salvos com sucesso!");
+      setTimeout(() => onClose(), 1200);
+    } catch {
+      setStatusMsg("❌ Erro ao salvar parâmetros de IA.");
+    }
+  };
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title="🤖 Parâmetros Globais de Inteligência Artificial & Disparo"
+      size="lg"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancelar
+          </Button>
+          <Button onClick={handleSave}>Salvar Parâmetros</Button>
+        </>
+      }
+    >
+      <div className="space-y-4 text-xs">
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label className="block font-semibold text-secondary mb-1">Provedor de IA</label>
+            <select value={provider} onChange={(e) => setProvider(e.target.value)} className="w-full input-setting">
+              <option value="ollama_local">Ollama Local (Offline / High Speed)</option>
+              <option value="openai">OpenAI ChatGPT (Nuvem)</option>
+              <option value="anthropic">Anthropic Claude</option>
+            </select>
+          </div>
+          <div>
+            <label className="block font-semibold text-secondary mb-1">Modelo de IA</label>
+            <input type="text" value={model} onChange={(e) => setModel(e.target.value)} placeholder="llama3.2 ou gpt-4o-mini" className="w-full input-setting" />
+          </div>
+        </div>
+
+        <div>
+          <label className="block font-semibold text-secondary mb-1">Endpoint de Conexão IA</label>
+          <input type="text" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="http://localhost:11434" className="w-full input-setting font-mono" />
+        </div>
+
+        <div>
+          <label className="block font-semibold text-secondary mb-1">System Prompt Padrão da Empresa</label>
+          <textarea value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)} rows={4} className="w-full input-setting resize-none" />
+        </div>
+
+        {statusMsg && (
+          <div className="p-3 bg-violet-600/20 border border-violet-500/30 text-violet-300 rounded-xl font-bold">
+            {statusMsg}
+          </div>
         )}
       </div>
     </Modal>
