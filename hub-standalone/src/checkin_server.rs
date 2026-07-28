@@ -20,6 +20,7 @@ pub async fn start(db: Arc<Database>, port: u16) {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await
         .expect("Falha ao bindar check-in server");
+    println!("Servidor HTTP Check-in rodando em http://0.0.0.0:{}", port);
     axum::serve(listener, app).await
         .expect("Falha ao iniciar check-in server");
 }

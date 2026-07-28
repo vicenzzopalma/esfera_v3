@@ -249,6 +249,8 @@ pub fn run() {
             send_intent_to_display,
             launch_camera_stream,
             inject_virtual_camera,
+            inject_virtual_camera_region,
+            inject_base64_frame,
             optimize_device_hpc,
             install_agent_apk,
             provision_device,

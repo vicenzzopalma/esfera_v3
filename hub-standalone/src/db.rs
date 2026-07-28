@@ -312,56 +312,41 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 
 pub struct Database {
     pool: Pool<SqliteConnectionManager>,
-    cached: Mutex<Option<r2d2::PooledConnection<SqliteConnectionManager>>>,
-}
-
-// Wrapper para MutexGuard que implementa Deref<Target=Connection>
-pub struct ConnGuard<'a>(std::sync::MutexGuard<'a, Option<r2d2::PooledConnection<SqliteConnectionManager>>>);
-
-impl<'a> std::ops::Deref for ConnGuard<'a> {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
-        self.0.as_ref().unwrap()
-    }
 }
 
 impl Database {
     pub fn init(db_path: &str) -> Result<Self> {
         let manager = SqliteConnectionManager::file(db_path);
         let pool = Pool::builder()
-            .max_size(8)
+            .max_size(32)
             .min_idle(Some(2))
             .build(manager)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
         // Configura PRAGMAs HPC em todas as conexões do pool
         {
-            let conn = pool.get().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            conn.execute_batch("
-                PRAGMA journal_mode=WAL;
-                PRAGMA synchronous=NORMAL;
-                PRAGMA busy_timeout=10000;
-                PRAGMA foreign_keys=ON;
-                PRAGMA cache_size=-64000;
-                PRAGMA temp_store=MEMORY;
-                PRAGMA mmap_size=268435456;
-                PRAGMA page_size=8192;
-            ").map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            if let Ok(conn) = pool.get() {
+                let _ = conn.execute_batch("
+                    PRAGMA journal_mode=WAL;
+                    PRAGMA synchronous=NORMAL;
+                    PRAGMA busy_timeout=10000;
+                    PRAGMA foreign_keys=ON;
+                    PRAGMA cache_size=-64000;
+                    PRAGMA temp_store=MEMORY;
+                    PRAGMA mmap_size=268435456;
+                ");
+            }
         }
 
-        let db = Database { pool, cached: Mutex::new(None) };
-        db.create_tables()?;
-        db.migrate_existing_tables()?;
-        db.seed_data()?;
+        let db = Database { pool };
+        let _ = db.create_tables();
+        let _ = db.migrate_existing_tables();
+        let _ = db.seed_data();
         Ok(db)
     }
 
-    fn conn(&self) -> ConnGuard<'_> {
-        let mut guard = self.cached.lock().expect("db conn lock poisoned");
-        if guard.is_none() {
-            *guard = Some(self.pool.get().expect("r2d2 pool exhausted (max_size=8)"));
-        }
-        ConnGuard(guard)
+    fn conn(&self) -> r2d2::PooledConnection<SqliteConnectionManager> {
+        self.pool.get().expect("r2d2 pool exhausted")
     }
 
     fn create_tables(&self) -> Result<()> {
@@ -686,28 +671,6 @@ impl Database {
 
         // Garante que a empresa #1 seja REALESS e que nenhuma informação seja perdida
         let _ = self.conn().execute("UPDATE ESF_Company SET CompanyName='REALESS' WHERE CompanyId=1 AND (CompanyName='Empresa Principal' OR CompanyName='');", []);
-
-        // Garante que os 8 celulares ativados da REALESS estejam sempre pré-cadastrados no banco SQLite
-        let default_devices = vec![
-            ("192.168.1.185:5555", "Aparelho 1", "Xiaomi", "Redmi Note", "192.168.1.185", 1, "junior"),
-            ("192.168.1.35:5555", "Aparelho 2", "Multilaser", "F Pro 2", "192.168.1.35", 2, "junior"),
-            ("192.168.1.54:5555", "Aparelho 3", "Samsung", "Galaxy A01", "192.168.1.54", 3, "junior"),
-            ("192.168.1.57:5555", "Aparelho 4", "Xiaomi", "Redmi 9", "192.168.1.57", 4, "junior"),
-            ("192.168.1.92:5555", "Aparelho 5", "Samsung", "Galaxy J7", "192.168.1.92", 5, "junior"),
-            ("192.168.1.93:5555", "Aparelho 6", "Motorola", "Moto G22", "192.168.1.93", 6, "junior"),
-            ("192.168.1.94:5555", "Aparelho 7", "Motorola", "Moto G", "192.168.1.94", 7, "junior"),
-            ("192.168.1.95:5555", "Aparelho 8", "Multilaser", "F Pro 2", "192.168.1.95", 8, "junior"),
-        ];
-
-        for (serial, name, brand, model, ip, num, sector) in default_devices {
-            let esfera_id = format!("ESF-LEGACY-{}", num);
-            let _ = self.conn().execute(
-                "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId)
-                VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7, ?8)
-                ON CONFLICT(AdbDeviceId) DO NOTHING;",
-                params![serial, name, brand, model, ip, num, sector, esfera_id],
-            );
-        }
 
         Ok(())
     }

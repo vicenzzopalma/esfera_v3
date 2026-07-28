@@ -15,13 +15,13 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            hub_enabled: false,
-            hub_address: String::new(),
+            hub_enabled: true,
+            hub_address: "34.29.70.113:8888".to_string(),
             empresa_server_enabled: false,
             empresa_server_port: 7777,
             checkin_server_enabled: true,
             checkin_server_port: 8080,
-            mode: "local".to_string(),
+            mode: "empresa".to_string(),
         }
     }
 }

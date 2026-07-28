@@ -1,4 +1,4 @@
-﻿// ============================================================
+// ============================================================
 // Esfera v3 — Hub de Gestão de Dispositivos ADB Celulares
 // Exibe EXCLUSIVAMENTE celulares ativamente conectados/adicionados.
 // Sem quadros vazios ou slots fictícios. Com suporte a setores,
@@ -76,6 +76,7 @@ export default function DevicesTab() {
 
   // Lista APENAS de celulares conectados/adicionados pelo usuário
   const [devicesList, setDevicesList] = useState<Device[]>([]);
+  const [selectedSerials, setSelectedSerials] = useState<string[]>([]);
 
   // Mapa de usuários ativos por dispositivo (para gestor/master ver quem está usando)
   const [activeUserMap, setActiveUserMap] = useState<Record<string, { activeUserId?: number; activeUserDisplayName?: string }>>({});
@@ -85,6 +86,10 @@ export default function DevicesTab() {
   const [diagnosticModalOpen, setDiagnosticModalOpen] = useState(false);
   const [mirrorModalOpen, setMirrorModalOpen] = useState(false);
   const [selectedDeviceForMirror, setSelectedDeviceForMirror] = useState<Device | null>(null);
+
+  // Modal de Enquadramento da Câmera Virtual (Quadrado Movível)
+  const [regionModalOpen, setRegionModalOpen] = useState(false);
+  const [selectedSerialForRegion, setSelectedSerialForRegion] = useState("");
 
   // Modal de Configurações de Celular (Renomear, Otimizar, Mudar Setor)
   const [configModalOpen, setConfigModalOpen] = useState(false);
@@ -280,15 +285,68 @@ export default function DevicesTab() {
     }
   };
 
-  // Remover Celular
+  // Remover Celular Individual
   const handleRemoveDevice = async (serial: string) => {
     try {
       await api("delete_device", { serial });
       setDevicesList((prev) => prev.filter((d) => d.serial !== serial));
+      setSelectedSerials((prev) => prev.filter((s) => s !== serial));
       refreshDevices();
     } catch (e) {
       console.warn("Falha ao apagar dispositivo no SQLite:", e);
     }
+  };
+
+  // Ações em Lote (Seleção Múltipla & Limpeza de Offlines)
+  const toggleSelectAll = (allDevices: Device[]) => {
+    if (selectedSerials.length === allDevices.length && allDevices.length > 0) {
+      setSelectedSerials([]);
+    } else {
+      setSelectedSerials(allDevices.map((d) => d.serial));
+    }
+  };
+
+  const toggleSelectDevice = (serial: string) => {
+    setSelectedSerials((prev) =>
+      prev.includes(serial) ? prev.filter((s) => s !== serial) : [...prev, serial]
+    );
+  };
+
+  const handleBatchDeleteSelected = async () => {
+    if (selectedSerials.length === 0) return;
+    if (!confirm(`Deseja apagar os ${selectedSerials.length} celular(es) selecionado(s)?`)) return;
+
+    for (const serial of selectedSerials) {
+      try {
+        await api("delete_device", { serial });
+      } catch (e) {
+        console.warn("Falha ao apagar no SQLite:", e);
+      }
+    }
+    setDevicesList((prev) => prev.filter((d) => !selectedSerials.includes(d.serial)));
+    setSelectedSerials([]);
+    refreshDevices();
+  };
+
+  const handleClearAllOfflineDevices = async () => {
+    const offlineDevs = devicesList.filter((d) => d.status === "offline");
+    if (offlineDevs.length === 0) {
+      alert("Nenhum celular offline encontrado para remover.");
+      return;
+    }
+    if (!confirm(`Deseja excluir TODOS os ${offlineDevs.length} celular(es) offline de uma só vez?`)) return;
+
+    const offlineSerials = offlineDevs.map((d) => d.serial);
+    for (const serial of offlineSerials) {
+      try {
+        await api("delete_device", { serial });
+      } catch (e) {
+        console.warn("Falha ao apagar offline no SQLite:", e);
+      }
+    }
+    setDevicesList((prev) => prev.filter((d) => d.status !== "offline"));
+    setSelectedSerials((prev) => prev.filter((s) => !offlineSerials.includes(s)));
+    refreshDevices();
   };
 
   // Filtra APENAS os celulares reais existentes com memoização HPC para 0ms de lag no React
@@ -408,7 +466,8 @@ export default function DevicesTab() {
               if (!confirm(`Provisionar ${unprovisioned.length} dispositivo(s) sem ID permanente?`)) return;
               for (const d of unprovisioned) {
                 try {
-                  await api<string>("provision_device", { serial: d.serial, server_url: null });
+                  const targetSerial = (d.status === "online" && d.currentAdbAddress) ? d.currentAdbAddress : d.serial;
+                  await api<string>("provision_device", { serial: targetSerial, server_url: null });
                 } catch (e: any) {
                   alert(`Erro ao provisionar ${d.serial}: ${typeof e === "string" ? e : e?.message || "Erro"}`);
                 }
@@ -540,6 +599,54 @@ export default function DevicesTab() {
       </div>
 
       {/* ============================================================ */}
+      {/* BARRA DE SELEÇÃO MÚLTIPLA & AÇÕES EM LOTE (APAGAR EM MASSA) */}
+      {/* ============================================================ */}
+      <div className="flex flex-wrap items-center justify-between gap-3 bg-[#111726]/90 border border-slate-800 p-3 rounded-2xl text-xs shadow-lg backdrop-blur-md">
+        <div className="flex items-center gap-3">
+          <label className="flex items-center gap-2 cursor-pointer font-bold text-slate-200 hover:text-white select-none">
+            <input
+              type="checkbox"
+              checked={selectedSerials.length > 0 && selectedSerials.length === filteredDevices.length}
+              onChange={() => toggleSelectAll(filteredDevices)}
+              className="w-4 h-4 rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500/20 cursor-pointer"
+            />
+            <span>
+              {selectedSerials.length === filteredDevices.length && filteredDevices.length > 0
+                ? "Desmarcar Todos"
+                : `Selecionar Todos (${filteredDevices.length})`}
+            </span>
+          </label>
+
+          {selectedSerials.length > 0 && (
+            <span className="px-2.5 py-1 rounded-full bg-blue-500/20 text-blue-300 font-bold border border-blue-500/30 font-mono">
+              {selectedSerials.length} selecionado(s)
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2 flex-wrap">
+          {selectedSerials.length > 0 && (
+            <button
+              onClick={handleBatchDeleteSelected}
+              className="px-3.5 py-1.5 rounded-xl bg-red-600 hover:bg-red-500 text-white font-extrabold shadow-lg shadow-red-600/30 transition-all cursor-pointer flex items-center gap-1.5"
+            >
+              <Trash2 size={14} />
+              <span>Apagar Selecionados ({selectedSerials.length})</span>
+            </button>
+          )}
+
+          <button
+            onClick={handleClearAllOfflineDevices}
+            className="px-3.5 py-1.5 rounded-xl bg-amber-600/20 hover:bg-amber-600/30 text-amber-300 border border-amber-500/30 font-bold transition-all cursor-pointer flex items-center gap-1.5"
+            title="Exclui instantaneamente todos os celulares que estão offline"
+          >
+            <XCircle size={14} className="text-amber-400" />
+            <span>🚫 Limpar Todos os Celulares Offline ({devicesList.filter(d => d.status === "offline").length})</span>
+          </button>
+        </div>
+      </div>
+
+      {/* ============================================================ */}
       {/* CONTEÚDO PRINCIPAL: EXIBE APENAS CELULARES CONECTADOS */}
       {/* ============================================================ */}
       {viewMode === "grid" ? (
@@ -550,6 +657,8 @@ export default function DevicesTab() {
                 key={device.serial}
                 device={device}
                 activeUserDisplayName={activeUserMap[device.serial]?.activeUserDisplayName}
+                isSelected={selectedSerials.includes(device.serial)}
+                onToggleSelect={() => toggleSelectDevice(device.serial)}
                 onRemove={() => handleRemoveDevice(device.serial)}
                 onOpenMirror={() => {
                   setSelectedDeviceForMirror(device);
@@ -558,6 +667,10 @@ export default function DevicesTab() {
                 onOpenConfig={() => {
                   setSelectedDeviceForConfig(device);
                   setConfigModalOpen(true);
+                }}
+                onOpenRegion={() => {
+                  setSelectedSerialForRegion(device.serial);
+                  setRegionModalOpen(true);
                 }}
                 onForceWireless={() => {
                   handleForceWirelessAdb(
@@ -597,7 +710,15 @@ export default function DevicesTab() {
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="border-b border-border text-[11px] font-bold text-tertiary uppercase tracking-wider bg-white/[0.01]">
-                  <th className="px-6 py-3.5">Modelo do Celular</th>
+                  <th className="px-4 py-3.5 w-10">
+                    <input
+                      type="checkbox"
+                      checked={selectedSerials.length > 0 && selectedSerials.length === filteredDevices.length}
+                      onChange={() => toggleSelectAll(filteredDevices)}
+                      className="w-4 h-4 rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500/20 cursor-pointer"
+                    />
+                  </th>
+                  <th className="px-4 py-3.5">Modelo do Celular</th>
                   <th className="px-6 py-3.5">IP / Serial ADB</th>
                   <th className="px-6 py-3.5">Setor</th>
                   <th className="px-6 py-3.5">Status Conexão</th>
@@ -607,8 +728,16 @@ export default function DevicesTab() {
               </thead>
               <tbody className="divide-y divide-border text-xs">
                 {filteredDevices.map((device) => (
-                  <tr key={device.serial} className="hover:bg-white/[0.02] transition-colors">
-                    <td className="px-6 py-4">
+                  <tr key={device.serial} className={`hover:bg-white/[0.02] transition-colors ${selectedSerials.includes(device.serial) ? "bg-blue-600/10" : ""}`}>
+                    <td className="px-4 py-4">
+                      <input
+                        type="checkbox"
+                        checked={selectedSerials.includes(device.serial)}
+                        onChange={() => toggleSelectDevice(device.serial)}
+                        className="w-4 h-4 rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500/20 cursor-pointer"
+                      />
+                    </td>
+                    <td className="px-4 py-4">
                       <div className="flex items-center gap-3">
                         <div className="p-2 rounded-xl bg-blue-500/15 border border-blue-500/30 text-blue-400">
                           <Smartphone size={20} />
@@ -1032,6 +1161,21 @@ export default function DevicesTab() {
           isOpen={mirrorModalOpen}
           onClose={() => setMirrorModalOpen(false)}
           device={selectedDeviceForMirror}
+          onOpenRegion={() => {
+            if (selectedDeviceForMirror) {
+              setSelectedSerialForRegion(selectedDeviceForMirror.serial);
+              setRegionModalOpen(true);
+            }
+          }}
+        />
+      )}
+
+      {/* Modal de Seleção de Área/Quadrado da Câmera Virtual */}
+      {regionModalOpen && (
+        <ScreenRegionSelectorModal
+          isOpen={regionModalOpen}
+          onClose={() => setRegionModalOpen(false)}
+          serial={selectedSerialForRegion}
         />
       )}
 
@@ -1050,16 +1194,22 @@ export default function DevicesTab() {
 const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
   device,
   activeUserDisplayName,
+  isSelected,
+  onToggleSelect,
   onRemove,
   onOpenMirror,
   onOpenConfig,
+  onOpenRegion,
   onForceWireless,
 }: {
   device: Device;
   activeUserDisplayName?: string;
+  isSelected: boolean;
+  onToggleSelect: () => void;
   onRemove: () => void;
   onOpenMirror: () => void;
   onOpenConfig: () => void;
+  onOpenRegion: () => void;
   onForceWireless: () => void;
 }) {
   const status = statusConfig[device.status as DeviceStatus] || statusConfig.offline;
@@ -1067,10 +1217,18 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
   const isUsbOnly = !device.serial.includes(":");
 
   return (
-    <div className="bg-[#0e121d]/90 border border-slate-800/90 rounded-2xl p-4 space-y-3 shadow-xl hover:border-slate-700/80 transition-all flex flex-col justify-between">
-      {/* Top Header: Nome Principal (Aparelho 1, 2...) + Subtítulo (Modelo) + Setor */}
+    <div className={`bg-[#0e121d]/90 border rounded-2xl p-4 space-y-3 shadow-xl transition-all flex flex-col justify-between ${
+      isSelected ? "border-blue-500 shadow-blue-500/20 ring-1 ring-blue-500/50" : "border-slate-800/90 hover:border-slate-700/80"
+    }`}>
+      {/* Top Header: Checkbox + Nome Principal + Subtítulo + Setor */}
       <div className="flex items-center justify-between gap-1 pb-1 border-b border-slate-800/60">
         <div className="flex items-center gap-2 min-w-0">
+          <input
+            type="checkbox"
+            checked={isSelected}
+            onChange={onToggleSelect}
+            className="w-4 h-4 rounded border-slate-700 bg-slate-900 text-blue-600 focus:ring-blue-500/20 cursor-pointer shrink-0"
+          />
           <div className="p-1.5 rounded-lg bg-blue-500/10 text-blue-400 shrink-0">
             <Smartphone size={18} />
           </div>
@@ -1207,18 +1365,11 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
             <span>Espelhar Tela</span>
           </button>
           <button
-            onClick={async () => {
-              try {
-                const msg = await api<string>("launch_camera_stream", { serial: device.serial, facing: "back" });
-                alert(msg);
-              } catch (err: any) {
-                alert(typeof err === "string" ? err : err?.message || "Erro ao abrir câmera.");
-              }
-            }}
-            className="w-full bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-xs py-2 px-2 rounded-xl shadow-lg shadow-purple-600/30 transition-all cursor-pointer flex items-center justify-center gap-1"
-            title="Abrir Transmissão de Câmera Ao Vivo (60 FPS)"
+            onClick={onOpenRegion}
+            className="w-full bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white font-extrabold text-xs py-2 px-2 rounded-xl shadow-lg shadow-amber-600/30 transition-all cursor-pointer flex items-center justify-center gap-1 animate-pulse"
+            title="Abrir Seleção de Enquadramento da Câmera Virtual (Leitura de QR Code)"
           >
-            <Camera size={13} className="text-purple-200" />
+            <Camera size={13} className="text-amber-200" />
             <span>📷 Câmera</span>
           </button>
         </div>
@@ -1346,6 +1497,241 @@ function DeviceSlotConfigModal({
   );
 }
 
+// ============================================================
+// JANELA / OVERLAY DE SELEÇÃO DE ENQUADRAMENTO MOVÍVEL (VCAM)
+// ============================================================
+function ScreenRegionSelectorModal({
+  isOpen,
+  onClose,
+  serial,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  serial: string;
+}) {
+  const [posX, setPosX] = useState(400);
+  const [posY, setPosY] = useState(200);
+  const [width, setWidth] = useState(500);
+  const [height, setHeight] = useState(500);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [statusMsg, setStatusMsg] = useState("");
+  const [streamActive, setStreamActive] = useState(false);
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Drag state
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const [boxStart, setBoxStart] = useState({ x: 0, y: 0 });
+
+  const startScreenShare = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.play();
+        setStreamActive(true);
+        setStatusMsg("✅ Monitor capturado! Arraste o quadrado amarelo para a área desejada.");
+      }
+    } catch (err) {
+      setStatusMsg("❌ Erro ao acessar monitor. Permissão negada?");
+    }
+  };
+
+  const captureAndInjectBase64 = useCallback(async () => {
+    if (!videoRef.current || !canvasRef.current || !streamActive) return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    canvas.width = width;
+    canvas.height = height;
+    
+    // Fill with black to ensure no alpha channel (fully opaque)
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(video, posX, posY, width, height, 0, 0, width, height);
+
+    // Use JPEG to force 24-bit RGB and drastically reduce file size over Wi-Fi
+    const base64Data = canvas.toDataURL("image/jpeg", 0.7);
+
+    try {
+      const msg = await api<string>("inject_base64_frame", { serial, frameData: base64Data });
+      setStatusMsg(msg);
+    } catch (err: any) {
+      setStatusMsg(`❌ Erro: ${typeof err === "string" ? err : err?.message || "Falha na injeção"}`);
+    }
+  }, [serial, posX, posY, width, height, streamActive]);
+
+  useEffect(() => {
+    let isActive = true;
+    let timerId: any;
+
+    const loop = async () => {
+      if (!isActive || !isStreaming) return;
+      
+      const startTime = Date.now();
+      await captureAndInjectBase64();
+      
+      const elapsed = Date.now() - startTime;
+      const delay = Math.max(500, 1500 - elapsed); // Tenta manter ~1.5s total, mas no min 500ms entre frames
+
+      if (isActive && isStreaming) {
+        timerId = setTimeout(loop, delay);
+      }
+    };
+
+    if (isStreaming) {
+      loop();
+    }
+
+    return () => {
+      isActive = false;
+      clearTimeout(timerId);
+    };
+  }, [isStreaming, captureAndInjectBase64]);
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    setIsDragging(true);
+    setDragStart({ x: e.clientX, y: e.clientY });
+    setBoxStart({ x: posX, y: posY });
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!isDragging || !videoRef.current) return;
+    const dx = e.clientX - dragStart.x;
+    const dy = e.clientY - dragStart.y;
+    const rect = videoRef.current.getBoundingClientRect();
+    
+    // Prevent div-by-zero or NaN if video is not loaded yet
+    if (rect.width === 0 || rect.height === 0 || !videoRef.current.videoWidth) return;
+
+    const scaleX = videoRef.current.videoWidth / rect.width;
+    const scaleY = videoRef.current.videoHeight / rect.height;
+
+    setPosX(Math.max(0, Math.round(boxStart.x + dx * scaleX)));
+    setPosY(Math.max(0, Math.round(boxStart.y + dy * scaleY)));
+  };
+
+  const handlePointerUp = (e: React.PointerEvent) => {
+    setIsDragging(false);
+    e.currentTarget.releasePointerCapture(e.pointerId);
+  };
+
+  // Calcula % para overlay no CSS
+  const getOverlayStyle = () => {
+    if (!videoRef.current || !videoRef.current.videoWidth) return { display: "none" };
+    const vw = videoRef.current.videoWidth;
+    const vh = videoRef.current.videoHeight;
+    return {
+      left: `${(posX / vw) * 100}%`,
+      top: `${(posY / vh) * 100}%`,
+      width: `${(width / vw) * 100}%`,
+      height: `${(height / vh) * 100}%`,
+    };
+  };
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      onClose={() => {
+        setIsStreaming(false);
+        if (videoRef.current && videoRef.current.srcObject) {
+          const stream = videoRef.current.srcObject as MediaStream;
+          stream.getTracks().forEach(track => track.stop());
+        }
+        onClose();
+      }}
+      title="🔳 Selecionar Área de Enquadramento (Viewfinder Visual)"
+      size="xl"
+    >
+      <div className="space-y-4 text-xs font-sans text-slate-100 flex flex-col items-center">
+        {!streamActive ? (
+          <div className="w-full p-8 border-2 border-dashed border-slate-700 rounded-2xl bg-slate-900/50 flex flex-col items-center justify-center text-center space-y-4">
+            <div className="p-4 bg-amber-500/20 text-amber-300 rounded-full">
+              <Camera size={48} />
+            </div>
+            <div>
+              <h3 className="text-lg font-bold text-white mb-2">Captura Visual em Tempo Real</h3>
+              <p className="text-sm text-slate-400 mb-4 max-w-md">
+                Para um enquadramento perfeito, selecione a tela do seu PC. Você poderá arrastar um quadrado diretamente sobre o WhatsApp Web para capturar o QR Code.
+              </p>
+            </div>
+            <Button onClick={startScreenShare} className="px-8 py-3 text-sm font-bold bg-amber-600 hover:bg-amber-500 text-white rounded-xl shadow-lg shadow-amber-500/20">
+              🖥️ Selecionar Tela / Monitor
+            </Button>
+          </div>
+        ) : (
+          <div className="w-full relative rounded-xl overflow-hidden border-2 border-slate-700 bg-black flex justify-center items-center" style={{ minHeight: "400px", maxHeight: "60vh" }}>
+            <video ref={videoRef} className="max-w-full max-h-full" muted playsInline />
+            
+            {/* Viewfinder Draggable Overlay */}
+            <div
+              className={`absolute border-4 ${isStreaming ? 'border-red-500 shadow-[0_0_20px_rgba(239,68,68,0.5)]' : 'border-amber-400 border-dashed'} bg-amber-400/10 cursor-move transition-shadow duration-300`}
+              style={getOverlayStyle()}
+              onPointerDown={handlePointerDown}
+              onPointerMove={handlePointerMove}
+              onPointerUp={handlePointerUp}
+              onPointerCancel={handlePointerUp}
+            >
+              <div className="absolute -top-6 left-0 bg-amber-400 text-black font-bold text-[10px] px-2 py-0.5 rounded-t-md whitespace-nowrap">
+                Arraste-me ({posX}, {posY}) - {width}x{height}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Inputs Ocultos de Posição & Tamanho (ainda visíveis para ajuste fino se quiser, ou apenas tamanho) */}
+        {streamActive && (
+          <div className="w-full grid grid-cols-4 gap-3 p-3 bg-slate-900/80 border border-slate-800 rounded-xl">
+            <div>
+              <label className="block font-bold text-slate-400 mb-1">Posição X</label>
+              <input type="number" value={posX} onChange={(e) => setPosX(parseInt(e.target.value) || 0)} className="w-full bg-[#121624] border border-slate-700 text-slate-100 rounded-lg p-2 text-center font-mono font-bold" />
+            </div>
+            <div>
+              <label className="block font-bold text-slate-400 mb-1">Posição Y</label>
+              <input type="number" value={posY} onChange={(e) => setPosY(parseInt(e.target.value) || 0)} className="w-full bg-[#121624] border border-slate-700 text-slate-100 rounded-lg p-2 text-center font-mono font-bold" />
+            </div>
+            <div>
+              <label className="block font-bold text-slate-400 mb-1">Largura</label>
+              <input type="number" value={width} onChange={(e) => setWidth(parseInt(e.target.value) || 200)} className="w-full bg-[#121624] border border-slate-700 text-slate-100 rounded-lg p-2 text-center font-mono font-bold" />
+            </div>
+            <div>
+              <label className="block font-bold text-slate-400 mb-1">Altura</label>
+              <input type="number" value={height} onChange={(e) => setHeight(parseInt(e.target.value) || 200)} className="w-full bg-[#121624] border border-slate-700 text-slate-100 rounded-lg p-2 text-center font-mono font-bold" />
+            </div>
+          </div>
+        )}
+
+        {/* Botões de Ação */}
+        {streamActive && (
+          <div className="w-full flex flex-col sm:flex-row items-center gap-3 pt-2">
+            <Button
+              variant={isStreaming ? "danger" : "primary"}
+              onClick={() => setIsStreaming(!isStreaming)}
+              icon={<RefreshCw size={18} className={isStreaming ? "animate-spin" : ""} />}
+              className={`w-full py-3.5 px-4 font-extrabold rounded-xl text-sm ${isStreaming ? 'animate-pulse' : 'bg-gradient-to-r from-emerald-600 to-teal-600'}`}
+            >
+              {isStreaming ? "🔴 PARAR TRANSMISSÃO PARA O CELULAR" : "⚡ INICIAR CÂMERA VIRTUAL (AO VIVO)"}
+            </Button>
+          </div>
+        )}
+
+        {statusMsg && (
+          <div className="w-full p-3 bg-emerald-950/40 border border-emerald-500/30 text-emerald-300 font-mono text-xs rounded-xl font-bold break-words leading-relaxed text-center">
+            {statusMsg}
+          </div>
+        )}
+
+        <canvas ref={canvasRef} className="hidden" />
+      </div>
+    </Modal>
+  );
+}
+
 // ---- Auxiliar Bateria ----
 function BatteryIcon({ level }: { level: number }) {
   if (level > 60) return <BatteryFull size={16} className="text-emerald-400" />;
@@ -1379,10 +1765,12 @@ function ScreenMirrorModal({
   isOpen,
   onClose,
   device,
+  onOpenRegion,
 }: {
   isOpen: boolean;
   onClose: () => void;
   device: Device;
+  onOpenRegion: () => void;
 }) {
   const [screenSrc, setScreenSrc] = useState<string | null>(null);
   const [loadingFrame, setLoadingFrame] = useState(false);
@@ -1519,18 +1907,11 @@ function ScreenMirrorModal({
               </button>
 
               <button
-                onClick={async () => {
-                  try {
-                    const msg = await api<string>("inject_virtual_camera", { serial: device.serial, targetType: "screen" });
-                    alert(msg);
-                  } catch (err: any) {
-                    alert(typeof err === "string" ? err : err?.message || "Erro ao injetar Câmera Virtual.");
-                  }
-                }}
+                onClick={onOpenRegion}
                 className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-amber-600 to-orange-600 text-white text-xs font-extrabold shadow-lg hover:from-amber-500 hover:to-orange-500 transition-all cursor-pointer flex items-center gap-1.5 animate-pulse"
-                title="Substitui o sinal da câmera física do celular pela imagem do monitor do PC (Leitura de QR Code)"
+                title="Abre a janela de enquadramento do monitor para injetar o QR Code na Câmera Virtual"
               >
-                🎯 Injetar Tela na Câmera
+                🎯 Injetar Enquadramento (VCam)
               </button>
 
               <button
