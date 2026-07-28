@@ -1,0 +1,16 @@
+[Unit]
+Description=Esfera Hub Standalone Service
+After=network.target
+
+[Service]
+Type=simple
+User=vicenzzoconstantine
+WorkingDirectory=/home/vicenzzoconstantine/esfera_v3/hub-standalone
+ExecStart=/home/vicenzzoconstantine/esfera_v3/hub-standalone/target/release/esfera-hub-standalone
+Restart=always
+RestartSec=5
+Environment=HUB_PORT=8555
+Environment=HTTP_PORT=8080
+
+[Install]
+WantedBy=multi-user.target
