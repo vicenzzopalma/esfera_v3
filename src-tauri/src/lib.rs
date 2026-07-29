@@ -16,10 +16,12 @@ pub mod hub;
 pub mod hub_client;
 pub mod master_client;
 pub mod protocol;
+pub mod scrcpy_manager;
 mod session;
 
 use commands::*;
 use db::Database;
+use crate::protocol::HubMessage;
 use master_client::MasterClient;
 use session::SessionManager;
 use std::sync::{Arc, Mutex};
@@ -131,7 +133,19 @@ pub fn run() {
                         backoff = 1;
                         loop {
                             tokio::time::sleep(Duration::from_secs(10)).await;
-                            if mc.lock().await.is_none() { break; }
+                            let mut guard = mc.lock().await;
+                            if guard.is_none() { break; }
+                            if let Some(ref c) = *guard {
+                                if c.send_raw(&HubMessage::Ping).await.is_err() {
+                                    *guard = None;
+                                    break;
+                                }
+                                // Consume Pong
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(3),
+                                    c.read_one(),
+                                ).await;
+                            }
                         }
                     }
                     Err(e) => {
@@ -254,6 +268,9 @@ pub fn run() {
             optimize_device_hpc,
             install_agent_apk,
             provision_device,
+            provision_all_devices,
+            debloat_device,
+            debloat_all_devices,
             get_device_by_esfera_id,
             // AI Config
             get_ai_config,
@@ -268,7 +285,6 @@ pub fn run() {
             // Campaign Dispatch
             send_campaign,
             pause_campaign,
-            resume_campaign,
             start_campaign,
             rewrite_message_ai,
             // Hub / Master
@@ -286,6 +302,8 @@ pub fn run() {
             reject_device_access,
             end_device_access,
             get_devices_with_active_user_map,
+            configure_device_proxy_and_antiban,
+            trigger_manual_intent_bezier_dispatch,
             // Config
             get_app_config,
             save_app_config,

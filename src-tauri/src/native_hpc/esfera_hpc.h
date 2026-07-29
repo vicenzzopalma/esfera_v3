@@ -56,9 +56,28 @@ esfera_int32_t esfera_hpc_generate_bezier_points(
     esfera_int32_t* out_count
 );
 
+esfera_int32_t esfera_hpc_calculate_tap_coordinates(
+    esfera_int32_t screen_width,
+    esfera_int32_t screen_height,
+    double pct_x,
+    double pct_y,
+    esfera_int32_t* out_x,
+    esfera_int32_t* out_y
+);
+
 void esfera_hpc_format_active_user_badge(
     const char* user_display_name,
     char* out_buf,
+    esfera_size_t max_len
+);
+
+typedef void (*esfera_hpc_process_fn)(const esfera_uint8_t* in, esfera_size_t len, esfera_uint8_t* out, esfera_size_t* out_written);
+
+esfera_hpc_process_fn esfera_hpc_get_optimized_processor(void);
+
+esfera_int32_t esfera_hpc_get_debloat_package_list(
+    const char* brand_or_manufacturer,
+    char* out_packages_buf,
     esfera_size_t max_len
 );
 

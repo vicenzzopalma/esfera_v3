@@ -147,11 +147,7 @@ pub fn update_company(
 // ============================================================
 
 use std::sync::RwLock;
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
-
-static BATTERY_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (i32, Instant)>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 static ADB_LIST_CACHE: std::sync::LazyLock<RwLock<(Vec<AdbDeviceInfo>, Instant)>> =
     std::sync::LazyLock::new(|| RwLock::new((Vec::new(), Instant::now() - Duration::from_secs(10))));
@@ -172,20 +168,8 @@ fn get_cached_adb_devices() -> Vec<AdbDeviceInfo> {
 }
 
 fn get_cached_battery(serial: &str) -> i32 {
-    let now = Instant::now();
-    if let Ok(cache) = BATTERY_CACHE.read() {
-        if let Some((level, timestamp)) = cache.get(serial) {
-            if now.duration_since(*timestamp).as_secs() < 120 {
-                return *level;
-            }
-        }
-    }
-
-    let real_bat = AdbManager::get_battery_level(serial).unwrap_or(85);
-    if let Ok(mut cache) = BATTERY_CACHE.write() {
-        cache.insert(serial.to_string(), (real_bat, now));
-    }
-    real_bat
+    // Usa cache do AdbManager (15s TTL)
+    AdbManager::get_battery_level(serial).unwrap_or(85)
 }
 
 #[tauri::command]
@@ -497,9 +481,9 @@ pub fn optimize_device(state: State<'_, AppState>, token: String, serial: String
     ];
     let mut results = Vec::new();
     for cmd in commands {
-        let output = crate::adb_manager::create_cmd("adb")
-            .args(["-s", &serial, "shell", cmd])
-            .output();
+        let mut adb = crate::adb_manager::create_cmd("adb");
+        adb.args(["-s", &serial, "shell", cmd]);
+        let output = crate::adb_manager::run_cmd_timeout(adb, std::time::Duration::from_secs(6));
         match output {
             Ok(_) => results.push(format!("✓ {}", cmd)),
             Err(e) => results.push(format!("✗ {}: {}", cmd, e)),
@@ -884,18 +868,6 @@ pub fn was_already_sent(
     Ok(db.was_already_sent(&phone, campaign_id))
 }
 
-#[tauri::command]
-pub fn mark_as_sent(
-    state: State<'_, AppState>,
-    token: String,
-    phone: String,
-    campaign_id: i32,
-) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
-    let db = &state.db;
-    db.mark_as_sent(&phone, campaign_id)
-}
-
 // ============================================================
 // DEVICE STATUS & PREFS
 // ============================================================
@@ -1109,8 +1081,18 @@ pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -
                 let ip_parts: Vec<&str> = dev.serial.split(':').collect();
                 let ip = ip_parts[0];
                 let (brand, model) = AdbManager::get_device_info(&dev.serial);
-                let dev_num = (idx + 1) as i32;
-                let device_obj = Device {
+
+                let all_existing = db_arc.get_devices(0);
+                if let Some(existing_dev) = all_existing.iter().find(|d| d.serial == dev.serial) {
+                    let mut updated = existing_dev.clone();
+                    updated.status = "online".to_string();
+                    updated.ip = ip.to_string();
+                    if updated.brand.is_empty() { updated.brand = brand; }
+                    if updated.model.is_empty() { updated.model = model; }
+                    let _ = db_arc.upsert_device(&updated);
+                } else {
+                    let dev_num = (all_existing.len() + 1) as i32;
+                    let device_obj = Device {
                         id: 0,
                         serial: dev.serial.clone(),
                         name: format!("Aparelho {}", dev_num),
@@ -1128,6 +1110,7 @@ pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -
                         last_seen_utc: None,
                     };
                     let _ = db_arc.upsert_device(&device_obj);
+                }
             }
         }
     });
@@ -1327,21 +1310,14 @@ pub fn send_campaign(
 pub fn pause_campaign(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
     let db = &state.db;
-    db.update_campaign_status(campaign_id, "paused")
-}
-
-#[tauri::command]
-pub fn resume_campaign(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<(), String> {
-    let _session = validate_session(&state.sessions, &token)?;
-    let db = &state.db;
-    db.update_campaign_status(campaign_id, "running")
+    db.set_campaign_status(campaign_id, "paused")
 }
 
 #[tauri::command]
 pub fn start_campaign(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
     let db = &state.db;
-    db.update_campaign_status(campaign_id, "running")
+    db.set_campaign_status(campaign_id, "running")
 }
 
 #[tauri::command]
@@ -1450,19 +1426,92 @@ pub async fn install_agent_apk(_token: String, serial: String) -> Result<String,
 
 #[tauri::command]
 pub async fn provision_device(
+    state: State<'_, AppState>,
     _token: String,
     serial: String,
     server_url: Option<String>,
 ) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let cloned_serial = serial.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         AdbManager::provision_device(&serial, server_url.as_deref())
-    }).await.map_err(|e| e.to_string())?
+    }).await.map_err(|e| e.to_string())??;
+
+    let db = &state.db;
+
+    // Salva o EsferaDeviceId no banco local após provisionar
+    if let Some(esfera_id) = AdbManager::get_persistent_device_id(&cloned_serial) {
+        if let Err(e) = db.update_device_esfera_id(&cloned_serial, &esfera_id) {
+            eprintln!("Aviso: nao foi possivel salvar EsferaDeviceId no DB: {}", e);
+        }
+    }
+
+    // Otimiza desempenho do dispositivo após provisionamento
+    let _ = AdbManager::optimize_device_performance(&cloned_serial);
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn provision_all_devices(
+    state: State<'_, AppState>,
+    _token: String,
+    server_url: Option<String>,
+) -> Result<Vec<String>, String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::provision_all_devices(server_url.as_deref())
+    }).await.map_err(|e| e.to_string())?;
+
+    let db = &state.db;
+    let mut outputs = Vec::new();
+
+    for res in result {
+        match res {
+            Ok(msg) => {
+                let active = AdbManager::list_devices().unwrap_or_default();
+                for dev in active {
+                    if dev.state == "device" {
+                        if let Some(esfera_id) = AdbManager::get_persistent_device_id(&dev.serial) {
+                            let _ = db.update_device_esfera_id(&dev.serial, &esfera_id);
+                        }
+                        let _ = AdbManager::optimize_device_performance(&dev.serial);
+                    }
+                }
+                outputs.push(msg);
+            }
+            Err(e) => outputs.push(format!("Erro: {}", e)),
+        }
+    }
+
+    Ok(outputs)
 }
 
 #[tauri::command]
 pub fn get_device_by_esfera_id(state: State<'_, AppState>, _token: String, esfera_device_id: String) -> Result<Option<Device>, String> {
     let db = &state.db;
     Ok(db.get_device_by_esfera_id(&esfera_device_id))
+}
+
+#[tauri::command]
+pub async fn debloat_device(_token: String, serial: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::debloat_device(&serial)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn debloat_all_devices(_token: String) -> Result<Vec<String>, String> {
+    let results = tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::debloat_all_devices()
+    }).await.map_err(|e| e.to_string())?;
+
+    let mut outputs = Vec::new();
+    for res in results {
+        match res {
+            Ok(msg) => outputs.push(msg),
+            Err(e) => outputs.push(format!("Erro debloat: {}", e)),
+        }
+    }
+    Ok(outputs)
 }
 
 // ============================================================
@@ -1642,5 +1691,28 @@ pub fn get_devices_with_active_user_map(
     let session = validate_session(&state.sessions, &token)?;
     let target_company = session.company_id.unwrap_or(company_id);
     Ok(state.db.get_devices_with_active_user_map(target_company))
+}
+
+#[tauri::command]
+pub fn configure_device_proxy_and_antiban(
+    state: State<'_, AppState>,
+    token: String,
+    serial: String,
+    proxy_url: Option<String>,
+) -> Result<(), String> {
+    let _session = validate_session(&state.sessions, &token)?;
+    AdbManager::configure_device_socks_proxy_and_revoke_bssid(&serial, proxy_url.as_deref())
+}
+
+#[tauri::command]
+pub fn trigger_manual_intent_bezier_dispatch(
+    state: State<'_, AppState>,
+    token: String,
+    serial: String,
+    phone: String,
+    message: String,
+) -> Result<(), String> {
+    let _session = validate_session(&state.sessions, &token)?;
+    AdbManager::send_whatsapp_intent_and_bezier_tap(&serial, &phone, &message)
 }
 
