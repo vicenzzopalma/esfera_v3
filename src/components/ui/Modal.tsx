@@ -55,28 +55,28 @@ export default function Modal({ isOpen, onClose, title, children, footer, size =
       {/* Modal Content */}
       <div
         className={`relative w-full ${sizeClasses[size]} rounded-2xl border
-          bg-card border-border shadow-2xl animate-scale-in`}
+          bg-card border-white/[0.08] shadow-2xl shadow-black/40 animate-scale-in`}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-border">
-          <h2 className="text-lg font-semibold text-primary">{title}</h2>
+        <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.06]">
+          <h2 className="text-lg font-bold text-primary tracking-tight">{title}</h2>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-secondary hover:text-primary
-              hover:bg-white/10 transition-colors"
+            className="p-1.5 rounded-xl text-secondary hover:text-primary
+              hover:bg-white/10 transition-all"
           >
             <X size={20} />
           </button>
         </div>
 
         {/* Body */}
-        <div className="px-6 py-4 max-h-[60vh] overflow-y-auto custom-scrollbar">
+        <div className="px-6 py-5 max-h-[75vh] overflow-y-auto custom-scrollbar">
           {children}
         </div>
 
         {/* Footer */}
         {footer && (
-          <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-border">
+          <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-white/[0.06]">
             {footer}
           </div>
         )}

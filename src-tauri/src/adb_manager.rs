@@ -1942,7 +1942,7 @@ impl AdbManager {
         let mut cmd = create_cmd("adb");
         cmd.args(["-s", serial, "shell", &batch_cmd]);
 
-        match run_cmd_timeout(cmd, Duration::from_secs(3)) {
+        match run_cmd_timeout(cmd, Duration::from_secs(8)) {
             Ok(_) => Ok(format!(
                 "🏷️ ID permanente '{}' injetada no celular {}",
                 persistent_id, serial
@@ -1984,7 +1984,7 @@ impl AdbManager {
         let mut cmd = create_cmd("adb");
         cmd.args(["-s", serial, "shell", &batch_cmd]);
 
-        match run_cmd_timeout(cmd, Duration::from_secs(5)) {
+        match run_cmd_timeout(cmd, Duration::from_secs(10)) {
             Ok(_) => Ok(format!(
                 "🛡️ Imunidade, MAC Físico e Kernel ID Injetados no Celular {} com sucesso!",
                 serial
@@ -2011,7 +2011,7 @@ impl AdbManager {
         let mut cmd = create_cmd("adb");
         cmd.args(["-s", serial, "shell", &batch_cmd]);
 
-        match run_cmd_timeout(cmd, Duration::from_secs(3)) {
+        match run_cmd_timeout(cmd, Duration::from_secs(8)) {
             Ok(_) => Ok(format!(
                 "Configuração do servidor '{}' injetada",
                 server_url
@@ -2503,7 +2503,7 @@ impl AdbManager {
             let _ = db_conn.mark_stale_devices_offline(120);
 
             // 2. Reconecta todo device offline que tenha CurrentAdbAddress (com ou sem EsferaDeviceId)
-            let devices = db_conn.get_devices(1);
+            let devices = db_conn.get_devices(0);
             for dev in devices {
                 let has_checkin = dev.last_seen_utc.is_some();
                 let is_online = dev.status == "online";
@@ -2612,8 +2612,13 @@ impl AdbManager {
         encoded
     }
 
-    /// Envia mensagem no WhatsApp via Deep Link Intent + Toque Físico Curva de Bézier C++ HPC
+    /// Envia mensagem no WhatsApp via Deep Link Intent + Toque Físico
+    /// Para mensagens longas (>1500 chars), usa fallback: Intent só com telefone + digitação via ADB
     pub fn send_whatsapp_intent_and_bezier_tap(serial: &str, phone: &str, message: &str) -> Result<(), String> {
+        if message.len() > 1500 {
+            return Self::send_long_message_typing(serial, phone, message);
+        }
+
         let encoded_msg = Self::url_encode(message);
         let intent_url = format!("https://api.whatsapp.com/send?phone={}&text={}", phone, encoded_msg);
 
@@ -2635,21 +2640,18 @@ impl AdbManager {
             return Err(format!("Falha ao disparar Intent do WhatsApp: {}", e));
         }
 
-        // 2. Aguarda delay Gaussiano calculado via C++ HPC
+        // 2. Aguarda delay Gaussiano
         let delay_ms = unsafe { esfera_hpc_calculate_gaussian_delay(2200, 3500) };
         std::thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
 
-        // 3. Calcula coordenadas da tela com C++ HPC
+        // 3. Calcula coordenadas e toca no botão Enviar
         let (screen_w, screen_h) = Self::get_device_screen_size(serial);
         let mut tap_x: i32 = 0;
         let mut tap_y: i32 = 0;
-
-        // Botão de Enviar no WhatsApp: ~92.5% na horizontal (X), ~96.0% na vertical (Y)
         unsafe {
             esfera_hpc_calculate_tap_coordinates(screen_w, screen_h, 92.5, 96.0, &mut tap_x, &mut tap_y);
         }
 
-        // 4. Executa o Toque Físico com micro-pressão via input swipe
         let mut swipe_adb = create_cmd("adb");
         swipe_adb
             .arg("-s")
@@ -2667,6 +2669,46 @@ impl AdbManager {
         match swipe_cmd {
             Ok(out) if out.status.success() => Ok(()),
             Ok(out) => Err(String::from_utf8_lossy(&out.stderr).to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Fallback para mensagens longas: abre o chat via Intent só com telefone e digita o texto
+    fn send_long_message_typing(serial: &str, phone: &str, message: &str) -> Result<(), String> {
+        let intent_url = format!("https://api.whatsapp.com/send?phone={}", phone);
+
+        let mut intent_adb = create_cmd("adb");
+        intent_adb
+            .arg("-s")
+            .arg(serial)
+            .arg("shell")
+            .arg("am")
+            .arg("start")
+            .arg("-a")
+            .arg("android.intent.action.VIEW")
+            .arg("-d")
+            .arg(&intent_url);
+        let intent_cmd = run_cmd_timeout(intent_adb, Duration::from_secs(8));
+
+        if let Err(e) = intent_cmd {
+            return Err(format!("Falha ao abrir chat WhatsApp: {}", e));
+        }
+
+        // Aguarda a tela do chat abrir
+        let delay_ms = unsafe { esfera_hpc_calculate_gaussian_delay(2500, 4000) };
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
+
+        // Digita a mensagem caractere por caractere com delay humano
+        Self::type_text_human_hpc(serial, message)?;
+
+        // Pressiona ENTER para enviar
+        let mut enter_adb = create_cmd("adb");
+        enter_adb
+            .args(["-s", serial, "shell", "input", "keyevent", "66"]);
+        let enter_cmd = run_cmd_timeout(enter_adb, Duration::from_secs(6));
+        match enter_cmd {
+            Ok(out) if out.status.success() => Ok(()),
+            Ok(_) => Err("Falha ao pressionar ENTER no WhatsApp".to_string()),
             Err(e) => Err(e.to_string()),
         }
     }

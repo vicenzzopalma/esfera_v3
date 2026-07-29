@@ -7,10 +7,14 @@ use crate::adb_manager::AdbManager;
 use crate::ai_engine::AiEngine;
 use crate::db::Database;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 use tokio::task::spawn_blocking;
 use tokio::time::{sleep, Duration};
+
+static CAMPAIGN_DEVICE_INDEX: std::sync::LazyLock<Mutex<HashMap<i32, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignProgressEvent {
@@ -81,8 +85,14 @@ impl Dispatcher {
                             .unwrap_or_default();
                         let online_devices: Vec<_> = active_devices.into_iter().filter(|d| d.status == "online").collect();
 
-                        if let Some(target_dev) = online_devices.first() {
-                            let serial = target_dev.serial.clone();
+                        if !online_devices.is_empty() {
+                            let serial = {
+                                let mut idx_map = CAMPAIGN_DEVICE_INDEX.lock().unwrap();
+                                let idx = idx_map.entry(campaign.id).or_insert(0);
+                                let target_dev = &online_devices[*idx % online_devices.len()];
+                                *idx = (*idx + 1) % online_devices.len();
+                                target_dev.serial.clone()
+                            };
                             let msg = message_to_send.clone();
                             let phone = contact.phone.clone();
                             let _ = spawn_blocking(move || {

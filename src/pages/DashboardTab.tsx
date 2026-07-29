@@ -99,17 +99,17 @@ export default function DashboardTab() {
   return (
     <div className="space-y-6 animate-fade-in">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl font-extrabold text-primary tracking-tight">
             Dashboard
           </h2>
-          <p className="text-sm text-tertiary mt-1">
+          <p className="text-sm text-tertiary mt-1 leading-snug">
             Visão geral do sistema — Indicadores em tempo real
           </p>
         </div>
-        <div className="flex items-center gap-3">
-          <span className="text-[10px] text-tertiary font-mono">
+        <div className="flex items-center gap-3 shrink-0">
+          <span className="text-[10px] text-tertiary font-mono whitespace-nowrap">
             Atualizado: {lastRefresh.toLocaleTimeString("pt-BR")}
           </span>
           <Button
@@ -164,8 +164,8 @@ export default function DashboardTab() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* Status dos Dispositivos */}
         <Card padding="md" className="lg:col-span-1">
-          <h3 className="text-sm font-semibold text-primary flex items-center gap-2 mb-4">
-            <Smartphone size={16} className="text-violet-400" />
+          <h3 className="text-sm font-bold text-primary flex items-center gap-2 mb-4">
+            <Smartphone size={16} className="text-violet-400 shrink-0" />
             Status dos Dispositivos
           </h3>
 
@@ -219,8 +219,8 @@ export default function DashboardTab() {
 
         {/* Atividade Recente */}
         <Card padding="md" className="lg:col-span-2">
-          <h3 className="text-sm font-semibold text-primary flex items-center gap-2 mb-4">
-            <Zap size={16} className="text-violet-400" />
+          <h3 className="text-sm font-bold text-primary flex items-center gap-2 mb-4">
+            <Zap size={16} className="text-violet-400 shrink-0" />
             Atividade Recente
           </h3>
 
@@ -235,9 +235,9 @@ export default function DashboardTab() {
             ].map((item, i) => (
               <div
                 key={i}
-                className="flex items-start gap-3 p-3 rounded-xl bg-white/[0.02] border border-border hover:bg-white/[0.04] transition-colors"
+                className="flex items-start gap-3 p-3.5 rounded-xl bg-white/[0.02] border border-white/[0.06] hover:bg-white/[0.04] transition-colors"
               >
-                <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-white/[0.05] shrink-0 mt-0.5">
+                <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-white/[0.05] shrink-0">
                   <span className="text-[10px] font-mono text-tertiary">{item.time}</span>
                 </div>
                 <div className="flex-1 min-w-0">
@@ -286,8 +286,8 @@ export default function DashboardTab() {
 
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-border">
             <div className="p-3 rounded-xl bg-white/5 border border-border">
-              <p className="text-[10px] text-tertiary uppercase font-mono">Assinatura Hardware UUID (SHA-256)</p>
-              <p className="text-xs font-mono font-bold text-violet-300 mt-1 truncate">ESFERA-HWID-8F9A-4B2C-1D3E</p>
+              <p className="text-[10px] text-tertiary uppercase font-mono leading-snug">Assinatura Hardware UUID (SHA-256)</p>
+              <p className="text-xs font-mono font-bold text-violet-300 mt-1.5 truncate" title="ESFERA-HWID-8F9A-4B2C-1D3E">ESFERA-HWID-8F9A-4B2C-1D3E</p>
             </div>
             <div className="p-3 rounded-xl bg-white/5 border border-border">
               <p className="text-[10px] text-tertiary uppercase font-mono">Instruções CPU Utilizadas</p>

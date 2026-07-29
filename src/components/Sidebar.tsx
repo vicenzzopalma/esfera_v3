@@ -183,32 +183,32 @@ export default function Sidebar() {
   };
 
   return (
-    <aside style={{ width: "256px" }} className="fixed left-0 top-0 bottom-0 flex flex-col z-40 bg-sidebar border-r border-border shadow-xl">
+    <aside style={{ width: "256px" }} className="fixed left-0 top-0 bottom-0 flex flex-col z-40 bg-sidebar border-r border-white/[0.06] shadow-xl">
       {/* Brand Header */}
-      <div className="flex items-center justify-between px-5 h-16 border-b border-border">
+      <div className="flex items-center justify-between px-5 h-16 border-b border-white/[0.06]">
         <div className="flex items-center gap-3">
-          <div className="flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 shadow-md shadow-violet-500/30">
+          <div className="flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 shadow-md shadow-violet-500/30 shrink-0">
             <Zap size={20} className="text-white" />
           </div>
           <div>
-            <h1 className="text-base font-extrabold text-primary tracking-tight">Esfera</h1>
-            <p className="text-[10px] text-violet-400 font-semibold tracking-wider">v3.0 HIGH PERFORMANCE</p>
+            <h1 className="text-base font-extrabold text-primary tracking-tight leading-tight">Esfera</h1>
+            <p className="text-[10px] text-violet-400 font-semibold tracking-wider leading-none mt-0.5">v3.0 HIGH PERFORMANCE</p>
           </div>
         </div>
       </div>
 
       {/* Empresa Ativa Widget */}
       {insideCompany && selectedCompany && (
-        <div className="mx-3 mt-3 p-3 rounded-2xl bg-white/[0.03] border border-border">
+        <div className="mx-3 mt-3 p-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]">
           <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 min-w-0">
+            <div className="flex items-center gap-2.5 min-w-0">
               <Building2 size={16} className="text-violet-400 shrink-0" />
-              <span className="text-xs font-semibold text-primary truncate">{selectedCompany.name}</span>
+              <span className="text-xs font-semibold text-primary truncate" title={selectedCompany.name}>{selectedCompany.name}</span>
             </div>
             {user.role === "master" && (
               <button
                 onClick={handleBackToCompanies}
-                className="p-1 rounded-lg text-tertiary hover:text-violet-400 hover:bg-violet-500/10 transition-colors cursor-pointer"
+                className="p-1.5 rounded-lg text-tertiary hover:text-violet-400 hover:bg-violet-500/10 transition-colors cursor-pointer shrink-0"
                 title="Voltar às Empresas"
               >
                 <ChevronLeft size={16} />
@@ -219,7 +219,7 @@ export default function Sidebar() {
       )}
 
       {/* Navigation List — Filtrado por role + permissões */}
-      <nav className="flex-1 px-3 py-4 space-y-5 overflow-y-auto custom-scrollbar">
+      <nav className="flex-1 px-3 py-5 space-y-6 overflow-y-auto custom-scrollbar">
         {NAV_GROUPS.map((group) => {
           const visibleItems = group.items.filter((item) => {
             if (!item.roles.includes(user.role)) return false;
@@ -233,7 +233,7 @@ export default function Sidebar() {
 
           return (
             <div key={group.groupName}>
-              <h3 className="px-3 text-[10px] font-bold text-tertiary uppercase tracking-wider mb-2">
+              <h3 className="px-3 text-[10px] font-bold text-tertiary uppercase tracking-wider mb-2.5">
                 {group.groupName}
               </h3>
               <div className="space-y-1">
@@ -249,12 +249,12 @@ export default function Sidebar() {
                           : "text-secondary hover:text-primary hover:bg-white/5"
                       }`}
                     >
-                      <span className={isActive ? "text-violet-400" : "text-tertiary"}>
+                      <span className={`shrink-0 ${isActive ? "text-violet-400" : "text-tertiary"}`}>
                         {item.icon}
                       </span>
-                      <span className="flex-1 text-left">{item.label}</span>
+                      <span className="flex-1 text-left truncate">{item.label}</span>
                       {item.badge && (
-                        <span className="px-1.5 py-0.5 text-[9px] rounded-md bg-violet-500/20 text-violet-300 font-mono">
+                        <span className="px-1.5 py-0.5 text-[9px] rounded-md bg-violet-500/20 text-violet-300 font-mono whitespace-nowrap shrink-0">
                           {item.badge}
                         </span>
                       )}
@@ -268,15 +268,15 @@ export default function Sidebar() {
       </nav>
 
       {/* Footer Profile & Logout */}
-      <div className="border-t border-border p-3">
-        <div className="flex items-center justify-between p-2 rounded-xl bg-white/[0.02] border border-border">
+      <div className="border-t border-white/[0.06] p-3">
+        <div className="flex items-center justify-between p-2.5 rounded-xl bg-white/[0.02] border border-white/[0.06]">
           <div className="flex items-center gap-2.5 min-w-0">
-            <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-gradient-to-br from-violet-600 to-indigo-600 text-white font-bold text-xs shrink-0">
+            <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-gradient-to-br from-violet-600 to-indigo-600 text-white font-bold text-xs shrink-0 shadow-sm">
               {user.displayName.charAt(0).toUpperCase()}
             </div>
             <div className="min-w-0">
-              <p className="text-xs font-semibold text-primary truncate">{user.displayName}</p>
-              <p className="text-[10px] text-tertiary capitalize">{user.role}</p>
+              <p className="text-xs font-semibold text-primary truncate leading-tight" title={user.displayName}>{user.displayName}</p>
+              <p className="text-[10px] text-tertiary capitalize leading-tight mt-0.5">{user.role}</p>
             </div>
           </div>
           <button
