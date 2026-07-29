@@ -101,33 +101,33 @@ export default function Header() {
   };
 
   return (
-    <header className="sticky top-0 z-30 h-16 w-full glass-header flex items-center justify-between px-6 transition-all">
+    <header className="sticky top-0 z-30 h-16 w-full glass-header flex items-center justify-between px-6 gap-4 transition-all">
       {/* Left: Title & Context */}
-      <div className="flex items-center gap-4">
-        <div>
-          <div className="flex items-center gap-2">
-            <h1 className="text-base font-bold text-primary tracking-tight">
+      <div className="flex items-center gap-4 min-w-0">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-base font-bold text-primary tracking-tight leading-tight">
               {currentRoute.title}
             </h1>
             {selectedCompany && (
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-violet-500/10 text-violet-400 border border-violet-500/20">
-                <Building2 size={11} />
+              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-violet-500/10 text-violet-400 border border-violet-500/20 whitespace-nowrap shrink-0">
+                <Building2 size={11} className="shrink-0" />
                 {selectedCompany.name}
               </span>
             )}
           </div>
-          <p className="text-xs text-tertiary hidden sm:block">{currentRoute.subtitle}</p>
+          <p className="text-xs text-tertiary hidden sm:block mt-0.5 leading-snug">{currentRoute.subtitle}</p>
         </div>
       </div>
 
       {/* Right: Actions, Switcher & User */}
       <div className="flex items-center gap-3">
         {/* Engine ADB Status Badge */}
-        <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white/[0.03] border border-border text-xs">
-          <Cpu size={14} className="text-indigo-400" />
-          <span className="text-tertiary">ADB Engine:</span>
-          <span className="font-semibold text-emerald-400 flex items-center gap-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+        <div className="hidden lg:flex items-center gap-2 px-3.5 py-2 rounded-xl bg-white/[0.03] border border-white/[0.08] text-xs">
+          <Cpu size={14} className="text-indigo-400 shrink-0" />
+          <span className="text-tertiary whitespace-nowrap">ADB Engine:</span>
+          <span className="font-semibold text-emerald-400 flex items-center gap-1.5 whitespace-nowrap">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
             {onlineDevicesCount > 0 ? `${onlineDevicesCount} Online` : "Pronto"}
           </span>
         </div>
@@ -137,13 +137,13 @@ export default function Header() {
           <div className="relative" ref={companyDropdownRef}>
             <button
               onClick={() => setCompanyDropdownOpen(!companyDropdownOpen)}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white/5 border border-border hover:bg-white/10 text-xs font-medium text-primary transition-all cursor-pointer"
+              className="flex items-center gap-2.5 px-3.5 py-2 rounded-xl bg-white/5 border border-white/[0.08] hover:bg-white/10 text-xs font-medium text-primary transition-all cursor-pointer"
             >
-              <Building2 size={14} className="text-violet-400" />
-              <span className="max-w-[120px] truncate">
+              <Building2 size={14} className="text-violet-400 shrink-0" />
+              <span className="max-w-[120px] truncate" title={selectedCompany ? selectedCompany.name : "Selecionar Empresa"}>
                 {selectedCompany ? selectedCompany.name : "Selecionar Empresa"}
               </span>
-              <ChevronDown size={14} className="text-tertiary" />
+              <ChevronDown size={14} className="text-tertiary shrink-0" />
             </button>
 
             {companyDropdownOpen && (
@@ -184,7 +184,7 @@ export default function Header() {
         {/* Theme Toggle */}
         <button
           onClick={toggleTheme}
-          className="p-2 rounded-xl bg-white/5 border border-border text-secondary hover:text-primary hover:bg-white/10 transition-all cursor-pointer"
+          className="p-2.5 rounded-xl bg-white/5 border border-white/[0.08] text-secondary hover:text-primary hover:bg-white/10 transition-all cursor-pointer"
           title={isDark ? "Modo Claro" : "Modo Escuro"}
         >
           {isDark ? <Sun size={16} /> : <Moon size={16} />}

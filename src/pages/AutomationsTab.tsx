@@ -244,7 +244,7 @@ export default function AutomationsTab() {
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-xl font-bold text-primary tracking-tight">Automações Avançadas</h2>
-          <p className="text-xs text-tertiary mt-0.5">
+          <p className="text-xs text-tertiary mt-1 leading-snug">
             Triggers inteligentes com ações automáticas — detections, agendamentos e respostas.
           </p>
         </div>
@@ -255,8 +255,8 @@ export default function AutomationsTab() {
 
       {/* KPI Stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <Card padding="sm" className="flex items-center gap-3">
-          <div className="p-2.5 rounded-xl bg-violet-500/15 border border-violet-500/20 text-violet-400">
+        <Card padding="md" className="flex items-center gap-4">
+          <div className="p-2.5 rounded-xl bg-violet-500/15 border border-violet-500/20 text-violet-400 shrink-0">
             <Bot size={20} />
           </div>
           <div>
@@ -265,8 +265,8 @@ export default function AutomationsTab() {
           </div>
         </Card>
 
-        <Card padding="sm" className="flex items-center gap-3">
-          <div className="p-2.5 rounded-xl bg-emerald-500/15 border border-emerald-500/20 text-emerald-400">
+        <Card padding="md" className="flex items-center gap-4">
+          <div className="p-2.5 rounded-xl bg-emerald-500/15 border border-emerald-500/20 text-emerald-400 shrink-0">
             <CheckCircle2 size={20} />
           </div>
           <div>
@@ -275,8 +275,8 @@ export default function AutomationsTab() {
           </div>
         </Card>
 
-        <Card padding="sm" className="flex items-center gap-3">
-          <div className="p-2.5 rounded-xl bg-amber-500/15 border border-amber-500/20 text-amber-400">
+        <Card padding="md" className="flex items-center gap-4">
+          <div className="p-2.5 rounded-xl bg-amber-500/15 border border-amber-500/20 text-amber-400 shrink-0">
             <Zap size={20} />
           </div>
           <div>
@@ -285,8 +285,8 @@ export default function AutomationsTab() {
           </div>
         </Card>
 
-        <Card padding="sm" className="flex items-center gap-3">
-          <div className="p-2.5 rounded-xl bg-blue-500/15 border border-blue-500/20 text-blue-400">
+        <Card padding="md" className="flex items-center gap-4">
+          <div className="p-2.5 rounded-xl bg-blue-500/15 border border-blue-500/20 text-blue-400 shrink-0">
             <AlertTriangle size={20} />
           </div>
           <div>

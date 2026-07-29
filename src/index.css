@@ -134,7 +134,9 @@
     backdrop-filter: blur(24px);
     -webkit-backdrop-filter: blur(24px);
     border: 1px solid var(--color-border);
-    box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.08),
+      0 10px 30px -10px rgba(0, 0, 0, 0.5);
   }
 
   .glass-header {
@@ -149,6 +151,16 @@
     background: linear-gradient(135deg, #c084fc 0%, #818cf8 50%, #60a5fa 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
+  }
+
+  /* Icon alignment helper — use on parent of icon + text */
+  .icon-aligned {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+  }
+  .icon-aligned > svg {
+    flex-shrink: 0;
   }
 }
 
@@ -200,6 +212,7 @@ label {
   font-weight: 600;
   margin-bottom: 0.375rem;
   color: var(--color-text-secondary);
+  line-height: 1.25;
 }
 
 input[type="text"],
@@ -244,8 +257,13 @@ textarea {
 input:focus, select:focus, textarea:focus {
   outline: none;
   border-color: rgba(168, 85, 247, 0.5);
-  box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.2);
+  box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.15);
   background-color: rgba(255, 255, 255, 0.06);
+}
+
+input::placeholder, textarea::placeholder {
+  color: var(--color-text-tertiary);
+  opacity: 0.7;
 }
 
 .input-with-icon-left {
@@ -279,7 +297,8 @@ input:focus, select:focus, textarea:focus {
   color: #0f172a;
 }
 
-.dark select option {
+.dark select option,
+select option {
   background-color: #12141f;
   color: #f1f5f9;
 }
@@ -307,4 +326,21 @@ input:focus, select:focus, textarea:focus {
 
 .custom-scrollbar::-webkit-scrollbar {
   width: 5px;
+}
+
+/* ============================================================
+   VISUAL REFINEMENT UTILITIES
+   ============================================================ */
+
+/* Truncated text tooltip helper */
+[data-truncate-title] {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Smooth scroll for modal bodies */
+.custom-scrollbar {
+  scroll-behavior: smooth;
+  scrollbar-gutter: stable;
 }

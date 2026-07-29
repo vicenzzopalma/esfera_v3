@@ -43,7 +43,7 @@ export default function Badge({
   return (
     <span
       className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs
-        font-medium border ${variantClasses[variant]} ${className}`}
+        font-medium border whitespace-nowrap shrink-0 ${variantClasses[variant]} ${className}`}
     >
       {dot && (
         <span className="relative flex h-2 w-2">

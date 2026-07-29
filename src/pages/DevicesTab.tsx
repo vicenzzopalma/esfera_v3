@@ -403,7 +403,7 @@ export default function DevicesTab() {
       {/* ============================================================ */}
       {/* BARRA SUPERIOR: FILTRO DE SETORES & BUSCA DE CELULARES */}
       {/* ============================================================ */}
-      <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3 bg-[#0d111c]/90 border border-slate-800/80 p-3 rounded-2xl shadow-2xl backdrop-blur-md">
+      <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4 bg-[#0d111c]/90 border border-slate-800/60 p-4 rounded-2xl shadow-2xl backdrop-blur-md">
         {/* Tabs de Filtro de Setor */}
         <div className="flex items-center gap-1.5 overflow-x-auto custom-scrollbar pb-1 xl:pb-0">
           {[
@@ -562,7 +562,7 @@ export default function DevicesTab() {
       {/* ============================================================ */}
       {/* SEGUNDA BARRA: STATUS DA REDE ADB & ESTATÍSTICAS */}
       {/* ============================================================ */}
-      <div className="flex flex-wrap items-center justify-between gap-3 bg-[#0d111c]/60 border border-slate-800/50 p-2.5 rounded-xl text-xs">
+      <div className="flex flex-wrap items-center justify-between gap-4 bg-[#0d111c]/60 border border-slate-800/40 p-3 rounded-xl text-xs">
         <div className="flex items-center gap-4 text-slate-300">
           <span className="flex items-center gap-1.5 font-bold">
             <Smartphone size={15} className="text-blue-400" /> Total Celulares:{" "}
@@ -601,7 +601,7 @@ export default function DevicesTab() {
       {/* ============================================================ */}
       {/* BARRA DE SELEÇÃO MÚLTIPLA & AÇÕES EM LOTE (APAGAR EM MASSA) */}
       {/* ============================================================ */}
-      <div className="flex flex-wrap items-center justify-between gap-3 bg-[#111726]/90 border border-slate-800 p-3 rounded-2xl text-xs shadow-lg backdrop-blur-md">
+      <div className="flex flex-wrap items-center justify-between gap-4 bg-[#111726]/90 border border-slate-800/60 p-4 rounded-2xl text-xs shadow-lg backdrop-blur-md">
         <div className="flex items-center gap-3">
           <label className="flex items-center gap-2 cursor-pointer font-bold text-slate-200 hover:text-white select-none">
             <input
@@ -1217,11 +1217,11 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
   const isUsbOnly = !device.serial.includes(":");
 
   return (
-    <div className={`bg-[#0e121d]/90 border rounded-2xl p-4 space-y-3 shadow-xl transition-all flex flex-col justify-between ${
-      isSelected ? "border-blue-500 shadow-blue-500/20 ring-1 ring-blue-500/50" : "border-slate-800/90 hover:border-slate-700/80"
+    <div className={`bg-[#0e121d]/90 border rounded-2xl p-5 space-y-3.5 shadow-xl transition-all flex flex-col justify-between ${
+      isSelected ? "border-blue-500 shadow-blue-500/20 ring-1 ring-blue-500/50" : "border-slate-800/60 hover:border-slate-700/80"
     }`}>
       {/* Top Header: Checkbox + Nome Principal + Subtítulo + Setor */}
-      <div className="flex items-center justify-between gap-1 pb-1 border-b border-slate-800/60">
+      <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-800/50">
         <div className="flex items-center gap-2 min-w-0">
           <input
             type="checkbox"
@@ -1234,9 +1234,9 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
           </div>
           <div className="min-w-0">
             {/* TÍTULO PRINCIPAL (Ex: Aparelho 1, Aparelho 2) */}
-            <span className="font-black text-sm text-white block truncate tracking-tight">{displayName}</span>
+            <span className="font-black text-sm text-white block truncate tracking-tight leading-tight" title={displayName}>{displayName}</span>
             {/* SUBTÍTULO / RÓTULO (Ex: moto g22) */}
-            <span className="text-[10px] text-slate-400 font-semibold block truncate">
+            <span className="text-[10px] text-slate-400 font-semibold block truncate mt-0.5" title={`${device.model}${isUsbOnly ? " (Cabo USB)" : ""}`}>
               {device.model} {isUsbOnly && "(Cabo USB)"}
             </span>
             <span className="px-1.5 py-0.5 rounded-full bg-blue-950/80 text-blue-300 border border-blue-800/60 text-[9px] font-bold uppercase inline-block mt-0.5">
@@ -1325,7 +1325,7 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
       )}
 
       {/* Connection IP / Serial */}
-      <div className="bg-slate-900/80 border border-slate-800 px-2.5 py-1.5 rounded-xl flex items-center justify-between text-[11px] font-mono">
+      <div className="bg-slate-900/80 border border-slate-800/60 px-3 py-2 rounded-xl flex items-center justify-between text-[11px] font-mono">
         <span className="text-slate-400">{isUsbOnly ? "Serial USB:" : "IP ADB:"}</span>
         <span className="text-blue-300 font-bold">{device.currentAdbAddress || device.serial}</span>
       </div>
