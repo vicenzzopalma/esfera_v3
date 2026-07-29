@@ -1546,13 +1546,17 @@ function ScreenRegionSelectorModal({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    canvas.width = width;
-    canvas.height = height;
+    // Force output to standard camera size (720x1280) to avoid VCam crashes
+    const outWidth = 720;
+    const outHeight = 1280;
+    canvas.width = outWidth;
+    canvas.height = outHeight;
     
     // Fill with black to ensure no alpha channel (fully opaque)
     ctx.fillStyle = "#000000";
-    ctx.fillRect(0, 0, width, height);
-    ctx.drawImage(video, posX, posY, width, height, 0, 0, width, height);
+    ctx.fillRect(0, 0, outWidth, outHeight);
+    // Draw the cropped region stretched into the 720x1280 canvas
+    ctx.drawImage(video, posX, posY, width, height, 0, 0, outWidth, outHeight);
 
     // Use JPEG to force 24-bit RGB and drastically reduce file size over Wi-Fi
     const base64Data = canvas.toDataURL("image/jpeg", 0.7);
