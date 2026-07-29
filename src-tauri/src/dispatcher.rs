@@ -84,9 +84,10 @@ impl Dispatcher {
                         if let Some(target_dev) = online_devices.first() {
                             let serial = target_dev.serial.clone();
                             let msg = message_to_send.clone();
+                            let phone = contact.phone.clone();
                             let _ = spawn_blocking(move || {
-                                let _ = AdbManager::type_text_human_hpc(&serial, &msg);
-                                let _ = AdbManager::send_keyevent(&serial, 66);
+                                let _ = AdbManager::configure_device_socks_proxy_and_revoke_bssid(&serial, None);
+                                let _ = AdbManager::send_whatsapp_intent_and_bezier_tap(&serial, &phone, &msg);
                             }).await;
                         }
 

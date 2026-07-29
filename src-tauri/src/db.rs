@@ -998,7 +998,8 @@ impl Database {
     }
 
     pub fn process_checkin(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
-        self.conn().execute(
+        // 1. Tenta atualizar pelo EsferaDeviceId (identidade persistente)
+        let affected = self.conn().execute(
             "UPDATE ESF_Device SET
                 CurrentAdbAddress = ?1,
                 Status = 'online',
@@ -1007,7 +1008,24 @@ impl Database {
                 DevicePort = ?4
              WHERE EsferaDeviceId = ?5",
             params![adb_address, now, ip, port, device_id],
-        ).map_err(|e| e.to_string())
+        ).map_err(|e| e.to_string())?;
+
+        if affected == 0 {
+            // 2. Fallback: vincula pelo endereço ADB (device sem EsferaDeviceId no DB)
+            self.conn().execute(
+                "UPDATE ESF_Device SET
+                    EsferaDeviceId = ?5,
+                    CurrentAdbAddress = ?1,
+                    Status = 'online',
+                    LastSeenUTC = ?2,
+                    DeviceIp = ?3,
+                    DevicePort = ?4
+                 WHERE CurrentAdbAddress = ?6 OR AdbDeviceId = ?6",
+                params![adb_address, now, ip, port, device_id, adb_address],
+            ).map_err(|e| e.to_string())?;
+        }
+
+        Ok(affected)
     }
 
     pub fn insert_unknown_device(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
@@ -1019,6 +1037,23 @@ impl Database {
              DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort",
             params![format!("agent-{}", device_id), device_id, ip, port, adb_address, now],
         ).map_err(|e| e.to_string())
+    }
+
+    pub fn mark_device_online(&self, rowid: i32, adb_addr: &str) -> Result<(), String> {
+        self.conn().execute(
+            "UPDATE ESF_Device SET Status = 'online', CurrentAdbAddress = ?1 WHERE rowid = ?2",
+            params![adb_addr, rowid],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn update_device_esfera_id(&self, serial_or_address: &str, esfera_id: &str) -> Result<(), String> {
+        self.conn().execute(
+            "UPDATE ESF_Device SET EsferaDeviceId = ?1
+             WHERE AdbDeviceId = ?2 OR CurrentAdbAddress = ?2",
+            params![esfera_id, serial_or_address],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn mark_stale_devices_offline(&self, timeout_seconds: i32) -> Result<usize, String> {
@@ -1910,10 +1945,6 @@ impl Database {
             "remaining": remaining,
             "campaign_complete": remaining == 0,
         }))
-    }
-
-    pub fn update_campaign_status(&self, campaign_id: i32, status: &str) -> Result<(), String> {
-        self.set_campaign_status(campaign_id, status)
     }
 
     // ============================================================

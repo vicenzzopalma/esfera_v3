@@ -15,6 +15,355 @@ use uuid::Uuid;
 /// Script shell embutido (fallback quando APK não está disponível)
 const AGENT_SCRIPT_CONTENT: &str = include_str!("../../src-agent/esfera_agent.sh");
 
+// ============================================================
+// LISTAS DE DEBLOAT POR FABRICANTE
+// ============================================================
+const SAMSUNG_BLOAT: &[&str] = &[
+    "com.samsung.android.bixby.wakeup",
+    "com.samsung.android.bixby.agent",
+    "com.samsung.android.bixby.es.global",
+    "com.samsung.android.app.spage",
+    "com.samsung.android.app.settings.bixby",
+    "com.samsung.systemui.bixby2",
+    "com.samsung.android.bixby.service",
+    "com.samsung.android.bixby.agent.dummy",
+    "com.samsung.android.bixbyvision.framework",
+    "com.samsung.android.svoice",
+    "com.samsung.android.svoiceime",
+    "com.samsung.android.visionintelligence",
+    "com.samsung.android.voc",
+    "com.samsung.android.app.social",
+    "com.samsung.android.app.tips",
+    "com.samsung.android.app.withtv",
+    "com.samsung.android.app.watchmanager",
+    "com.samsung.android.app.watchmanagerstub",
+    "com.samsung.android.samsungpay.gear",
+    "com.samsung.android.samsungpay",
+    "com.samsung.android.spay",
+    "com.samsung.android.spaymini",
+    "com.samsung.android.authfw",
+    "com.samsung.android.mapsagent",
+    "com.samsung.android.beaconmanager",
+    "com.samsung.android.game.gamehome",
+    "com.samsung.android.game.gametools",
+    "com.samsung.android.game.gos",
+    "com.samsung.android.honeyboard",
+    "com.samsung.android.livestream",
+    "com.samsung.android.mateagent",
+    "com.samsung.android.oneconnect",
+    "com.samsung.android.packageinstaller",
+    "com.samsung.android.plusfriend",
+    "com.samsung.android.popupcalculator",
+    "com.samsung.android.rims",
+    "com.samsung.android.samsungpass",
+    "com.samsung.android.samsungpassautofill",
+    "com.samsung.android.scloud",
+    "com.samsung.android.sdk.handwriting",
+    "com.samsung.android.sdk.professional",
+    "com.samsung.android.stickercenter",
+    "com.samsung.android.themestore",
+    "com.samsung.android.widgetapp",
+    "com.samsung.android.bbc.bbcagent",
+    "com.samsung.android.drivingmode",
+    "com.samsung.android.easysetup",
+    "com.samsung.android.app.clipboardedge",
+    "com.samsung.android.app.cocktailbarservice",
+    "com.samsung.android.app.galaxyfinder",
+    "com.samsung.android.app.ledcoverdream",
+    "com.samsung.android.app.personaldictionary",
+    "com.samsung.android.app.routines",
+    "com.samsung.android.app.sbrowseredge",
+    "com.samsung.android.app.taskedge",
+    "com.samsung.android.edgeapps",
+    "com.samsung.android.app.reminder",
+    "com.samsung.android.app.telephonyui",
+    "com.facebook.appmanager",
+    "com.facebook.katana",
+    "com.facebook.orca",
+    "com.facebook.system",
+    "com.microsoft.skydrive",
+    "com.microsoft.office.officehubrow",
+    "com.linkedin.android",
+    "com.netflix.mediaclient",
+    "com.netflix.partner.activation",
+    "com.google.android.apps.magazines",
+    "com.google.android.apps.plus",
+    "com.google.android.apps.maps",
+    "com.google.android.apps.photos",
+    "com.google.android.youtube",
+    "com.google.android.gm",
+    "com.google.android.apps.docs",
+    "com.google.android.apps.docs.editors.docs",
+    "com.google.android.apps.docs.editors.sheets",
+    "com.google.android.apps.docs.editors.slides",
+    "com.google.android.apps.walletnfcrel",
+    "com.google.android.apps.subscriptions.red",
+    "com.google.android.apps.fitness",
+    "com.google.android.apps.chromecast.app",
+    "com.google.android.apps.nbu.files",
+    "com.google.android.apps.adm",
+    "com.google.android.music",
+    "com.google.android.videos",
+    "com.google.android.keep",
+    "com.google.android.calendar",
+    "com.android.chrome",
+    "com.spotify.music",
+    "com.zhiliaoapp.musically",
+    "com.kwai.video",
+    "com.shopee.br",
+    "com.alibaba.aliexpresshd",
+    "com.booking",
+    "com.amazon.mShop.android.shopping",
+    "com.amazon.mp3",
+    "com.amazon.kindle",
+];
+
+const REALME_BLOAT: &[&str] = &[
+    "com.heytap.pictorial",
+    "com.realmecomm.app",
+    "com.netflix.mediaclient",
+    "com.facebook.katana",
+    "com.facebook.appmanager",
+    "com.facebook.system",
+    "com.linkedin.android",
+    "com.spotify.music",
+    "com.amazon.mp3",
+    "com.amazon.mShop.android.shopping",
+    "com.amazon.appmanager",
+    "com.zhiliaoapp.musically",
+    "com.kwai.video",
+    "kwai.lite.video",
+    "com.shopee.br",
+    "com.alibaba.aliexpresshd",
+    "com.booking",
+    "cn.wps.moffice_eng",
+    "com.google.android.apps.walletnfcrel",
+    "com.google.android.apps.magazines",
+    "com.google.android.apps.fitness",
+    "com.google.android.apps.chromecast.app",
+    "com.google.android.apps.subscriptions.red",
+    "com.google.android.apps.nbu.files",
+    "com.google.android.apps.adm",
+    "com.google.android.apps.photos",
+    "com.google.android.youtube",
+    "com.google.android.gm",
+    "com.google.android.music",
+    "com.google.android.videos",
+    "com.android.chrome",
+    "com.google.android.keep",
+    "com.newleaf.app.android.victor",
+    "com.katanlabs.matchballgame",
+    "com.katanlabs.worm.ioeatemall",
+    "com.katanlabs.wordconnectwondersofview",
+    "com.katanlabs.bubblepop",
+    "com.fullmetalgamedev.fruitshooting",
+    "com.lemon.lvoverseas",
+    "com.taboola.scoop",
+];
+
+const XIAOMI_BLOAT: &[&str] = &[
+    "com.miui.android.fashiongallery",
+    "com.miui.calculator.go",
+    "com.miui.miservice",
+    "com.miui.video",
+    "com.miui.player",
+    "com.miui.music",
+    "com.miui.notes",
+    "com.miui.micloudsync",
+    "com.miui.cloudservice",
+    "com.miui.hybrid",
+    "com.miui.hybrid.accessory",
+    "com.miui.screenrecorder",
+    "com.miui.compass",
+    "com.miui.cleanmaster",
+    "com.miui.yellowpage",
+    "com.miui.bugreport",
+    "com.miui.analytics",
+    "com.miui.greenguard",
+    "com.miui.securityadd",
+    "com.miui.weather2",
+    "com.miui.mishare.connectivity",
+    "com.miui.virtualsim",
+    "com.miui.wmsvc",
+    "com.xiaomi.midrop",
+    "com.xiaomi.glgm",
+    "com.xiaomi.payment",
+    "com.xiaomi.scanner",
+    "com.xiaomi.shop",
+    "com.xiaomi.vipaccount",
+    "com.xiaomi.mipicks",
+    "com.xiaomi.mi_connect_service",
+    "com.xiaomi.mico",
+    "com.netflix.mediaclient",
+    "com.facebook.katana",
+    "com.facebook.appmanager",
+    "com.facebook.system",
+    "com.linkedin.android",
+    "com.spotify.music",
+    "com.amazon.mp3",
+    "com.amazon.mShop.android.shopping",
+    "com.amazon.appmanager",
+    "com.zhiliaoapp.musically",
+    "com.zhiliaoapp.musically.go",
+    "com.kwai.video",
+    "kwai.lite.video",
+    "com.shopee.br",
+    "com.alibaba.aliexpresshd",
+    "com.booking",
+    "cn.wps.moffice_eng",
+    "com.google.android.apps.walletnfcrel",
+    "com.google.android.apps.magazines",
+    "com.google.android.apps.fitness",
+    "com.google.android.apps.chromecast.app",
+    "com.google.android.apps.subscriptions.red",
+    "com.google.android.apps.nbu.files",
+    "com.google.android.apps.adm",
+    "com.google.android.youtube",
+    "com.android.chrome",
+    "com.tencent.ig",
+    "com.king.candycrushsaga",
+    "com.fugo.wow",
+    "com.oakever.tiletrip",
+    "com.gamedots.seasideescape.flexion",
+    "com.vitastudio.mahjong",
+    "com.block.juggle",
+    "com.google.android.calendar.go",
+    "br.com.timbrasil.meutim",
+];
+
+const MOTOROLA_BLOAT: &[&str] = &[
+    "com.facebook.katana",
+    "com.facebook.appmanager",
+    "com.facebook.system",
+    "com.linkedin.android",
+    "com.spotify.music",
+    "com.amazon.mp3",
+    "com.amazon.kindle",
+    "com.amazon.mShop.android.shopping",
+    "com.zhiliaoapp.musically",
+    "com.kwai.video",
+    "com.booking",
+    "com.netflix.mediaclient",
+    "com.google.android.apps.walletnfcrel",
+    "com.google.android.apps.magazines",
+    "com.google.android.apps.fitness",
+    "com.google.android.apps.chromecast.app",
+    "com.google.android.apps.subscriptions.red",
+    "com.google.android.apps.docs.editors.docs",
+    "com.google.android.apps.docs.editors.sheets",
+    "com.google.android.apps.docs.editors.slides",
+    "com.google.android.youtube",
+    "com.android.chrome",
+    "com.google.android.gm",
+    "com.google.android.keep",
+    "com.adobe.spark.post",
+    "com.callapp.contacts",
+    "com.c6bank.app",
+    "com.luizalabs.mlapp",
+    "com.novanews.android.localnews.br",
+    "com.nebula.mahjongtile",
+    "in.playsimple.newwordsearch",
+    "com.easybrain.crossword.puzzles",
+];
+
+const MULTILASER_BLOAT: &[&str] = &[
+    "com.google.android.apps.photos",
+    "com.google.android.youtube",
+    "com.google.android.gm",
+    "com.google.android.apps.maps",
+    "com.google.android.apps.docs",
+    "com.google.android.apps.walletnfcrel",
+    "com.google.android.apps.magazines",
+    "com.google.android.apps.fitness",
+    "com.google.android.apps.chromecast.app",
+    "com.google.android.apps.subscriptions.red",
+    "com.google.android.apps.nbu.files",
+    "com.android.chrome",
+    "com.google.android.music",
+    "com.google.android.videos",
+    "com.google.android.keep",
+    "com.google.android.calendar",
+    "com.netflix.mediaclient",
+    "com.facebook.katana",
+    "com.facebook.appmanager",
+    "com.facebook.system",
+    "com.linkedin.android",
+    "com.spotify.music",
+    "com.amazon.mp3",
+    "com.amazon.kindle",
+    "com.amazon.mShop.android.shopping",
+    "com.zhiliaoapp.musically",
+    "com.kwai.video",
+    "com.booking",
+    "com.shopee.br",
+    "com.alibaba.aliexpresshd",
+];
+
+const LG_BLOAT: &[&str] = &[
+    "com.lge.lgworld",
+    "com.lge.cloudhub",
+    "com.lge.clock",
+    "com.lge.qpair",
+    "com.lge.remote",
+    "com.lge.sizechangable",
+    "com.lge.voicecommand",
+    "com.lge.android.atf",
+    "com.lge.ia.task",
+    "com.lge.ia.startup",
+    "com.lge.ia.bixby",
+    "com.lge.media.photoviewer",
+    "com.lge.media.videoplayer",
+    "com.facebook.katana",
+    "com.facebook.appmanager",
+    "com.linkedin.android",
+    "com.netflix.mediaclient",
+    "com.amazon.mp3",
+    "com.amazon.kindle",
+    "com.spotify.music",
+    "com.zhiliaoapp.musically",
+    "com.kwai.video",
+    "com.booking",
+];
+
+const GENERIC_BLOAT: &[&str] = &[
+    "com.facebook.katana",
+    "com.facebook.appmanager",
+    "com.facebook.system",
+    "com.facebook.orca",
+    "com.linkedin.android",
+    "com.netflix.mediaclient",
+    "com.netflix.partner.activation",
+    "com.spotify.music",
+    "com.amazon.mp3",
+    "com.amazon.kindle",
+    "com.amazon.mShop.android.shopping",
+    "com.amazon.appmanager",
+    "com.zhiliaoapp.musically",
+    "com.kwai.video",
+    "kwai.lite.video",
+    "com.booking",
+    "com.shopee.br",
+    "com.alibaba.aliexpresshd",
+    "com.google.android.apps.photos",
+    "com.google.android.youtube",
+    "com.google.android.gm",
+    "com.google.android.apps.maps",
+    "com.google.android.apps.docs",
+    "com.google.android.apps.walletnfcrel",
+    "com.google.android.apps.magazines",
+    "com.google.android.apps.fitness",
+    "com.google.android.apps.chromecast.app",
+    "com.google.android.apps.subscriptions.red",
+    "com.google.android.apps.nbu.files",
+    "com.google.android.apps.adm",
+    "com.android.chrome",
+    "com.google.android.music",
+    "com.google.android.videos",
+    "com.google.android.keep",
+    "com.google.android.calendar",
+    "cn.wps.moffice_eng",
+];
+
 pub fn run_cmd_timeout(
     mut cmd: Command,
     timeout: Duration,
@@ -128,15 +477,13 @@ extern "C" {
     ) -> i32;
     pub fn esfera_hpc_calculate_gaussian_delay(min_ms: i32, max_ms: i32) -> i32;
     pub fn esfera_hpc_generate_hardware_uuid(out_uuid_buf: *mut u8, max_len: usize);
-    pub fn esfera_hpc_generate_bezier_points(
-        start_x: i32,
-        start_y: i32,
-        end_x: i32,
-        end_y: i32,
-        out_pts_x: *mut i32,
-        out_pts_y: *mut i32,
-        max_points: i32,
-        out_count: *mut i32,
+    pub fn esfera_hpc_calculate_tap_coordinates(
+        screen_width: i32,
+        screen_height: i32,
+        pct_x: f64,
+        pct_y: f64,
+        out_x: *mut i32,
+        out_y: *mut i32,
     ) -> i32;
 }
 
@@ -232,9 +579,9 @@ impl AdbManager {
         ];
         let mut errors = Vec::new();
         for cmd in commands {
-            let result = create_cmd("adb")
-                .args(["-s", serial, "shell", cmd])
-                .output();
+            let mut adb = create_cmd("adb");
+            adb.args(["-s", serial, "shell", cmd]);
+            let result = run_cmd_timeout(adb, Duration::from_secs(6));
             if let Err(e) = result {
                 errors.push(format!("{}: {}", cmd, e));
             }
@@ -811,6 +1158,41 @@ impl AdbManager {
             camera_arg.to_uppercase()
         );
 
+        // 1. Tenta obter o SDK level do Android (Android 12+ / SDK 31+ suporta --video-source=camera nativo no scrcpy)
+        let mut sdk_level = 0;
+        let mut sdk_cmd = create_cmd("adb");
+        sdk_cmd.args(["-s", serial, "shell", "getprop", "ro.build.version.sdk"]);
+        if let Ok(out) = run_cmd_timeout(sdk_cmd, Duration::from_secs(3)) {
+            let sdk_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            sdk_level = sdk_str.parse::<i32>().unwrap_or(0);
+        }
+
+        // Se o dispositivo for Android < 12 (SDK < 31), abre o app de Câmera nativo via ADB Intent e abre o espelhamento Scrcpy
+        if sdk_level > 0 && sdk_level < 31 {
+            let mut cam_intent = create_cmd("adb");
+            cam_intent.args([
+                "-s",
+                serial,
+                "shell",
+                "am",
+                "start",
+                "-a",
+                "android.media.action.STILL_IMAGE_CAMERA",
+            ]);
+            let _ = run_cmd_timeout(cam_intent, Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(500));
+
+            let result = create_cmd("scrcpy")
+                .args(["-s", serial, "--window-title", &title])
+                .spawn();
+
+            return match result {
+                Ok(_) => Ok(format!("Câmera nativa iniciada para {} (Android SDK {}) com espelhamento!", serial, sdk_level)),
+                Err(e) => Err(format!("Falha ao iniciar espelhamento de câmera: {}", e)),
+            };
+        }
+
+        // Para Android 12+ (SDK >= 31), tenta a captura nativa de câmera pelo Scrcpy v2 com fallback inteligente
         let result = create_cmd("scrcpy")
             .args([
                 "-s",
@@ -825,17 +1207,43 @@ impl AdbManager {
             .spawn();
 
         match result {
-            Ok(_) => Ok(format!(
-                "Transmissão de Câmera ({}) iniciada com sucesso para {}!",
-                camera_arg, serial
-            )),
+            Ok(mut child) => {
+                std::thread::sleep(Duration::from_millis(1200));
+                match child.try_wait() {
+                    Ok(Some(status)) if !status.success() => {
+                        let mut cam_intent = create_cmd("adb");
+                        cam_intent.args([
+                            "-s",
+                            serial,
+                            "shell",
+                            "am",
+                            "start",
+                            "-a",
+                            "android.media.action.STILL_IMAGE_CAMERA",
+                        ]);
+                        let _ = run_cmd_timeout(cam_intent, Duration::from_secs(3));
+
+                        let fallback = create_cmd("scrcpy")
+                            .args(["-s", serial, "--window-title", &title])
+                            .spawn();
+                        match fallback {
+                            Ok(_) => Ok(format!("Câmera aberta via fallback e espelhamento ativado para {}!", serial)),
+                            Err(_) => Err("Falha ao iniciar scrcpy fallback.".to_string()),
+                        }
+                    }
+                    _ => Ok(format!(
+                        "Transmissão de Câmera ({}) iniciada com sucesso para {}!",
+                        camera_arg, serial
+                    )),
+                }
+            }
             Err(e) => {
                 let fallback = create_cmd("scrcpy")
                     .args(["-s", serial, "--window-title", &title])
                     .spawn();
                 match fallback {
                     Ok(_) => Ok(format!("Espelhamento de tela ativado para {}!", serial)),
-                    Err(_) => Err(format!("Falha ao iniciar transmissão de câmera: {}. Verifique se o scrcpy.exe está instalado.", e)),
+                    Err(_) => Err(format!("Falha ao iniciar transmissão de câmera: {}", e)),
                 }
             }
         }
@@ -1417,7 +1825,9 @@ impl AdbManager {
 
         let mut success_count = 0;
         for cmd in &commands {
-            let res = create_cmd("adb").arg("-s").arg(serial).args(cmd).output();
+            let mut adb = create_cmd("adb");
+            adb.arg("-s").arg(serial).args(cmd);
+            let res = run_cmd_timeout(adb, Duration::from_secs(6));
             if let Ok(o) = res {
                 if o.status.success() {
                     success_count += 1;
@@ -1433,22 +1843,85 @@ impl AdbManager {
         ))
     }
 
-    /// Lê a identificação persistente gravada no Kernel/OS do celular (persist.esfera.device_id ou /sdcard/.esfera_device_id)
-    pub fn get_persistent_device_id(serial: &str) -> Option<String> {
+    /// Remove/disables bloatware packages do dispositivo baseado no fabricante
+    pub fn debloat_device(serial: &str) -> Result<String, String> {
+        let manufacturer = Self::get_device_manufacturer(serial);
+
+        let bloat_list: &[&str] = match manufacturer.to_lowercase().as_str() {
+            m if m.contains("samsung") => &SAMSUNG_BLOAT,
+            m if m.contains("realme") | m.contains("oppo") | m.contains("oneplus") => &REALME_BLOAT,
+            m if m.contains("xiaomi") | m.contains("redmi") | m.contains("poco") => &XIAOMI_BLOAT,
+            m if m.contains("motorola") => &MOTOROLA_BLOAT,
+            m if m.contains("multilaser") => &MULTILASER_BLOAT,
+            m if m.contains("lg") => &LG_BLOAT,
+            _ => &GENERIC_BLOAT,
+        };
+
+        let mut disabled = 0;
+        let mut errors = Vec::new();
+
+        for pkg in bloat_list {
+            let mut cmd = create_cmd("adb");
+            cmd.args(["-s", serial, "shell", "pm", "disable-user", "--user", "0", pkg]);
+            match run_cmd_timeout(cmd, Duration::from_secs(5)) {
+                Ok(out) if out.status.success() => disabled += 1,
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if !stderr.contains("not found") && !stderr.contains("already") {
+                        errors.push(format!("{}: {}", pkg, stderr.trim()));
+                    }
+                }
+                Err(e) => {
+                    if !e.contains("not found") {
+                        errors.push(format!("{}: {}", pkg, e));
+                    }
+                }
+            }
+        }
+
+        // Força limpeza de cache e stop dos apps desativados
+        let _ = create_cmd("adb").args(["-s", serial, "shell", "am", "force-stop", "com.whatsapp"]).output();
+        let _ = create_cmd("adb").args(["-s", serial, "shell", "am", "force-stop", "com.whatsapp.w4b"]).output();
+
+        let mut result = format!(
+            "Debloat concluido em {} [{}]: {}/{} apps desativados",
+            serial, manufacturer, disabled, bloat_list.len()
+        );
+        if !errors.is_empty() {
+            result.push_str(&format!("\nErros: {}", errors.join("; ")));
+        }
+        Ok(result)
+    }
+
+    fn get_device_manufacturer(serial: &str) -> String {
         let mut cmd = create_cmd("adb");
-        cmd.args(["-s", serial, "shell", "getprop persist.esfera.device_id"]);
-        if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(2)) {
+        cmd.args(["-s", serial, "shell", "getprop", "ro.product.manufacturer"]);
+        if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        } else {
+            "unknown".to_string()
+        }
+    }
+
+    /// Lê a identificação persistente do celular (/sdcard/.esfera_device_id ou persist.esfera.device_id)
+    /// Prioriza sdcard porque setprop/getprop pode ser bloqueado por SELinux em dispositivos nao-root
+    pub fn get_persistent_device_id(serial: &str) -> Option<String> {
+        // 1. Tenta sdcard primeiro (mais confiavel)
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s", serial, "shell", "cat", "/sdcard/.esfera_device_id"]);
+        if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
             let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !val.is_empty() && val.starts_with("ESFERA_") {
+            if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
                 return Some(val);
             }
         }
 
+        // 2. Fallback: getprop (pode falhar em SELinux enforcing)
         let mut cmd2 = create_cmd("adb");
-        cmd2.args(["-s", serial, "shell", "cat /sdcard/.esfera_device_id"]);
+        cmd2.args(["-s", serial, "shell", "getprop", "persist.esfera.device_id"]);
         if let Ok(out) = run_cmd_timeout(cmd2, Duration::from_secs(2)) {
             let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !val.is_empty() && val.starts_with("ESFERA_") {
+            if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
                 return Some(val);
             }
         }
@@ -1494,6 +1967,8 @@ impl AdbManager {
 
         let batch_cmd = format!(
             "{}settings put global wifi_connected_mac_randomization_enabled 0; \
+             settings put global verifier_verify_adb_installs 0; \
+             settings put global package_verifier_enable 0; \
              setprop persist.adb.tcp.port 5555; \
              settings put global wifi_sleep_policy 2; \
              settings put global wifi_scan_always_enabled 1; \
@@ -1501,7 +1976,8 @@ impl AdbManager {
              device_config put activity_manager max_phantom_processes 2147483647; \
              dumpsys deviceidle disable; \
              dumpsys deviceidle whitelist +com.mouldybread.adbautoenable; \
-             dumpsys deviceidle whitelist +com.android.shell",
+             dumpsys deviceidle whitelist +com.android.shell; \
+             dumpsys deviceidle whitelist +com.esfera.agent",
             id_cmd
         );
 
@@ -1546,9 +2022,9 @@ impl AdbManager {
 
     /// Inicia o serviço do Agent Android via ADB
     pub fn start_agent_service(serial: &str) -> Result<String, String> {
-        // Tenta iniciar o novo agente (v4), fallback para o antigo (mouldybread)
+        // Tenta iniciar o novo agente (v4), fallback para o antigo (mouldybread/tpn)
         let result = (|| -> Result<String, String> {
-            // Tenta novo agente
+            // 1. Tenta novo agente v4 (com.esfera.agent)
             let mut cmd = create_cmd("adb");
             cmd.args([
                 "-s",
@@ -1559,14 +2035,34 @@ impl AdbManager {
                 "-n",
                 "com.esfera.agent/.EsferaAgentService",
             ]);
-            match run_cmd_timeout(cmd, Duration::from_secs(3)) {
-                Ok(_) => return Ok("Agente Esfera v4 iniciado".to_string()),
-                Err(_) => {}
+            if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if stdout.contains("Starting") || out.status.success() {
+                    return Ok("Agente Esfera v4 iniciado".to_string());
+                }
             }
 
-            // Fallback: agente antigo (mouldybread)
-            let mut cmd = create_cmd("adb");
-            cmd.args([
+            // 2. Tenta agente tpn (com.tpn.adbautoenable)
+            let mut cmd_tpn = create_cmd("adb");
+            cmd_tpn.args([
+                "-s",
+                serial,
+                "shell",
+                "am",
+                "start",
+                "-n",
+                "com.tpn.adbautoenable/.MainActivity",
+            ]);
+            if let Ok(out) = run_cmd_timeout(cmd_tpn, Duration::from_secs(3)) {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if stdout.contains("Starting") || out.status.success() {
+                    return Ok("Agente TPN ADB Auto Enable iniciado".to_string());
+                }
+            }
+
+            // 3. Fallback: agente mouldybread (com.mouldybread.adbautoenable)
+            let mut cmd_mb = create_cmd("adb");
+            cmd_mb.args([
                 "-s",
                 serial,
                 "shell",
@@ -1575,7 +2071,7 @@ impl AdbManager {
                 "-n",
                 "com.mouldybread.adbautoenable/.MainActivity",
             ]);
-            run_cmd_timeout(cmd, Duration::from_secs(3))
+            run_cmd_timeout(cmd_mb, Duration::from_secs(3))
                 .map(|_| "Agente ADB Auto Enable iniciado (fallback)".to_string())
         })();
 
@@ -1585,20 +2081,109 @@ impl AdbManager {
         }
     }
 
-    /// Provisiona um dispositivo: gera UUID, injeta ID + config + imunidade, instala APK, inicia servi\u{e7}o
-    /// server_url \u{e9} opcional: se omitido, deriva automaticamente da config + IP local
-    pub fn provision_device(serial: &str, server_url: Option<&str>) -> Result<String, String> {
+    /// Resolve o serial exato do dispositivo alvo no ADB de forma segura, suportando resolução nativa por Rede Wi-Fi, Hardware Serial (ro.serialno) ou ID do banco de dados
+    pub fn resolve_target_serial(requested_serial: &str) -> Result<String, String> {
+        let requested = requested_serial.trim();
+
+        // 1. Tenta reconexão prévia se for IP Wi-Fi
+        if requested.contains(':') || requested.contains('.') {
+            let parts: Vec<&str> = requested.split(':').collect();
+            let ip = parts[0];
+            let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
+            let _ = Self::connect_device(ip, port);
+            std::thread::sleep(Duration::from_millis(400));
+        }
+
         let active_devices = Self::list_devices().unwrap_or_default();
-        let target_serial = if active_devices
-            .iter()
-            .any(|d| d.serial == serial && d.state == "device")
-        {
-            serial.to_string()
-        } else if let Some(active_dev) = active_devices.iter().find(|d| d.state == "device") {
-            active_dev.serial.clone()
-        } else {
-            serial.to_string()
-        };
+
+        // 2. Procura correspondência exata de serial no ADB ativo
+        if let Some(dev) = active_devices.iter().find(|d| d.serial == requested) {
+            if dev.state == "device" {
+                return Ok(dev.serial.clone());
+            } else if dev.state == "unauthorized" {
+                return Err(format!("Dispositivo '{}' exige autorização de depuração USB. Aceite a mensagem exibida na tela do celular.", requested));
+            } else if dev.state == "offline" {
+                return Err(format!("Dispositivo '{}' está OFFLINE no ADB. Reconecte o cabo USB ou refaça a conexão Wi-Fi.", requested));
+            }
+        }
+
+        // 3. Procura por IP ou sufixo/prefixo de serial nos ativos
+        let requested_ip = requested.split(':').next().unwrap_or(requested);
+        if let Some(dev) = active_devices.iter().find(|d| {
+            d.serial.contains(requested_ip) || requested.contains(&d.serial)
+        }) {
+            if dev.state == "device" {
+                return Ok(dev.serial.clone());
+            } else if dev.state == "unauthorized" {
+                return Err(format!("Dispositivo '{}' exige autorização de depuração USB na tela do celular.", dev.serial));
+            } else if dev.state == "offline" {
+                return Err(format!("Dispositivo '{}' está OFFLINE no ADB.", dev.serial));
+            }
+        }
+
+        // 4. VERIFICAÇÃO DE HARDWARE VIA ADB EM REDE:
+        // Percorre os celulares conectados via Wi-Fi (IP:5555) e verifica se ro.serialno ou EsferaDeviceId corresponde ao serial USB solicitado
+        for dev in &active_devices {
+            if dev.state == "device" {
+                // Checa o número de série da CPU/Hardware (ro.serialno)
+                let mut cmd = create_cmd("adb");
+                cmd.args(["-s", &dev.serial, "shell", "getprop", "ro.serialno"]);
+                if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(2)) {
+                    let serialno = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !serialno.is_empty() && (serialno == requested || requested.contains(&serialno)) {
+                        return Ok(dev.serial.clone());
+                    }
+                }
+
+                // Checa o EsferaDeviceId gravado no armazenamento do celular
+                if let Some(esfera_id) = Self::get_persistent_device_id(&dev.serial) {
+                    if esfera_id == requested || requested.contains(&esfera_id) {
+                        return Ok(dev.serial.clone());
+                    }
+                }
+            }
+        }
+
+        // 5. RESOLUÇÃO VIA BANCO DE DADOS LOCAL (SQLite):
+        // Se o frontend passou o serial USB antigo gravado no DB, consulta o IP Wi-Fi atual (CurrentAdbAddress) e conecta
+        let db_path = crate::get_db_path();
+        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+            let mut stmt = conn.prepare(
+                "SELECT CurrentAdbAddress, IpAddress FROM ESF_Device WHERE AdbDeviceId = ?1 OR EsferaDeviceId = ?1 OR SerialNumber = ?1 LIMIT 1"
+            );
+            if let Ok(mut stmt) = stmt {
+                let row_res = stmt.query_row([requested], |row| {
+                    let cur_adb: Option<String> = row.get(0).ok();
+                    let ip_addr: Option<String> = row.get(1).ok();
+                    Ok((cur_adb, ip_addr))
+                });
+                if let Ok((cur_adb, ip_addr)) = row_res {
+                    let target_net = cur_adb.or(ip_addr);
+                    if let Some(net_addr) = target_net {
+                        if !net_addr.is_empty() {
+                            let parts: Vec<&str> = net_addr.split(':').collect();
+                            let ip = parts[0];
+                            let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
+                            let _ = Self::connect_device(ip, port);
+                            std::thread::sleep(Duration::from_millis(600));
+
+                            let active_retry = Self::list_devices().unwrap_or_default();
+                            if let Some(rev_dev) = active_retry.iter().find(|d| d.serial.contains(ip) && d.state == "device") {
+                                return Ok(rev_dev.serial.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(format!("Dispositivo '{}' não está pronto no ADB. Certifique-se de que ele está conectado e com 'Depuração USB' autorizada.", requested))
+    }
+
+    /// Provisiona um dispositivo: gera UUID, injeta ID + config + imunidade, instala APK, inicia serviço
+    /// server_url é opcional: se omitido, deriva automaticamente da config + IP local
+    pub fn provision_device(serial: &str, server_url: Option<&str>) -> Result<String, String> {
+        let target_serial = Self::resolve_target_serial(serial)?;
 
         let uuid = Uuid::new_v4().to_string();
         let device_id = format!("ESF-{}", uuid);
@@ -1627,15 +2212,63 @@ impl AdbManager {
                     target_serial, device_id, msg
                 ))
             }
-            Err(e) => {
-                Self::push_agent_script(&target_serial)?;
-                Self::start_agent_script(&target_serial)?;
+            Err(_e) => {
+                // Reconecta dispositivo antes do fallback script
+                if target_serial.contains(':') || target_serial.contains('.') {
+                    let parts: Vec<&str> = target_serial.split(':').collect();
+                    let ip = parts[0];
+                    let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
+                    let _ = Self::connect_device(ip, port);
+                } else {
+                    let _ = Self::restart_server();
+                }
+                std::thread::sleep(Duration::from_millis(1000));
+
+                let _ = Self::push_agent_script(&target_serial);
+                let _ = Self::start_agent_script(&target_serial);
                 Ok(format!(
-                    "Provisionado: {} com ID {} (fallback script: {})",
-                    target_serial, device_id, e
+                    "Provisionado: {} com ID {} (script fallback ativado)",
+                    target_serial, device_id
                 ))
             }
         }
+    }
+
+    /// Provisiona nativamente todos os dispositivos Android online conectados no ADB
+    pub fn provision_all_devices(server_url: Option<&str>) -> Vec<Result<String, String>> {
+        let active = Self::list_devices().unwrap_or_default();
+        let mut results = Vec::new();
+        for dev in active {
+            if dev.state == "device" {
+                let res = Self::provision_device(&dev.serial, server_url);
+                results.push(res);
+            }
+        }
+        results
+    }
+
+    /// Executa Debloat Avançado nativo em todos os celulares online conectados no ADB
+    pub fn debloat_all_devices() -> Vec<Result<String, String>> {
+        let active = Self::list_devices().unwrap_or_default();
+        let mut results = Vec::new();
+        for dev in active {
+            if dev.state == "device" {
+                let res = Self::debloat_device(&dev.serial);
+                results.push(res);
+            }
+        }
+        results
+    }
+
+    fn get_host_lan_ip() -> String {
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if socket.connect("8.8.8.8:80").is_ok() {
+                if let Ok(addr) = socket.local_addr() {
+                    return addr.ip().to_string();
+                }
+            }
+        }
+        "127.0.0.1".to_string()
     }
 
     fn resolve_server_url(serial: &str, config: &crate::config::AppConfig) -> String {
@@ -1652,8 +2285,8 @@ impl AdbManager {
         if is_usb {
             return format!("http://localhost:{}", port);
         }
-        let ip = serial.split(':').next().unwrap_or("34.29.70.113");
-        format!("http://{}:{}", ip, port)
+        let host_ip = Self::get_host_lan_ip();
+        format!("http://{}:{}", host_ip, port)
     }
 
     /// adb reverse tcp:{port} tcp:{port} — permite device USB alcan\u{e7}ar servidor local
@@ -1790,7 +2423,6 @@ impl AdbManager {
             .to_str()
             .ok_or("Caminho do arquivo APK inválido.")?;
 
-        // Se for conexão Wi-Fi, garante reconexão preventiva antes de tentar a instalação
         if serial.contains(':') || serial.contains('.') {
             let parts: Vec<&str> = serial.split(':').collect();
             let ip = parts[0];
@@ -1799,18 +2431,33 @@ impl AdbManager {
                 .and_then(|p| p.parse::<i32>().ok())
                 .unwrap_or(5555);
             let _ = Self::connect_device(ip, port);
-            std::thread::sleep(Duration::from_millis(800));
+            std::thread::sleep(Duration::from_millis(400));
         }
 
-        let mut cmd = create_cmd("adb");
-        cmd.args(["-s", serial, "install", "-r", "-g", apk_str]);
+        // Garantir desativação de verificadores de pacote para evitar timeouts/prompts
+        let mut verifier_cmd = create_cmd("adb");
+        verifier_cmd.args(["-s", serial, "shell", "settings put global verifier_verify_adb_installs 0; settings put global package_verifier_enable 0"]);
+        let _ = run_cmd_timeout(verifier_cmd, Duration::from_secs(4));
 
-        let output = run_cmd_timeout(cmd, Duration::from_secs(25))
-            .map_err(|e| format!("Falha ao executar 'adb install': {}", e))?;
+        // 1. Push rápido do APK para /data/local/tmp/
+        let remote_apk = "/data/local/tmp/Esfera_Agent_ADB.apk";
+        let mut push_cmd = create_cmd("adb");
+        push_cmd.args(["-s", serial, "push", apk_str, remote_apk]);
+        let _ = run_cmd_timeout(push_cmd, Duration::from_secs(15));
 
-        if output.status.success() {
+        // 2. Instalação ultra-rápida via pm install
+        let mut pm_cmd = create_cmd("adb");
+        pm_cmd.args(["-s", serial, "shell", "pm", "install", "-r", "-g", remote_apk]);
+
+        let output = run_cmd_timeout(pm_cmd, Duration::from_secs(20))
+            .map_err(|e| format!("Falha ao executar 'pm install': {}", e))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{} {}", stdout, stderr);
+
+        if output.status.success() || combined.to_lowercase().contains("success") {
             let _ = Self::start_agent_service(serial);
-
             let _ = Self::deploy_keepalive(serial);
             let _ = Self::inject_device_immunity(serial, None);
 
@@ -1819,50 +2466,31 @@ impl AdbManager {
                 serial
             ))
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let combined = format!("{} {}", stdout, stderr);
-
-            // Se o erro indicar 'device offline', executa reconexão de emergência e tenta a instalação novamente!
-            if combined.to_lowercase().contains("offline")
-                && (serial.contains(':') || serial.contains('.'))
-            {
-                let parts: Vec<&str> = serial.split(':').collect();
-                let ip = parts[0];
-                let port = parts
-                    .get(1)
-                    .and_then(|p| p.parse::<i32>().ok())
-                    .unwrap_or(5555);
-                let _ = Self::connect_device(ip, port);
-                std::thread::sleep(Duration::from_millis(1500));
-
-                let mut retry_cmd = create_cmd("adb");
-                retry_cmd.args(["-s", serial, "install", "-r", "-g", apk_str]);
-                if let Ok(retry_out) = run_cmd_timeout(retry_cmd, Duration::from_secs(25)) {
-                    if retry_out.status.success() {
-                        let _ = Self::start_agent_service(serial);
-
-                        let _ = Self::deploy_keepalive(serial);
-                        let _ = Self::inject_device_immunity(serial, None);
-                        return Ok(format!("📱 App Agente Esfera v3 instalado e ativado no celular {} com sucesso após auto-reconexão!", serial));
-                    }
+            // Fallback para adb install padrão caso pm install falhe
+            let mut fallback_cmd = create_cmd("adb");
+            fallback_cmd.args(["-s", serial, "install", "-r", "-g", apk_str]);
+            if let Ok(retry_out) = run_cmd_timeout(fallback_cmd, Duration::from_secs(45)) {
+                if retry_out.status.success() {
+                    let _ = Self::start_agent_service(serial);
+                    let _ = Self::deploy_keepalive(serial);
+                    let _ = Self::inject_device_immunity(serial, None);
+                    return Ok(format!(
+                        "📱 App Agente Esfera v3 instalado e ativado no celular {} com sucesso!",
+                        serial
+                    ));
                 }
             }
 
-            let err_msg = if !stderr.trim().is_empty() {
-                stderr.trim()
-            } else {
-                stdout.trim()
-            };
             Err(format!(
                 "Falha na instalação do APK no celular {}: {}",
-                serial, err_msg
+                serial,
+                combined.trim()
             ))
         }
     }
 
     /// Monitor de status: marca devices como offline se check-in expirou
-    /// Para devices legado (sem EsferaDeviceId), mantém reconnect via ADB
+    /// Reconecta automaticamente qualquer device offline que tenha CurrentAdbAddress
     pub fn start_status_monitor(db_conn: std::sync::Arc<crate::db::Database>) {
         use std::collections::HashSet;
         let injected: std::sync::Arc<std::sync::Mutex<HashSet<String>>> =
@@ -1874,43 +2502,225 @@ impl AdbManager {
             // 1. Marca offline devices com check-in expirado (>120s sem heartbeat)
             let _ = db_conn.mark_stale_devices_offline(120);
 
-            // 2. Para devices legado (nunca fizeram check-in), tenta reconnect via ADB
+            // 2. Reconecta todo device offline que tenha CurrentAdbAddress (com ou sem EsferaDeviceId)
             let devices = db_conn.get_devices(1);
             for dev in devices {
-                let has_esfera_id = dev.esfera_device_id.is_some();
                 let has_checkin = dev.last_seen_utc.is_some();
+                let is_online = dev.status == "online";
 
-                if has_esfera_id && has_checkin {
-                    // Device com agent ativo — não precisa de reconnect cego
+                if is_online {
+                    // Preventivo: devices online também tentam reconnect no CurrentAdbAddress
+                    if let Some(ref addr) = dev.current_adb_address {
+                        if addr.contains(':') && addr.contains('.') {
+                            let mut adb = create_cmd("adb");
+                            adb.arg("connect").arg(addr);
+                            let _ = run_cmd_timeout(adb, Duration::from_secs(8));
+                        }
+                    }
                     continue;
                 }
 
-                // Device legado — tenta manter conexão ADB
-                let target = if !dev.ip.is_empty() {
+                // Device offline — tenta reconnect pelo CurrentAdbAddress, IP ou serial
+                let target = if let Some(ref addr) = dev.current_adb_address {
+                    if addr.contains(':') && addr.contains('.') {
+                        addr.clone()
+                    } else if !dev.ip.is_empty() && dev.ip.contains('.') {
+                        format!("{}:{}", dev.ip, dev.port)
+                    } else if dev.serial.contains(':') {
+                        dev.serial.clone()
+                    } else {
+                        continue;
+                    }
+                } else if !dev.ip.is_empty() && dev.ip.contains('.') {
                     format!("{}:{}", dev.ip, dev.port)
                 } else if dev.serial.contains(':') {
                     dev.serial.clone()
                 } else {
-                    "".to_string()
+                    continue;
                 };
 
-                if !target.is_empty() && target.contains('.') {
-                    let _ = create_cmd("adb").arg("connect").arg(&target).output();
+                let mut adb = create_cmd("adb");
+                adb.arg("connect").arg(&target);
+                let _ = run_cmd_timeout(adb, Duration::from_secs(8));
 
-                    let already = injected
-                        .lock()
-                        .map(|s| s.contains(&target))
-                        .unwrap_or(false);
-                    if !already {
-                        let pid = format!("ESFERA_DEV_{:03}", dev.device_number);
-                        if Self::inject_device_immunity(&target, Some(&pid)).is_ok() {
-                            let _ = injected.lock().map(|mut s| {
-                                s.insert(target.clone());
-                            });
-                        }
+                // Se conectou, marca online
+                if let Ok(active) = Self::list_devices() {
+                    let ip_part = target.split(':').next().unwrap_or(&target);
+                    if active.iter().any(|d| d.serial == target || d.serial.contains(ip_part)) {
+                        let _ = db_conn.mark_device_online(dev.id, &target);
+                    }
+                }
+
+                let already = injected
+                    .lock()
+                    .map(|s| s.contains(&target))
+                    .unwrap_or(false);
+                if !already {
+                    let pid = format!("ESFERA_DEV_{:03}", dev.device_number);
+                    if Self::inject_device_immunity(&target, Some(&pid)).is_ok() {
+                        let _ = injected.lock().map(|mut s| {
+                            s.insert(target.clone());
+                        });
                     }
                 }
             }
         });
+    }
+
+    /// Obtém a resolução da tela física do dispositivo (Physical size: WxH)
+    pub fn get_device_screen_size(serial: &str) -> (i32, i32) {
+        let output = create_cmd("adb")
+            .arg("-s")
+            .arg(serial)
+            .arg("shell")
+            .arg("wm")
+            .arg("size")
+            .output();
+
+        if let Ok(out) = output {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                if line.contains("Physical size:") || line.contains("Override size:") {
+                    if let Some(res) = line.split(':').nth(1) {
+                        let parts: Vec<&str> = res.trim().split('x').collect();
+                        if parts.len() == 2 {
+                            if let (Ok(w), Ok(h)) = (parts[0].trim().parse::<i32>(), parts[1].trim().parse::<i32>()) {
+                                return (w, h);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (1080, 2400) // Fallback seguro padrão
+    }
+
+    /// Encoder de URL para parâmetros do Intent
+    pub fn url_encode(input: &str) -> String {
+        let mut encoded = String::new();
+        for byte in input.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    encoded.push(byte as char);
+                }
+                b' ' => encoded.push_str("%20"),
+                _ => {
+                    encoded.push_str(&format!("%{:02X}", byte));
+                }
+            }
+        }
+        encoded
+    }
+
+    /// Envia mensagem no WhatsApp via Deep Link Intent + Toque Físico Curva de Bézier C++ HPC
+    pub fn send_whatsapp_intent_and_bezier_tap(serial: &str, phone: &str, message: &str) -> Result<(), String> {
+        let encoded_msg = Self::url_encode(message);
+        let intent_url = format!("https://api.whatsapp.com/send?phone={}&text={}", phone, encoded_msg);
+
+        // 1. Dispara Intent do WhatsApp
+        let mut intent_adb = create_cmd("adb");
+        intent_adb
+            .arg("-s")
+            .arg(serial)
+            .arg("shell")
+            .arg("am")
+            .arg("start")
+            .arg("-a")
+            .arg("android.intent.action.VIEW")
+            .arg("-d")
+            .arg(&intent_url);
+        let intent_cmd = run_cmd_timeout(intent_adb, Duration::from_secs(8));
+
+        if let Err(e) = intent_cmd {
+            return Err(format!("Falha ao disparar Intent do WhatsApp: {}", e));
+        }
+
+        // 2. Aguarda delay Gaussiano calculado via C++ HPC
+        let delay_ms = unsafe { esfera_hpc_calculate_gaussian_delay(2200, 3500) };
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
+
+        // 3. Calcula coordenadas da tela com C++ HPC
+        let (screen_w, screen_h) = Self::get_device_screen_size(serial);
+        let mut tap_x: i32 = 0;
+        let mut tap_y: i32 = 0;
+
+        // Botão de Enviar no WhatsApp: ~92.5% na horizontal (X), ~96.0% na vertical (Y)
+        unsafe {
+            esfera_hpc_calculate_tap_coordinates(screen_w, screen_h, 92.5, 96.0, &mut tap_x, &mut tap_y);
+        }
+
+        // 4. Executa o Toque Físico com micro-pressão via input swipe
+        let mut swipe_adb = create_cmd("adb");
+        swipe_adb
+            .arg("-s")
+            .arg(serial)
+            .arg("shell")
+            .arg("input")
+            .arg("swipe")
+            .arg(tap_x.to_string())
+            .arg(tap_y.to_string())
+            .arg((tap_x + 1).to_string())
+            .arg((tap_y + 1).to_string())
+            .arg("120");
+        let swipe_cmd = run_cmd_timeout(swipe_adb, Duration::from_secs(8));
+
+        match swipe_cmd {
+            Ok(out) if out.status.success() => Ok(()),
+            Ok(out) => Err(String::from_utf8_lossy(&out.stderr).to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Configura Proxy SOCKS5/HTTP por aparelho via ADB e revoga permissões BSSID Wi-Fi (Anti-Ban)
+    pub fn configure_device_socks_proxy_and_revoke_bssid(serial: &str, proxy_url: Option<&str>) -> Result<(), String> {
+        // 1. Aplica Proxy Global via ADB se fornecido
+        if let Some(proxy) = proxy_url {
+            if !proxy.trim().is_empty() {
+                let _ = create_cmd("adb")
+                    .arg("-s")
+                    .arg(serial)
+                    .arg("shell")
+                    .arg("settings")
+                    .arg("put")
+                    .arg("global")
+                    .arg("http_proxy")
+                    .arg(proxy)
+                    .output();
+            } else {
+                let _ = create_cmd("adb")
+                    .arg("-s")
+                    .arg(serial)
+                    .arg("shell")
+                    .arg("settings")
+                    .arg("put")
+                    .arg("global")
+                    .arg("http_proxy")
+                    .arg(":0")
+                    .output();
+            }
+        }
+
+        // 2. Revoga permissões de localização (BSSID Wi-Fi) do WhatsApp Oficial e Business
+        let packages = ["com.whatsapp", "com.whatsapp.w4b"];
+        let permissions = [
+            "android.permission.ACCESS_FINE_LOCATION",
+            "android.permission.ACCESS_COARSE_LOCATION",
+        ];
+
+        for pkg in &packages {
+            for perm in &permissions {
+                let _ = create_cmd("adb")
+                    .arg("-s")
+                    .arg(serial)
+                    .arg("shell")
+                    .arg("pm")
+                    .arg("revoke")
+                    .arg(pkg)
+                    .arg(perm)
+                    .output();
+            }
+        }
+
+        Ok(())
     }
 }

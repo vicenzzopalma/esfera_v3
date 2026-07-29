@@ -1262,7 +1262,8 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
               onClick={async () => {
                 if (!confirm("Dispositivo ja provisionado. Reprovisionar?")) return;
                 try {
-                  const msg = await api<string>("provision_device", { serial: device.serial, server_url: null });
+                  const targetSerial = (device.status === "online" && device.currentAdbAddress) ? device.currentAdbAddress : device.serial;
+                  const msg = await api<string>("provision_device", { serial: targetSerial, server_url: null });
                   alert(`Reprovisionado: ${msg}`);
                 } catch (err: any) {
                   alert(typeof err === "string" ? err : err?.message || "Erro ao reprovisionar.");
@@ -1277,7 +1278,8 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
             <button
               onClick={async () => {
                 try {
-                  const msg = await api<string>("provision_device", { serial: device.serial, server_url: null });
+                  const targetSerial = (device.status === "online" && device.currentAdbAddress) ? device.currentAdbAddress : device.serial;
+                  const msg = await api<string>("provision_device", { serial: targetSerial, server_url: null });
                   alert(`Provisionado: ${msg}`);
                 } catch (err: any) {
                   alert(typeof err === "string" ? err : err?.message || "Erro ao provisionar.");

@@ -328,6 +328,36 @@ esfera_int32_t esfera_hpc_generate_bezier_points(
     return 0;
 }
 
+esfera_int32_t esfera_hpc_calculate_tap_coordinates(
+    esfera_int32_t screen_width,
+    esfera_int32_t screen_height,
+    double pct_x,
+    double pct_y,
+    esfera_int32_t* out_x,
+    esfera_int32_t* out_y
+) {
+    if (!out_x || !out_y || screen_width <= 0 || screen_height <= 0) return -1;
+
+    thread_local std::random_device rd;
+    thread_local std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> jitter_dist(-3, 3);
+
+    double base_x = (static_cast<double>(screen_width) * pct_x) / 100.0;
+    double base_y = (static_cast<double>(screen_height) * pct_y) / 100.0;
+
+    int final_x = static_cast<int>(base_x) + jitter_dist(gen);
+    int final_y = static_cast<int>(base_y) + jitter_dist(gen);
+
+    if (final_x < 0) final_x = 0;
+    if (final_x >= screen_width) final_x = screen_width - 1;
+    if (final_y < 0) final_y = 0;
+    if (final_y >= screen_height) final_y = screen_height - 1;
+
+    *out_x = static_cast<esfera_int32_t>(final_x);
+    *out_y = static_cast<esfera_int32_t>(final_y);
+    return 0;
+}
+
 void esfera_hpc_format_active_user_badge(
     const char* user_display_name,
     char* out_buf,
@@ -353,6 +383,103 @@ void esfera_hpc_format_active_user_badge(
         }
     }
     out_buf[i] = '\0';
+}
+
+static void process_buffer_avx2(const esfera_uint8_t* in, esfera_size_t len, esfera_uint8_t* out, esfera_size_t* out_written) {
+    if (!in || !out || !out_written) return;
+    esfera_size_t out_idx = 0;
+    for (esfera_size_t i = 0; i < len; ++i) {
+        if (in[i] == 0x0D && (i + 1 < len) && in[i + 1] == 0x0A) {
+            out[out_idx++] = 0x0A;
+            i++;
+        } else {
+            out[out_idx++] = in[i];
+        }
+    }
+    *out_written = out_idx;
+}
+
+static void process_buffer_generic(const esfera_uint8_t* in, esfera_size_t len, esfera_uint8_t* out, esfera_size_t* out_written) {
+    if (!in || !out || !out_written) return;
+    for (esfera_size_t i = 0; i < len; ++i) {
+        out[i] = in[i];
+    }
+    *out_written = len;
+}
+
+esfera_hpc_process_fn esfera_hpc_get_optimized_processor(void) {
+    EsferaHardwareCaps caps;
+    esfera_hpc_detect_hardware(&caps);
+    if (caps.supports_avx2) {
+        return process_buffer_avx2;
+    }
+    return process_buffer_generic;
+}
+
+esfera_int32_t esfera_hpc_get_debloat_package_list(
+    const char* brand_or_manufacturer,
+    char* out_packages_buf,
+    esfera_size_t max_len
+) {
+    if (!out_packages_buf || max_len < 64) return -1;
+
+    std::string brand = brand_or_manufacturer ? brand_or_manufacturer : "";
+    std::transform(brand.begin(), brand.end(), brand.begin(), ::tolower);
+
+    std::vector<std::string> pkgs;
+
+    // Bloatware Genérico / Telemetria / Adware comum em dispositivos operacionais
+    pkgs.push_back("com.facebook.katana");
+    pkgs.push_back("com.facebook.system");
+    pkgs.push_back("com.facebook.appmanager");
+    pkgs.push_back("com.facebook.services");
+    pkgs.push_back("com.google.android.videos");
+    pkgs.push_back("com.google.android.music");
+    pkgs.push_back("com.google.android.apps.docs");
+
+    // Samsung especifico
+    if (brand.find("samsung") != std::string::npos || brand.find("sec") != std::string::npos) {
+        pkgs.push_back("com.samsung.android.bixby.agent");
+        pkgs.push_back("com.samsung.android.bixby.wakeup");
+        pkgs.push_back("com.samsung.android.app.spage");
+        pkgs.push_back("com.samsung.android.game.gamehome");
+        pkgs.push_back("com.samsung.android.game.gametools");
+        pkgs.push_back("com.sec.android.app.sbrowser");
+        pkgs.push_back("com.samsung.android.mateagent");
+    }
+
+    // Xiaomi / MIUI especifico
+    if (brand.find("xiaomi") != std::string::npos || brand.find("redmi") != std::string::npos || brand.find("poco") != std::string::npos) {
+        pkgs.push_back("com.miui.analytics");
+        pkgs.push_back("com.miui.msa.global");
+        pkgs.push_back("com.miui.cloudservice");
+        pkgs.push_back("com.miui.cloudbackup");
+        pkgs.push_back("com.miui.hybrid");
+        pkgs.push_back("com.xiaomi.glgm");
+        pkgs.push_back("com.miui.bugreport");
+    }
+
+    // Motorola especifico
+    if (brand.find("motorola") != std::string::npos || brand.find("moto") != std::string::npos) {
+        pkgs.push_back("com.motorola.ccc.ota");
+        pkgs.push_back("com.motorola.demomode");
+        pkgs.push_back("com.motorola.genie");
+    }
+
+    std::ostringstream ss;
+    for (size_t i = 0; i < pkgs.size(); ++i) {
+        ss << pkgs[i];
+        if (i + 1 < pkgs.size()) ss << ",";
+    }
+
+    std::string res = ss.str();
+    esfera_size_t idx = 0;
+    while (idx < res.length() && idx < max_len - 1) {
+        out_packages_buf[idx] = res[idx];
+        idx++;
+    }
+    out_packages_buf[idx] = '\0';
+    return static_cast<esfera_int32_t>(pkgs.size());
 }
 
 }
