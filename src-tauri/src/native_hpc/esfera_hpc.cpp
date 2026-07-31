@@ -1,6 +1,6 @@
 // ============================================================
 // Esfera v3 — Engine Nativa C++ High-Performance Computing (HPC)
-// Processador de Buffers ADB, Sanitizador de Frames & Dispatch CPU
+// Processador SIMD de Buffers ADB/Logs, Sanitizador PNG & Dispatch CPU Runtime
 // ============================================================
 
 #include "esfera_hpc.h"
@@ -8,6 +8,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <cstring>
 
 #if defined(_WIN32) || defined(_MSC_VER)
     #include <windows.h>
@@ -15,13 +16,19 @@
     #include <tlhelp32.h>
     #include <string>
     #include <algorithm>
+    #include <mutex>
     #pragma comment(lib, "setupapi.lib")
+#else
+    #include <mutex>
 #endif
 
 #if defined(_MSC_VER)
     #include <intrin.h>
 #elif defined(__GNUC__) || defined(__clang__)
     #include <cpuid.h>
+    #if defined(__AVX2__)
+        #include <immintrin.h>
+    #endif
 #endif
 
 extern "C" {
@@ -65,10 +72,8 @@ esfera_int32_t esfera_hpc_sanitize_png_buffer(
         return -1;
     }
 
-    // Assinatura PNG Válida: 89 50 4E 47 0D 0A 1A 0A
     static const esfera_uint8_t png_header[8] = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
 
-    // Se o buffer já é um PNG perfeitamente válido, faz cópia direta de memória
     bool is_valid_png = true;
     for (int i = 0; i < 8; ++i) {
         if (in[i] != png_header[i]) {
@@ -85,19 +90,7 @@ esfera_int32_t esfera_hpc_sanitize_png_buffer(
         return 0;
     }
 
-    // Se o stdout do ADB converteu \n -> \r\n, varredura rápida em C++
-    esfera_size_t out_idx = 0;
-    for (esfera_size_t i = 0; i < in_len && out_idx < max_out; ++i) {
-        if (in[i] == 0x0D && (i + 1 < in_len) && in[i + 1] == 0x0A) {
-            out[out_idx++] = 0x0A;
-            i++;
-        } else {
-            out[out_idx++] = in[i];
-        }
-    }
-
-    *out_written = out_idx;
-    return 0;
+    return esfera_hpc_process_buffer(in, in_len, out, max_out, out_written);
 }
 
 void esfera_hpc_run_adb_diagnostic(EsferaAdbDiagnostic* diag) {
@@ -108,6 +101,7 @@ void esfera_hpc_run_adb_diagnostic(EsferaAdbDiagnostic* diag) {
     diag->detected_usb_count = 0;
     for (int i = 0; i < 256; ++i) diag->diagnostic_msg[i] = '\0';
 
+#if defined(_WIN32) || defined(_MSC_VER)
     const char* init_msg = "Diagnóstico não suportado nesta plataforma.";
     int idx_init = 0;
     while (init_msg[idx_init] != '\0' && idx_init < 255) {
@@ -116,8 +110,6 @@ void esfera_hpc_run_adb_diagnostic(EsferaAdbDiagnostic* diag) {
     }
     diag->diagnostic_msg[idx_init] = '\0';
 
-#if defined(_WIN32) || defined(_MSC_VER)
-    // 1. Verificar se o processo adb.exe está em execução
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot != INVALID_HANDLE_VALUE) {
         PROCESSENTRY32W pe32;
@@ -135,7 +127,6 @@ void esfera_hpc_run_adb_diagnostic(EsferaAdbDiagnostic* diag) {
         CloseHandle(hSnapshot);
     }
 
-    // 2. Enumerar dispositivos USB
     HDEVINFO hDevInfo = SetupDiGetClassDevsW(NULL, L"USB", NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
     if (hDevInfo != INVALID_HANDLE_VALUE) {
         SP_DEVINFO_DATA devInfoData;
@@ -271,14 +262,14 @@ void esfera_hpc_generate_hardware_uuid(char* out_uuid_buf, esfera_size_t max_len
 #endif
 
     std::string raw = ss.str();
-    unsigned long long hash = 14695981039346656037ULL; // FNV-1a offset basis
+    unsigned long long hash = 14695981039346656037ULL;
     for (char c : raw) {
         hash ^= static_cast<unsigned char>(c);
-        hash *= 1099511628211ULL; // FNV prime
+        hash *= 1099511628211ULL;
     }
 
     std::ostringstream final_ss;
-    final_ss << "ESFERA-HWID-" 
+    final_ss << "ESFERA-HWID-"
              << std::uppercase << std::setfill('0') << std::setw(8) << std::hex << (hash & 0xFFFFFFFF)
              << "-"
              << std::setfill('0') << std::setw(8) << std::hex << ((hash >> 32) & 0xFFFFFFFF);
@@ -308,7 +299,6 @@ esfera_int32_t esfera_hpc_generate_bezier_points(
     thread_local std::mt19937 gen(rd());
     std::uniform_int_distribution<int> offset_dist(-40, 40);
 
-    // Ponto de controle P1 com desvio perpendicular aleatório
     int ctrl_x = (start_x + end_x) / 2 + offset_dist(gen);
     int ctrl_y = (start_y + end_y) / 2 + offset_dist(gen);
 
@@ -385,35 +375,160 @@ void esfera_hpc_format_active_user_badge(
     out_buf[i] = '\0';
 }
 
-static void process_buffer_avx2(const esfera_uint8_t* in, esfera_size_t len, esfera_uint8_t* out, esfera_size_t* out_written) {
-    if (!in || !out || !out_written) return;
-    esfera_size_t out_idx = 0;
-    for (esfera_size_t i = 0; i < len; ++i) {
-        if (in[i] == 0x0D && (i + 1 < len) && in[i + 1] == 0x0A) {
-            out[out_idx++] = 0x0A;
-            i++;
-        } else {
-            out[out_idx++] = in[i];
-        }
-    }
-    *out_written = out_idx;
-}
+// ============================================================
+// Runtime SIMD Dispatch — Buffer Processor
+// ============================================================
 
 static void process_buffer_generic(const esfera_uint8_t* in, esfera_size_t len, esfera_uint8_t* out, esfera_size_t* out_written) {
     if (!in || !out || !out_written) return;
+    esfera_size_t j = 0;
     for (esfera_size_t i = 0; i < len; ++i) {
-        out[i] = in[i];
+        if (in[i] == '\r' && i + 1 < len && in[i + 1] == '\n') {
+            out[j++] = '\n';
+            ++i;
+        } else {
+            out[j++] = in[i];
+        }
     }
-    *out_written = len;
+    *out_written = j;
+}
+
+#if defined(__AVX2__)
+static void process_buffer_avx2(const esfera_uint8_t* in, esfera_size_t len, esfera_uint8_t* out, esfera_size_t* out_written) {
+    if (!in || !out || !out_written) return;
+
+    esfera_size_t i = 0;
+    esfera_size_t j = 0;
+    const __m256i v_cr = _mm256_set1_epi8('\r');
+
+    while (i + 32 <= len) {
+        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(in + i));
+        __m256i eq_cr = _mm256_cmpeq_epi8(v, v_cr);
+        uint32_t mask = _mm256_movemask_epi8(eq_cr);
+
+        if (mask == 0) {
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + j), v);
+            i += 32;
+            j += 32;
+        } else {
+            // Chunk tem CR; processa scalar para não perder bytes na compressão.
+            for (int k = 0; k < 32 && i + k < len; ++k) {
+                uint8_t c = in[i + k];
+                if (c == '\r' && i + k + 1 < len && in[i + k + 1] == '\n') {
+                    out[j++] = '\n';
+                    ++k;
+                } else {
+                    out[j++] = c;
+                }
+            }
+            i += 32;
+        }
+    }
+
+    while (i < len) {
+        if (in[i] == '\r' && i + 1 < len && in[i + 1] == '\n') {
+            out[j++] = '\n';
+            i += 2;
+        } else {
+            out[j++] = in[i];
+            ++i;
+        }
+    }
+
+    *out_written = j;
+}
+#else
+static void process_buffer_avx2(const esfera_uint8_t* in, esfera_size_t len, esfera_uint8_t* out, esfera_size_t* out_written) {
+    process_buffer_generic(in, len, out, out_written);
+}
+#endif
+
+#if defined(__AVX512F__)
+static void process_buffer_avx512(const esfera_uint8_t* in, esfera_size_t len, esfera_uint8_t* out, esfera_size_t* out_written) {
+    if (!in || !out || !out_written) return;
+
+    esfera_size_t i = 0;
+    esfera_size_t j = 0;
+    const __m512i v_cr = _mm512_set1_epi8('\r');
+
+    while (i + 64 <= len) {
+        __m512i v = _mm512_loadu_si512(in + i);
+        __mmask64 cr_mask = _mm512_cmpeq_epi8_mask(v, v_cr);
+
+        if (cr_mask == 0) {
+            _mm512_storeu_si512(out + j, v);
+            i += 64;
+            j += 64;
+        } else {
+            for (int k = 0; k < 64 && i + k < len; ++k) {
+                uint8_t c = in[i + k];
+                if (c == '\r' && i + k + 1 < len && in[i + k + 1] == '\n') {
+                    out[j++] = '\n';
+                    ++k;
+                } else {
+                    out[j++] = c;
+                }
+            }
+            i += 64;
+        }
+    }
+
+    while (i < len) {
+        if (in[i] == '\r' && i + 1 < len && in[i + 1] == '\n') {
+            out[j++] = '\n';
+            i += 2;
+        } else {
+            out[j++] = in[i];
+            ++i;
+        }
+    }
+
+    *out_written = j;
+}
+#else
+static void process_buffer_avx512(const esfera_uint8_t* in, esfera_size_t len, esfera_uint8_t* out, esfera_size_t* out_written) {
+    process_buffer_generic(in, len, out, out_written);
+}
+#endif
+
+// Dispatch estabelecido no boot e reutilizado em todas as chamadas.
+static esfera_hpc_process_fn g_processor = nullptr;
+
+static void init_processor_once(void) {
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        EsferaHardwareCaps caps;
+        esfera_hpc_detect_hardware(&caps);
+        if (caps.supports_avx512) {
+            g_processor = process_buffer_avx512;
+        } else if (caps.supports_avx2) {
+            g_processor = process_buffer_avx2;
+        } else {
+            g_processor = process_buffer_generic;
+        }
+    });
 }
 
 esfera_hpc_process_fn esfera_hpc_get_optimized_processor(void) {
-    EsferaHardwareCaps caps;
-    esfera_hpc_detect_hardware(&caps);
-    if (caps.supports_avx2) {
-        return process_buffer_avx2;
+    init_processor_once();
+    return g_processor;
+}
+
+esfera_int32_t esfera_hpc_process_buffer(
+    const esfera_uint8_t* input_ptr,
+    esfera_size_t input_len,
+    esfera_uint8_t* output_ptr,
+    esfera_size_t max_out_len,
+    esfera_size_t* out_written
+) {
+    if (out_written) *out_written = 0;
+    if (!input_ptr || !output_ptr || !out_written || max_out_len < input_len) {
+        return -1;
     }
-    return process_buffer_generic;
+
+    init_processor_once();
+    g_processor(input_ptr, input_len, output_ptr, out_written);
+    return 0;
 }
 
 esfera_int32_t esfera_hpc_get_debloat_package_list(
@@ -427,8 +542,6 @@ esfera_int32_t esfera_hpc_get_debloat_package_list(
     std::transform(brand.begin(), brand.end(), brand.begin(), ::tolower);
 
     std::vector<std::string> pkgs;
-
-    // Bloatware Genérico / Telemetria / Adware comum em dispositivos operacionais
     pkgs.push_back("com.facebook.katana");
     pkgs.push_back("com.facebook.system");
     pkgs.push_back("com.facebook.appmanager");
@@ -437,7 +550,6 @@ esfera_int32_t esfera_hpc_get_debloat_package_list(
     pkgs.push_back("com.google.android.music");
     pkgs.push_back("com.google.android.apps.docs");
 
-    // Samsung especifico
     if (brand.find("samsung") != std::string::npos || brand.find("sec") != std::string::npos) {
         pkgs.push_back("com.samsung.android.bixby.agent");
         pkgs.push_back("com.samsung.android.bixby.wakeup");
@@ -448,7 +560,6 @@ esfera_int32_t esfera_hpc_get_debloat_package_list(
         pkgs.push_back("com.samsung.android.mateagent");
     }
 
-    // Xiaomi / MIUI especifico
     if (brand.find("xiaomi") != std::string::npos || brand.find("redmi") != std::string::npos || brand.find("poco") != std::string::npos) {
         pkgs.push_back("com.miui.analytics");
         pkgs.push_back("com.miui.msa.global");
@@ -459,7 +570,6 @@ esfera_int32_t esfera_hpc_get_debloat_package_list(
         pkgs.push_back("com.miui.bugreport");
     }
 
-    // Motorola especifico
     if (brand.find("motorola") != std::string::npos || brand.find("moto") != std::string::npos) {
         pkgs.push_back("com.motorola.ccc.ota");
         pkgs.push_back("com.motorola.demomode");
@@ -483,4 +593,3 @@ esfera_int32_t esfera_hpc_get_debloat_package_list(
 }
 
 }
-

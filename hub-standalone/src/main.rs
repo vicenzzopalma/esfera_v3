@@ -65,8 +65,56 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
     
+    // 5. Motor de Auto-Atualizador do Hub Standalone via Git (Auto-Update Daemon)
+    tokio::spawn(async move {
+        println!("Motor de Auto-Atualização do Hub iniciado (verificação a cada 5 min)...");
+        let _ = std::io::stdout().flush();
+        loop {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            
+            let fetch_res = std::process::Command::new("git").arg("fetch").output();
+            if let Ok(out) = fetch_res {
+                if out.status.success() {
+                    let current = std::process::Command::new("git")
+                        .args(["rev-parse", "--short", "HEAD"])
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default();
+
+                    let latest = std::process::Command::new("git")
+                        .args(["rev-parse", "--short", "origin/main"])
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default();
+
+                    if !latest.is_empty() && current != latest {
+                        println!("[AUTO-UPDATE] Novo commit detectado no repositório (HEAD: {}, Remoto: {}). Aplicando atualização...", current, latest);
+                        let _ = std::io::stdout().flush();
+
+                        let pull = std::process::Command::new("git")
+                            .args(["pull", "--rebase", "origin", "main"])
+                            .output();
+
+                        if let Ok(p) = pull {
+                            if p.status.success() {
+                                println!("[AUTO-UPDATE] Código do Hub atualizado com sucesso! Reiniciando processo...");
+                                let _ = std::io::stdout().flush();
+
+                                if let Ok(exe) = std::env::current_exe() {
+                                    let _ = std::process::Command::new(exe).spawn();
+                                }
+                                std::process::exit(0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     println!("Iniciando Servidor HTTP Check-in na porta {}...", http_port);
     let _ = std::io::stdout().flush();
     checkin_server::start(db, http_port).await;
 }
+
 

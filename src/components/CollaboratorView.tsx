@@ -20,6 +20,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Activity,
+  Eye,
 } from "lucide-react";
 import Button from "./ui/Button";
 import Card from "./ui/Card";
@@ -246,19 +247,41 @@ export default function CollaboratorView() {
                   <div className="pt-2">
                     {isApproved ? (
                       <div className="space-y-2">
-                        <div className="p-3 bg-emerald-500/15 rounded-xl border border-emerald-500/30 text-emerald-300 text-xs flex items-center justify-between">
-                          <span className="font-semibold flex items-center gap-1.5">
-                            <Zap size={14} /> Celular Pronto para Uso!
-                          </span>
-                          <span className="text-[10px] bg-emerald-500/20 px-2 py-0.5 rounded-md">Ativo</span>
+                        <div className="p-3 bg-emerald-500/15 rounded-xl border border-emerald-500/30 text-emerald-300 text-xs flex flex-col gap-1">
+                          <div className="flex items-center justify-between font-semibold">
+                            <span className="flex items-center gap-1.5">
+                              <Zap size={14} /> Celular Autorizado pelo Gestor!
+                            </span>
+                            <span className="text-[10px] bg-emerald-500/20 px-2 py-0.5 rounded-md">Ativo</span>
+                          </div>
+                          <p className="text-[11px] text-slate-400">
+                            🔒 Permissão Restrita: Apenas visualização de tela habilitada. Câmeras e processamento em segundo plano desativados.
+                          </p>
                         </div>
+
+                        {/* Botão Único Permitido: Visualizar Tela */}
+                        <Button
+                          variant="primary"
+                          onClick={async () => {
+                            try {
+                              await api("launch_scrcpy_stream", { serial: dev.serial, turnScreenOff: false });
+                              setMessage({ type: "success", text: `Visualização de tela iniciada para ${dev.name || dev.serial}.` });
+                            } catch (e: any) {
+                              setMessage({ type: "error", text: `Erro ao abrir tela: ${e.toString()}` });
+                            }
+                          }}
+                          className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 font-bold py-2.5 shadow-lg shadow-blue-950/40"
+                        >
+                          <Eye size={18} />
+                          Visualizar Tela do Celular
+                        </Button>
 
                         <Button
                           variant="danger"
                           onClick={() => handleEndSession(req.requestId)}
-                          className="w-full flex items-center justify-center gap-2"
+                          className="w-full flex items-center justify-center gap-2 text-xs py-2"
                         >
-                          <Power size={16} />
+                          <Power size={14} />
                           Encerrar Uso do Celular
                         </Button>
                       </div>

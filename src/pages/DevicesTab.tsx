@@ -206,7 +206,7 @@ export default function DevicesTab() {
         companyId: effectiveCompanyId,
         deviceNumber,
         sector,
-        deviceName: deviceName || `Aparelho ${deviceNumber}`,
+        deviceName: deviceName || serial,
       });
       setLinkingStatus(result);
       refreshDevices();
@@ -240,7 +240,7 @@ export default function DevicesTab() {
         companyId: effectiveCompanyId,
         deviceNumber,
         sector,
-        deviceName: deviceName || `Aparelho ${deviceNumber}`,
+        deviceName: deviceName || finalIp,
       });
       refreshDevices();
       setConnectModalOpen(false);
@@ -403,7 +403,7 @@ export default function DevicesTab() {
       {/* ============================================================ */}
       {/* BARRA SUPERIOR: FILTRO DE SETORES & BUSCA DE CELULARES */}
       {/* ============================================================ */}
-      <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4 bg-[#0d111c]/90 border border-slate-800/60 p-4 rounded-2xl shadow-2xl backdrop-blur-md">
+      <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4 bg-[#0a0a0a]/90 border border-white/[0.08] p-4 rounded-2xl backdrop-blur-md">
         {/* Tabs de Filtro de Setor */}
         <div className="flex items-center gap-1.5 overflow-x-auto custom-scrollbar pb-1 xl:pb-0">
           {[
@@ -420,10 +420,10 @@ export default function DevicesTab() {
               <button
                 key={tab.id}
                 onClick={() => setSectorTab(tab.id)}
-                className={`px-4 py-2 rounded-full text-xs font-bold transition-all cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
+                className={`px-4 py-2 rounded-full text-xs font-semibold transition-all cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
                   sectorTab === tab.id
-                    ? "bg-blue-600 text-white shadow-lg shadow-blue-600/40 border border-blue-400/30 scale-105"
-                    : "bg-slate-900/80 text-slate-300 border border-slate-800 hover:bg-slate-800 hover:text-white"
+                    ? "bg-white text-black shadow-lg shadow-white/10 border border-white/20"
+                    : "bg-[#0a0a0a] text-slate-300 border border-white/10 hover:bg-white/10 hover:text-white"
                 }`}
               >
                 <span>{tab.label}</span>
@@ -438,20 +438,20 @@ export default function DevicesTab() {
         {/* Busca e Ações Principais */}
         <div className="flex flex-wrap items-center gap-2">
           <div className="relative flex-1 min-w-[240px] sm:min-w-[320px]">
-            <Search size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+            <Search size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" />
             <input
               type="text"
-              placeholder="Buscar celular por modelo, marca ou IP..."
+              placeholder="Buscar por modelo, serial ou IP..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full bg-[#121624] border border-slate-700/70 text-slate-100 rounded-full pl-9 pr-4 py-2 text-xs placeholder:text-slate-500 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20"
+              className="w-full bg-[#0a0a0a] border border-white/10 text-slate-100 rounded-full pl-9 pr-4 py-2 text-xs placeholder:text-slate-500 focus:border-white/30 focus:ring-0"
             />
           </div>
 
           <Button
             onClick={() => setConnectModalOpen(true)}
             icon={<Plus size={15} />}
-            className="bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-xs shadow-lg shadow-blue-600/30"
+            className="bg-white text-black hover:bg-slate-200 font-semibold rounded-full text-xs shadow-none"
           >
             + Conectar Celular
           </Button>
@@ -475,7 +475,7 @@ export default function DevicesTab() {
               refreshDevices();
             }}
             icon={<Shield size={14} className="text-emerald-400" />}
-            className="bg-emerald-950/60 hover:bg-emerald-900 border-emerald-600/50 text-emerald-200 rounded-xl text-xs font-extrabold shadow-lg"
+            className="bg-[#0a0a0a] hover:bg-white/10 border border-white/10 text-slate-200 rounded-full text-xs font-semibold shadow-none"
             title="Provisiona todos os dispositivos sem ID permanente"
           >
             Provisionar Todos
@@ -493,7 +493,7 @@ export default function DevicesTab() {
               }
             }}
             icon={<Shield size={14} className="text-cyan-400" />}
-            className="bg-cyan-950/60 hover:bg-cyan-900 border-cyan-600/50 text-cyan-200 rounded-xl text-xs font-extrabold shadow-lg"
+            className="bg-[#0a0a0a] hover:bg-white/10 border border-white/10 text-slate-200 rounded-full text-xs font-semibold shadow-none"
             title="Injeta no Android a fixação de MAC Físico (desativa MAC aleatório) e imuniza a porta TCP 5555"
           >
             🛡️ Injetar Imunidade & MAC Físico
@@ -504,10 +504,10 @@ export default function DevicesTab() {
             onClick={async () => {
               try {
                 const msg = await api<string>("force_reconnect_all_adb", {});
-                alert(msg);
+                console.log("[RECONEXAO]", msg);
                 refreshDevices();
               } catch (e: any) {
-                alert(typeof e === "string" ? e : e?.message || "Erro ao forçar reconexão.");
+                console.error("Erro ao forçar reconexão:", e);
               }
             }}
             icon={<Zap size={14} className="text-amber-400" />}
@@ -1213,7 +1213,7 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
   onForceWireless: () => void;
 }) {
   const status = statusConfig[device.status as DeviceStatus] || statusConfig.offline;
-  const displayName = device.name || `Aparelho ${device.deviceNumber}`;
+  const displayName = device.name || device.serial;
   const isUsbOnly = !device.serial.includes(":");
 
   return (

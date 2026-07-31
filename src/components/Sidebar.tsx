@@ -18,7 +18,6 @@ import {
   Building2,
   LogOut,
   ChevronLeft,
-  Zap,
   Shield,
   BarChart3,
   ClipboardList,
@@ -183,32 +182,32 @@ export default function Sidebar() {
   };
 
   return (
-    <aside style={{ width: "256px" }} className="fixed left-0 top-0 bottom-0 flex flex-col z-40 bg-sidebar border-r border-white/[0.06] shadow-xl">
+    <aside style={{ width: "256px" }} className="fixed left-0 top-0 bottom-0 flex flex-col z-40 bg-[#0a0a0a] border-r border-white/[0.08]">
       {/* Brand Header */}
-      <div className="flex items-center justify-between px-5 h-16 border-b border-white/[0.06]">
+      <div className="flex items-center justify-between px-5 h-16 border-b border-white/[0.08]">
         <div className="flex items-center gap-3">
-          <div className="flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 shadow-md shadow-violet-500/30 shrink-0">
-            <Zap size={20} className="text-white" />
+          <div className="flex items-center justify-center w-9 h-9 rounded-xl bg-white text-black font-black text-sm shadow-none">
+            E
           </div>
           <div>
-            <h1 className="text-base font-extrabold text-primary tracking-tight leading-tight">Esfera</h1>
-            <p className="text-[10px] text-violet-400 font-semibold tracking-wider leading-none mt-0.5">v3.0 HIGH PERFORMANCE</p>
+            <h1 className="text-sm font-semibold text-white tracking-tight leading-tight">Esfera</h1>
+            <p className="text-[10px] text-slate-500 font-medium tracking-wider leading-none mt-0.5">v3</p>
           </div>
         </div>
       </div>
 
       {/* Empresa Ativa Widget */}
       {insideCompany && selectedCompany && (
-        <div className="mx-3 mt-3 p-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]">
+        <div className="mx-3 mt-3 p-3 rounded-xl border border-white/[0.08] bg-white/[0.02]">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2.5 min-w-0">
-              <Building2 size={16} className="text-violet-400 shrink-0" />
-              <span className="text-xs font-semibold text-primary truncate" title={selectedCompany.name}>{selectedCompany.name}</span>
+              <Building2 size={16} className="text-slate-400 shrink-0" />
+              <span className="text-xs font-medium text-slate-200 truncate" title={selectedCompany.name}>{selectedCompany.name}</span>
             </div>
             {user.role === "master" && (
               <button
                 onClick={handleBackToCompanies}
-                className="p-1.5 rounded-lg text-tertiary hover:text-violet-400 hover:bg-violet-500/10 transition-colors cursor-pointer shrink-0"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
                 title="Voltar às Empresas"
               >
                 <ChevronLeft size={16} />
@@ -233,7 +232,7 @@ export default function Sidebar() {
 
           return (
             <div key={group.groupName}>
-              <h3 className="px-3 text-[10px] font-bold text-tertiary uppercase tracking-wider mb-2.5">
+              <h3 className="px-3 text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-2.5">
                 {group.groupName}
               </h3>
               <div className="space-y-1">
@@ -245,16 +244,16 @@ export default function Sidebar() {
                       onClick={() => navigate(item.path)}
                       className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium transition-all cursor-pointer ${
                         isActive
-                          ? "bg-gradient-to-r from-violet-600/20 to-indigo-600/20 text-violet-300 font-semibold border border-violet-500/30 shadow-sm"
-                          : "text-secondary hover:text-primary hover:bg-white/5"
+                          ? "bg-white text-black"
+                          : "text-slate-300 hover:text-white hover:bg-white/10"
                       }`}
                     >
-                      <span className={`shrink-0 ${isActive ? "text-violet-400" : "text-tertiary"}`}>
+                      <span className={`shrink-0 ${isActive ? "text-black" : "text-slate-400"}`}>
                         {item.icon}
                       </span>
                       <span className="flex-1 text-left truncate">{item.label}</span>
                       {item.badge && (
-                        <span className="px-1.5 py-0.5 text-[9px] rounded-md bg-violet-500/20 text-violet-300 font-mono whitespace-nowrap shrink-0">
+                        <span className="px-1.5 py-0.5 text-[9px] rounded-md bg-white/10 text-slate-300 font-mono whitespace-nowrap shrink-0">
                           {item.badge}
                         </span>
                       )}
@@ -268,20 +267,20 @@ export default function Sidebar() {
       </nav>
 
       {/* Footer Profile & Logout */}
-      <div className="border-t border-white/[0.06] p-3">
+      <div className="border-t border-white/[0.08] p-3">
         <div className="flex items-center justify-between p-2.5 rounded-xl bg-white/[0.02] border border-white/[0.06]">
           <div className="flex items-center gap-2.5 min-w-0">
-            <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-gradient-to-br from-violet-600 to-indigo-600 text-white font-bold text-xs shrink-0 shadow-sm">
+            <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-white text-black font-bold text-xs shrink-0">
               {user.displayName.charAt(0).toUpperCase()}
             </div>
             <div className="min-w-0">
-              <p className="text-xs font-semibold text-primary truncate leading-tight" title={user.displayName}>{user.displayName}</p>
-              <p className="text-[10px] text-tertiary capitalize leading-tight mt-0.5">{user.role}</p>
+              <p className="text-xs font-medium text-slate-200 truncate leading-tight" title={user.displayName}>{user.displayName}</p>
+              <p className="text-[10px] text-slate-500 capitalize leading-tight mt-0.5">{user.role}</p>
             </div>
           </div>
           <button
             onClick={handleLogout}
-            className="p-1.5 rounded-lg text-tertiary hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer shrink-0"
+            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
             title="Sair"
           >
             <LogOut size={16} />
