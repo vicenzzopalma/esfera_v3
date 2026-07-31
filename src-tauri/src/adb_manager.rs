@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::sync::RwLock;
@@ -14,6 +15,47 @@ use uuid::Uuid;
 
 /// Script shell embutido (fallback quando APK não está disponível)
 const AGENT_SCRIPT_CONTENT: &str = include_str!("../../src-agent/esfera_agent.sh");
+
+// ============================================================
+// RESOLUÇÃO DE FERRAMENTAS EMBUTIDAS (adb.exe / scrcpy.exe)
+// O app é 100% standalone: localiza os binários colados ao exe
+// (instalador NSIS -> resources/binaries, pasta portátil -> binaries)
+// e só usa o PATH do sistema como último recurso.
+// ============================================================
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok()?.parent().map(PathBuf::from)
+}
+
+fn tools_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = exe_dir() {
+        candidates.push(dir.join("resources").join("binaries"));
+        candidates.push(dir.join("binaries"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("src-tauri").join("binaries"));
+    }
+    candidates
+}
+
+/// Retorna o diretório onde estão as ferramentas embutidas (adb, scrcpy, jar, apk).
+pub fn bundled_tools_dir() -> Option<PathBuf> {
+    tools_dir_candidates()
+        .into_iter()
+        .find(|p| p.join("adb.exe").exists() || p.join("adb").exists())
+}
+
+/// Caminho completo de um binário embutido (ex.: "adb.exe", "scrcpy.exe"),
+/// ou None se não houver cópia local — nesse caso o PATH do sistema é usado.
+pub fn bundled_tool_path(name: &str) -> Option<PathBuf> {
+    if let Some(dir) = bundled_tools_dir() {
+        let path = dir.join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
 
 // ============================================================
 // LISTAS DE DEBLOAT POR FABRICANTE
@@ -422,11 +464,28 @@ pub fn run_cmd_timeout(
 }
 
 pub fn create_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    let mut cmd = Command::new(program);
+    let name = program.as_ref().to_string_lossy().to_string();
+    let resolved: std::ffi::OsString = match name.as_str() {
+        "adb" => bundled_tool_path("adb.exe")
+            .or_else(|| bundled_tool_path("adb"))
+            .map(PathBuf::into_os_string)
+            .unwrap_or_else(|| program.as_ref().to_os_string()),
+        "scrcpy" => bundled_tool_path("scrcpy.exe")
+            .or_else(|| bundled_tool_path("scrcpy"))
+            .map(PathBuf::into_os_string)
+            .unwrap_or_else(|| program.as_ref().to_os_string()),
+        _ => program.as_ref().to_os_string(),
+    };
+    let mut cmd = Command::new(resolved);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000);
+    }
+    if (name == "adb" || name == "scrcpy")
+        && let Some(dir) = bundled_tools_dir()
+    {
+        cmd.current_dir(dir);
     }
     cmd
 }
@@ -485,6 +544,14 @@ extern "C" {
         out_x: *mut i32,
         out_y: *mut i32,
     ) -> i32;
+    pub fn esfera_hpc_process_buffer(
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        max_out_len: usize,
+        out_written: *mut usize,
+    ) -> i32;
+    pub fn esfera_hpc_get_optimized_processor() -> Option<fn(input: *const u8, len: usize, output: *mut u8, written: *mut usize)>;
 }
 
 static DEVICE_INFO_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (String, String, Instant)>>> =
@@ -524,10 +591,49 @@ impl AdbManager {
         String::from_utf8_lossy(&buf[..len]).into_owned()
     }
 
-    /// Varredura segura de sub-rede na porta 5555 usando scope (zero overhead de join manual)
+    /// Processa buffer com o caminho SIMD/C++ escolhido no boot.
+    pub fn process_buffer(input: &[u8]) -> Vec<u8> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+
+        let mut out = vec![0u8; input.len()];
+        let mut written: usize = 0;
+        let status = unsafe {
+            esfera_hpc_process_buffer(
+                input.as_ptr(),
+                input.len(),
+                out.as_mut_ptr(),
+                out.len(),
+                &mut written,
+            )
+        };
+
+        if status == 0 && written <= out.len() && written > 0 {
+            out.truncate(written);
+        } else if written == 0 {
+            out.clear();
+        }
+        out
+    }
+
+    /// Expõe para UI/debug qual caminho o runtime SIMD escolheu,
+    /// inferido diretamente das capacidades de hardware (fonte oficial).
+    pub fn active_processor_label(caps: EsferaHardwareCaps) -> &'static str {
+        if caps.supports_avx512 {
+            "avx512"
+        } else if caps.supports_avx2 {
+            "avx2"
+        } else {
+            "generic"
+        }
+    }
+
+    /// Varredura segura de sub-rede na porta 5555 usando paralelismo limitado.
     pub fn scan_subnet(subnet_prefix: &str) -> Vec<String> {
-        use std::net::TcpStream;
+        use std::sync::Arc;
         use std::time::Duration;
+        use tokio::sync::Semaphore;
 
         let prefix = if subnet_prefix.is_empty() {
             "192.168.1"
@@ -535,23 +641,25 @@ impl AdbManager {
             subnet_prefix.trim_end_matches('.')
         }
         .to_string();
-        let num_workers = 16;
-        let active_ips = std::sync::Mutex::new(Vec::new());
 
+        let num_workers = 16;
+        let max_concurrency = 48;
+        let active_ips = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scan_timeout = Duration::from_millis(25);
         std::thread::scope(|s| {
             for worker_id in 0..num_workers {
                 let prefix_ref = &prefix;
-                let ips_ref = &active_ips;
+                let ips_ref = active_ips.clone();
                 s.spawn(move || {
                     let start = worker_id * 16 + 1;
                     let end = ((worker_id + 1) * 16).min(254);
                     for i in start..=end {
                         let ip = format!("{}.{}", prefix_ref, i);
                         if let Ok(addr) = format!("{}:5555", ip).parse() {
-                            if TcpStream::connect_timeout(&addr, Duration::from_millis(60)).is_ok()
-                            {
-                                let mut ips = ips_ref.lock().unwrap();
-                                ips.push(ip);
+                            if std::net::TcpStream::connect_timeout(&addr, scan_timeout).is_ok() {
+                                if let Ok(mut ips) = ips_ref.lock() {
+                                    ips.push(ip);
+                                }
                             }
                         }
                     }
@@ -559,7 +667,10 @@ impl AdbManager {
             }
         });
 
-        active_ips.into_inner().unwrap_or_default()
+        match Arc::try_unwrap(active_ips) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+            Err(arc) => arc.lock().unwrap().clone(),
+        }
     }
 
     /// Injeta scripts e propriedades persistentes no Android para proibir o desligamento do Wi-Fi e ADB
@@ -2395,6 +2506,18 @@ impl AdbManager {
             }
         }
 
+        if let Some(dir) = bundled_tools_dir() {
+            let exe_candidates = vec![
+                dir.join("Esfera_Agent_ADB.apk"),
+                dir.join("Esfera_Agent_v4.apk"),
+            ];
+            for path in exe_candidates {
+                if path.exists() {
+                    return Ok(path);
+                }
+            }
+        }
+
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
                 let exe_candidates = vec![
@@ -2765,4 +2888,118 @@ impl AdbManager {
 
         Ok(())
     }
+
+    /// Reconecta todos os dispositivos ativos limpos de soquetes zumbis do Windows com varredura por TCP Probe
+    pub fn force_reconnect_all_adb(db: &crate::db::Database) -> Result<String, String> {
+        let _ = create_cmd("adb").arg("kill-server").output();
+        let _ = create_cmd("adb").arg("start-server").output();
+
+        let devices = db.get_all_devices();
+        let mut count = 0;
+        let mut reconnected = Vec::new();
+
+        // 1. Tenta reconectar os aparelhos cadastrados no banco com expurgo de zumbis
+        for dev in &devices {
+            let target_ip = if !dev.ip.is_empty() && dev.ip != "0.0.0.0" {
+                format!("{}:{}", dev.ip, if dev.port > 0 { dev.port } else { 5555 })
+            } else if let Some(ref addr) = dev.current_adb_address {
+                if !addr.is_empty() { addr.clone() } else { "".to_string() }
+            } else if dev.serial.contains(':') {
+                dev.serial.clone()
+            } else {
+                continue;
+            };
+
+            if !target_ip.is_empty() && target_ip.contains('.') {
+                let ip_part = target_ip.split(':').next().unwrap_or(&target_ip).to_string();
+                
+                // Valida o soquete TCP antes de instanciar o processo ADB no SO
+                let socket_addr = format!("{}:5555", ip_part);
+                if let Ok(addr) = socket_addr.parse::<std::net::SocketAddr>() {
+                    if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_ok() {
+                        // 1. Expurga o soquete zumbi do Windows
+                        let _ = create_cmd("adb").arg("disconnect").arg(&target_ip).output();
+                        let _ = create_cmd("adb").arg("disconnect").arg(&ip_part).output();
+
+                        // 2. Conecta no soquete novo
+                        let out = create_cmd("adb").arg("connect").arg(&target_ip).output();
+                        if let Ok(o) = out {
+                            let txt = String::from_utf8_lossy(&o.stdout);
+                            if txt.contains("connected to") || txt.contains("already connected") {
+                                // Lê o Hardware Serial ro.serialno e atualiza o banco
+                                let get_prop = create_cmd("adb")
+                                    .args(["-s", &target_ip, "shell", "getprop", "ro.serialno"])
+                                    .output();
+                                if let Ok(p) = get_prop {
+                                    let serial_no = String::from_utf8_lossy(&p.stdout).trim().to_string();
+                                    if !serial_no.is_empty() {
+                                        let now = chrono::Utc::now().to_rfc3339();
+                                        let _ = db.process_checkin(&serial_no, &target_ip, &ip_part, 5555, &now);
+                                    }
+                                }
+                                reconnected.push(format!("✓ {} ({})", dev.name, target_ip));
+                            }
+                        }
+                    }
+                }
+                count += 1;
+            }
+        }
+
+        // 2. Varredura Paralela na Sub-rede (192.168.1.1 a 254) para celulares que trocaram de IP por DHCP
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut handles = vec![];
+
+        for i in 1..=254 {
+            let tx_clone = tx.clone();
+            let handle = std::thread::spawn(move || {
+                let ip = format!("192.168.1.{}", i);
+                let addr_str = format!("{}:5555", ip);
+                if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+                    if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(120)) {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        let _ = tx_clone.send(ip);
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+        drop(tx);
+
+        for h in handles {
+            let _ = h.join();
+        }
+
+        while let Ok(found_ip) = rx.try_recv() {
+            let target_addr = format!("{}:5555", found_ip);
+            let _ = create_cmd("adb").arg("disconnect").arg(&target_addr).output();
+            let out = create_cmd("adb").arg("connect").arg(&target_addr).output();
+
+            if let Ok(o) = out {
+                let txt = String::from_utf8_lossy(&o.stdout);
+                if txt.contains("connected to") || txt.contains("already connected") {
+                    let get_prop = create_cmd("adb")
+                        .args(["-s", &target_addr, "shell", "getprop", "ro.serialno"])
+                        .output();
+                    if let Ok(p) = get_prop {
+                        let serial_no = String::from_utf8_lossy(&p.stdout).trim().to_string();
+                        if !serial_no.is_empty() {
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let _ = db.process_checkin(&serial_no, &target_addr, &found_ip, 5555, &now);
+                            if !reconnected.iter().any(|r| r.contains(&found_ip)) {
+                                reconnected.push(format!("✓ Autodetectado ({})", target_addr));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if reconnected.is_empty() {
+            Ok(format!("Varredura concluída para {} cadastrados. Nenhum dispositivo com porta 5555 aberta no momento.", count))
+        } else {
+            Ok(format!("⚡ Reconexão Wi-Fi Concluída ({} ativos):\n{}", reconnected.len(), reconnected.join("\n")))
+        }
+    }
 }
+

@@ -749,14 +749,14 @@ impl Database {
 
             // Pré-cadastra os 8 celulares Wi-Fi ativados da REALESS para garantia de exibição instantânea a 0ms
             let default_devices = vec![
-                ("192.168.1.185:5555", "Aparelho 1", "Xiaomi", "Redmi Note", "192.168.1.185", 1, "junior"),
-                ("192.168.1.35:5555", "Aparelho 2", "Multilaser", "F Pro 2", "192.168.1.35", 2, "junior"),
-                ("192.168.1.54:5555", "Aparelho 3", "Samsung", "Galaxy A01", "192.168.1.54", 3, "junior"),
-                ("192.168.1.57:5555", "Aparelho 4", "Xiaomi", "Redmi 9", "192.168.1.57", 4, "junior"),
-                ("192.168.1.92:5555", "Aparelho 5", "Samsung", "Galaxy J7", "192.168.1.92", 5, "junior"),
-                ("192.168.1.93:5555", "Aparelho 6", "Motorola", "Moto G22", "192.168.1.93", 6, "junior"),
-                ("192.168.1.94:5555", "Aparelho 7", "Motorola", "Moto G", "192.168.1.94", 7, "junior"),
-                ("192.168.1.95:5555", "Aparelho 8", "Multilaser", "F Pro 2", "192.168.1.95", 8, "junior"),
+                ("192.168.1.185:5555", "1", "Xiaomi", "Redmi Note", "192.168.1.185", 1, "junior"),
+                ("192.168.1.35:5555", "2", "Multilaser", "F Pro 2", "192.168.1.35", 2, "junior"),
+                ("192.168.1.54:5555", "3", "Samsung", "Galaxy A01", "192.168.1.54", 3, "junior"),
+                ("192.168.1.57:5555", "4", "Xiaomi", "Redmi 9", "192.168.1.57", 4, "junior"),
+                ("192.168.1.92:5555", "5", "Samsung", "Galaxy J7", "192.168.1.92", 5, "junior"),
+                ("192.168.1.93:5555", "6", "Motorola", "Moto G22", "192.168.1.93", 6, "junior"),
+                ("192.168.1.94:5555", "7", "Motorola", "Moto G", "192.168.1.94", 7, "junior"),
+                ("192.168.1.95:5555", "8", "Multilaser", "F Pro 2", "192.168.1.95", 8, "junior"),
             ];
 
             for (serial, name, brand, model, ip, num, sector) in default_devices {
@@ -998,44 +998,49 @@ impl Database {
     }
 
     pub fn process_checkin(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
-        // 1. Tenta atualizar pelo EsferaDeviceId (identidade persistente)
+        let upper_id = device_id.to_uppercase();
         let affected = self.conn().execute(
             "UPDATE ESF_Device SET
                 CurrentAdbAddress = ?1,
                 Status = 'online',
                 LastSeenUTC = ?2,
                 DeviceIp = ?3,
-                DevicePort = ?4
-             WHERE EsferaDeviceId = ?5",
-            params![adb_address, now, ip, port, device_id],
+                DevicePort = ?4,
+                EsferaDeviceId = COALESCE(EsferaDeviceId, ?5)
+             WHERE EsferaDeviceId = ?5 
+                OR UPPER(EsferaDeviceId) = ?6 
+                OR AdbDeviceId = ?5 
+                OR UPPER(AdbDeviceId) = ?6
+                OR DeviceIp = ?3 
+                OR CurrentAdbAddress = ?1",
+            params![adb_address, now, ip, port, device_id, upper_id],
         ).map_err(|e| e.to_string())?;
-
-        if affected == 0 {
-            // 2. Fallback: vincula pelo endereço ADB (device sem EsferaDeviceId no DB)
-            self.conn().execute(
-                "UPDATE ESF_Device SET
-                    EsferaDeviceId = ?5,
-                    CurrentAdbAddress = ?1,
-                    Status = 'online',
-                    LastSeenUTC = ?2,
-                    DeviceIp = ?3,
-                    DevicePort = ?4
-                 WHERE CurrentAdbAddress = ?6 OR AdbDeviceId = ?6",
-                params![adb_address, now, ip, port, device_id, adb_address],
-            ).map_err(|e| e.to_string())?;
-        }
 
         Ok(affected)
     }
 
     pub fn insert_unknown_device(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
+        let upper_id = device_id.to_uppercase();
+        let affected = self.conn().execute(
+            "UPDATE ESF_Device SET
+                EsferaDeviceId = COALESCE(EsferaDeviceId, ?1),
+                CurrentAdbAddress = ?2,
+                Status = 'online',
+                LastSeenUTC = ?3,
+                DeviceIp = ?4,
+                DevicePort = ?5
+             WHERE DeviceIp = ?4 OR CurrentAdbAddress = ?2 OR AdbDeviceId = ?1 OR UPPER(AdbDeviceId) = ?6",
+            params![device_id, adb_address, now, ip, port, upper_id],
+        ).map_err(|e| e.to_string())?;
+
+        if affected > 0 {
+            return Ok(affected);
+        }
+
         self.conn().execute(
             "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
-             VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, 1, 0, 'junior', ?5, ?6)
-             ON CONFLICT(EsferaDeviceId) DO UPDATE SET
-             CurrentAdbAddress=excluded.CurrentAdbAddress, Status='online', LastSeenUTC=excluded.LastSeenUTC,
-             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort",
-            params![format!("agent-{}", device_id), device_id, ip, port, adb_address, now],
+             VALUES (?1, ?1, ?2, 'Android', 'Smartphone', ?3, ?4, 'online', 100, 1, 0, 'junior', ?5, ?6)",
+            params![device_id, format!("Celular {}", ip), ip, port, adb_address, now],
         ).map_err(|e| e.to_string())
     }
 
@@ -2184,16 +2189,19 @@ impl Database {
 
     pub fn get_devices_with_active_user_map(&self, company_id: i32) -> Vec<DeviceWithActiveUser> {
         let conn = self.conn();
-        let sql = "SELECT d.rowid, d.AdbDeviceId, d.DeviceName, d.Brand, d.Model, d.DeviceIp, d.DevicePort, d.Status, d.BatteryLevel, d.CompanyId, d.DeviceNumber, d.Sector,
-                          d.EsferaDeviceId, d.CurrentAdbAddress, d.LastSeenUTC,
-                          pr.UserId, u.Username, u.DisplayName, pr.RequestId,
+        let sql = "SELECT d.rowid, d.AdbDeviceId, d.DeviceName, d.Brand, d.Model, d.DeviceIp, d.DevicePort, 
+                          d.Status, d.BatteryLevel, d.CompanyId, d.DeviceNumber, d.Sector, d.EsferaDeviceId, 
+                          d.CurrentAdbAddress, d.LastSeenUTC,
+                          u.UserId, u.Username, u.DisplayName, pr.RequestId,
                           da.UserId, au.DisplayName
                    FROM ESF_Device d
-                   LEFT JOIN ESF_DevicePermissionRequest pr ON d.AdbDeviceId = pr.AdbDeviceId AND pr.Status IN ('approved', 'active')
+                   LEFT JOIN ESF_DevicePermissionRequest pr ON (d.AdbDeviceId = pr.AdbDeviceId OR d.EsferaDeviceId = pr.AdbDeviceId) AND pr.Status IN ('approved', 'active')
                    LEFT JOIN ESF_User u ON pr.UserId = u.UserId
-                   LEFT JOIN ESF_DeviceAssignment da ON d.AdbDeviceId = da.AdbDeviceId
+                   LEFT JOIN ESF_DeviceAssignment da ON (d.AdbDeviceId = da.AdbDeviceId OR d.EsferaDeviceId = da.AdbDeviceId)
                    LEFT JOIN ESF_User au ON da.UserId = au.UserId
-                   WHERE (d.CompanyId = ?1 OR ?1 <= 0);";
+                   WHERE (d.CompanyId = ?1 OR ?1 <= 0)
+                   GROUP BY COALESCE(d.EsferaDeviceId, d.AdbDeviceId)
+                   ORDER BY CASE WHEN d.Status = 'online' THEN 0 ELSE 1 END, d.DeviceNumber ASC;";
 
         let mut stmt = match conn.prepare_cached(sql) {
             Ok(s) => s,
@@ -2232,3 +2240,5 @@ impl Database {
         }
     }
 }
+
+

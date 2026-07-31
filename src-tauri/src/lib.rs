@@ -30,15 +30,20 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 
 fn get_db_path() -> String {
-    if let Some(mut dir) = std::env::var_os("APPDATA").map(PathBuf::from) {
-        dir.push("esfera_v3");
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("Aviso: nao foi possivel criar diretorio do banco: {}", e);
-        }
-        dir.push("esfera_v3.db");
-        return dir.to_string_lossy().to_string();
+    let base_dir = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+
+    let mut dir = base_dir.join("esfera_v3");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("Aviso: nao foi possivel criar diretorio do banco: {}", e);
+        dir = std::env::temp_dir().join("esfera_v3");
+        let _ = std::fs::create_dir_all(&dir);
     }
-    "esfera_v3.db".to_string()
+    dir.push("esfera_v3.db");
+    dir.to_string_lossy().to_string()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -47,7 +52,10 @@ pub fn run() {
     let db = match Database::init(&db_path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("FATAL: Nao foi possivel abrir o banco SQLite: {}", e);
+            let err_msg = format!("FATAL: Nao foi possivel abrir o banco SQLite em '{}': {}", db_path, e);
+            eprintln!("{}", err_msg);
+            let crash_log = std::env::temp_dir().join("esfera_v3_crash.log");
+            let _ = std::fs::write(crash_log, &err_msg);
             std::process::exit(1);
         }
     };
@@ -295,6 +303,8 @@ pub fn run() {
             // Device Assignments & Permissions
             assign_device_to_user,
             unassign_device_from_user,
+            set_device_responsible_collaborator,
+            remove_device_responsible_collaborator,
             get_assigned_devices_for_user,
             request_device_access,
             get_device_permission_requests,
@@ -304,6 +314,8 @@ pub fn run() {
             get_devices_with_active_user_map,
             configure_device_proxy_and_antiban,
             trigger_manual_intent_bezier_dispatch,
+            check_git_auto_update,
+            apply_git_auto_update,
             // Config
             get_app_config,
             save_app_config,

@@ -200,6 +200,11 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             }
 
             let is_wireless = adb_dev.serial.contains(':') || adb_dev.serial.contains('.');
+            let ip_only = if is_wireless {
+                adb_dev.serial.split(':').next().unwrap_or("").to_string()
+            } else {
+                "".to_string()
+            };
 
             let status = if adb_dev.state == "device" {
                 "online".to_string()
@@ -209,12 +214,21 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 "offline".to_string()
             };
 
-            let existing_idx = db_devices.iter().position(|d| d.serial == adb_dev.serial);
+            let existing_idx = db_devices.iter().position(|d| {
+                d.serial == adb_dev.serial
+                    || (!ip_only.is_empty() && d.ip == ip_only)
+                    || d.current_adb_address.as_deref() == Some(&adb_dev.serial)
+                    || d.esfera_device_id.as_deref() == Some(&adb_dev.serial)
+            });
 
             if let Some(idx) = existing_idx {
                 let old_status = db_devices[idx].status.clone();
                 let old_battery = db_devices[idx].battery;
                 db_devices[idx].status = status;
+                if is_wireless && !ip_only.is_empty() {
+                    db_devices[idx].ip = ip_only.clone();
+                    db_devices[idx].current_adb_address = Some(adb_dev.serial.clone());
+                }
                 if adb_dev.state == "device" {
                     db_devices[idx].battery = get_cached_battery(&adb_dev.serial);
                 }
@@ -233,14 +247,10 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 let new_dev = Device {
                     id: 0,
                     serial: adb_dev.serial.clone(),
-                    name: format!("Aparelho {}", db_devices.len() + 1),
+                    name: format!("Celular {}", if !ip_only.is_empty() { &ip_only } else { &adb_dev.serial }),
                     brand,
                     model,
-                    ip: if is_wireless {
-                        adb_dev.serial.split(':').next().unwrap_or("").to_string()
-                    } else {
-                        "".to_string()
-                    },
+                    ip: ip_only,
                     port: 5555,
                     status,
                     battery,
@@ -248,8 +258,8 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     device_number: (db_devices.len() + 1) as i32,
                     sector: "junior".to_string(),
                     esfera_device_id: None,
-                    current_adb_address: None,
-                    last_seen_utc: None,
+                    current_adb_address: Some(adb_dev.serial.clone()),
+                    last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
                 };
                 let _ = state_db.upsert_device(&new_dev);
                 changed = true;
@@ -343,7 +353,7 @@ pub fn connect_adb_device(
     let (brand, model) = AdbManager::get_device_info(&serial);
     let final_name = device_name
         .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| format!("Aparelho {}", device_number));
+        .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { target_ip.clone() });
     let dev = Device {
         id: 0,
         serial: serial.clone(),
@@ -408,7 +418,7 @@ pub fn pair_and_connect_adb_device(
     let (brand, model) = AdbManager::get_device_info(&wireless_serial);
     let final_name = device_name
         .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| format!("Aparelho {}", device_number));
+        .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { clean_ip.clone() });
 
     let device = Device {
         id: 0,
@@ -987,7 +997,7 @@ pub async fn link_usb_to_wireless(
         let wireless_serial = format!("{}:5555", ip);
         let final_name = device_name
             .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| format!("Aparelho {}", device_number));
+            .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { ip.clone() });
         let device = Device {
             id: 0,
             serial: wireless_serial.clone(),
@@ -1021,32 +1031,8 @@ pub async fn link_usb_to_wireless(
 #[tauri::command]
 pub async fn force_reconnect_all_adb(_token: String, state: State<'_, AppState>) -> Result<String, String> {
     let state_db = state.db.clone();
-
     tauri::async_runtime::spawn_blocking(move || {
-        let devices = state_db.get_devices(1);
-        let mut reconnected = Vec::new();
-
-        for dev in devices {
-            let target = if !dev.ip.is_empty() {
-                format!("{}:5555", dev.ip)
-            } else if dev.serial.contains(':') {
-                dev.serial.clone()
-            } else {
-                "".to_string()
-            };
-
-            if !target.is_empty() && target.contains('.') {
-                if let Ok(_) = AdbManager::connect_device(&dev.ip, dev.port) {
-                    reconnected.push(format!("✓ {} ({})", dev.model, target));
-                }
-            }
-        }
-
-        if reconnected.is_empty() {
-            Ok("Disparada reconexão via Wi-Fi para todos os celulares salvos!".to_string())
-        } else {
-            Ok(format!("⚡ Reconexão Wi-Fi Concluída:\n{}", reconnected.join("\n")))
-        }
+        AdbManager::force_reconnect_all_adb(&state_db)
     }).await.map_err(|e| e.to_string())?
 }
 
@@ -1095,7 +1081,7 @@ pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -
                     let device_obj = Device {
                         id: 0,
                         serial: dev.serial.clone(),
-                        name: format!("Aparelho {}", dev_num),
+                        name: dev_num.to_string(),
                         brand,
                         model,
                         ip: ip.to_string(),
@@ -1172,7 +1158,7 @@ pub fn force_enable_wireless_adb(
     let db = &state.db;
     let final_name = device_name
         .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| format!("Aparelho {}", device_number));
+        .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { ip.clone() });
 
     let device = Device {
         id: 0,
@@ -1715,4 +1701,96 @@ pub fn trigger_manual_intent_bezier_dispatch(
     let _session = validate_session(&state.sessions, &token)?;
     AdbManager::send_whatsapp_intent_and_bezier_tap(&serial, &phone, &message)
 }
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitUpdateStatus {
+    pub has_update: bool,
+    pub current_commit: String,
+    pub latest_commit: String,
+    pub commit_message: String,
+}
+
+#[tauri::command]
+pub fn check_git_auto_update() -> Result<GitUpdateStatus, String> {
+    let _ = std::process::Command::new("git")
+        .arg("fetch")
+        .output();
+
+    let current = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "main".to_string());
+
+    let log_cmd = std::process::Command::new("git")
+        .args(["log", "-1", "--pretty=format:%h - %s", "origin/main"])
+        .output();
+
+    match log_cmd {
+        Ok(out) if out.status.success() => {
+            let msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let latest_hash = msg.split_whitespace().next().unwrap_or("").to_string();
+            let has_up = !latest_hash.is_empty() && latest_hash != current;
+            Ok(GitUpdateStatus {
+                has_update: has_up,
+                current_commit: current,
+                latest_commit: latest_hash,
+                commit_message: msg,
+            })
+        }
+        _ => Ok(GitUpdateStatus {
+            has_update: false,
+            current_commit: current.clone(),
+            latest_commit: current,
+            commit_message: "Sistema atualizado.".to_string(),
+        }),
+    }
+}
+
+#[tauri::command]
+pub fn apply_git_auto_update() -> Result<String, String> {
+    let pull_out = std::process::Command::new("git")
+        .args(["pull", "--rebase", "origin", "main"])
+        .output()
+        .map_err(|e| format!("Falha ao executar git pull: {}", e))?;
+
+    if pull_out.status.success() {
+        Ok("Atualização aplicada com sucesso! Reinicie o aplicativo para carregar a nova versão.".to_string())
+    } else {
+        Err(String::from_utf8_lossy(&pull_out.stderr).to_string())
+    }
+}
+
+#[tauri::command]
+pub fn set_device_responsible_collaborator(
+    state: State<'_, AppState>,
+    token: String,
+    device_serial: String,
+    user_id: i32,
+) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Acesso Negado: apenas Gestores podem definir o responsável pelo celular.".to_string());
+    }
+    state.db.assign_device_to_user(&device_serial, user_id)
+}
+
+#[tauri::command]
+pub fn remove_device_responsible_collaborator(
+    state: State<'_, AppState>,
+    token: String,
+    device_serial: String,
+    user_id: i32,
+) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Acesso Negado: apenas Gestores podem remover o responsável pelo celular.".to_string());
+    }
+    state.db.unassign_device_from_user(&device_serial, user_id)
+}
+
+
+
+
 

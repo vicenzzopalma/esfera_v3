@@ -45,6 +45,8 @@ export interface DeviceWithActiveUser extends Device {
   permissionRequestId?: number;
   assignedUserId?: number;
   assignedUserName?: string;
+  responsibleUserId?: number;
+  responsibleUserName?: string;
 }
 
 export interface Company {

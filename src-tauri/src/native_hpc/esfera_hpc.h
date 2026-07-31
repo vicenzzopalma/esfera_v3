@@ -1,6 +1,8 @@
 #ifndef ESFERA_HPC_H
 #define ESFERA_HPC_H
 
+#include <stddef.h>
+
 #if defined(_MSC_VER)
     typedef unsigned __int64 esfera_size_t;
     typedef unsigned __int8  esfera_uint8_t;
@@ -71,6 +73,18 @@ void esfera_hpc_format_active_user_badge(
     esfera_size_t max_len
 );
 
+// Processador genérico de buffer: remove CRLF -> LF.
+// Útil para parser/logs ADB ou stream de texto.
+// Se out_written > max_out_len, retorna -2.
+esfera_int32_t esfera_hpc_process_buffer(
+    const esfera_uint8_t* input_ptr,
+    esfera_size_t input_len,
+    esfera_uint8_t* output_ptr,
+    esfera_size_t max_out_len,
+    esfera_size_t* out_written
+);
+
+// Ponteiro de função para o caminho SIMD escolhido no boot.
 typedef void (*esfera_hpc_process_fn)(const esfera_uint8_t* in, esfera_size_t len, esfera_uint8_t* out, esfera_size_t* out_written);
 
 esfera_hpc_process_fn esfera_hpc_get_optimized_processor(void);
