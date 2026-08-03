@@ -1,10 +1,12 @@
 fn main() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+
     let mut builder = cc::Build::new();
     builder.cpp(true)
-        .file("src/native_hpc/esfera_hpc.cpp")
-        .file("src/hpc_device_router.cpp")
-        .include("src/native_hpc")
-        .include("src")
+        .file(format!("{}/src/native_hpc/esfera_hpc.cpp", manifest_dir))
+        .file(format!("{}/src/hpc_device_router.cpp", manifest_dir))
+        .include(format!("{}/src/native_hpc", manifest_dir))
+        .include(format!("{}/src", manifest_dir))
         .flag_if_supported("/std:c++17")
         .flag_if_supported("-std=c++17");
 
@@ -17,9 +19,9 @@ fn main() {
 
     builder.compile("esfera_hpc");
 
-    println!("cargo:rerun-if-changed=src/native_hpc/esfera_hpc.cpp");
-    println!("cargo:rerun-if-changed=src/native_hpc/esfera_hpc.h");
-    println!("cargo:rerun-if-changed=src/hpc_device_router.cpp");
-    println!("cargo:rerun-if-changed=src/hpc_device_router.hpp");
+    println!("cargo:rerun-if-changed={}/src/native_hpc/esfera_hpc.cpp", manifest_dir);
+    println!("cargo:rerun-if-changed={}/src/native_hpc/esfera_hpc.h", manifest_dir);
+    println!("cargo:rerun-if-changed={}/src/hpc_device_router.cpp", manifest_dir);
+    println!("cargo:rerun-if-changed={}/src/hpc_device_router.hpp", manifest_dir);
     tauri_build::build();
 }

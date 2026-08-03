@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef HPC_EXPORT
+#define HPC_EXPORT
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -20,7 +24,7 @@ typedef struct {
     size_t count;
 } HpcDeviceAuthTable;
 
-void hpc_device_router_init(const HpcDeviceAuthTable* table);
+void hpc_device_router_init(void);
 void hpc_device_router_shutdown(void);
 int32_t hpc_device_router_check_authorized(const char* adb_device_id, int32_t user_id);
 int32_t hpc_device_router_find_user_id(const char* adb_device_id);

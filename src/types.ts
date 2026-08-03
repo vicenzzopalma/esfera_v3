@@ -277,6 +277,8 @@ export interface AppConfig {
   empresa_server_port: number;
   checkin_server_enabled: boolean;
   checkin_server_port: number;
+  tunnel_server_enabled: boolean;
+  tunnel_server_port: number;
   mode: "local" | "empresa" | "master";
 }
 

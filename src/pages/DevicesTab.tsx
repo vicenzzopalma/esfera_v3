@@ -1671,7 +1671,7 @@ function ScreenRegionSelectorModal({
             </Button>
           </div>
         ) : (
-          <div className="w-full relative rounded-xl overflow-hidden border-2 border-slate-700 bg-black flex justify-center items-center" style={{ minHeight: "400px", maxHeight: "60vh" }}>
+          <div className="w-full relative rounded-xl overflow-hidden border-2 border-slate-700 bg-black flex justify-center items-center" style={{ minHeight: "30vh", maxHeight: "60vh" }}>
             <video ref={videoRef} className="max-w-full max-h-full" muted playsInline />
             
             {/* Viewfinder Draggable Overlay */}
@@ -1994,7 +1994,7 @@ function ScreenMirrorModal({
           </div>
         </div>
 
-        <div className="relative w-64 h-[480px] rounded-[36px] bg-black border-4 border-slate-800 shadow-2xl overflow-hidden flex flex-col items-center justify-between p-2 group select-none">
+        <div className="relative w-64 h-[min(70vh,480px)] rounded-[36px] bg-black border-4 border-slate-800 shadow-2xl overflow-hidden flex flex-col items-center justify-between p-2 group select-none">
           <div className="w-16 h-4 bg-slate-900 rounded-full mb-1 z-20 flex items-center justify-center">
             <div className="w-2.5 h-2.5 rounded-full bg-slate-800" />
           </div>

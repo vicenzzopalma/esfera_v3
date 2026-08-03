@@ -1,0 +1,72 @@
+# Tarefa: Correção Cirúrgica do Esfera_Nativo
+
+## Contexto REAL do Código
+
+Este é um cliente desktop Win32 C++ com renderização Direct2D customizada. A interface tem 3 bugs:
+
+### BUG 1: Botões Fantasmas
+O main.cpp cria controles Win32 (CreateWindowEx) com posições que NÃO batem com o layout D2D.
+
+**O que existe no main.cpp:**
+- Constantes: SIDEBAR_W = 210.0f, HEADER_H = 60.0f
+- Controles Win32 são criados em `CreateMainUIControls()` com coordenadas fixas
+- A função `RepositionControls()` já existe e usa SIDEBAR_W + 24.0f como contentX
+- O UIManager tem um método `RenderDevicesTab()` que renderiza cards de dispositivos com D2D
+- Os controles Win32 (edit boxes, botões) ficam SOBRE o D2D
+
+**O que o UIManager faz (NÃO MEXER):**
+- Render() → RenderSidebar() + RenderHeader() + tab content
+- RenderDevicesTab() → desenha cards com D2D (posições: contentX = sidebarWidth + 24, y = headerHeight + 12)
+- HandleMouseMove/HandleClick → hit testing em 22+ ações (DEVICE_CONNECT_ACTION, DEVICE_REBOOT, etc.)
+- BuildUITree() → monta a árvore de componentes D2DUI
+- 18 brushes D2D, sistema de partículas, sistema de logs
+
+**Problema específico:**
+- O DrawDeviceCard renderiza o card D2D em (cx, cyDev) = (contentX, headerHeight + 12)
+- O card tem: label "IP:Port" em (cx+12, cyDev+12), botões de ação em (cx+16, cyDev+80)
+- Os controles Win32 (edit IP, botão Conectar) devem ficar DENTRO do card D2D
+- Se as posições não batem, os controles ficam flutuando em lugar errado
+
+### BUG 2: Dashboard com Dados Aleatórios
+O DashboardViewModel já foi corrigido para usar SQLite + AdbConnector (não mais rand()). Isso já está funcionando.
+
+### BUG 3: Logs Visíveis ao Cliente
+O UIManager tem um sistema de logs com `m_logEntries` (deque de LogEntry com severity DEBUG/INFO/WARN/ERR). A aba de logs já filtra `DEBUG` quando `m_logShowDebug` é falso. Isso já foi corrigido.
+
+### BUG 4 (NOVO): Security Bypass
+Quando `g_sessionContext` é nulo (antes do login), o DrawDeviceCard mostra TODOS os 6 botões de admin no `else`. Já foi corrigido para `if (!g_sessionContext) { /* no buttons */ }`.
+
+## REGRAS ABSOLUTAS
+
+1. **NÃO reescreva o UIManager** - Ele tem 1600+ linhas de código D2D que funcionam. Não crie Singleton, não mude a classe.
+2. **NÃO reescreva o main.cpp** - Ele tem 611 linhas com ADB, Dashboard, Logs, Config, Celulares, etc. Não crie apenas 2 botões.
+3. **NÃO crie novos arquivos** (IDataRepository, PermissionManager, etc.) - Use os que já existem.
+4. **NÃO mude a arquitetura** - Mantenha D2D, MVVM, Win32 controls overlay.
+5. **APENAS corrija as posições dos controles Win32** para bater com o layout D2D.
+6. **APENAS corrija o security bypass** no DrawDeviceCard/HandleMouseMove/HandleClick.
+
+## O QUE PRECISA SER CORRIGIDO
+
+### Correção 1: Posições Win32 no main.cpp
+A função `RepositionControls()` já existe e usa `cx = SIDEBAR_W + 24.0f` e `cyDev = HEADER_H + 12.0f`. Verifique se as posições dos controles Win32 (hwndEditDevIp, hwndButtonConnect, etc.) correspondem EXATAMENTE às posições D2D do DrawDeviceCard:
+- Label D2D: RectF(contentX + 12, y + 12, contentX + 140, y + 32) → Win32 edit deve começar em contentX + 140 + 8
+- Botão D2D: (contentX + 16, y + 80) com tamanho (cardW - 32) / 3 → Win32 button deve ficar nessas coordenadas
+
+### Correção 2: Segurança no UIManager.cpp
+Nos 3 locais onde `g_sessionContext && g_sessionContext->hasRole("colaborador")` é usado:
+- Linha ~662 (DrawDeviceCard)
+- Linha ~1040 (HandleMouseMove)  
+- Linha ~1228 (HandleClick)
+Mude de `if (g_sessionContext && ...)` para `if (!g_sessionContext) { /* no action */ } else if (g_sessionContext->hasRole("colaborador")) { /* connect only */ } else { /* all 6 buttons */ }`
+
+### Correção 3: Filtro de logs
+O `m_logShowDebug` já filtra logs DEBUG no RenderLogsTab(). Verifique se o filtro está funcionando.
+
+## FORMATO DE SAÍDA
+
+Gere o `solucao_do_conselho.md` com:
+1. Análise do Arquiteto (o que precisa mudar, por quê)
+2. Código corrigido APENAS para os arquivos que precisam mudar (UIManager.cpp, main.cpp)
+3. Reviewer deve validar que o código compila e que a arquitetura existente foi preservada
+
+NÃO crie arquivos novos. NÃO reescreva classes existentes. APENAS corrija as posições e o security bypass.

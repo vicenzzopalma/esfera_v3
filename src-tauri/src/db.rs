@@ -10,6 +10,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
+use std::time::Duration;
 
 // ============================================================
 // STRUCTS
@@ -313,6 +314,7 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 pub struct Database {
     pool: Pool<SqliteConnectionManager>,
     cached: Mutex<Option<r2d2::PooledConnection<SqliteConnectionManager>>>,
+    write_queue: Mutex<Option<std::sync::Arc<crate::write_queue::WriteQueue>>>,
 }
 
 // Wrapper para MutexGuard que implementa Deref<Target=Connection>
@@ -327,29 +329,38 @@ impl<'a> std::ops::Deref for ConnGuard<'a> {
 
 impl Database {
     pub fn init(db_path: &str) -> Result<Self> {
-        let manager = SqliteConnectionManager::file(db_path);
+        // PRAGMAs por conexão: aplicados automaticamente a TODAS as conexões do pool
+        // (busy_timeout, synchronous, foreign_keys, cache_size, temp_store, mmap_size)
+        let manager = SqliteConnectionManager::file(db_path).with_init(|conn| {
+            conn.execute_batch(
+                "PRAGMA busy_timeout=10000;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA foreign_keys=ON;
+                 PRAGMA cache_size=-64000;
+                 PRAGMA temp_store=MEMORY;
+                 PRAGMA mmap_size=268435456;",
+            )
+        });
         let pool = Pool::builder()
             .max_size(8)
             .min_idle(Some(2))
             .build(manager)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-        // Configura PRAGMAs HPC em todas as conexões do pool
+        // PRAGMAs de nível de arquivo: WAL + page_size (persistem no disco)
         {
             let conn = pool.get().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             conn.execute_batch("
                 PRAGMA journal_mode=WAL;
-                PRAGMA synchronous=NORMAL;
-                PRAGMA busy_timeout=10000;
-                PRAGMA foreign_keys=ON;
-                PRAGMA cache_size=-64000;
-                PRAGMA temp_store=MEMORY;
-                PRAGMA mmap_size=268435456;
                 PRAGMA page_size=8192;
             ").map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         }
 
-        let db = Database { pool, cached: Mutex::new(None) };
+        let db = Database {
+            pool,
+            cached: Mutex::new(None),
+            write_queue: Mutex::new(None),
+        };
         db.create_tables()?;
         db.migrate_existing_tables()?;
         db.seed_data()?;
@@ -362,6 +373,168 @@ impl Database {
             *guard = Some(self.pool.get().expect("r2d2 pool exhausted (max_size=8)"));
         }
         ConnGuard(guard)
+    }
+
+    /// Obtém uma conexão dedicada do pool (usada pela thread única de escrita)
+    pub(crate) fn pooled_conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+        self.pool.get().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+    }
+
+    /// Executa uma operação com retry em caso de SQLITE_BUSY (contenção de escrita WAL),
+    /// aplicando exponential backoff com desvio estocástico (jitter).
+    pub(crate) fn with_busy_retry<T>(f: impl Fn() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+        let mut attempt = 0u32;
+        loop {
+            match f() {
+                Ok(v) => return Ok(v),
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::DatabaseBusy =>
+                {
+                    attempt += 1;
+                    if attempt >= 3 {
+                        return Err(rusqlite::Error::SqliteFailure(err, None));
+                    }
+                    let base_ms = 25u64 * (1 << attempt);
+                    let jitter_ms = rand::random::<u64>() % 25;
+                    std::thread::sleep(Duration::from_millis(base_ms + jitter_ms));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Executa um INSERT/UPDATE/DELETE com retry de contenção (SQLITE_BUSY)
+    fn exec_retry(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<usize> {
+        let conn = self.conn();
+        let c: &Connection = &conn;
+        Self::with_busy_retry(|| c.execute(sql, params))
+    }
+
+    /// Conecta a Fila Única de Escrita Assíncrona (MPSC) ao banco
+    pub fn attach_write_queue(&self, queue: std::sync::Arc<crate::write_queue::WriteQueue>) {
+        *self.write_queue.lock().unwrap() = Some(queue);
+    }
+
+    /// Enfileira uma operação de escrita; retorna false se a fila não estiver ativa
+    fn enqueue(&self, op: crate::write_queue::WriteOp) -> bool {
+        match self.write_queue.lock() {
+            Ok(guard) => guard.as_ref().map(|q| q.enqueue(op)).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// Log de auditoria assíncrono via fila única de escrita (fire-and-forget com fallback síncrono)
+    pub fn queue_add_log(&self, company_id: i32, log_type: &str, source: &str, message: &str) {
+        if !self.enqueue(crate::write_queue::WriteOp::Log {
+            company_id,
+            log_type: log_type.to_string(),
+            source: source.to_string(),
+            message: message.to_string(),
+        }) {
+            let _ = self.add_log(company_id, log_type, source, message);
+        }
+    }
+
+    /// Marca envio concluído de forma ATÔMICA — 3 escritas em 1 transação loteada na fila
+    pub fn queue_send_completed(&self, phone: &str, campaign_id: i32, contact_id: i32) {
+        if !self.enqueue(crate::write_queue::WriteOp::SendCompleted {
+            phone: phone.to_string(),
+            campaign_id,
+            contact_id,
+        }) {
+            let _ = self.mark_as_sent(phone, campaign_id);
+            let _ = self.update_contact_status(contact_id, "sent");
+            let _ = self.increment_campaign_sent_count(campaign_id);
+        }
+    }
+
+    /// Aplica um lote de operações de escrita em UMA transação (single-writer batch)
+    pub(crate) fn apply_write_batch(&self, conn: &Connection, ops: &[crate::write_queue::WriteOp]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        Self::with_busy_retry(|| conn.execute_batch("BEGIN IMMEDIATE;"))?;
+        let result = ops.iter().try_for_each(|op| self.execute_write_op(conn, op));
+        match result {
+            Ok(()) => match Self::with_busy_retry(|| conn.execute_batch("COMMIT;")) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    fn execute_write_op(&self, conn: &Connection, op: &crate::write_queue::WriteOp) -> Result<()> {
+        use crate::write_queue::WriteOp::*;
+        match op {
+            Log { company_id, log_type, source, message } => {
+                conn.execute(
+                    "INSERT INTO ESF_AuditLog (CompanyId, LogType, Source, Message) VALUES (?1, ?2, ?3, ?4);",
+                    params![company_id, log_type, source, message],
+                )?;
+            }
+            MarkSent { phone, campaign_id } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO ESF_SentHistory (Phone, CampaignId, SentAt) VALUES (?1, ?2, datetime('now'));",
+                    params![phone, campaign_id],
+                )?;
+            }
+            ContactStatus { contact_id, status } => {
+                conn.execute(
+                    "UPDATE ESF_Contact SET Status=?1, SentAt=datetime('now') WHERE ContactId=?2;",
+                    params![status, contact_id],
+                )?;
+            }
+            IncrementSent { campaign_id } => {
+                conn.execute(
+                    "UPDATE ESF_Campaign SET SentContacts = SentContacts + 1, UpdatedAt = datetime('now') WHERE CampaignId = ?1;",
+                    params![campaign_id],
+                )?;
+            }
+            SendCompleted { phone, campaign_id, contact_id } => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO ESF_SentHistory (Phone, CampaignId, SentAt) VALUES (?1, ?2, datetime('now'));",
+                    params![phone, campaign_id],
+                )?;
+                conn.execute(
+                    "UPDATE ESF_Contact SET Status='sent', SentAt=datetime('now') WHERE ContactId=?1;",
+                    params![contact_id],
+                )?;
+                conn.execute(
+                    "UPDATE ESF_Campaign SET SentContacts = SentContacts + 1, UpdatedAt = datetime('now') WHERE CampaignId = ?1;",
+                    params![campaign_id],
+                )?;
+            }
+            DeviceCheckin { device_id, adb_address, ip, port, now } => {
+                let upper_id = device_id.to_uppercase();
+                conn.execute(
+                    "UPDATE ESF_Device SET
+                        CurrentAdbAddress = ?1,
+                        Status = 'online',
+                        LastSeenUTC = ?2,
+                        DeviceIp = ?3,
+                        DevicePort = ?4,
+                        EsferaDeviceId = COALESCE(EsferaDeviceId, ?5)
+                     WHERE EsferaDeviceId = ?5 OR UPPER(EsferaDeviceId) = ?6
+                        OR AdbDeviceId = ?5 OR UPPER(AdbDeviceId) = ?6
+                        OR DeviceIp = ?3 OR CurrentAdbAddress = ?1",
+                    params![adb_address, now, ip, port, device_id, upper_id],
+                )?;
+            }
+            MarkDeviceOnline { rowid, adb_addr } => {
+                conn.execute(
+                    "UPDATE ESF_Device SET Status = 'online', CurrentAdbAddress = ?1 WHERE rowid = ?2",
+                    params![adb_addr, rowid],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn create_tables(&self) -> Result<()> {
@@ -924,34 +1097,33 @@ impl Database {
 
     pub fn upsert_device(&self, device: &Device) -> Result<(), String> {
         let target_comp = if device.company_id <= 0 { 1 } else { device.company_id };
-        self.conn()
-            .execute(
-                "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-                ON CONFLICT(AdbDeviceId) DO UPDATE SET
-                DeviceName=excluded.DeviceName, Brand=excluded.Brand, Model=excluded.Model,
-                DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
-                BatteryLevel=excluded.BatteryLevel, DeviceNumber=excluded.DeviceNumber, Sector=excluded.Sector,
-                EsferaDeviceId=COALESCE(excluded.EsferaDeviceId, ESF_Device.EsferaDeviceId),
-                CurrentAdbAddress=excluded.CurrentAdbAddress, LastSeenUTC=excluded.LastSeenUTC;",
-                params![
-                    device.serial,
-                    device.name,
-                    device.brand,
-                    device.model,
-                    device.ip,
-                    device.port,
-                    device.status,
-                    device.battery,
-                    target_comp,
-                    device.device_number,
-                    device.sector,
-                    device.esfera_device_id,
-                    device.current_adb_address,
-                    device.last_seen_utc,
-                ],
-            )
-            .map_err(|e| e.to_string())?;
+        self.exec_retry(
+            "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ON CONFLICT(AdbDeviceId) DO UPDATE SET
+            DeviceName=excluded.DeviceName, Brand=excluded.Brand, Model=excluded.Model,
+            DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
+            BatteryLevel=excluded.BatteryLevel, DeviceNumber=excluded.DeviceNumber, Sector=excluded.Sector,
+            EsferaDeviceId=COALESCE(excluded.EsferaDeviceId, ESF_Device.EsferaDeviceId),
+            CurrentAdbAddress=excluded.CurrentAdbAddress, LastSeenUTC=excluded.LastSeenUTC;",
+            params![
+                device.serial,
+                device.name,
+                device.brand,
+                device.model,
+                device.ip,
+                device.port,
+                device.status,
+                device.battery,
+                target_comp,
+                device.device_number,
+                device.sector,
+                device.esfera_device_id,
+                device.current_adb_address,
+                device.last_seen_utc,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -999,19 +1171,20 @@ impl Database {
 
     pub fn process_checkin(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
         let upper_id = device_id.to_uppercase();
-        let affected = self.conn().execute(
+        let affected = self.exec_retry(
             "UPDATE ESF_Device SET
+                AdbDeviceId = ?1,
                 CurrentAdbAddress = ?1,
                 Status = 'online',
                 LastSeenUTC = ?2,
                 DeviceIp = ?3,
                 DevicePort = ?4,
                 EsferaDeviceId = COALESCE(EsferaDeviceId, ?5)
-             WHERE EsferaDeviceId = ?5 
-                OR UPPER(EsferaDeviceId) = ?6 
-                OR AdbDeviceId = ?5 
+             WHERE EsferaDeviceId = ?5
+                OR UPPER(EsferaDeviceId) = ?6
+                OR AdbDeviceId = ?5
                 OR UPPER(AdbDeviceId) = ?6
-                OR DeviceIp = ?3 
+                OR DeviceIp = ?3
                 OR CurrentAdbAddress = ?1",
             params![adb_address, now, ip, port, device_id, upper_id],
         ).map_err(|e| e.to_string())?;
@@ -1021,7 +1194,7 @@ impl Database {
 
     pub fn insert_unknown_device(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
         let upper_id = device_id.to_uppercase();
-        let affected = self.conn().execute(
+        let affected = self.exec_retry(
             "UPDATE ESF_Device SET
                 EsferaDeviceId = COALESCE(EsferaDeviceId, ?1),
                 CurrentAdbAddress = ?2,
@@ -1037,7 +1210,7 @@ impl Database {
             return Ok(affected);
         }
 
-        self.conn().execute(
+        self.exec_retry(
             "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
              VALUES (?1, ?1, ?2, 'Android', 'Smartphone', ?3, ?4, 'online', 100, 1, 0, 'junior', ?5, ?6)",
             params![device_id, format!("Celular {}", ip), ip, port, adb_address, now],
@@ -1045,7 +1218,7 @@ impl Database {
     }
 
     pub fn mark_device_online(&self, rowid: i32, adb_addr: &str) -> Result<(), String> {
-        self.conn().execute(
+        self.exec_retry(
             "UPDATE ESF_Device SET Status = 'online', CurrentAdbAddress = ?1 WHERE rowid = ?2",
             params![adb_addr, rowid],
         ).map_err(|e| e.to_string())?;
@@ -1070,7 +1243,7 @@ impl Database {
              AND datetime(LastSeenUTC) < datetime('now', '-{} seconds')",
             timeout_seconds
         );
-        self.conn().execute(&sql, []).map_err(|e| e.to_string())
+        self.exec_retry(&sql, &[]).map_err(|e| e.to_string())
     }
 
     pub fn get_device_by_esfera_id(&self, esfera_device_id: &str) -> Option<Device> {
@@ -1200,7 +1373,7 @@ impl Database {
     }
 
     pub fn increment_campaign_sent_count(&self, campaign_id: i32) -> Result<()> {
-        self.conn().execute(
+        self.exec_retry(
             "UPDATE ESF_Campaign SET SentContacts = SentContacts + 1, UpdatedAt = datetime('now') WHERE CampaignId = ?1",
             params![campaign_id],
         )?;
@@ -1359,7 +1532,7 @@ impl Database {
     }
 
     pub fn add_log(&self, company_id: i32, log_type: &str, source: &str, message: &str) -> Result<(), String> {
-        self.conn().execute(
+        self.exec_retry(
             "INSERT INTO ESF_AuditLog (CompanyId, LogType, Source, Message) VALUES (?1, ?2, ?3, ?4);",
             params![company_id, log_type, source, message],
         ).map_err(|e| e.to_string())?;
@@ -1573,7 +1746,7 @@ impl Database {
     }
 
     pub fn update_contact_status(&self, contact_id: i32, status: &str) -> Result<(), String> {
-        self.conn().execute(
+        self.exec_retry(
             "UPDATE ESF_Contact SET Status=?1, SentAt=datetime('now') WHERE ContactId=?2;",
             params![status, contact_id],
         ).map_err(|e| e.to_string())?;
@@ -1621,7 +1794,7 @@ impl Database {
     }
 
     pub fn mark_as_sent(&self, phone: &str, campaign_id: i32) -> Result<(), String> {
-        self.conn().execute(
+        self.exec_retry(
             "INSERT OR REPLACE INTO ESF_SentHistory (Phone, CampaignId, SentAt) VALUES (?1, ?2, datetime('now'));",
             params![phone, campaign_id],
         ).map_err(|e| e.to_string())?;
@@ -1873,9 +2046,11 @@ impl Database {
     // ============================================================
 
     pub fn send_campaign_next_batch(&self, campaign_id: i32) -> Result<serde_json::Value, String> {
-        // Get next 5 pending contacts
         let conn = self.conn();
-        let mut stmt = conn.prepare_cached(
+        let c: &Connection = &conn;
+
+        // Get next 5 pending contacts
+        let mut stmt = c.prepare_cached(
             "SELECT ContactId, ContactName, Phone FROM ESF_Contact
              WHERE CampaignId=?1 AND Status='pending' AND ExcluidoEm IS NULL
              ORDER BY ContactId LIMIT 5;"
@@ -1890,65 +2065,85 @@ impl Database {
 
         let total_sent = contacts.len() as i32;
 
-        for (contact_id, _name, _phone) in &contacts {
-            // Check dedup via SentHistory
-            let already: bool = self.conn().query_row(
-                "SELECT COUNT(*) > 0 FROM ESF_SentHistory
-                 WHERE CampaignId=?1 AND Phone=(SELECT Phone FROM ESF_Contact WHERE ContactId=?2);",
-                params![campaign_id, contact_id],
-                |row| row.get(0),
-            ).unwrap_or(false);
+        // Executa o lote inteiro em UMA transação atômica (Rollback em qualquer falha)
+        Self::with_busy_retry(|| c.execute_batch("BEGIN IMMEDIATE;"))
+            .map_err(|e| format!("Falha ao iniciar transação de envio: {}", e))?;
 
-            if !already {
-                // Mark as sent
-                let _ = self.conn().execute(
-                    "UPDATE ESF_Contact SET Status='sent', SentAt=datetime('now')
-                     WHERE ContactId=?1;",
-                    params![contact_id],
-                );
-
-                // Record in sent history
-                let _ = self.conn().execute(
-                    "INSERT INTO ESF_SentHistory (CampaignId, Phone, SentAt)
-                     SELECT ?1, Phone, datetime('now') FROM ESF_Contact WHERE ContactId=?2;",
+        let batch_result: Result<(i32, bool)> = (|| {
+            for (contact_id, _name, _phone) in &contacts {
+                // Check dedup via SentHistory
+                let already: bool = c.query_row(
+                    "SELECT COUNT(*) > 0 FROM ESF_SentHistory
+                     WHERE CampaignId=?1 AND Phone=(SELECT Phone FROM ESF_Contact WHERE ContactId=?2);",
                     params![campaign_id, contact_id],
-                );
-            } else {
-                // Already sent - mark as skipped
-                let _ = self.conn().execute(
-                    "UPDATE ESF_Contact SET Status='sent' WHERE ContactId=?1;",
-                    params![contact_id],
-                );
+                    |row| row.get(0),
+                ).unwrap_or(false);
+
+                if !already {
+                    // Mark as sent
+                    c.execute(
+                        "UPDATE ESF_Contact SET Status='sent', SentAt=datetime('now')
+                         WHERE ContactId=?1;",
+                        params![contact_id],
+                    )?;
+
+                    // Record in sent history
+                    c.execute(
+                        "INSERT INTO ESF_SentHistory (CampaignId, Phone, SentAt)
+                         SELECT ?1, Phone, datetime('now') FROM ESF_Contact WHERE ContactId=?2;",
+                        params![campaign_id, contact_id],
+                    )?;
+                } else {
+                    // Already sent - mark as skipped
+                    c.execute(
+                        "UPDATE ESF_Contact SET Status='sent' WHERE ContactId=?1;",
+                        params![contact_id],
+                    )?;
+                }
             }
-        }
 
-        // Update campaign counters
-        let _ = self.conn().execute(
-            "UPDATE ESF_Campaign SET
-             SentCount = (SELECT COUNT(*) FROM ESF_Contact WHERE CampaignId=?1 AND Status='sent' AND ExcluidoEm IS NULL)
-             WHERE CampaignId=?1;",
-            params![campaign_id],
-        );
-
-        // Check if campaign is complete
-        let remaining: i32 = self.conn().query_row(
-            "SELECT COUNT(*) FROM ESF_Contact
-             WHERE CampaignId=?1 AND Status='pending' AND ExcluidoEm IS NULL;",
-            params![campaign_id],
-            |row| row.get(0),
-        ).unwrap_or(0);
-
-        if remaining == 0 {
-            let _ = self.conn().execute(
-                "UPDATE ESF_Campaign SET Status='completed' WHERE CampaignId=?1;",
+            // Update campaign counters
+            c.execute(
+                "UPDATE ESF_Campaign SET
+                 SentContacts = (SELECT COUNT(*) FROM ESF_Contact WHERE CampaignId=?1 AND Status='sent' AND ExcluidoEm IS NULL)
+                 WHERE CampaignId=?1;",
                 params![campaign_id],
-            );
-        }
+            )?;
+
+            // Check if campaign is complete
+            let remaining: i32 = c.query_row(
+                "SELECT COUNT(*) FROM ESF_Contact
+                 WHERE CampaignId=?1 AND Status='pending' AND ExcluidoEm IS NULL;",
+                params![campaign_id],
+                |row| row.get(0),
+            ).unwrap_or(0);
+
+            if remaining == 0 {
+                c.execute(
+                    "UPDATE ESF_Campaign SET Status='completed' WHERE CampaignId=?1;",
+                    params![campaign_id],
+                )?;
+            }
+
+            Ok((remaining, remaining == 0))
+        })();
+
+        let (remaining, campaign_complete) = match batch_result {
+            Ok(v) => {
+                Self::with_busy_retry(|| c.execute_batch("COMMIT;"))
+                    .map_err(|e| format!("Falha no commit do lote de envio: {}", e))?;
+                v
+            }
+            Err(e) => {
+                let _ = c.execute_batch("ROLLBACK;");
+                return Err(format!("Falha no lote de envio (transação revertida): {}", e));
+            }
+        };
 
         Ok(serde_json::json!({
             "sent_in_batch": total_sent,
             "remaining": remaining,
-            "campaign_complete": remaining == 0,
+            "campaign_complete": campaign_complete,
         }))
     }
 

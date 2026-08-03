@@ -29,3 +29,8 @@ dist-ssr
 *.db-wal
 *.mp4
 
+# Secrets e caches Python
+**/.env
+__pycache__/
+*.pyc
+

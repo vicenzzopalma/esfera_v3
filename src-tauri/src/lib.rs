@@ -5,6 +5,7 @@
 // ============================================================
 
 mod adb_manager;
+mod adb_tcp;
 mod ai_engine;
 pub mod checkin_server;
 mod commands;
@@ -18,6 +19,9 @@ pub mod master_client;
 pub mod protocol;
 pub mod scrcpy_manager;
 mod session;
+mod spintax;
+mod tunnel_server;
+mod write_queue;
 
 use commands::*;
 use db::Database;
@@ -60,6 +64,10 @@ pub fn run() {
         }
     };
     let db_arc = Arc::new(db);
+
+    // Fila Única de Escrita Assíncrona (MPSC single-writer com transações em lote)
+    let write_queue = write_queue::WriteQueue::spawn(db_arc.clone(), write_queue::QUEUE_CAPACITY);
+    db_arc.attach_write_queue(write_queue);
 
     let db_arc_clone = Arc::clone(&db_arc);
     let sessions = Arc::new(Mutex::new(SessionManager::new()));
@@ -184,6 +192,15 @@ pub fn run() {
                 });
             }
 
+            if app_config.tunnel_server_enabled {
+                let db = db_arc_clone.clone();
+                let port = app_config.tunnel_server_port;
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tunnel_server::start(db, port, Some(handle)).await;
+                });
+            }
+
             dispatcher::Dispatcher::start_worker(db_arc_clone.clone(), Some(app.handle().clone()));
             dispatcher::Dispatcher::start_persistent_adb_keepalive_loop(db_arc_clone.clone());
             adb_manager::AdbManager::start_status_monitor(db_arc_clone);
@@ -265,6 +282,10 @@ pub fn run() {
             restart_adb_server,
             scan_adb_subnet,
             deploy_adb_keepalive,
+            install_kernel_agent,
+            // Spintax
+            resolve_spintax,
+            spintax_combinations,
             get_hardware_uuid,
             launch_scrcpy_stream,
             launch_virtual_display_stream,
