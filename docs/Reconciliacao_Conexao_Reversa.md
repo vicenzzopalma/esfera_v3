@@ -120,6 +120,20 @@ Itens do rascunho que **NÃO** exigem ação (já existem):
 - Foreground Service + notificação + auto-start no boot → já implementados.
 - Servidor de túnel reverso com handshake UUID + heartbeat + descarte de socket obsoleto → já implementado (`tunnel_server.rs`), agora ligado por padrão.
 
+### 7. Finalização do Backend (tarefas do OpenCode — concluídas)
+
+Após o OpenCode expirar, as pendências do plano de backend (D1–D4) foram concluídas e validadas:
+
+- **[D1] `unregister_all_tunnel_serials()`** — ✅ IMPLEMENTADO (`adb_tcp.rs:339-343`): limpa o `TUNNEL_SERIALS` (`Mutex<HashMap<String,()>>`) via `m.clear()`, espelhando `register_tunnel_serial`/`unregister_tunnel_serial` (linhas 327-337).
+- **[D2] Limpeza no shutdown do túnel/app** — ✅ IMPLEMENTADO:
+  - `tunnel_server::shutdown()` (`tunnel_server.rs:331-336`) limpa o `REGISTRY` e chama `crate::adb_tcp::unregister_all_tunnel_serials()`.
+  - `lib.rs` `.run(...)` agora recebe closure `|_app, event| { if let RunEvent::WindowEvent { event: WindowEvent::Destroyed, .. } = event { tunnel_server::shutdown(); } }` — dispara a limpeza no encerramento da janela/app, evitando túneis fantasmas. (Nota: `App::on_window_event` não é utilizável aqui pois consome `self`/exige owned `App`; o hook via `RunEvent` no `.run` é o caminho válido em Tauri 2.11.5.)
+- **[D3] Contrato Rust ↔ Kotlin validado** — handshake `hardwareUuid`/`currentLocalIp` (camelCase) casa; heartbeat `ping`/`pong` casa; **proxy-ack fechado**: o servidor `run_proxy_relay` envia `{"type":"proxy","port":N}` e espera `{"type":"proxy-ack"}`. O agente **não tinha** handler de proxy — foi implementado em `EsferaAgentService.kt` (`readerJob` trata `proxy`, responde `proxy-ack` e dispara `relayToLocal(socket, port)` que faz relay bruto 127.0.0.1:N ↔ túnel via `pump`). Agora o ADB reverso atrás de NAT fecha ponta a ponta.
+- **[D4] Compilação** — ✅ `cargo build` / `cargo check` passam (exit 0). `gradle assembleRelease` do agente também passa e o APK assinado permanece em `public/Esfera_Agent_ADB.apk`.
+
+Resumo do contrato túnel (servidor → agente):
+`handshake{uuid,ip}` → `welcome` · `ping` ↔ `pong` (heartbeat 45s) · `proxy{port}` → `proxy-ack` + relay local `127.0.0.1:port` ↔ soquete do túnel.
+
 ---
 
 ## 7. Conclusão

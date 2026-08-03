@@ -260,6 +260,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     esfera_device_id: None,
                     current_adb_address: Some(adb_dev.serial.clone()),
                     last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
+                    via_tunnel: false,
                 };
                 let _ = state_db.upsert_device(&new_dev);
                 changed = true;
@@ -267,6 +268,23 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         }
 
         let mut refreshed_db = if changed { state_db.get_devices(target_company_id) } else { db_devices };
+
+        // Cruza o estado de túnel reverso com o DB: devices com sessão ativa de túnel
+        // passam a ser apresentados com identidade estável (EsferaDeviceId), e NÃO como
+        // endpoint ADB volátil (ip:porta). Isso evita a "aparência de modelo antigo".
+        for dev in &mut refreshed_db {
+            if let Some(ref uuid) = dev.esfera_device_id {
+                if crate::tunnel_server::is_tunnel_active(uuid) {
+                    dev.via_tunnel = true;
+                    dev.status = "online".to_string();
+                    if let Some(addr) = crate::tunnel_server::tunnel_local_ip(uuid) {
+                        if dev.current_adb_address.as_deref() != Some(addr.as_str()) {
+                            dev.current_adb_address = Some(addr);
+                        }
+                    }
+                }
+            }
+        }
 
         for dev in &mut refreshed_db {
             let is_active = active_adb_list.iter().any(|adb_d| adb_d.serial == dev.serial);
@@ -486,6 +504,7 @@ pub fn connect_adb_device(
         esfera_device_id: None,
         current_adb_address: None,
         last_seen_utc: None,
+        via_tunnel: false,
     };
     db.upsert_device(&dev)?;
     let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
@@ -552,6 +571,7 @@ pub fn pair_and_connect_adb_device(
         esfera_device_id: None,
         current_adb_address: None,
         last_seen_utc: None,
+        via_tunnel: false,
     };
     db.upsert_device(&device)?;
 
@@ -1130,6 +1150,7 @@ pub async fn link_usb_to_wireless(
             esfera_device_id: None,
             current_adb_address: None,
             last_seen_utc: None,
+            via_tunnel: false,
         };
         state_db.upsert_device(&device)?;
         let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
@@ -1210,6 +1231,7 @@ pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -
                         esfera_device_id: None,
                         current_adb_address: None,
                         last_seen_utc: None,
+                        via_tunnel: false,
                     };
                     let _ = db_arc.upsert_device(&device_obj);
                 }
@@ -1292,6 +1314,7 @@ pub fn force_enable_wireless_adb(
         esfera_device_id: None,
         current_adb_address: None,
         last_seen_utc: None,
+        via_tunnel: false,
     };
     db.upsert_device(&device)?;
 

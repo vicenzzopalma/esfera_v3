@@ -59,6 +59,9 @@ pub struct Device {
     pub esfera_device_id: Option<String>,
     pub current_adb_address: Option<String>,
     pub last_seen_utc: Option<String>,
+    /// true quando o device está acessível via Túnel Reverso (conexão iniciada pelo celular),
+    /// e não por um endpoint ADB direto (IP:porta volátil). Usado para priorizar rota e UI.
+    pub via_tunnel: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -245,6 +248,7 @@ pub struct DeviceWithActiveUser {
     pub esfera_device_id: Option<String>,
     pub current_adb_address: Option<String>,
     pub last_seen_utc: Option<String>,
+    pub via_tunnel: bool,
     pub active_user_id: Option<i32>,
     pub active_user_name: Option<String>,
     pub active_user_display_name: Option<String>,
@@ -1081,6 +1085,7 @@ impl Database {
                 esfera_device_id: row.get(12)?,
                 current_adb_address: row.get(13)?,
                 last_seen_utc: row.get(14)?,
+                via_tunnel: false,
             })
         };
 
@@ -1153,6 +1158,7 @@ impl Database {
                 esfera_device_id: row.get(12)?,
                 current_adb_address: row.get(13)?,
                 last_seen_utc: row.get(14)?,
+                via_tunnel: false,
             })
         });
 
@@ -1270,6 +1276,7 @@ impl Database {
                 esfera_device_id: row.get(12)?,
                 current_adb_address: row.get(13)?,
                 last_seen_utc: row.get(14)?,
+                via_tunnel: false,
             })
         }).ok()
     }
@@ -2273,6 +2280,7 @@ impl Database {
                 esfera_device_id: row.get(12)?,
                 current_adb_address: row.get(13)?,
                 last_seen_utc: row.get(14)?,
+                via_tunnel: false,
             })
         });
 
@@ -2420,6 +2428,7 @@ impl Database {
                 esfera_device_id: row.get(12)?,
                 current_adb_address: row.get(13)?,
                 last_seen_utc: row.get(14)?,
+                via_tunnel: false,
                 active_user_id: row.get(15)?,
                 active_user_name: row.get(16)?,
                 active_user_display_name: row.get(17)?,

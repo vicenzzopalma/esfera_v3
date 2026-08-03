@@ -79,6 +79,9 @@ export interface Device {
   esferaDeviceId?: string | null;
   currentAdbAddress?: string | null;
   lastSeenUtc?: string | null;
+  /// true quando o device está acessível via Túnel Reverso (conexão iniciada pelo celular),
+  /// e não por endpoint ADB direto (IP:porta volátil).
+  viaTunnel?: boolean;
 }
 
 export type CampaignStatus = "running" | "paused" | "completed" | "draft" | "error";

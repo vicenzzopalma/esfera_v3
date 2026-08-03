@@ -16,9 +16,11 @@ pub mod empresa_server;
 pub mod hub;
 pub mod hub_client;
 pub mod master_client;
+pub mod presence_server;
 pub mod protocol;
 pub mod scrcpy_manager;
 mod session;
+pub mod session_manager;
 mod spintax;
 mod tunnel_server;
 mod write_queue;
@@ -32,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
+use tauri::Manager;
 
 fn get_db_path() -> String {
     let base_dir = std::env::var_os("LOCALAPPDATA")
@@ -201,6 +204,12 @@ pub fn run() {
                 });
             }
 
+            // Servidor de Presença WebSocket (MDM Architecture) na porta 7779
+            let ws_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                presence_server::start(7779, Some(ws_handle)).await;
+            });
+
             dispatcher::Dispatcher::start_worker(db_arc_clone.clone(), Some(app.handle().clone()));
             dispatcher::Dispatcher::start_persistent_adb_keepalive_loop(db_arc_clone.clone());
             adb_manager::AdbManager::start_status_monitor(db_arc_clone);
@@ -341,8 +350,12 @@ pub fn run() {
             get_app_config,
             save_app_config,
         ])
-        .run(tauri::generate_context!());
-    if let Err(e) = result {
-        eprintln!("Erro ao iniciar aplicação Esfera v3: {}", e);
-    }
+        .build(tauri::generate_context!())
+        .expect("Erro ao construir aplicação Tauri")
+        .run(|_app, event| {
+            // No encerramento do app, limpa o estado do túnel reverso (evita túneis fantasmas).
+            if let tauri::RunEvent::WindowEvent { event: tauri::WindowEvent::Destroyed, .. } = event {
+                crate::tunnel_server::shutdown();
+            }
+        });
 }

@@ -1,0 +1,10 @@
+# Build artifacts (não versionar)
+.gradle/
+build/
+**/build/
+*.dex
+*.apk
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
