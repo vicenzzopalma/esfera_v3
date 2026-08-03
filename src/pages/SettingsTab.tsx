@@ -20,9 +20,10 @@ import {
   Database,
   RefreshCw,
   Wifi,
+  Sparkles,
 } from "lucide-react";
 
-type SettingsSection = "geral" | "notificacoes" | "adb" | "hub" | "seguranca";
+type SettingsSection = "geral" | "notificacoes" | "adb" | "hub" | "ia" | "seguranca";
 
 export default function SettingsTab() {
   const { selectedCompanyId, user } = useAuth();
@@ -58,8 +59,19 @@ export default function SettingsTab() {
   const [customIpOverride, setCustomIpOverride] = useState(false);
   const [empresaServerEnabled, setEmpresaServerEnabled] = useState(false);
   const [empresaServerPort, setEmpresaServerPort] = useState(7777);
+  const [tunnelServerEnabled, setTunnelServerEnabled] = useState(false);
+  const [tunnelServerPort, setTunnelServerPort] = useState(8888);
   const [appMode, setAppMode] = useState<"local" | "empresa" | "master">("empresa");
   const [hubStatus, setHubStatus] = useState("");
+
+  // IA / LLM local
+  const [aiProvider, setAiProvider] = useState("ollama");
+  const [aiModel, setAiModel] = useState("llama3");
+  const [aiTemperature, setAiTemperature] = useState("0.7");
+  const [aiSystemPrompt, setAiSystemPrompt] = useState("");
+  const [aiApiKey, setAiApiKey] = useState("");
+  const [aiEndpoint, setAiEndpoint] = useState("http://localhost:11434/api/generate");
+  const [aiStatus, setAiStatus] = useState("");
 
   // Load app config
   useEffect(() => {
@@ -71,6 +83,8 @@ export default function SettingsTab() {
         setHubAddress(cfg.hub_address || "34.29.70.113:8888");
         setEmpresaServerEnabled(cfg.empresa_server_enabled);
         setEmpresaServerPort(cfg.empresa_server_port);
+        setTunnelServerEnabled(cfg.tunnel_server_enabled ?? false);
+        setTunnelServerPort(cfg.tunnel_server_port ?? 8888);
         // Garante que apenas master possa ter modo 'master'
         if (cfg.mode === "master" && !isMasterUser) {
           setAppMode("empresa");
@@ -79,8 +93,41 @@ export default function SettingsTab() {
         }
       })
       .catch(() => {});
+    if (selectedCompanyId) {
+      api<import("../types").AiConfig | null>("get_ai_config", { company_id: selectedCompanyId })
+        .then((cfg) => {
+          if (!mounted || !cfg) return;
+          setAiProvider(cfg.provider || "ollama");
+          setAiModel(cfg.model || "llama3");
+          setAiTemperature(String(cfg.temperature ?? 0.7));
+          setAiSystemPrompt(cfg.systemPrompt || "");
+          setAiApiKey(cfg.apiKey || "");
+          setAiEndpoint(cfg.endpoint || "http://localhost:11434/api/generate");
+        })
+        .catch(() => {});
+    }
     return () => { mounted = false; };
-  }, [isMasterUser]);
+  }, [isMasterUser, selectedCompanyId]);
+
+  const handleSaveAi = async () => {
+    if (!selectedCompanyId) return;
+    try {
+      await api("save_ai_config", {
+        config: {
+          company_id: selectedCompanyId,
+          provider: aiProvider,
+          model: aiModel,
+          temperature: parseFloat(aiTemperature) || 0.7,
+          system_prompt: aiSystemPrompt,
+          api_key: aiApiKey,
+          endpoint: aiEndpoint,
+        },
+      });
+      setAiStatus("Configuração de IA salva com sucesso!");
+    } catch {
+      setAiStatus("Falha ao salvar configuração de IA.");
+    }
+  };
 
   const handleSaveAll = async () => {
     if (!selectedCompanyId) return;
@@ -90,6 +137,8 @@ export default function SettingsTab() {
         hub_address: hubAddress,
         empresa_server_enabled: empresaServerEnabled,
         empresa_server_port: empresaServerPort,
+        tunnel_server_enabled: tunnelServerEnabled,
+        tunnel_server_port: tunnelServerPort,
         mode: appMode,
       });
       setHubStatus("Configurações salvas com sucesso!");
@@ -101,6 +150,7 @@ export default function SettingsTab() {
     { id: "notificacoes", label: "Notificações", icon: <Bell size={18} /> },
     { id: "adb", label: "Rede & ADB", icon: <Smartphone size={18} /> },
     { id: "hub", label: "Conexão Hub Nuvem", icon: <Wifi size={18} /> },
+    { id: "ia", label: "IA & Spintax Local", icon: <Sparkles size={18} /> },
     { id: "seguranca", label: "Segurança", icon: <Shield size={18} /> },
   ] as const;
 
@@ -276,11 +326,78 @@ export default function SettingsTab() {
                     </div>
                   )}
 
+                  <div className="space-y-6 pt-4 border-t border-border">
+                    <ToggleRow label="Túnel Inverso de Dispositivos" desc="Recebe daemons dos celulares (aparelhos atrás de NAT/4G) para mantê-los sempre acessíveis via ADB" checked={tunnelServerEnabled} onChange={setTunnelServerEnabled} />
+                    {tunnelServerEnabled && (
+                      <div className="pl-6 ml-4 border-l-2 border-violet-500/30">
+                        <label className="block font-semibold text-secondary mb-2 text-sm">Porta do Túnel (daemons Android)</label>
+                        <input type="number" value={tunnelServerPort} onChange={(e) => setTunnelServerPort(parseInt(e.target.value) || 8888)} min={1024} max={65535} className="w-32 input-setting font-mono text-center" />
+                        <p className="text-[11px] text-violet-400 font-medium mt-1">
+                          Os aparelhos devem apontar para IP:porta desta máquina no instalador do daemon (Instalar Daemon).
+                        </p>
+                      </div>
+                    )}
+                  </div>
+
                   {hubStatus && (
                     <div className="p-4 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl text-sm font-medium mt-6">
                       {hubStatus}
                     </div>
                   )}
+                </div>
+              </div>
+            )}
+
+            {activeSection === "ia" && (
+              <div className="space-y-8 animate-fade-in">
+                <SectionHeader icon={<Sparkles size={24} />} color="violet" title="IA & Spintax Local" subtitle="Modelos LLM locais (Ollama / Llama.cpp) e personalização de mensagens" />
+                <div className="space-y-6 text-sm max-w-2xl">
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">Provedor</label>
+                    <select value={aiProvider} onChange={(e) => setAiProvider(e.target.value)} className="w-full input-setting">
+                      <option value="ollama">Ollama (Local — recomendado, zero custo)</option>
+                      <option value="openai">OpenAI (API paga)</option>
+                      <option value="anthropic">Anthropic (API paga)</option>
+                      <option value="custom">Custom (OpenAI-compatible)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">Modelo</label>
+                    <input type="text" value={aiModel} onChange={(e) => setAiModel(e.target.value)} placeholder="llama3 / qwen2.5:1.5b / llama3.2:3b (Q4_K_M)" className="w-full input-setting font-mono" />
+                    <p className="text-[11px] text-tertiary mt-1">Para inferência local, use um GGUF quantizado (ex.: Q4_K_M). Modelos sugeridos: Qwen2.5-1.5B-Instruct, Llama-3.2-3B-Instruct.</p>
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">Endpoint</label>
+                    <input type="text" value={aiEndpoint} onChange={(e) => setAiEndpoint(e.target.value)} placeholder="http://localhost:11434/api/generate" className="w-full input-setting font-mono" />
+                  </div>
+
+                  <div className="w-48">
+                    <label className="block font-semibold text-secondary mb-2 text-sm">Temperatura</label>
+                    <input type="number" step="0.1" min="0" max="2" value={aiTemperature} onChange={(e) => setAiTemperature(e.target.value)} className="w-full input-setting font-mono text-center" />
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">System Prompt (opcional)</label>
+                    <textarea value={aiSystemPrompt} onChange={(e) => setAiSystemPrompt(e.target.value)} rows={3} placeholder="Você é um assistente especialista em redação de mensagens para WhatsApp." className="w-full input-setting resize-none" />
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-secondary mb-2 text-sm">API Key (somente para OpenAI/Anthropic)</label>
+                    <input type="password" value={aiApiKey} onChange={(e) => setAiApiKey(e.target.value)} placeholder="sk-..." className="w-full input-setting font-mono" />
+                  </div>
+
+                  <div className="pt-2">
+                    <Button icon={<Sparkles size={18} />} onClick={handleSaveAi} className="px-6 py-2.5">Salvar Configuração de IA</Button>
+                  </div>
+
+                  {aiStatus && (
+                    <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 rounded-xl text-sm font-medium mt-2">
+                      {aiStatus}
+                    </div>
+                  )}
+                  <p className="text-[11px] text-tertiary">O Spintax é resolvido automaticamente no criador de campanhas (aba Campanhas → Simular Spintax). Combine Spintax + Ollama local para zero custo de API e conformidade LGPD.</p>
                 </div>
               </div>
             )}

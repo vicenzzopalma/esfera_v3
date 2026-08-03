@@ -1,0 +1,18 @@
+[package]
+name = "device-agent"
+version = "0.1.0"
+description = "Esfera v3 — Daemon kernel-level para Android (túnel inverso TCP + UDP handshake)"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = { version = "0.6", features = ["all"] }
+rand = "0.8"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

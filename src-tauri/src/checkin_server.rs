@@ -72,6 +72,13 @@ pub fn start_udp_broadcast_listener(db: Arc<Database>, app_handle: Option<AppHan
                         let _ = db.insert_unknown_device(&payload.hardware_uuid, &target_addr, &payload.ip, port, &now);
                     }
 
+                    // Flush preventivo de socket zumbi antes de reconectar (evita "already connected")
+                    let flush_target = target_addr.clone();
+                    let _ = crate::adb_manager::create_cmd("adb")
+                        .arg("disconnect")
+                        .arg(&flush_target)
+                        .output();
+
                     // Conecta via ADB sob demanda
                     let conn_target = target_addr.clone();
                     tokio::task::spawn_blocking(move || {
@@ -122,6 +129,12 @@ async fn handle_checkin(
 
     // Event-Driven PUSH: Conecta instantaneamente via ADB ao endereço notificado pelo APK do aparelho
     let connect_target = format!("{}:{}", ip, port);
+    // Flush preventivo de socket zumbi antes de reconectar (evita "already connected")
+    let flush_target = connect_target.clone();
+    let _ = crate::adb_manager::create_cmd("adb")
+        .arg("disconnect")
+        .arg(&flush_target)
+        .output();
     tokio::task::spawn_blocking(move || {
         let _ = crate::adb_manager::create_cmd("adb")
             .arg("connect")

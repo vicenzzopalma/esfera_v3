@@ -13,10 +13,18 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.provider.Settings
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.io.PrintWriter
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.SocketTimeoutException
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.android.Android
-import io.ktor.client.plugins.timeout
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
@@ -28,6 +36,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -39,13 +48,25 @@ import java.util.concurrent.TimeUnit
 @Serializable
 data class EsferaConfig(
     val serverUrl: String = "",
-    val deviceId: String = ""
+    val deviceId: String = "",
+    val tunnelEnabled: Boolean = true,
+    val tunnelPort: Int = 8888
 )
 
 @Serializable
 data class CheckInRequest(
     val esferaDeviceId: String,
     val currentAdbAddress: String
+)
+
+@Serializable
+data class TunnelHandshake(
+    val type: String = "handshake",
+    val hardwareUuid: String = "",
+    val macAddress: String = "",
+    val serialNumber: String = "",
+    val agentVersion: String = "1.0-tunnel",
+    val currentLocalIp: String = ""
 )
 
 class EsferaAgentService : Service() {
@@ -59,14 +80,18 @@ class EsferaAgentService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var checkInJob: Job? = null
+    private var tunnelJob: Job? = null
     private var lastKnownIp: String? = null
+    private var agentConfig: EsferaConfig? = null
 
     private val json = Json { ignoreUnknownKeys = true }
     private val httpClient = HttpClient(Android) {
-        install(io.ktor.client.plugins.contentnegotiation.ContentNegotiation) {
+        install(ContentNegotiation) {
             json(json)
         }
-        timeout { requestTimeoutMillis = 10_000 }
+        install(HttpTimeout) {
+            requestTimeoutMillis = 10_000
+        }
     }
 
     private lateinit var connectivityManager: ConnectivityManager
@@ -99,6 +124,7 @@ class EsferaAgentService : Service() {
         unregisterNetworkCallback()
         releaseWakeLock()
         checkInJob?.cancel()
+        tunnelJob?.cancel()
         scope.cancel()
         httpClient.close()
         super.onDestroy()
@@ -109,21 +135,34 @@ class EsferaAgentService : Service() {
     // ----------------------------------------------------------------
 
     private fun loadConfig(): EsferaConfig {
+        val defaultAndroidId = try {
+            Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "UNKNOWN_DEVICE"
+        } catch (e: Exception) {
+            "UNKNOWN_DEVICE"
+        }
+
         val file = File(CONFIG_FILE)
-        return if (file.exists()) {
+        val loadedConfig = if (file.exists()) {
             try {
-                json.decodeFromString(file.readText())
+                json.decodeFromString<EsferaConfig>(file.readText())
             } catch (e: Exception) {
                 EsferaConfig()
             }
         } else {
-            // Fallback: SharedPreferences
             val prefs = getSharedPreferences("esfera_agent", MODE_PRIVATE)
             EsferaConfig(
                 serverUrl = prefs.getString("serverUrl", "") ?: "",
                 deviceId = prefs.getString("deviceId", "") ?: ""
             )
         }
+
+        val finalDeviceId = if (loadedConfig.deviceId.isBlank() || loadedConfig.deviceId == "UNIQUE_DEVICE_ID") {
+            defaultAndroidId
+        } else {
+            loadedConfig.deviceId
+        }
+
+        return loadedConfig.copy(deviceId = finalDeviceId)
     }
 
     private fun loadConfigAndStart() {
@@ -132,7 +171,11 @@ class EsferaAgentService : Service() {
             stopSelf()
             return
         }
+        agentConfig = config
         startCheckInLoop(config)
+        if (config.tunnelEnabled) {
+            startTunnelLoop(config)
+        }
     }
 
     // ----------------------------------------------------------------
@@ -164,8 +207,79 @@ class EsferaAgentService : Service() {
     }
 
     // ----------------------------------------------------------------
-    // IP resolution via ConnectivityManager.NetworkCallback
+    // Tunnel reverso (celular -> servidor, handshake por Hardware UUID)
+    // Mantém socket TCP persistente; reconecta em ms quando a rede muda.
+    // O backend correspondente é tunnel_server.rs (porta tunnelPort, default 8888).
     // ----------------------------------------------------------------
+
+    private fun startTunnelLoop(config: EsferaConfig) {
+        tunnelJob?.cancel() // evita duplo túnel se rechamado
+        var first = true
+        tunnelJob = scope.launch {
+            var backoffMs = 1_000L
+            while (isActive) {
+                val host = config.serverUrl
+                    .replace("http://", "")
+                    .replace("https://", "")
+                    .substringBefore(':')
+                    .substringBefore('/')
+                    .ifEmpty { "127.0.0.1" }
+                try {
+                    openTunnel(host, config.tunnelPort, config.deviceId)
+                    backoffMs = 1_000L // reset em caso de fechamento limpo
+                } catch (e: Exception) {
+                    android.util.Log.w("EsferaAgent", "Túnel caiu: ${e.message}")
+                }
+                if (first) { first = false; backoffMs = 1_000L }
+                delay(backoffMs)
+                backoffMs = (backoffMs * 2).coerceAtMost(15_000L)
+            }
+        }
+    }
+
+    private suspend fun openTunnel(host: String, port: Int, deviceId: String) {
+        val ip = resolveCurrentIp() ?: "0.0.0.0"
+        val socket = Socket()
+        socket.connect(InetSocketAddress(host, port), 10_000)
+        socket.soTimeout = 0
+        val writer = PrintWriter(socket.getOutputStream(), true)
+        val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+
+        // 1. Handshake na primeira linha (hardware_uuid = deviceId do agente)
+        val hs = TunnelHandshake(
+            hardwareUuid = deviceId,
+            currentLocalIp = ip
+        )
+        writer.println(json.encodeToString(TunnelHandshake.serializer(), hs))
+        writer.flush()
+
+        // 2. Loop de heartbeat L7 + leitura da resposta do servidor.
+        //    Se o servidor fechar o socket (readLine() == null), encerramos o
+        //    coroutineScope filho -> openTunnel retorna -> startTunnelLoop reconecta.
+        coroutineScope {
+            val readerJob = launch {
+                while (isActive) {
+                    val line = try { reader.readLine() } catch (_: Exception) { null }
+                    if (line == null) {
+                        // EOF ou erro de leitura: o servidor caiu. Sai do escopo.
+                        return@launch
+                    }
+                    // O backend responde ping<->pong; não é necessário tratar aqui.
+                }
+            }
+
+            try {
+                while (isActive && !socket.isClosed) {
+                    delay(10_000L) // envia ping a cada 10s (backend tolera 45s de silêncio)
+                    if (socket.isClosed) break
+                    writer.println("""{"type":"ping"}""")
+                    writer.flush()
+                }
+            } finally {
+                readerJob.cancel()
+            }
+        }
+    }
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
@@ -173,7 +287,10 @@ class EsferaAgentService : Service() {
                 .firstOrNull { it.address is java.net.Inet4Address }
                 ?.address?.hostAddress
             if (ip != null && ip != lastKnownIp) {
-                android.util.Log.d("EsferaAgent", "IP mudou: $ip")
+                lastKnownIp = ip
+                android.util.Log.d("EsferaAgent", "IP mudou: $ip — reconectando túnel reverso")
+                // Reconexão imediata do túnel (entrega "reconexão em ms" do design)
+                agentConfig?.let { startTunnelLoop(it) }
             }
         }
     }

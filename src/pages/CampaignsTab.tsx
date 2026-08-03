@@ -3,7 +3,8 @@
 // Central de Campanhas, Importador de Contatos CSV e Editor
 // ============================================================
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useAuth } from "../context/AuthContext";
 import { MOCK_CAMPAIGNS } from "../mock-data";
 import Card from "../components/ui/Card";
@@ -69,6 +70,28 @@ export default function CampaignsTab() {
       .catch(() => { if (mounted) setCampaignsList(MOCK_CAMPAIGNS.filter((c) => c.companyId === selectedCompanyId)); });
     return () => { mounted = false; };
   }, [selectedCompanyId]);
+
+  // Atualiza a lista ao vivo conforme o motor de disparos emite progresso (1x a cada 2s no máx)
+  const refreshCampaigns = useCallback(() => {
+    if (!selectedCompanyId) return;
+    api<Campaign[]>("get_campaigns", { companyId: selectedCompanyId })
+      .then((data) => setCampaignsList(data))
+      .catch(() => { /* mantém lista atual */ });
+  }, [selectedCompanyId]);
+
+  useEffect(() => {
+    if (!selectedCompanyId) return;
+    let unlisten: (() => void) | undefined;
+    let lastRefresh = 0;
+    listen("campaign-progress", () => {
+      const now = Date.now();
+      if (now - lastRefresh >= 2000) {
+        lastRefresh = now;
+        refreshCampaigns();
+      }
+    }).then((fn) => { unlisten = fn; });
+    return () => { if (unlisten) unlisten(); };
+  }, [selectedCompanyId, refreshCampaigns]);
 
   const filteredCampaigns = campaignsList.filter((c) => {
     const matchesSearch = c.name.toLowerCase().includes(searchQuery.toLowerCase());
@@ -470,7 +493,7 @@ function CampaignCard({
   const devices = campaign.deviceIds || [];
 
   return (
-    <Card padding="md" hover className="flex flex-col justify-between h-[340px]">
+    <Card padding="md" hover className="flex flex-col justify-between min-h-[30vh]">
       <div>
         <div className="flex items-start justify-between gap-3 mb-4">
           <h3 className="font-bold text-sm text-primary leading-tight line-clamp-1">{campaign.name}</h3>
@@ -578,7 +601,7 @@ function CampaignEditModal({
   const [delayMaxVal, setDelayMaxVal] = useState(campaign?.delayMax || 90);
   const [aiModelVal, setAiModelVal] = useState(campaign?.aiModel || "gpt-4o-mini");
   const [aiPromptVal, setAiPromptVal] = useState(campaign?.aiPrompt || "");
-  const [spintaxPreview, setSpintaxPreview] = useState("");
+  const [spintaxPreview, setSpintaxPreview] = useState<string[]>([]);
 
   useEffect(() => {
     if (isOpen) {
@@ -592,7 +615,7 @@ function CampaignEditModal({
       setUseAI(campaign?.useAI ?? false);
       setAiModelVal(campaign?.aiModel || "gpt-4o-mini");
       setAiPromptVal(campaign?.aiPrompt || "");
-      setSpintaxPreview("");
+      setSpintaxPreview([]);
     }
   }, [isOpen, campaign]);
 
@@ -654,8 +677,8 @@ function CampaignEditModal({
     }
   };
 
-  const handleTestSpintax = () => {
-    const resolveSpintax = (text: string) => {
+  const handleTestSpintax = async () => {
+    const resolveLocal = (text: string) => {
       let resolved = text;
       const spintaxRegex = /\{([^{}]+)\}/g;
       let match;
@@ -668,19 +691,33 @@ function CampaignEditModal({
       }
       return resolved;
     };
-    const resolvedGreeting = resolveSpintax(greetingText);
-    const resolvedBody = resolveSpintax(bodyText);
-    const resolvedClosing = resolveSpintax(closingText);
-    setSpintaxPreview(`${resolvedGreeting} ${resolvedBody} ${resolvedClosing}`.trim());
+    const fullText = `${greetingText} ${bodyText} ${closingText}`.trim();
+    // Gera até 5 variações distintas para o operador avaliar a diversidade
+    const count = 5;
+    const seen = new Set<string>();
+    const variants: string[] = [];
+    let guard = 0;
+    while (variants.length < count && guard++ < 200) {
+      let v = resolveLocal(fullText);
+      try {
+        const resolved = await api<string>("resolve_spintax", { text: fullText });
+        if (resolved) v = resolved;
+      } catch { /* fallback: resolução local */ }
+      if (!seen.has(v)) {
+        seen.add(v);
+        variants.push(v);
+      }
+    }
+    setSpintaxPreview(variants);
   };
 
   const handleTestAI = async () => {
     const msg = `${greetingText} ${bodyText} ${closingText}`.trim();
     try {
       const rewritten = await api<string>("rewrite_message_ai", { message: msg, contactName: "Maria" });
-      setSpintaxPreview(rewritten);
+      setSpintaxPreview([rewritten]);
     } catch {
-      setSpintaxPreview("[IA Mock] " + msg.replace("{nome}", "Maria"));
+      setSpintaxPreview([`[IA Mock] ${msg.replace(/\{nome\}/g, "Maria")}`]);
     }
   };
 
@@ -772,9 +809,14 @@ function CampaignEditModal({
                   Simular Spintax
                 </Button>
               </div>
-              {spintaxPreview && (
-                <div className="p-3 rounded-xl bg-violet-600/10 border border-violet-500/25 text-violet-200 font-mono">
-                  {spintaxPreview}
+              {spintaxPreview.length > 0 && (
+                <div className="space-y-2">
+                  <span className="text-[11px] text-violet-300/80 font-medium">Variações geradas ({spintaxPreview.length})</span>
+                  {spintaxPreview.map((v, i) => (
+                    <div key={i} className="p-3 rounded-xl bg-violet-600/10 border border-violet-500/25 text-violet-200 font-mono text-xs whitespace-pre-wrap break-words">
+                      {v}
+                    </div>
+                  ))}
                 </div>
               )}
             </div>

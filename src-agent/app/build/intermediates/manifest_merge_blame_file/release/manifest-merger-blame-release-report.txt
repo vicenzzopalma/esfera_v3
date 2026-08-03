@@ -1,0 +1,118 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="com.esfera.agent"
+4    android:installLocation="internalOnly"
+5    android:versionCode="1"
+6    android:versionName="1.0.0" >
+7
+8    <uses-sdk
+9        android:minSdkVersion="26"
+10        android:targetSdkVersion="34" />
+11
+12    <uses-permission android:name="android.permission.INTERNET" />
+12-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:6:5-67
+12-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:6:22-64
+13    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+13-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:7:5-79
+13-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:7:22-76
+14    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+14-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:8:5-77
+14-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:8:22-74
+15    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+15-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:9:5-87
+15-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:9:22-84
+16    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+16-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:10:5-77
+16-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:10:22-74
+17    <uses-permission android:name="android.permission.WAKE_LOCK" />
+17-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:11:5-68
+17-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:11:22-65
+18    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+18-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:12:5-81
+18-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:12:22-78
+19
+20    <permission
+20-->[androidx.core:core:1.10.1] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\3e37edfa99bafc36859ad12e7d646bef\transformed\core-1.10.1\AndroidManifest.xml:22:5-24:47
+21        android:name="com.esfera.agent.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+21-->[androidx.core:core:1.10.1] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\3e37edfa99bafc36859ad12e7d646bef\transformed\core-1.10.1\AndroidManifest.xml:23:9-81
+22        android:protectionLevel="signature" />
+22-->[androidx.core:core:1.10.1] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\3e37edfa99bafc36859ad12e7d646bef\transformed\core-1.10.1\AndroidManifest.xml:24:9-44
+23
+24    <uses-permission android:name="com.esfera.agent.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+24-->[androidx.core:core:1.10.1] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\3e37edfa99bafc36859ad12e7d646bef\transformed\core-1.10.1\AndroidManifest.xml:26:5-97
+24-->[androidx.core:core:1.10.1] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\3e37edfa99bafc36859ad12e7d646bef\transformed\core-1.10.1\AndroidManifest.xml:26:22-94
+25
+26    <application
+26-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:14:5-41:19
+27        android:allowBackup="false"
+27-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:15:9-36
+28        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
+28-->[androidx.core:core:1.10.1] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\3e37edfa99bafc36859ad12e7d646bef\transformed\core-1.10.1\AndroidManifest.xml:28:18-86
+29        android:extractNativeLibs="false"
+30        android:supportsRtl="true"
+30-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:16:9-35
+31        android:theme="@style/Theme.EsferaAgent.Transparent" >
+31-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:17:9-61
+32        <service
+32-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:19:9-22:56
+33            android:name="com.esfera.agent.EsferaAgentService"
+33-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:20:13-47
+34            android:exported="false"
+34-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:21:13-37
+35            android:foregroundServiceType="dataSync" />
+35-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:22:13-53
+36
+37        <receiver
+37-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:24:9-30:20
+38            android:name="com.esfera.agent.BootReceiver"
+38-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:25:13-41
+39            android:exported="true" >
+39-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:26:13-36
+40            <intent-filter>
+40-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:27:13-29:29
+41                <action android:name="android.intent.action.BOOT_COMPLETED" />
+41-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:28:17-79
+41-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:28:25-76
+42            </intent-filter>
+43        </receiver>
+44
+45        <activity
+45-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:32:9-39:20
+46            android:name="com.esfera.agent.MainActivity"
+46-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:33:13-41
+47            android:exported="true"
+47-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:34:13-36
+48            android:theme="@style/Theme.EsferaAgent.Transparent" >
+48-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:35:13-65
+49            <intent-filter>
+49-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:36:13-38:29
+50                <action android:name="android.intent.action.MAIN" />
+50-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:37:17-69
+50-->D:\Novo\Esfera v3\src-agent\app\src\main\AndroidManifest.xml:37:25-66
+51            </intent-filter>
+52        </activity>
+53
+54        <provider
+54-->[androidx.emoji2:emoji2:1.2.0] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\47a3644321431e4496557e6c0d7c84f5\transformed\emoji2-1.2.0\AndroidManifest.xml:24:9-32:20
+55            android:name="androidx.startup.InitializationProvider"
+55-->[androidx.emoji2:emoji2:1.2.0] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\47a3644321431e4496557e6c0d7c84f5\transformed\emoji2-1.2.0\AndroidManifest.xml:25:13-67
+56            android:authorities="com.esfera.agent.androidx-startup"
+56-->[androidx.emoji2:emoji2:1.2.0] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\47a3644321431e4496557e6c0d7c84f5\transformed\emoji2-1.2.0\AndroidManifest.xml:26:13-68
+57            android:exported="false" >
+57-->[androidx.emoji2:emoji2:1.2.0] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\47a3644321431e4496557e6c0d7c84f5\transformed\emoji2-1.2.0\AndroidManifest.xml:27:13-37
+58            <meta-data
+58-->[androidx.emoji2:emoji2:1.2.0] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\47a3644321431e4496557e6c0d7c84f5\transformed\emoji2-1.2.0\AndroidManifest.xml:29:13-31:52
+59                android:name="androidx.emoji2.text.EmojiCompatInitializer"
+59-->[androidx.emoji2:emoji2:1.2.0] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\47a3644321431e4496557e6c0d7c84f5\transformed\emoji2-1.2.0\AndroidManifest.xml:30:17-75
+60                android:value="androidx.startup" />
+60-->[androidx.emoji2:emoji2:1.2.0] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\47a3644321431e4496557e6c0d7c84f5\transformed\emoji2-1.2.0\AndroidManifest.xml:31:17-49
+61            <meta-data
+61-->[androidx.lifecycle:lifecycle-process:2.4.1] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\d56aa352ad2ab7a26d7e5e4a9f73964f\transformed\lifecycle-process-2.4.1\AndroidManifest.xml:31:13-33:52
+62                android:name="androidx.lifecycle.ProcessLifecycleInitializer"
+62-->[androidx.lifecycle:lifecycle-process:2.4.1] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\d56aa352ad2ab7a26d7e5e4a9f73964f\transformed\lifecycle-process-2.4.1\AndroidManifest.xml:32:17-78
+63                android:value="androidx.startup" />
+63-->[androidx.lifecycle:lifecycle-process:2.4.1] C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\d56aa352ad2ab7a26d7e5e4a9f73964f\transformed\lifecycle-process-2.4.1\AndroidManifest.xml:33:17-49
+64        </provider>
+65    </application>
+66
+67</manifest>

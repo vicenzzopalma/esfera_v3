@@ -482,10 +482,10 @@ pub fn create_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000);
     }
-    if (name == "adb" || name == "scrcpy")
-        && let Some(dir) = bundled_tools_dir()
-    {
-        cmd.current_dir(dir);
+    if name == "adb" || name == "scrcpy" {
+        if let Some(dir) = bundled_tools_dir() {
+            cmd.current_dir(dir);
+        }
     }
     cmd
 }
@@ -536,6 +536,16 @@ extern "C" {
     ) -> i32;
     pub fn esfera_hpc_calculate_gaussian_delay(min_ms: i32, max_ms: i32) -> i32;
     pub fn esfera_hpc_generate_hardware_uuid(out_uuid_buf: *mut u8, max_len: usize);
+    pub fn esfera_hpc_generate_bezier_points(
+        start_x: i32,
+        start_y: i32,
+        end_x: i32,
+        end_y: i32,
+        out_pts_x: *mut i32,
+        out_pts_y: *mut i32,
+        max_points: i32,
+        out_count: *mut i32,
+    ) -> i32;
     pub fn esfera_hpc_calculate_tap_coordinates(
         screen_width: i32,
         screen_height: i32,
@@ -808,24 +818,43 @@ impl AdbManager {
         Ok(devices)
     }
 
+    /// Decide se usa o protocolo ADB nativo (IP Wi-Fi ou serial de túnel esfera-agent)
+    fn use_native_adb(serial: &str) -> bool {
+        serial.contains('.') || crate::adb_tcp::is_tunnel_serial(serial)
+    }
+
     /// Obtém o endereço IP do wlan0 via shell único combinado (3 métodos em 1 chamada)
     pub fn get_device_wifi_ip(serial: &str) -> Result<String, String> {
+        let shell_cmd = "getprop dhcp.wlan0.ipaddress; echo '---'; ip route; echo '---'; ip addr show wlan0";
+
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe (evita "adb server" no hub)
+        if Self::use_native_adb(serial) {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, shell_cmd) {
+                if let Some(ip) = Self::parse_wifi_ip_from_shell(&stdout) {
+                    return Ok(ip);
+                }
+            }
+        }
+
         let mut cmd = create_cmd("adb");
-        cmd.args([
-            "-s",
-            serial,
-            "shell",
-            "getprop dhcp.wlan0.ipaddress; echo '---'; ip route; echo '---'; ip addr show wlan0",
-        ]);
+        cmd.args(["-s", serial, "shell", shell_cmd]);
         let output = run_cmd_timeout(cmd, Duration::from_secs(3))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(ip) = Self::parse_wifi_ip_from_shell(&stdout) {
+            return Ok(ip);
+        }
+
+        Err(format!("Não foi possível detectar o IP Wi-Fi do celular '{}'. Verifique se o aparelho está conectado à rede Wi-Fi.", serial))
+    }
+
+    fn parse_wifi_ip_from_shell(stdout: &str) -> Option<String> {
         let sections: Vec<&str> = stdout.split("---").collect();
 
         if let Some(s0) = sections.first() {
             let ip = s0.trim();
             if !ip.is_empty() && ip.contains('.') && !ip.starts_with("127.") {
-                return Ok(ip.to_string());
+                return Some(ip.to_string());
             }
         }
 
@@ -837,7 +866,7 @@ impl AdbManager {
                         if src_idx + 1 < parts.len() {
                             let parsed_ip = parts[src_idx + 1].trim().to_string();
                             if parsed_ip.contains('.') && !parsed_ip.starts_with("127.") {
-                                return Ok(parsed_ip);
+                                return Some(parsed_ip);
                             }
                         }
                     }
@@ -850,12 +879,11 @@ impl AdbManager {
                 if line.trim().starts_with("inet ") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() > 1 {
-                        let ip_mask = parts[1];
-                        let ip_only: Vec<&str> = ip_mask.split('/').collect();
+                        let ip_only: Vec<&str> = parts[1].split('/').collect();
                         if !ip_only.is_empty() {
                             let parsed_ip = ip_only[0].trim().to_string();
                             if parsed_ip.contains('.') && !parsed_ip.starts_with("127.") {
-                                return Ok(parsed_ip);
+                                return Some(parsed_ip);
                             }
                         }
                     }
@@ -863,7 +891,7 @@ impl AdbManager {
             }
         }
 
-        Err(format!("Não foi possível detectar o IP Wi-Fi do celular '{}'. Verifique se o aparelho está conectado à rede Wi-Fi.", serial))
+        None
     }
 
     /// Habilita porta TCP no dispositivo
@@ -899,6 +927,41 @@ impl AdbManager {
         }
     }
 
+    /// Desconecta socket ADB zumbi, sonda o TCP (150ms) e conecta de novo.
+    /// Evita o "already connected" contra dispositivos que morreram na rede.
+    pub fn connect_device_flushed(ip: &str, port: i32) -> Result<String, String> {
+        let target = format!("{}:{}", ip, port);
+
+        // 1. Disconnect preventivo — limpa socket morto do ADB server
+        let mut dis = create_cmd("adb");
+        dis.arg("disconnect").arg(&target);
+        let _ = run_cmd_timeout(dis, Duration::from_secs(3));
+
+        // 2. Sonda TCP rápida: se a porta não responde, não adianta conectar
+        if let Ok(addr) = target.parse::<std::net::SocketAddr>() {
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_err() {
+                return Err(format!(
+                    "Dispositivo {} não respondeu ao probe TCP",
+                    target
+                ));
+            }
+        }
+
+        // 3. Connect limpo
+        Self::connect_device(ip, port)
+    }
+
+    /// Variante que aceita o alvo já formatado como "IP:Porta"
+    pub fn connect_target_flushed(target: &str) -> Result<String, String> {
+        let parts: Vec<&str> = target.split(':').collect();
+        if parts.is_empty() || parts[0].is_empty() {
+            return Err(format!("Alvo ADB inválido: {}", target));
+        }
+        let ip = parts[0];
+        let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
+        Self::connect_device_flushed(ip, port)
+    }
+
     /// Executa `adb pair <ip>:<port> <code>` para parear celular Android 11+ via Wi-Fi sem cabo
     pub fn pair_device(ip: &str, port: u16, code: &str) -> Result<String, String> {
         let target = format!("{}:{}", ip, port);
@@ -932,6 +995,10 @@ impl AdbManager {
 
     /// Desconecta de um dispositivo via `adb disconnect serial`
     pub fn disconnect_device(serial: &str) -> Result<String, String> {
+        // Expurga da pool nativa e do registro de túneis (idempotente)
+        crate::adb_tcp::evict(serial);
+        crate::adb_tcp::unregister_tunnel_serial(serial);
+
         let output = create_cmd("adb")
             .arg("disconnect")
             .arg(serial)
@@ -952,25 +1019,43 @@ impl AdbManager {
             }
         }
 
-        let output = create_cmd("adb")
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("dumpsys battery | grep level:")
-            .output()
-            .map_err(|e| format!("Falha ao consultar bateria via ADB: {}", e))?;
+        let mut level: Option<i32> = None;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let line = line.trim();
-            if let Some(val) = line.strip_prefix("level:") {
-                if let Ok(level) = val.trim().parse::<i32>() {
-                    if let Ok(mut cache) = BATTERY_CACHE.write() {
-                        cache.insert(serial.to_string(), (level, Instant::now()));
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "dumpsys battery | grep level:") {
+                for line in stdout.lines() {
+                    let line = line.trim();
+                    if let Some(val) = line.strip_prefix("level:") {
+                        level = val.trim().parse::<i32>().ok();
                     }
-                    return Ok(level);
                 }
             }
+        }
+
+        if level.is_none() {
+            let output = create_cmd("adb")
+                .arg("-s")
+                .arg(serial)
+                .arg("shell")
+                .arg("dumpsys battery | grep level:")
+                .output()
+                .map_err(|e| format!("Falha ao consultar bateria via ADB: {}", e))?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let line = line.trim();
+                if let Some(val) = line.strip_prefix("level:") {
+                    level = val.trim().parse::<i32>().ok();
+                }
+            }
+        }
+
+        if let Some(level) = level {
+            if let Ok(mut cache) = BATTERY_CACHE.write() {
+                cache.insert(serial.to_string(), (level, Instant::now()));
+            }
+            return Ok(level);
         }
 
         Ok(85)
@@ -978,55 +1063,74 @@ impl AdbManager {
 
     /// Captura a tela do dispositivo via `adb -s <serial> exec-out screencap -p` e aplica sanitização nativa C++ HPC
     pub fn capture_screen(serial: &str) -> Result<String, String> {
-        let output = create_cmd("adb")
-            .args(["-s", serial, "exec-out", "screencap", "-p"])
-            .output()
-            .map_err(|e| format!("Falha ao executar screencap ADB: {}", e))?;
-
-        if output.status.success() && !output.stdout.is_empty() {
-            let raw_bytes = &output.stdout;
-            let mut sanitized = vec![0u8; raw_bytes.len()];
-            let mut out_written: usize = 0;
-
-            let status = unsafe {
-                esfera_hpc_sanitize_png_buffer(
-                    raw_bytes.as_ptr(),
-                    raw_bytes.len(),
-                    sanitized.as_mut_ptr(),
-                    sanitized.len(),
-                    &mut out_written,
-                )
-            };
-
-            let final_bytes = if status == 0 && out_written > 0 && out_written <= sanitized.len() {
-                &sanitized[..out_written]
-            } else {
-                raw_bytes.as_slice()
-            };
-
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(final_bytes);
-            Ok(format!("data:image/png;base64,{}", b64))
+        let raw_bytes: Vec<u8> = if Self::use_native_adb(serial) {
+            // Wi-Fi: protocolo ADB nativo (bytes crus do frame)
+            match crate::adb_tcp::exec_shell_bytes(serial, "screencap -p") {
+                Ok((stdout, _, true)) => stdout,
+                Ok((_, _, false)) => return Err("Comando screencap nativo falhou".to_string()),
+                Err(_) => {
+                    let fallback = create_cmd("adb")
+                        .args(["-s", serial, "exec-out", "screencap", "-p"])
+                        .output()
+                        .map_err(|e| format!("Falha ao executar screencap ADB: {}", e))?;
+                    if !fallback.status.success() || fallback.stdout.is_empty() {
+                        return Err(format!(
+                            "Não foi possível capturar o frame da tela do celular ({})",
+                            serial
+                        ));
+                    }
+                    fallback.stdout
+                }
+            }
         } else {
-            Err(format!(
-                "Não foi possível capturar o frame da tela do celular ({})",
-                serial
-            ))
-        }
+            let output = create_cmd("adb")
+                .args(["-s", serial, "exec-out", "screencap", "-p"])
+                .output()
+                .map_err(|e| format!("Falha ao executar screencap ADB: {}", e))?;
+            if !output.status.success() || output.stdout.is_empty() {
+                return Err(format!(
+                    "Não foi possível capturar o frame da tela do celular ({})",
+                    serial
+                ));
+            }
+            output.stdout
+        };
+
+        let mut sanitized = vec![0u8; raw_bytes.len()];
+        let mut out_written: usize = 0;
+
+        let status = unsafe {
+            esfera_hpc_sanitize_png_buffer(
+                raw_bytes.as_ptr(),
+                raw_bytes.len(),
+                sanitized.as_mut_ptr(),
+                sanitized.len(),
+                &mut out_written,
+            )
+        };
+
+        let final_bytes = if status == 0 && out_written > 0 && out_written <= sanitized.len() {
+            &sanitized[..out_written]
+        } else {
+            raw_bytes.as_slice()
+        };
+
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(final_bytes);
+        Ok(format!("data:image/png;base64,{}", b64))
     }
 
     /// Envia um toque na tela via `adb -s <serial> shell input tap x y`
     pub fn tap_screen(serial: &str, x: u32, y: u32) -> Result<(), String> {
+        let tap_cmd = format!("input tap {} {}", x, y);
+
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) && crate::adb_tcp::exec_shell_bytes(serial, &tap_cmd).is_ok() {
+            return Ok(());
+        }
+
         let output = create_cmd("adb")
-            .args([
-                "-s",
-                serial,
-                "shell",
-                "input",
-                "tap",
-                &x.to_string(),
-                &y.to_string(),
-            ])
+            .args(["-s", serial, "shell", "input", "tap", &x.to_string(), &y.to_string()])
             .output()
             .map_err(|e| format!("Falha ao enviar toque ADB: {}", e))?;
 
@@ -1039,6 +1143,13 @@ impl AdbManager {
 
     /// Envia um evento de tecla via `adb -s <serial> shell input keyevent <keycode>`
     pub fn send_keyevent(serial: &str, keycode: u32) -> Result<(), String> {
+        let key_cmd = format!("input keyevent {}", keycode);
+
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) && crate::adb_tcp::exec_shell_bytes(serial, &key_cmd).is_ok() {
+            return Ok(());
+        }
+
         let output = create_cmd("adb")
             .args([
                 "-s",
@@ -1080,6 +1191,14 @@ impl AdbManager {
             ));
         }
         let full_cmd = shell_cmds.join(" ");
+
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) {
+            if let Ok((_, _, _)) = crate::adb_tcp::exec_shell_bytes(serial, &full_cmd) {
+                return Ok(());
+            }
+        }
+
         let output = create_cmd("adb")
             .args(["-s", serial, "shell", &full_cmd])
             .output()
@@ -1100,6 +1219,33 @@ impl AdbManager {
                 if info.2.elapsed() < Duration::from_secs(30) {
                     return (info.0.clone(), info.1.clone());
                 }
+            }
+        }
+
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(
+                serial,
+                "getprop ro.product.brand; echo; getprop ro.product.model",
+            ) {
+                let lines: Vec<&str> = stdout.lines().collect();
+                let brand = lines
+                    .first()
+                    .map(|l| l.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Android".to_string());
+                let model = lines
+                    .get(1)
+                    .map(|l| l.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Smartphone".to_string());
+                if let Ok(mut cache) = DEVICE_INFO_CACHE.write() {
+                    cache.insert(
+                        serial.to_string(),
+                        (brand.clone(), model.clone(), Instant::now()),
+                    );
+                }
+                return (brand, model);
             }
         }
 
@@ -1228,6 +1374,35 @@ impl AdbManager {
         url: &str,
         display_id: u32,
     ) -> Result<String, String> {
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) {
+            let intent_cmd = format!(
+                "am start --display {} -a android.intent.action.VIEW -d '{}'",
+                display_id,
+                Self::shell_quote(url)
+            );
+            match crate::adb_tcp::exec_shell_bytes(serial, &intent_cmd) {
+                Ok((_, _, true)) => {
+                    return Ok(format!(
+                        "Intent aberto no Display #{} com sucesso no aparelho {}",
+                        display_id, serial
+                    ));
+                }
+                Ok((_, _, false)) => {
+                    return Err(format!(
+                        "Erro ao abrir Intent no Display #{} (nativo)",
+                        display_id
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Erro ao abrir Intent no Display #{} via túnel: {}",
+                        display_id, e
+                    ));
+                }
+            }
+        }
+
         let output = create_cmd("adb")
             .args([
                 "-s",
@@ -1271,11 +1446,17 @@ impl AdbManager {
 
         // 1. Tenta obter o SDK level do Android (Android 12+ / SDK 31+ suporta --video-source=camera nativo no scrcpy)
         let mut sdk_level = 0;
-        let mut sdk_cmd = create_cmd("adb");
-        sdk_cmd.args(["-s", serial, "shell", "getprop", "ro.build.version.sdk"]);
-        if let Ok(out) = run_cmd_timeout(sdk_cmd, Duration::from_secs(3)) {
-            let sdk_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            sdk_level = sdk_str.parse::<i32>().unwrap_or(0);
+        let sdk_native = if Self::use_native_adb(serial) {
+            crate::adb_tcp::exec_shell(serial, "getprop ro.build.version.sdk")
+        } else {
+            let mut sdk_cmd = create_cmd("adb");
+            sdk_cmd.args(["-s", serial, "shell", "getprop", "ro.build.version.sdk"]);
+            run_cmd_timeout(sdk_cmd, Duration::from_secs(3)).map(|o| {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            })
+        };
+        if let Ok(sdk_str) = sdk_native {
+            sdk_level = sdk_str.trim().parse::<i32>().unwrap_or(0);
         }
 
         // Se o dispositivo for Android < 12 (SDK < 31), abre o app de Câmera nativo via ADB Intent e abre o espelhamento Scrcpy
@@ -2005,6 +2186,17 @@ impl AdbManager {
     }
 
     fn get_device_manufacturer(serial: &str) -> String {
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "getprop ro.product.manufacturer") {
+                let val = stdout.trim();
+                if !val.is_empty() {
+                    return val.to_string();
+                }
+            }
+            return "unknown".to_string();
+        }
+
         let mut cmd = create_cmd("adb");
         cmd.args(["-s", serial, "shell", "getprop", "ro.product.manufacturer"]);
         if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
@@ -2017,23 +2209,43 @@ impl AdbManager {
     /// Lê a identificação persistente do celular (/sdcard/.esfera_device_id ou persist.esfera.device_id)
     /// Prioriza sdcard porque setprop/getprop pode ser bloqueado por SELinux em dispositivos nao-root
     pub fn get_persistent_device_id(serial: &str) -> Option<String> {
+        let is_native = Self::use_native_adb(serial);
+
         // 1. Tenta sdcard primeiro (mais confiavel)
-        let mut cmd = create_cmd("adb");
-        cmd.args(["-s", serial, "shell", "cat", "/sdcard/.esfera_device_id"]);
-        if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
-            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
-                return Some(val);
+        if is_native {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "cat /sdcard/.esfera_device_id") {
+                let val = stdout.trim().to_string();
+                if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
+                    return Some(val);
+                }
+            }
+        } else {
+            let mut cmd = create_cmd("adb");
+            cmd.args(["-s", serial, "shell", "cat", "/sdcard/.esfera_device_id"]);
+            if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
+                let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
+                    return Some(val);
+                }
             }
         }
 
         // 2. Fallback: getprop (pode falhar em SELinux enforcing)
-        let mut cmd2 = create_cmd("adb");
-        cmd2.args(["-s", serial, "shell", "getprop", "persist.esfera.device_id"]);
-        if let Ok(out) = run_cmd_timeout(cmd2, Duration::from_secs(2)) {
-            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
-                return Some(val);
+        if is_native {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "getprop persist.esfera.device_id") {
+                let val = stdout.trim().to_string();
+                if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
+                    return Some(val);
+                }
+            }
+        } else {
+            let mut cmd2 = create_cmd("adb");
+            cmd2.args(["-s", serial, "shell", "getprop", "persist.esfera.device_id"]);
+            if let Ok(out) = run_cmd_timeout(cmd2, Duration::from_secs(2)) {
+                let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
+                    return Some(val);
+                }
             }
         }
 
@@ -2196,12 +2408,17 @@ impl AdbManager {
     pub fn resolve_target_serial(requested_serial: &str) -> Result<String, String> {
         let requested = requested_serial.trim();
 
+        // 0. Fast-path: serial de túnel esfera-agent (UUID) já é roteável diretamente
+        if crate::adb_tcp::is_tunnel_serial(requested) {
+            return Ok(requested.to_string());
+        }
+
         // 1. Tenta reconexão prévia se for IP Wi-Fi
         if requested.contains(':') || requested.contains('.') {
             let parts: Vec<&str> = requested.split(':').collect();
             let ip = parts[0];
             let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
-            let _ = Self::connect_device(ip, port);
+            let _ = Self::connect_device_flushed(ip, port);
             std::thread::sleep(Duration::from_millis(400));
         }
 
@@ -2260,7 +2477,7 @@ impl AdbManager {
         let db_path = crate::get_db_path();
         if let Ok(conn) = rusqlite::Connection::open(&db_path) {
             let mut stmt = conn.prepare(
-                "SELECT CurrentAdbAddress, IpAddress FROM ESF_Device WHERE AdbDeviceId = ?1 OR EsferaDeviceId = ?1 OR SerialNumber = ?1 LIMIT 1"
+                "SELECT CurrentAdbAddress, DeviceIp FROM ESF_Device WHERE AdbDeviceId = ?1 OR EsferaDeviceId = ?1 OR UPPER(EsferaDeviceId) = UPPER(?1) LIMIT 1"
             );
             if let Ok(mut stmt) = stmt {
                 let row_res = stmt.query_row([requested], |row| {
@@ -2275,7 +2492,7 @@ impl AdbManager {
                             let parts: Vec<&str> = net_addr.split(':').collect();
                             let ip = parts[0];
                             let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
-                            let _ = Self::connect_device(ip, port);
+                            let _ = Self::connect_device_flushed(ip, port);
                             std::thread::sleep(Duration::from_millis(600));
 
                             let active_retry = Self::list_devices().unwrap_or_default();
@@ -2329,7 +2546,7 @@ impl AdbManager {
                     let parts: Vec<&str> = target_serial.split(':').collect();
                     let ip = parts[0];
                     let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
-                    let _ = Self::connect_device(ip, port);
+                    let _ = Self::connect_device_flushed(ip, port);
                 } else {
                     let _ = Self::restart_server();
                 }
@@ -2371,7 +2588,7 @@ impl AdbManager {
         results
     }
 
-    fn get_host_lan_ip() -> String {
+    pub fn get_host_lan_ip() -> String {
         if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
             if socket.connect("8.8.8.8:80").is_ok() {
                 if let Ok(addr) = socket.local_addr() {
@@ -2553,7 +2770,7 @@ impl AdbManager {
                 .get(1)
                 .and_then(|p| p.parse::<i32>().ok())
                 .unwrap_or(5555);
-            let _ = Self::connect_device(ip, port);
+            let _ = Self::connect_device_flushed(ip, port);
             std::thread::sleep(Duration::from_millis(400));
         }
 
@@ -2634,10 +2851,8 @@ impl AdbManager {
                 if is_online {
                     // Preventivo: devices online também tentam reconnect no CurrentAdbAddress
                     if let Some(ref addr) = dev.current_adb_address {
-                        if addr.contains(':') && addr.contains('.') {
-                            let mut adb = create_cmd("adb");
-                            adb.arg("connect").arg(addr);
-                            let _ = run_cmd_timeout(adb, Duration::from_secs(8));
+                        if addr.contains(':') && addr.contains('.') && !crate::adb_tcp::is_tunnel_serial(addr) {
+                            let _ = Self::connect_target_flushed(addr);
                         }
                     }
                     continue;
@@ -2645,7 +2860,7 @@ impl AdbManager {
 
                 // Device offline — tenta reconnect pelo CurrentAdbAddress, IP ou serial
                 let target = if let Some(ref addr) = dev.current_adb_address {
-                    if addr.contains(':') && addr.contains('.') {
+                    if addr.contains(':') && addr.contains('.') && !crate::adb_tcp::is_tunnel_serial(addr) {
                         addr.clone()
                     } else if !dev.ip.is_empty() && dev.ip.contains('.') {
                         format!("{}:{}", dev.ip, dev.port)
@@ -2662,9 +2877,7 @@ impl AdbManager {
                     continue;
                 };
 
-                let mut adb = create_cmd("adb");
-                adb.arg("connect").arg(&target);
-                let _ = run_cmd_timeout(adb, Duration::from_secs(8));
+                let _ = Self::connect_target_flushed(&target);
 
                 // Se conectou, marca online
                 if let Ok(active) = Self::list_devices() {
@@ -2672,6 +2885,11 @@ impl AdbManager {
                     if active.iter().any(|d| d.serial == target || d.serial.contains(ip_part)) {
                         let _ = db_conn.mark_device_online(dev.id, &target);
                     }
+                }
+
+                // Túneis esfera-agent se reconectam sozinhos — pulam imunidade/serial
+                if crate::adb_tcp::is_tunnel_serial(&target) {
+                    continue;
                 }
 
                 let already = injected
@@ -2692,6 +2910,27 @@ impl AdbManager {
 
     /// Obtém a resolução da tela física do dispositivo (Physical size: WxH)
     pub fn get_device_screen_size(serial: &str) -> (i32, i32) {
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "wm size") {
+                for line in stdout.lines() {
+                    if line.contains("Physical size:") || line.contains("Override size:") {
+                        if let Some(res) = line.split(':').nth(1) {
+                            let parts: Vec<&str> = res.trim().split('x').collect();
+                            if parts.len() == 2 {
+                                if let (Ok(w), Ok(h)) = (
+                                    parts[0].trim().parse::<i32>(),
+                                    parts[1].trim().parse::<i32>(),
+                                ) {
+                                    return (w, h);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let output = create_cmd("adb")
             .arg("-s")
             .arg(serial)
@@ -2716,6 +2955,11 @@ impl AdbManager {
             }
         }
         (1080, 2400) // Fallback seguro padrão
+    }
+
+    /// Escapa um valor para uso seguro entre aspas simples no shell do dispositivo
+    fn shell_quote(value: &str) -> String {
+        value.replace('\'', "'\"'\"'")
     }
 
     /// Encoder de URL para parâmetros do Intent
@@ -2745,22 +2989,41 @@ impl AdbManager {
         let encoded_msg = Self::url_encode(message);
         let intent_url = format!("https://api.whatsapp.com/send?phone={}&text={}", phone, encoded_msg);
 
-        // 1. Dispara Intent do WhatsApp
-        let mut intent_adb = create_cmd("adb");
-        intent_adb
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("am")
-            .arg("start")
-            .arg("-a")
-            .arg("android.intent.action.VIEW")
-            .arg("-d")
-            .arg(&intent_url);
-        let intent_cmd = run_cmd_timeout(intent_adb, Duration::from_secs(8));
+        // 1. Dispara Intent do WhatsApp (protocolo ADB nativo para Wi-Fi/túnel)
+        if Self::use_native_adb(serial) {
+            let intent_cmd = format!(
+                "am start -a android.intent.action.VIEW -d '{}'",
+                Self::shell_quote(&intent_url)
+            );
+            match crate::adb_tcp::exec_shell_bytes(serial, &intent_cmd) {
+                Ok((_, _, true)) => {}
+                Ok((_, _, false)) => {
+                    return Err("Falha ao disparar Intent do WhatsApp (nativo)".to_string())
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Falha ao disparar Intent do WhatsApp via túnel: {}",
+                        e
+                    ))
+                }
+            }
+        } else {
+            let mut intent_adb = create_cmd("adb");
+            intent_adb
+                .arg("-s")
+                .arg(serial)
+                .arg("shell")
+                .arg("am")
+                .arg("start")
+                .arg("-a")
+                .arg("android.intent.action.VIEW")
+                .arg("-d")
+                .arg(&intent_url);
+            let intent_cmd = run_cmd_timeout(intent_adb, Duration::from_secs(8));
 
-        if let Err(e) = intent_cmd {
-            return Err(format!("Falha ao disparar Intent do WhatsApp: {}", e));
+            if let Err(e) = intent_cmd {
+                return Err(format!("Falha ao disparar Intent do WhatsApp: {}", e));
+            }
         }
 
         // 2. Aguarda delay Gaussiano
@@ -2775,46 +3038,133 @@ impl AdbManager {
             esfera_hpc_calculate_tap_coordinates(screen_w, screen_h, 92.5, 96.0, &mut tap_x, &mut tap_y);
         }
 
-        let mut swipe_adb = create_cmd("adb");
-        swipe_adb
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("input")
-            .arg("swipe")
-            .arg(tap_x.to_string())
-            .arg(tap_y.to_string())
-            .arg((tap_x + 1).to_string())
-            .arg((tap_y + 1).to_string())
-            .arg("120");
-        let swipe_cmd = run_cmd_timeout(swipe_adb, Duration::from_secs(8));
+        // 3. Toque físico com trajetória Bézier (curva quadrática nativa HPC ±40px, 180-450ms)
+        Self::bezier_tap_screen(serial, tap_x, tap_y, tap_x, tap_y)
+    }
 
-        match swipe_cmd {
-            Ok(out) if out.status.success() => Ok(()),
-            Ok(out) => Err(String::from_utf8_lossy(&out.stderr).to_string()),
-            Err(e) => Err(e.to_string()),
+    /// Toque físico com trajetória Bézier gerada pelo HPC nativo (curva quadrática com
+    /// ponto de controle aleatório ±40px). Usa `input motionevent` (Android 10+) e, em
+    /// fallback, swipes segmentados traçando a curva. Último recurso: `input tap`.
+    pub fn bezier_tap_screen(
+        serial: &str,
+        start_x: i32,
+        start_y: i32,
+        end_x: i32,
+        end_y: i32,
+    ) -> Result<(), String> {
+        const MAX_POINTS: i32 = 16;
+        let mut xs = [0i32; MAX_POINTS as usize];
+        let mut ys = [0i32; MAX_POINTS as usize];
+        let mut count: i32 = 0;
+
+        let ret = unsafe {
+            esfera_hpc_generate_bezier_points(
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+                xs.as_mut_ptr(),
+                ys.as_mut_ptr(),
+                MAX_POINTS,
+                &mut count,
+            )
+        };
+
+        if ret != 0 || count < 2 {
+            // Fallback: toque simples
+            let mut tap = create_cmd("adb");
+            tap.args(["-s", serial, "shell", "input", "tap"])
+                .arg(start_x.to_string())
+                .arg(start_y.to_string());
+            return run_cmd_timeout(tap, Duration::from_secs(6))
+                .map(|_| ())
+                .map_err(|e| e.to_string());
         }
+
+        let pts = count as usize;
+
+        // Primário: input motionevent DOWN/MOVE/UP (Android 10+) traçando a curva real.
+        // Para Wi-Fi/túnel, a cadeia && inteira vai por uma única chamada nativa.
+        let mut sequence = format!("input motionevent DOWN {} {}", xs[0], ys[0]);
+        for i in 1..pts {
+            sequence.push_str(&format!(" && input motionevent MOVE {} {}", xs[i], ys[i]));
+        }
+        sequence.push_str(&format!(
+            " && input motionevent UP {} {}",
+            xs[pts - 1], ys[pts - 1]
+        ));
+
+        if Self::use_native_adb(serial) {
+            if let Ok((_, _, true)) = crate::adb_tcp::exec_shell_bytes(serial, &sequence) {
+                return Ok(());
+            }
+        } else {
+            let mut mot = create_cmd("adb");
+            mot.args(["-s", serial, "shell"]).arg(&sequence);
+            if let Ok(out) = run_cmd_timeout(mot, Duration::from_secs(12)) {
+                if out.status.success() {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fallback 2: swipes segmentados traçando a curva (APIs Android antigas)
+        let total_ms = unsafe { esfera_hpc_calculate_gaussian_delay(180, 450) } as u64;
+        let seg_count = std::cmp::min(pts - 1, 6);
+        let step = (pts - 1) / seg_count;
+        for i in 0..seg_count {
+            let a = i * step;
+            let b = if i == seg_count - 1 { pts - 1 } else { a + step };
+            let seg_dur = std::cmp::max(total_ms as usize / seg_count, 20);
+            let mut seg = create_cmd("adb");
+            seg.args(["-s", serial, "shell", "input", "swipe"])
+                .arg(xs[a].to_string())
+                .arg(ys[a].to_string())
+                .arg(xs[b].to_string())
+                .arg(ys[b].to_string())
+                .arg(seg_dur.to_string());
+            if run_cmd_timeout(seg, Duration::from_secs(6)).is_err() {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     /// Fallback para mensagens longas: abre o chat via Intent só com telefone e digita o texto
     fn send_long_message_typing(serial: &str, phone: &str, message: &str) -> Result<(), String> {
         let intent_url = format!("https://api.whatsapp.com/send?phone={}", phone);
 
-        let mut intent_adb = create_cmd("adb");
-        intent_adb
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("am")
-            .arg("start")
-            .arg("-a")
-            .arg("android.intent.action.VIEW")
-            .arg("-d")
-            .arg(&intent_url);
-        let intent_cmd = run_cmd_timeout(intent_adb, Duration::from_secs(8));
+        // Abre o chat via Intent (protocolo ADB nativo para Wi-Fi/túnel)
+        if Self::use_native_adb(serial) {
+            let intent_cmd = format!(
+                "am start -a android.intent.action.VIEW -d '{}'",
+                Self::shell_quote(&intent_url)
+            );
+            match crate::adb_tcp::exec_shell_bytes(serial, &intent_cmd) {
+                Ok((_, _, true)) => {}
+                Ok((_, _, false)) => return Err("Falha ao abrir chat WhatsApp (nativo)".to_string()),
+                Err(e) => {
+                    return Err(format!("Falha ao abrir chat WhatsApp via túnel: {}", e))
+                }
+            }
+        } else {
+            let mut intent_adb = create_cmd("adb");
+            intent_adb
+                .arg("-s")
+                .arg(serial)
+                .arg("shell")
+                .arg("am")
+                .arg("start")
+                .arg("-a")
+                .arg("android.intent.action.VIEW")
+                .arg("-d")
+                .arg(&intent_url);
+            let intent_cmd = run_cmd_timeout(intent_adb, Duration::from_secs(8));
 
-        if let Err(e) = intent_cmd {
-            return Err(format!("Falha ao abrir chat WhatsApp: {}", e));
+            if let Err(e) = intent_cmd {
+                return Err(format!("Falha ao abrir chat WhatsApp: {}", e));
+            }
         }
 
         // Aguarda a tela do chat abrir
@@ -2841,16 +3191,26 @@ impl AdbManager {
         // 1. Aplica Proxy Global via ADB se fornecido
         if let Some(proxy) = proxy_url {
             if !proxy.trim().is_empty() {
-                let _ = create_cmd("adb")
-                    .arg("-s")
-                    .arg(serial)
-                    .arg("shell")
-                    .arg("settings")
-                    .arg("put")
-                    .arg("global")
-                    .arg("http_proxy")
-                    .arg(proxy)
-                    .output();
+                if Self::use_native_adb(serial) {
+                    let cmd = format!(
+                        "settings put global http_proxy '{}'",
+                        Self::shell_quote(proxy)
+                    );
+                    let _ = crate::adb_tcp::exec_shell_bytes(serial, &cmd);
+                } else {
+                    let _ = create_cmd("adb")
+                        .arg("-s")
+                        .arg(serial)
+                        .arg("shell")
+                        .arg("settings")
+                        .arg("put")
+                        .arg("global")
+                        .arg("http_proxy")
+                        .arg(proxy)
+                        .output();
+                }
+            } else if Self::use_native_adb(serial) {
+                let _ = crate::adb_tcp::exec_shell_bytes(serial, "settings put global http_proxy :0");
             } else {
                 let _ = create_cmd("adb")
                     .arg("-s")
@@ -2872,17 +3232,31 @@ impl AdbManager {
             "android.permission.ACCESS_COARSE_LOCATION",
         ];
 
-        for pkg in &packages {
-            for perm in &permissions {
-                let _ = create_cmd("adb")
-                    .arg("-s")
-                    .arg(serial)
-                    .arg("shell")
-                    .arg("pm")
-                    .arg("revoke")
-                    .arg(pkg)
-                    .arg(perm)
-                    .output();
+        if Self::use_native_adb(serial) {
+            // Batch único via túnel: pm revoke dos 4 pares em uma só chamada
+            let mut batch = String::new();
+            for pkg in &packages {
+                for perm in &permissions {
+                    if !batch.is_empty() {
+                        batch.push_str(" && ");
+                    }
+                    batch.push_str(&format!("pm revoke {} {}", pkg, perm));
+                }
+            }
+            let _ = crate::adb_tcp::exec_shell_bytes(serial, &batch);
+        } else {
+            for pkg in &packages {
+                for perm in &permissions {
+                    let _ = create_cmd("adb")
+                        .arg("-s")
+                        .arg(serial)
+                        .arg("shell")
+                        .arg("pm")
+                        .arg("revoke")
+                        .arg(pkg)
+                        .arg(perm)
+                        .output();
+                }
             }
         }
 
@@ -2891,6 +3265,10 @@ impl AdbManager {
 
     /// Reconecta todos os dispositivos ativos limpos de soquetes zumbis do Windows com varredura por TCP Probe
     pub fn force_reconnect_all_adb(db: &crate::db::Database) -> Result<String, String> {
+        // Expurga a pool nativa e os registros de túnel (serão renegociados sob demanda)
+        crate::adb_tcp::reset_pool();
+        crate::adb_tcp::unregister_all_tunnel_serials();
+
         let _ = create_cmd("adb").arg("kill-server").output();
         let _ = create_cmd("adb").arg("start-server").output();
 

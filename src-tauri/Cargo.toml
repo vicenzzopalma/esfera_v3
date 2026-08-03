@@ -42,3 +42,5 @@ hex = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 axum = "0.7"
 uuid = { version = "1", features = ["v4"] }
+rsa = { version = "0.9", features = ["pem", "sha2"] }
+socket2 = "0.6"

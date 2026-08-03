@@ -83,19 +83,38 @@ impl Dispatcher {
                         continue;
                     }
 
+                    // Monta o texto base: saudação + corpo + despedida, com Spintax resolvido
+                    let campaign_text = {
+                        let mut full = String::new();
+                        if !campaign.greeting.trim().is_empty() {
+                            full.push_str(&campaign.greeting);
+                            full.push(' ');
+                        }
+                        full.push_str(&campaign.message);
+                        if !campaign.closing.trim().is_empty() {
+                            full.push(' ');
+                            full.push_str(&campaign.closing);
+                        }
+                        if campaign.use_spintax {
+                            crate::spintax::resolve_spintax(&full)
+                        } else {
+                            full
+                        }
+                    };
+
                     let message_to_send = if campaign.use_ai {
                         let db2 = db_arc.clone();
                         match spawn_blocking(move || db2.get_ai_config(campaign.company_id)).await {
                             Ok(Some(config)) => {
-                                match AiEngine::generate_message(&config, &campaign.message, &next_contact.contact_name).await {
+                                match AiEngine::generate_message(&config, &campaign_text, &next_contact.contact_name).await {
                                     Ok(custom_msg) => custom_msg,
-                                    Err(_) => campaign.message.replace("{nome}", &next_contact.contact_name),
+                                    Err(_) => campaign_text.replace("{nome}", &next_contact.contact_name),
                                 }
                             }
-                            _ => campaign.message.replace("{nome}", &next_contact.contact_name),
+                            _ => campaign_text.replace("{nome}", &next_contact.contact_name),
                         }
                     } else {
-                        campaign.message.replace("{nome}", &next_contact.contact_name)
+                        campaign_text.replace("{nome}", &next_contact.contact_name)
                     };
 
                     let db2 = db_arc.clone();
@@ -138,14 +157,12 @@ impl Dispatcher {
                     match outcome {
                         SendOutcome::Sent => {
                             let db3 = db_arc.clone();
-                            let cid = campaign.id;
-                            let cid2 = campaign.id;
                             let phone3 = phone.clone();
-                            let _ = spawn_blocking(move || {
-                                let _ = db3.mark_as_sent(&phone3, cid);
-                                let _ = db3.update_contact_status(next_contact.id, "sent");
-                                let _ = db3.increment_campaign_sent_count(cid2);
-                            }).await;
+                            let contact_id = next_contact.id;
+                            // Escrita atômica na Fila Única (MPSC): SentHistory + contato + contador
+                            spawn_blocking(move || db3.queue_send_completed(&phone3, campaign.id, contact_id))
+                                .await
+                                .unwrap_or_default();
                         }
                         SendOutcome::SkippedDuplicate | SendOutcome::NoOnlineDevice | SendOutcome::SendFailed(_) => {
                             // não contabiliza como enviado; mantém contato pendente para próxima rodada
@@ -210,7 +227,7 @@ impl Dispatcher {
                     let attempted = if !ip_target.is_empty() && ip_target.contains('.') {
                         let port = if dev.port > 0 { dev.port } else { 5555 };
                         let ip = ip_target.clone();
-                        spawn_blocking(move || AdbManager::connect_device(&ip, port)).await.map(|r| r.is_ok()).unwrap_or(false)
+                        spawn_blocking(move || AdbManager::connect_device_flushed(&ip, port)).await.map(|r| r.is_ok()).unwrap_or(false)
                     } else {
                         false
                     };

@@ -9,6 +9,8 @@ pub struct AppConfig {
     pub empresa_server_port: u16,
     pub checkin_server_enabled: bool,
     pub checkin_server_port: u16,
+    pub tunnel_server_enabled: bool,
+    pub tunnel_server_port: u16,
     pub mode: String,
 }
 
@@ -21,6 +23,8 @@ impl Default for AppConfig {
             empresa_server_port: 7777,
             checkin_server_enabled: true,
             checkin_server_port: 8080,
+            tunnel_server_enabled: true,
+            tunnel_server_port: 8888,
             mode: "empresa".to_string(),
         }
     }

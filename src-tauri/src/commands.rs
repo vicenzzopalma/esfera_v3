@@ -321,6 +321,122 @@ pub fn deploy_adb_keepalive(_token: String, serial: String) -> Result<String, St
 }
 
 #[tauri::command]
+pub fn resolve_spintax(_token: String, text: String) -> Result<String, String> {
+    Ok(crate::spintax::resolve_spintax(&text))
+}
+
+#[tauri::command]
+pub fn spintax_combinations(_token: String, text: String) -> Result<u64, String> {
+    Ok(crate::spintax::spintax_combinations(&text))
+}
+
+/// Instala o daemon kernel-level (device-agent) em um aparelho via ADB:
+/// envia o binário + scripts para /data/adb/earlypoint e executa o instalador.
+#[tauri::command]
+pub fn install_kernel_agent(
+    state: State<'_, AppState>,
+    token: String,
+    serial: String,
+) -> Result<String, String> {
+    validate_session(&state.sessions, &token)?;
+    use std::path::PathBuf;
+
+    // 1. Resolve o serial ADB ativo
+    let resolved = AdbManager::resolve_target_serial(&serial)?;
+
+    // 2. Localiza o binário do daemon (prioriza o bundled; fallback para target do device-agent)
+    let candidates: Vec<PathBuf> = [
+        "binaries/esfera-agent",
+        "device-agent/target/aarch64-linux-android/release/device-agent",
+        "device-agent/target/armv7-linux-androideabi/release/device-agent",
+        "device-agent/target/aarch64-linux-android/release/esfera-agent",
+        "device-agent/target/armv7-linux-androideabi/release/esfera-agent",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+
+    let bin_path = candidates
+        .iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| {
+            "Binário esfera-agent não encontrado. Compile com: cargo build --release --target aarch64-linux-android (em device-agent/) e copie para src-tauri/binaries/esfera-agent".to_string()
+        })?;
+
+    let script_dir = PathBuf::from("src-agent/scripts");
+    let daemon_script = script_dir.join("00_earlypoint_daemon.sh");
+    let install_script = script_dir.join("install.sh");
+    if !daemon_script.exists() || !install_script.exists() {
+        return Err("Scripts do daemon não encontrados em src-agent/scripts/".to_string());
+    }
+
+    // 3. Prepara diretório remoto
+    let mut mkdir_cmd = crate::adb_manager::create_cmd("adb");
+    mkdir_cmd.args(["-s", &resolved, "shell", "mkdir", "-p", "/data/local/tmp/earlypoint"]);
+    let _ = crate::adb_manager::run_cmd_timeout(mkdir_cmd, std::time::Duration::from_secs(5));
+
+    // 4. Push do binário + scripts
+    for (local, remote) in [
+        (bin_path.as_path(), "/data/local/tmp/earlypoint/esfera-agent"),
+        (daemon_script.as_path(), "/data/local/tmp/earlypoint/00_earlypoint_daemon.sh"),
+        (install_script.as_path(), "/data/local/tmp/earlypoint/install.sh"),
+    ] {
+        let mut cmd = crate::adb_manager::create_cmd("adb");
+        cmd.args(["-s", &resolved, "push", &local.to_string_lossy(), remote]);
+        let out = crate::adb_manager::run_cmd_timeout(cmd, std::time::Duration::from_secs(60))
+            .map_err(|e| format!("Falha no push de {}: {}", remote, e))?;
+        if !out.status.success() {
+            return Err(format!("Falha no push de {} para o aparelho", remote));
+        }
+    }
+
+    // 5. Determina o EsferaDeviceId do aparelho (para o handshake do túnel)
+    let devices = state.db.get_devices(0);
+    let hwid = devices
+        .iter()
+        .find(|d| d.serial == resolved || d.esfera_device_id.as_deref() == Some(resolved.as_str()))
+        .and_then(|d| d.esfera_device_id.clone())
+        .unwrap_or_default();
+
+    // 6. Servidor do túnel = IP LAN desta máquina + porta configurada
+    let cfg = crate::config::load_config();
+    let server = format!(
+        "{}:{}",
+        AdbManager::get_host_lan_ip(),
+        cfg.tunnel_server_port
+    );
+
+    // 7. Executa o instalador no aparelho (root)
+    let mut install_cmd = crate::adb_manager::create_cmd("adb");
+    install_cmd.args([
+        "-s",
+        &resolved,
+        "shell",
+        "sh",
+        "/data/local/tmp/earlypoint/install.sh",
+        &server,
+        &cfg.tunnel_server_port.to_string(),
+        &hwid,
+    ]);
+    let out = crate::adb_manager::run_cmd_timeout(install_cmd, std::time::Duration::from_secs(90))
+        .map_err(|e| format!("Falha ao executar o instalador: {}", e))?;
+    let combined = format!(
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    Ok(format!(
+        "✅ Daemon Esfera instalado em {} (túnel → {}:{}) {}{}",
+        resolved,
+        server,
+        cfg.tunnel_server_port,
+        if out.status.success() { "" } else { " (com avisos) " },
+        combined.trim()
+    ))
+}
+
+#[tauri::command]
 pub fn get_hardware_uuid(_token: String) -> String {
     AdbManager::get_hardware_uuid()
 }
@@ -375,7 +491,7 @@ pub fn connect_adb_device(
     let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
     let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
     let _ = AdbManager::deploy_keepalive(&serial);
-    let _ = db.add_log(
+    db.queue_add_log(
         company_id,
         "info",
         "ADB Engine",
@@ -447,7 +563,7 @@ pub fn disconnect_adb_device(state: State<'_, AppState>, token: String, serial: 
     let _session = validate_session(&state.sessions, &token)?;
     let result = AdbManager::disconnect_device(&serial)?;
     let db = &state.db;
-    let _ = db.add_log(
+    db.queue_add_log(
         0,
         "info",
         "ADB Engine",
@@ -528,7 +644,7 @@ pub fn create_campaign(state: State<'_, AppState>, token: String, campaign: Camp
     }
     let db = &state.db;
     let id = db.create_campaign(&campaign)?;
-    let _ = db.add_log(
+    db.queue_add_log(
         campaign.company_id,
         "info",
         "Central Campanhas",
@@ -593,7 +709,7 @@ pub fn create_automation(
     check_company_access(&session, automation.company_id)?;
     let db = &state.db;
     let id = db.create_automation(&automation)?;
-    let _ = db.add_log(
+    db.queue_add_log(
         automation.company_id,
         "info",
         "Motor Automações",
