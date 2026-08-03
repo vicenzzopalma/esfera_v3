@@ -1324,9 +1324,19 @@ const MobileDeviceCardItem = memo(function MobileDeviceCardItem({
         </div>
       )}
 
+      {/* Badge de modo de conexão — Túnel Reverso (modelo novo) vs IP ADB (modelo antigo) */}
+      {device.viaTunnel ? (
+        <div className="bg-emerald-900/40 border border-emerald-700/50 px-3 py-1.5 rounded-xl flex items-center justify-between text-[11px] font-mono">
+          <span className="text-emerald-400 font-bold">⟲ Túnel Reverso</span>
+          <span className="text-emerald-300">{device.esferaDeviceId || device.currentAdbAddress || device.serial}</span>
+        </div>
+      ) : (
+        <></>
+      )}
+
       {/* Connection IP / Serial */}
       <div className="bg-slate-900/80 border border-slate-800/60 px-3 py-2 rounded-xl flex items-center justify-between text-[11px] font-mono">
-        <span className="text-slate-400">{isUsbOnly ? "Serial USB:" : "IP ADB:"}</span>
+        <span className="text-slate-400">{device.viaTunnel ? "Túnel (UUID):" : isUsbOnly ? "Serial USB:" : "IP ADB:"}</span>
         <span className="text-blue-300 font-bold">{device.currentAdbAddress || device.serial}</span>
       </div>
 

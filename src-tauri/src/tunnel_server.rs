@@ -33,6 +33,11 @@ type ConnMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<ProxyRequest>>>>;
 
 static REGISTRY: LazyLock<ConnMap> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+/// Endereço local (IP:porta) reportado pelo agente em cada handshake de túnel.
+/// Usado pelo get_devices para expor a identidade estável do device via túnel.
+static TUNNEL_IPS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 const ADB_PORT: u16 = 5555;
 const HEARTBEAT_GRACE_SECS: u64 = 45;
 const PROXY_ACK_TIMEOUT_SECS: u64 = 5;
@@ -168,6 +173,11 @@ async fn handle_agent(stream: TcpStream, db: Arc<Database>, app_handle: Option<A
         });
     }
     crate::adb_tcp::register_tunnel_serial(&uuid);
+    crate::session_manager::update_adb_tunnel_status(&uuid, true);
+    // Guarda o endereço local reportado para o get_devices expor identidade estável.
+    if let Ok(mut m) = TUNNEL_IPS.lock() {
+        m.insert(uuid.clone(), adb_addr.clone());
+    }
 
     if let Some(ref app) = app_handle {
         let _ = app.emit(
@@ -230,6 +240,10 @@ async fn handle_agent(stream: TcpStream, db: Arc<Database>, app_handle: Option<A
 
     REGISTRY.lock().unwrap().remove(&uuid);
     crate::adb_tcp::unregister_tunnel_serial(&uuid);
+    crate::session_manager::update_adb_tunnel_status(&uuid, false);
+    if let Ok(mut m) = TUNNEL_IPS.lock() {
+        m.remove(&uuid);
+    }
 }
 
 /// Negocia o proxy com o daemon (JSON) e faz relay bidirecional bruto.
@@ -333,5 +347,17 @@ pub async fn open_proxy(uuid: &str, port: u16) -> Result<std::net::TcpStream, St
 /// servidor seja derrubado ou o app encerre.
 pub fn shutdown() {
     REGISTRY.lock().unwrap().clear();
+    TUNNEL_IPS.lock().unwrap().clear();
     crate::adb_tcp::unregister_all_tunnel_serials();
+}
+
+/// Indica se existe uma sessão de túnel reverso ativa para o `uuid` informado.
+pub fn is_tunnel_active(uuid: &str) -> bool {
+    REGISTRY.lock().map(|m| m.contains_key(uuid)).unwrap_or(false)
+}
+
+/// Endereço local (IP:porta) reportado pelo agente na última sessão de túnel do `uuid`.
+/// Retorna None se não houver sessão ativa.
+pub fn tunnel_local_ip(uuid: &str) -> Option<String> {
+    TUNNEL_IPS.lock().ok().and_then(|m| m.get(uuid).cloned())
 }

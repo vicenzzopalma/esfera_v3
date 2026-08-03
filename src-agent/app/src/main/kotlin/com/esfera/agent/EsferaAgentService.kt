@@ -15,7 +15,9 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
 import java.io.BufferedReader
+import java.io.InputStream
 import java.io.InputStreamReader
+import java.io.OutputStream
 import java.io.PrintWriter
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -102,6 +104,8 @@ class EsferaAgentService : Service() {
     // Lifecycle
     // ----------------------------------------------------------------
 
+    private var presenceClient: PresenceClient? = null
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
@@ -125,6 +129,7 @@ class EsferaAgentService : Service() {
         releaseWakeLock()
         checkInJob?.cancel()
         tunnelJob?.cancel()
+        presenceClient?.stop()
         scope.cancel()
         httpClient.close()
         super.onDestroy()
@@ -141,10 +146,10 @@ class EsferaAgentService : Service() {
             "UNKNOWN_DEVICE"
         }
 
-        val file = File(CONFIG_FILE)
-        val loadedConfig = if (file.exists()) {
+        val configFile = File(filesDir, "esfera_config.json")
+        val loadedConfig = if (configFile.exists()) {
             try {
-                json.decodeFromString<EsferaConfig>(file.readText())
+                json.decodeFromString<EsferaConfig>(configFile.readText())
             } catch (e: Exception) {
                 EsferaConfig()
             }
@@ -176,6 +181,23 @@ class EsferaAgentService : Service() {
         if (config.tunnelEnabled) {
             startTunnelLoop(config)
         }
+        startPresenceLoop(config)
+    }
+
+    private fun startPresenceLoop(config: EsferaConfig) {
+        presenceClient?.stop()
+        val host = config.serverUrl
+            .replace("http://", "")
+            .replace("https://", "")
+            .substringBefore(':')
+            .substringBefore('/')
+            .ifEmpty { "127.0.0.1" }
+        presenceClient = PresenceClient(
+            context = this,
+            deviceId = config.deviceId,
+            serverHost = host,
+            wsPort = 7779
+        ).apply { start() }
     }
 
     // ----------------------------------------------------------------
@@ -216,7 +238,7 @@ class EsferaAgentService : Service() {
         tunnelJob?.cancel() // evita duplo túnel se rechamado
         var first = true
         tunnelJob = scope.launch {
-            var backoffMs = 1_000L
+            var backoffMs = 5_000L
             while (isActive) {
                 val host = config.serverUrl
                     .replace("http://", "")
@@ -226,13 +248,17 @@ class EsferaAgentService : Service() {
                     .ifEmpty { "127.0.0.1" }
                 try {
                     openTunnel(host, config.tunnelPort, config.deviceId)
-                    backoffMs = 1_000L // reset em caso de fechamento limpo
+                    backoffMs = 5_000L // reset em caso de fechamento limpo
                 } catch (e: Exception) {
                     android.util.Log.w("EsferaAgent", "Túnel caiu: ${e.message}")
                 }
-                if (first) { first = false; backoffMs = 1_000L }
-                delay(backoffMs)
-                backoffMs = (backoffMs * 2).coerceAtMost(15_000L)
+                if (first) { first = false; backoffMs = 1_000L } // A primeira tentativa após ligar o app é rápida
+                
+                // Adiciona um Jitter de 0 a 2 segundos para evitar "thundering herd" (todos conectando no mesmo ms)
+                delay(backoffMs + (0..2000).random().toLong())
+                
+                // Backoff respeitando o limite pedido: entre 5 e 10 segundos de máximo.
+                backoffMs = (backoffMs * 2).coerceIn(5_000L, 10_000L)
             }
         }
     }
@@ -264,7 +290,21 @@ class EsferaAgentService : Service() {
                         // EOF ou erro de leitura: o servidor caiu. Sai do escopo.
                         return@launch
                     }
-                    // O backend responde ping<->pong; não é necessário tratar aqui.
+                    // Trata mensagens de controle enviadas pelo servidor (túnel reverso).
+                    when {
+                        line.contains("\"type\":\"ping\"") -> {
+                            writer.println("""{"type":"pong"}""")
+                            writer.flush()
+                        }
+                        line.contains("\"type\":\"proxy\"") -> {
+                            val port = Regex("\"port\"\\s*:\\s*(\\d+)").find(line)
+                                ?.groupValues?.get(1)?.toInt() ?: 5555
+                            // Sinaliza ack e abre o relay local (ADB do aparelho <-> túnel).
+                            writer.println("""{"type":"proxy-ack"}""")
+                            writer.flush()
+                            launch(Dispatchers.IO) { relayToLocal(socket, port) }
+                        }
+                    }
                 }
             }
 
@@ -278,6 +318,36 @@ class EsferaAgentService : Service() {
             } finally {
                 readerJob.cancel()
             }
+        }
+    }
+
+    /// Relay bidirecional bruto entre o soquete do túnel e o ADB local do aparelho
+    /// (127.0.0.1:port). Chamado quando o servidor pede um proxy (ADB reverso via túnel).
+    private suspend fun relayToLocal(tunnel: Socket, port: Int) {
+        try {
+            val local = Socket("127.0.0.1", port)
+            coroutineScope {
+                launch { pump(tunnel.getInputStream(), local.getOutputStream()) }
+                launch { pump(local.getInputStream(), tunnel.getOutputStream()) }
+            }
+            local.close()
+        } catch (_: Exception) {
+            // Relay encerrado (qualquer ponta fechou).
+        }
+    }
+
+    /// Copia bytes de `src` para `dst` até EOF ou erro.
+    private suspend fun pump(src: InputStream, dst: OutputStream) {
+        val buf = ByteArray(8192)
+        try {
+            var n = src.read(buf)
+            while (n > 0) {
+                dst.write(buf, 0, n)
+                dst.flush()
+                n = src.read(buf)
+            }
+        } catch (_: Exception) {
+            // EOF ou erro de leitura/escrita: encerra este sentido do relay.
         }
     }
 
