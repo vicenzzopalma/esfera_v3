@@ -20105,24 +20105,43 @@ impl AdbManager {
         Ok(devices)
     }
 
+    /// Decide se usa o protocolo ADB nativo (IP Wi-Fi ou serial de túnel esfera-agent)
+    fn use_native_adb(serial: &str) -> bool {
+        serial.contains('.') || crate::adb_tcp::is_tunnel_serial(serial)
+    }
+
     /// Obtém o endereço IP do wlan0 via shell único combinado (3 métodos em 1 chamada)
     pub fn get_device_wifi_ip(serial: &str) -> Result<String, String> {
+        let shell_cmd = "getprop dhcp.wlan0.ipaddress; echo '---'; ip route; echo '---'; ip addr show wlan0";
+
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe (evita "adb server" no hub)
+        if Self::use_native_adb(serial) {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, shell_cmd) {
+                if let Some(ip) = Self::parse_wifi_ip_from_shell(&stdout) {
+                    return Ok(ip);
+                }
+            }
+        }
+
         let mut cmd = create_cmd("adb");
-        cmd.args([
-            "-s",
-            serial,
-            "shell",
-            "getprop dhcp.wlan0.ipaddress; echo '---'; ip route; echo '---'; ip addr show wlan0",
-        ]);
+        cmd.args(["-s", serial, "shell", shell_cmd]);
         let output = run_cmd_timeout(cmd, Duration::from_secs(3))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(ip) = Self::parse_wifi_ip_from_shell(&stdout) {
+            return Ok(ip);
+        }
+
+        Err(format!("Não foi possível detectar o IP Wi-Fi do celular '{}'. Verifique se o aparelho está conectado à rede Wi-Fi.", serial))
+    }
+
+    fn parse_wifi_ip_from_shell(stdout: &str) -> Option<String> {
         let sections: Vec<&str> = stdout.split("---").collect();
 
         if let Some(s0) = sections.first() {
             let ip = s0.trim();
             if !ip.is_empty() && ip.contains('.') && !ip.starts_with("127.") {
-                return Ok(ip.to_string());
+                return Some(ip.to_string());
             }
         }
 
@@ -20134,7 +20153,7 @@ impl AdbManager {
                         if src_idx + 1 < parts.len() {
                             let parsed_ip = parts[src_idx + 1].trim().to_string();
                             if parsed_ip.contains('.') && !parsed_ip.starts_with("127.") {
-                                return Ok(parsed_ip);
+                                return Some(parsed_ip);
                             }
                         }
                     }
@@ -20147,12 +20166,11 @@ impl AdbManager {
                 if line.trim().starts_with("inet ") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() > 1 {
-                        let ip_mask = parts[1];
-                        let ip_only: Vec<&str> = ip_mask.split('/').collect();
+                        let ip_only: Vec<&str> = parts[1].split('/').collect();
                         if !ip_only.is_empty() {
                             let parsed_ip = ip_only[0].trim().to_string();
                             if parsed_ip.contains('.') && !parsed_ip.starts_with("127.") {
-                                return Ok(parsed_ip);
+                                return Some(parsed_ip);
                             }
                         }
                     }
@@ -20160,7 +20178,7 @@ impl AdbManager {
             }
         }
 
-        Err(format!("Não foi possível detectar o IP Wi-Fi do celular '{}'. Verifique se o aparelho está conectado à rede Wi-Fi.", serial))
+        None
     }
 
     /// Habilita porta TCP no dispositivo
@@ -20264,6 +20282,10 @@ impl AdbManager {
 
     /// Desconecta de um dispositivo via `adb disconnect serial`
     pub fn disconnect_device(serial: &str) -> Result<String, String> {
+        // Expurga da pool nativa e do registro de túneis (idempotente)
+        crate::adb_tcp::evict(serial);
+        crate::adb_tcp::unregister_tunnel_serial(serial);
+
         let output = create_cmd("adb")
             .arg("disconnect")
             .arg(serial)
@@ -20284,25 +20306,43 @@ impl AdbManager {
             }
         }
 
-        let output = create_cmd("adb")
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("dumpsys battery | grep level:")
-            .output()
-            .map_err(|e| format!("Falha ao consultar bateria via ADB: {}", e))?;
+        let mut level: Option<i32> = None;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let line = line.trim();
-            if let Some(val) = line.strip_prefix("level:") {
-                if let Ok(level) = val.trim().parse::<i32>() {
-                    if let Ok(mut cache) = BATTERY_CACHE.write() {
-                        cache.insert(serial.to_string(), (level, Instant::now()));
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "dumpsys battery | grep level:") {
+                for line in stdout.lines() {
+                    let line = line.trim();
+                    if let Some(val) = line.strip_prefix("level:") {
+                        level = val.trim().parse::<i32>().ok();
                     }
-                    return Ok(level);
                 }
             }
+        }
+
+        if level.is_none() {
+            let output = create_cmd("adb")
+                .arg("-s")
+                .arg(serial)
+                .arg("shell")
+                .arg("dumpsys battery | grep level:")
+                .output()
+                .map_err(|e| format!("Falha ao consultar bateria via ADB: {}", e))?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let line = line.trim();
+                if let Some(val) = line.strip_prefix("level:") {
+                    level = val.trim().parse::<i32>().ok();
+                }
+            }
+        }
+
+        if let Some(level) = level {
+            if let Ok(mut cache) = BATTERY_CACHE.write() {
+                cache.insert(serial.to_string(), (level, Instant::now()));
+            }
+            return Ok(level);
         }
 
         Ok(85)
@@ -20310,55 +20350,74 @@ impl AdbManager {
 
     /// Captura a tela do dispositivo via `adb -s <serial> exec-out screencap -p` e aplica sanitização nativa C++ HPC
     pub fn capture_screen(serial: &str) -> Result<String, String> {
-        let output = create_cmd("adb")
-            .args(["-s", serial, "exec-out", "screencap", "-p"])
-            .output()
-            .map_err(|e| format!("Falha ao executar screencap ADB: {}", e))?;
-
-        if output.status.success() && !output.stdout.is_empty() {
-            let raw_bytes = &output.stdout;
-            let mut sanitized = vec![0u8; raw_bytes.len()];
-            let mut out_written: usize = 0;
-
-            let status = unsafe {
-                esfera_hpc_sanitize_png_buffer(
-                    raw_bytes.as_ptr(),
-                    raw_bytes.len(),
-                    sanitized.as_mut_ptr(),
-                    sanitized.len(),
-                    &mut out_written,
-                )
-            };
-
-            let final_bytes = if status == 0 && out_written > 0 && out_written <= sanitized.len() {
-                &sanitized[..out_written]
-            } else {
-                raw_bytes.as_slice()
-            };
-
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(final_bytes);
-            Ok(format!("data:image/png;base64,{}", b64))
+        let raw_bytes: Vec<u8> = if Self::use_native_adb(serial) {
+            // Wi-Fi: protocolo ADB nativo (bytes crus do frame)
+            match crate::adb_tcp::exec_shell_bytes(serial, "screencap -p") {
+                Ok((stdout, _, true)) => stdout,
+                Ok((_, _, false)) => return Err("Comando screencap nativo falhou".to_string()),
+                Err(_) => {
+                    let fallback = create_cmd("adb")
+                        .args(["-s", serial, "exec-out", "screencap", "-p"])
+                        .output()
+                        .map_err(|e| format!("Falha ao executar screencap ADB: {}", e))?;
+                    if !fallback.status.success() || fallback.stdout.is_empty() {
+                        return Err(format!(
+                            "Não foi possível capturar o frame da tela do celular ({})",
+                            serial
+                        ));
+                    }
+                    fallback.stdout
+                }
+            }
         } else {
-            Err(format!(
-                "Não foi possível capturar o frame da tela do celular ({})",
-                serial
-            ))
-        }
+            let output = create_cmd("adb")
+                .args(["-s", serial, "exec-out", "screencap", "-p"])
+                .output()
+                .map_err(|e| format!("Falha ao executar screencap ADB: {}", e))?;
+            if !output.status.success() || output.stdout.is_empty() {
+                return Err(format!(
+                    "Não foi possível capturar o frame da tela do celular ({})",
+                    serial
+                ));
+            }
+            output.stdout
+        };
+
+        let mut sanitized = vec![0u8; raw_bytes.len()];
+        let mut out_written: usize = 0;
+
+        let status = unsafe {
+            esfera_hpc_sanitize_png_buffer(
+                raw_bytes.as_ptr(),
+                raw_bytes.len(),
+                sanitized.as_mut_ptr(),
+                sanitized.len(),
+                &mut out_written,
+            )
+        };
+
+        let final_bytes = if status == 0 && out_written > 0 && out_written <= sanitized.len() {
+            &sanitized[..out_written]
+        } else {
+            raw_bytes.as_slice()
+        };
+
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(final_bytes);
+        Ok(format!("data:image/png;base64,{}", b64))
     }
 
     /// Envia um toque na tela via `adb -s <serial> shell input tap x y`
     pub fn tap_screen(serial: &str, x: u32, y: u32) -> Result<(), String> {
+        let tap_cmd = format!("input tap {} {}", x, y);
+
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) && crate::adb_tcp::exec_shell_bytes(serial, &tap_cmd).is_ok() {
+            return Ok(());
+        }
+
         let output = create_cmd("adb")
-            .args([
-                "-s",
-                serial,
-                "shell",
-                "input",
-                "tap",
-                &x.to_string(),
-                &y.to_string(),
-            ])
+            .args(["-s", serial, "shell", "input", "tap", &x.to_string(), &y.to_string()])
             .output()
             .map_err(|e| format!("Falha ao enviar toque ADB: {}", e))?;
 
@@ -20371,6 +20430,13 @@ impl AdbManager {
 
     /// Envia um evento de tecla via `adb -s <serial> shell input keyevent <keycode>`
     pub fn send_keyevent(serial: &str, keycode: u32) -> Result<(), String> {
+        let key_cmd = format!("input keyevent {}", keycode);
+
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) && crate::adb_tcp::exec_shell_bytes(serial, &key_cmd).is_ok() {
+            return Ok(());
+        }
+
         let output = create_cmd("adb")
             .args([
                 "-s",
@@ -20412,6 +20478,14 @@ impl AdbManager {
             ));
         }
         let full_cmd = shell_cmds.join(" ");
+
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) {
+            if let Ok((_, _, _)) = crate::adb_tcp::exec_shell_bytes(serial, &full_cmd) {
+                return Ok(());
+            }
+        }
+
         let output = create_cmd("adb")
             .args(["-s", serial, "shell", &full_cmd])
             .output()
@@ -20432,6 +20506,33 @@ impl AdbManager {
                 if info.2.elapsed() < Duration::from_secs(30) {
                     return (info.0.clone(), info.1.clone());
                 }
+            }
+        }
+
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(
+                serial,
+                "getprop ro.product.brand; echo; getprop ro.product.model",
+            ) {
+                let lines: Vec<&str> = stdout.lines().collect();
+                let brand = lines
+                    .first()
+                    .map(|l| l.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Android".to_string());
+                let model = lines
+                    .get(1)
+                    .map(|l| l.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Smartphone".to_string());
+                if let Ok(mut cache) = DEVICE_INFO_CACHE.write() {
+                    cache.insert(
+                        serial.to_string(),
+                        (brand.clone(), model.clone(), Instant::now()),
+                    );
+                }
+                return (brand, model);
             }
         }
 
@@ -20560,6 +20661,35 @@ impl AdbManager {
         url: &str,
         display_id: u32,
     ) -> Result<String, String> {
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) {
+            let intent_cmd = format!(
+                "am start --display {} -a android.intent.action.VIEW -d '{}'",
+                display_id,
+                Self::shell_quote(url)
+            );
+            match crate::adb_tcp::exec_shell_bytes(serial, &intent_cmd) {
+                Ok((_, _, true)) => {
+                    return Ok(format!(
+                        "Intent aberto no Display #{} com sucesso no aparelho {}",
+                        display_id, serial
+                    ));
+                }
+                Ok((_, _, false)) => {
+                    return Err(format!(
+                        "Erro ao abrir Intent no Display #{} (nativo)",
+                        display_id
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Erro ao abrir Intent no Display #{} via túnel: {}",
+                        display_id, e
+                    ));
+                }
+            }
+        }
+
         let output = create_cmd("adb")
             .args([
                 "-s",
@@ -20603,11 +20733,17 @@ impl AdbManager {
 
         // 1. Tenta obter o SDK level do Android (Android 12+ / SDK 31+ suporta --video-source=camera nativo no scrcpy)
         let mut sdk_level = 0;
-        let mut sdk_cmd = create_cmd("adb");
-        sdk_cmd.args(["-s", serial, "shell", "getprop", "ro.build.version.sdk"]);
-        if let Ok(out) = run_cmd_timeout(sdk_cmd, Duration::from_secs(3)) {
-            let sdk_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            sdk_level = sdk_str.parse::<i32>().unwrap_or(0);
+        let sdk_native = if Self::use_native_adb(serial) {
+            crate::adb_tcp::exec_shell(serial, "getprop ro.build.version.sdk")
+        } else {
+            let mut sdk_cmd = create_cmd("adb");
+            sdk_cmd.args(["-s", serial, "shell", "getprop", "ro.build.version.sdk"]);
+            run_cmd_timeout(sdk_cmd, Duration::from_secs(3)).map(|o| {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            })
+        };
+        if let Ok(sdk_str) = sdk_native {
+            sdk_level = sdk_str.trim().parse::<i32>().unwrap_or(0);
         }
 
         // Se o dispositivo for Android < 12 (SDK < 31), abre o app de Câmera nativo via ADB Intent e abre o espelhamento Scrcpy
@@ -21337,6 +21473,17 @@ impl AdbManager {
     }
 
     fn get_device_manufacturer(serial: &str) -> String {
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "getprop ro.product.manufacturer") {
+                let val = stdout.trim();
+                if !val.is_empty() {
+                    return val.to_string();
+                }
+            }
+            return "unknown".to_string();
+        }
+
         let mut cmd = create_cmd("adb");
         cmd.args(["-s", serial, "shell", "getprop", "ro.product.manufacturer"]);
         if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
@@ -21349,23 +21496,43 @@ impl AdbManager {
     /// Lê a identificação persistente do celular (/sdcard/.esfera_device_id ou persist.esfera.device_id)
     /// Prioriza sdcard porque setprop/getprop pode ser bloqueado por SELinux em dispositivos nao-root
     pub fn get_persistent_device_id(serial: &str) -> Option<String> {
+        let is_native = Self::use_native_adb(serial);
+
         // 1. Tenta sdcard primeiro (mais confiavel)
-        let mut cmd = create_cmd("adb");
-        cmd.args(["-s", serial, "shell", "cat", "/sdcard/.esfera_device_id"]);
-        if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
-            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
-                return Some(val);
+        if is_native {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "cat /sdcard/.esfera_device_id") {
+                let val = stdout.trim().to_string();
+                if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
+                    return Some(val);
+                }
+            }
+        } else {
+            let mut cmd = create_cmd("adb");
+            cmd.args(["-s", serial, "shell", "cat", "/sdcard/.esfera_device_id"]);
+            if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
+                let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
+                    return Some(val);
+                }
             }
         }
 
         // 2. Fallback: getprop (pode falhar em SELinux enforcing)
-        let mut cmd2 = create_cmd("adb");
-        cmd2.args(["-s", serial, "shell", "getprop", "persist.esfera.device_id"]);
-        if let Ok(out) = run_cmd_timeout(cmd2, Duration::from_secs(2)) {
-            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
-                return Some(val);
+        if is_native {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "getprop persist.esfera.device_id") {
+                let val = stdout.trim().to_string();
+                if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
+                    return Some(val);
+                }
+            }
+        } else {
+            let mut cmd2 = create_cmd("adb");
+            cmd2.args(["-s", serial, "shell", "getprop", "persist.esfera.device_id"]);
+            if let Ok(out) = run_cmd_timeout(cmd2, Duration::from_secs(2)) {
+                let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
+                    return Some(val);
+                }
             }
         }
 
@@ -21527,6 +21694,11 @@ impl AdbManager {
     /// Resolve o serial exato do dispositivo alvo no ADB de forma segura, suportando resolução nativa por Rede Wi-Fi, Hardware Serial (ro.serialno) ou ID do banco de dados
     pub fn resolve_target_serial(requested_serial: &str) -> Result<String, String> {
         let requested = requested_serial.trim();
+
+        // 0. Fast-path: serial de túnel esfera-agent (UUID) já é roteável diretamente
+        if crate::adb_tcp::is_tunnel_serial(requested) {
+            return Ok(requested.to_string());
+        }
 
         // 1. Tenta reconexão prévia se for IP Wi-Fi
         if requested.contains(':') || requested.contains('.') {
@@ -21966,7 +22138,7 @@ impl AdbManager {
                 if is_online {
                     // Preventivo: devices online também tentam reconnect no CurrentAdbAddress
                     if let Some(ref addr) = dev.current_adb_address {
-                        if addr.contains(':') && addr.contains('.') {
+                        if addr.contains(':') && addr.contains('.') && !crate::adb_tcp::is_tunnel_serial(addr) {
                             let _ = Self::connect_target_flushed(addr);
                         }
                     }
@@ -21975,7 +22147,7 @@ impl AdbManager {
 
                 // Device offline — tenta reconnect pelo CurrentAdbAddress, IP ou serial
                 let target = if let Some(ref addr) = dev.current_adb_address {
-                    if addr.contains(':') && addr.contains('.') {
+                    if addr.contains(':') && addr.contains('.') && !crate::adb_tcp::is_tunnel_serial(addr) {
                         addr.clone()
                     } else if !dev.ip.is_empty() && dev.ip.contains('.') {
                         format!("{}:{}", dev.ip, dev.port)
@@ -22002,6 +22174,11 @@ impl AdbManager {
                     }
                 }
 
+                // Túneis esfera-agent se reconectam sozinhos — pulam imunidade/serial
+                if crate::adb_tcp::is_tunnel_serial(&target) {
+                    continue;
+                }
+
                 let already = injected
                     .lock()
                     .map(|s| s.contains(&target))
@@ -22020,6 +22197,27 @@ impl AdbManager {
 
     /// Obtém a resolução da tela física do dispositivo (Physical size: WxH)
     pub fn get_device_screen_size(serial: &str) -> (i32, i32) {
+        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
+        if Self::use_native_adb(serial) {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "wm size") {
+                for line in stdout.lines() {
+                    if line.contains("Physical size:") || line.contains("Override size:") {
+                        if let Some(res) = line.split(':').nth(1) {
+                            let parts: Vec<&str> = res.trim().split('x').collect();
+                            if parts.len() == 2 {
+                                if let (Ok(w), Ok(h)) = (
+                                    parts[0].trim().parse::<i32>(),
+                                    parts[1].trim().parse::<i32>(),
+                                ) {
+                                    return (w, h);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let output = create_cmd("adb")
             .arg("-s")
             .arg(serial)
@@ -22044,6 +22242,11 @@ impl AdbManager {
             }
         }
         (1080, 2400) // Fallback seguro padrão
+    }
+
+    /// Escapa um valor para uso seguro entre aspas simples no shell do dispositivo
+    fn shell_quote(value: &str) -> String {
+        value.replace('\'', "'\"'\"'")
     }
 
     /// Encoder de URL para parâmetros do Intent
@@ -22073,22 +22276,41 @@ impl AdbManager {
         let encoded_msg = Self::url_encode(message);
         let intent_url = format!("https://api.whatsapp.com/send?phone={}&text={}", phone, encoded_msg);
 
-        // 1. Dispara Intent do WhatsApp
-        let mut intent_adb = create_cmd("adb");
-        intent_adb
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("am")
-            .arg("start")
-            .arg("-a")
-            .arg("android.intent.action.VIEW")
-            .arg("-d")
-            .arg(&intent_url);
-        let intent_cmd = run_cmd_timeout(intent_adb, Duration::from_secs(8));
+        // 1. Dispara Intent do WhatsApp (protocolo ADB nativo para Wi-Fi/túnel)
+        if Self::use_native_adb(serial) {
+            let intent_cmd = format!(
+                "am start -a android.intent.action.VIEW -d '{}'",
+                Self::shell_quote(&intent_url)
+            );
+            match crate::adb_tcp::exec_shell_bytes(serial, &intent_cmd) {
+                Ok((_, _, true)) => {}
+                Ok((_, _, false)) => {
+                    return Err("Falha ao disparar Intent do WhatsApp (nativo)".to_string())
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Falha ao disparar Intent do WhatsApp via túnel: {}",
+                        e
+                    ))
+                }
+            }
+        } else {
+            let mut intent_adb = create_cmd("adb");
+            intent_adb
+                .arg("-s")
+                .arg(serial)
+                .arg("shell")
+                .arg("am")
+                .arg("start")
+                .arg("-a")
+                .arg("android.intent.action.VIEW")
+                .arg("-d")
+                .arg(&intent_url);
+            let intent_cmd = run_cmd_timeout(intent_adb, Duration::from_secs(8));
 
-        if let Err(e) = intent_cmd {
-            return Err(format!("Falha ao disparar Intent do WhatsApp: {}", e));
+            if let Err(e) = intent_cmd {
+                return Err(format!("Falha ao disparar Intent do WhatsApp: {}", e));
+            }
         }
 
         // 2. Aguarda delay Gaussiano
@@ -22148,7 +22370,8 @@ impl AdbManager {
 
         let pts = count as usize;
 
-        // Primário: input motionevent DOWN/MOVE/UP (Android 10+) traçando a curva real
+        // Primário: input motionevent DOWN/MOVE/UP (Android 10+) traçando a curva real.
+        // Para Wi-Fi/túnel, a cadeia && inteira vai por uma única chamada nativa.
         let mut sequence = format!("input motionevent DOWN {} {}", xs[0], ys[0]);
         for i in 1..pts {
             sequence.push_str(&format!(" && input motionevent MOVE {} {}", xs[i], ys[i]));
@@ -22158,11 +22381,17 @@ impl AdbManager {
             xs[pts - 1], ys[pts - 1]
         ));
 
-        let mut mot = create_cmd("adb");
-        mot.args(["-s", serial, "shell"]).arg(&sequence);
-        if let Ok(out) = run_cmd_timeout(mot, Duration::from_secs(12)) {
-            if out.status.success() {
+        if Self::use_native_adb(serial) {
+            if let Ok((_, _, true)) = crate::adb_tcp::exec_shell_bytes(serial, &sequence) {
                 return Ok(());
+            }
+        } else {
+            let mut mot = create_cmd("adb");
+            mot.args(["-s", serial, "shell"]).arg(&sequence);
+            if let Ok(out) = run_cmd_timeout(mot, Duration::from_secs(12)) {
+                if out.status.success() {
+                    return Ok(());
+                }
             }
         }
 
@@ -22193,21 +22422,36 @@ impl AdbManager {
     fn send_long_message_typing(serial: &str, phone: &str, message: &str) -> Result<(), String> {
         let intent_url = format!("https://api.whatsapp.com/send?phone={}", phone);
 
-        let mut intent_adb = create_cmd("adb");
-        intent_adb
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("am")
-            .arg("start")
-            .arg("-a")
-            .arg("android.intent.action.VIEW")
-            .arg("-d")
-            .arg(&intent_url);
-        let intent_cmd = run_cmd_timeout(intent_adb, Duration::from_secs(8));
+        // Abre o chat via Intent (protocolo ADB nativo para Wi-Fi/túnel)
+        if Self::use_native_adb(serial) {
+            let intent_cmd = format!(
+                "am start -a android.intent.action.VIEW -d '{}'",
+                Self::shell_quote(&intent_url)
+            );
+            match crate::adb_tcp::exec_shell_bytes(serial, &intent_cmd) {
+                Ok((_, _, true)) => {}
+                Ok((_, _, false)) => return Err("Falha ao abrir chat WhatsApp (nativo)".to_string()),
+                Err(e) => {
+                    return Err(format!("Falha ao abrir chat WhatsApp via túnel: {}", e))
+                }
+            }
+        } else {
+            let mut intent_adb = create_cmd("adb");
+            intent_adb
+                .arg("-s")
+                .arg(serial)
+                .arg("shell")
+                .arg("am")
+                .arg("start")
+                .arg("-a")
+                .arg("android.intent.action.VIEW")
+                .arg("-d")
+                .arg(&intent_url);
+            let intent_cmd = run_cmd_timeout(intent_adb, Duration::from_secs(8));
 
-        if let Err(e) = intent_cmd {
-            return Err(format!("Falha ao abrir chat WhatsApp: {}", e));
+            if let Err(e) = intent_cmd {
+                return Err(format!("Falha ao abrir chat WhatsApp: {}", e));
+            }
         }
 
         // Aguarda a tela do chat abrir
@@ -22234,16 +22478,26 @@ impl AdbManager {
         // 1. Aplica Proxy Global via ADB se fornecido
         if let Some(proxy) = proxy_url {
             if !proxy.trim().is_empty() {
-                let _ = create_cmd("adb")
-                    .arg("-s")
-                    .arg(serial)
-                    .arg("shell")
-                    .arg("settings")
-                    .arg("put")
-                    .arg("global")
-                    .arg("http_proxy")
-                    .arg(proxy)
-                    .output();
+                if Self::use_native_adb(serial) {
+                    let cmd = format!(
+                        "settings put global http_proxy '{}'",
+                        Self::shell_quote(proxy)
+                    );
+                    let _ = crate::adb_tcp::exec_shell_bytes(serial, &cmd);
+                } else {
+                    let _ = create_cmd("adb")
+                        .arg("-s")
+                        .arg(serial)
+                        .arg("shell")
+                        .arg("settings")
+                        .arg("put")
+                        .arg("global")
+                        .arg("http_proxy")
+                        .arg(proxy)
+                        .output();
+                }
+            } else if Self::use_native_adb(serial) {
+                let _ = crate::adb_tcp::exec_shell_bytes(serial, "settings put global http_proxy :0");
             } else {
                 let _ = create_cmd("adb")
                     .arg("-s")
@@ -22265,17 +22519,31 @@ impl AdbManager {
             "android.permission.ACCESS_COARSE_LOCATION",
         ];
 
-        for pkg in &packages {
-            for perm in &permissions {
-                let _ = create_cmd("adb")
-                    .arg("-s")
-                    .arg(serial)
-                    .arg("shell")
-                    .arg("pm")
-                    .arg("revoke")
-                    .arg(pkg)
-                    .arg(perm)
-                    .output();
+        if Self::use_native_adb(serial) {
+            // Batch único via túnel: pm revoke dos 4 pares em uma só chamada
+            let mut batch = String::new();
+            for pkg in &packages {
+                for perm in &permissions {
+                    if !batch.is_empty() {
+                        batch.push_str(" && ");
+                    }
+                    batch.push_str(&format!("pm revoke {} {}", pkg, perm));
+                }
+            }
+            let _ = crate::adb_tcp::exec_shell_bytes(serial, &batch);
+        } else {
+            for pkg in &packages {
+                for perm in &permissions {
+                    let _ = create_cmd("adb")
+                        .arg("-s")
+                        .arg(serial)
+                        .arg("shell")
+                        .arg("pm")
+                        .arg("revoke")
+                        .arg(pkg)
+                        .arg(perm)
+                        .output();
+                }
             }
         }
 
@@ -22284,6 +22552,10 @@ impl AdbManager {
 
     /// Reconecta todos os dispositivos ativos limpos de soquetes zumbis do Windows com varredura por TCP Probe
     pub fn force_reconnect_all_adb(db: &crate::db::Database) -> Result<String, String> {
+        // Expurga a pool nativa e os registros de túnel (serão renegociados sob demanda)
+        crate::adb_tcp::reset_pool();
+        crate::adb_tcp::unregister_all_tunnel_serials();
+
         let _ = create_cmd("adb").arg("kill-server").output();
         let _ = create_cmd("adb").arg("start-server").output();
 
@@ -22409,11 +22681,14 @@ impl AdbManager {
 // Autenticação RSA (PKCS#1 v1.5) com a chave ~/.android/adbkey.
 // Shell v2 com framing binário (stdin/stdout/stderr/exit).
 // Pool por serial com idle timeout. Fallback para CLI no caller.
+// Seriais de túnel inverso roteiam por ponte local do tunnel_server.
 // ============================================================
 
 use base64::Engine;
+use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
-use rsa::{BigUint, Pkcs1v15Encrypt, RsaPrivateKey};
+use rsa::traits::PublicKeyParts;
+use rsa::{BigUint, Pkcs1v15Sign, RsaPrivateKey};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -22574,10 +22849,9 @@ fn handshake(stream: &mut TcpStream, key: Option<&RsaPrivateKey>) -> io::Result<
                         "aparelho exige autenticação e não há chave em ~/.android/adbkey",
                     ));
                 };
-                let mut rng = rand::thread_rng();
                 // Assinatura ADB = RSA private_encrypt PKCS#1 v1.5 cru (sem DigestInfo)
                 let sig = k
-                    .encrypt(&mut rng, Pkcs1v15Encrypt, &msg.payload)
+                    .sign(Pkcs1v15Sign::new_unprefixed(), &msg.payload)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 write_msg(stream, A_AUTH, A_AUTH_SIGNATURE, 0, &sig)?;
             }
@@ -22709,6 +22983,78 @@ fn is_tcp_serial(serial: &str) -> bool {
     serial.contains(':') && serial.contains('.')
 }
 
+/// Captura o handle do runtime Tokio no setup (necessário para abrir a ponte de
+/// túnel inverso a partir de threads de spawn_blocking).
+pub fn init() {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if let Ok(mut slot) = RUNTIME_HANDLE.lock() {
+            *slot = Some(handle);
+        }
+    }
+}
+
+static RUNTIME_HANDLE: LazyLock<Mutex<Option<tokio::runtime::Handle>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Seriais registradas pelo tunnel_server (devices atrás de NAT roteiam por proxy).
+static TUNNEL_SERIALS: LazyLock<Mutex<HashMap<String, ()>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn register_tunnel_serial(serial: &str) {
+    if let Ok(mut m) = TUNNEL_SERIALS.lock() {
+        m.insert(serial.to_string(), ());
+    }
+}
+
+pub fn unregister_tunnel_serial(serial: &str) {
+    if let Ok(mut m) = TUNNEL_SERIALS.lock() {
+        m.remove(serial);
+    }
+}
+
+/// Limpa todo o estado de seriais virtuais do túnel (usado no shutdown do
+/// servidor de túnel / encerramento do app, evitando "túneis fantasmas").
+pub fn unregister_all_tunnel_serials() {
+    if let Ok(mut m) = TUNNEL_SERIALS.lock() {
+        m.clear();
+    }
+}
+
+pub fn is_tunnel_serial(serial: &str) -> bool {
+    TUNNEL_SERIALS
+        .lock()
+        .map(|m| m.contains_key(serial))
+        .unwrap_or(false)
+}
+
+/// Descarta a conexão nativa de um serial específico (ex.: ao desconectar o aparelho).
+pub fn evict(serial: &str) {
+    POOL.lock().unwrap().remove(serial);
+}
+
+/// Abre o transporte do protocolo ADB para o serial:
+/// Wi-Fi → TCP direto no IP:porta; túnel → ponte local criada pelo tunnel_server.
+fn connect_transport(serial: &str) -> Result<TcpStream, String> {
+    if is_tcp_serial(serial) {
+        let addr = serial
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| format!("serial inválida para ADB nativo: {}", e))?;
+        return TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+            .map_err(|e| format!("falha TCP em {}: {}", serial, e));
+    }
+    if is_tunnel_serial(serial) {
+        let handle = RUNTIME_HANDLE
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "runtime tokio não inicializado (adb_tcp::init)".to_string())?;
+        return handle
+            .block_on(crate::tunnel_server::open_proxy(serial, 5555))
+            .map_err(|e| format!("falha ao abrir proxy de túnel para {}: {}", serial, e));
+    }
+    Err("serial USB não suporta protocolo nativo (use Wi-Fi ou túnel inverso)".to_string())
+}
+
 /// Executa um comando shell via protocolo ADB nativo.
 /// Retorna Err quando o aparelho não suporta (USB, sem rede) ou o comando falhou.
 pub fn exec_shell(serial: &str, cmd: &str) -> Result<String, String> {
@@ -22743,12 +23089,8 @@ pub fn exec_shell_bytes(serial: &str, cmd: &str) -> Result<(Vec<u8>, Vec<u8>, bo
         }
     }
 
-    // Conexão nova
-    let addr = serial
-        .parse::<std::net::SocketAddr>()
-        .map_err(|e| format!("serial inválida para ADB nativo: {}", e))?;
-    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .map_err(|e| format!("falha TCP em {}: {}", serial, e))?;
+    // Conexão nova (Wi-Fi direto ou ponte do túnel inverso)
+    let stream = connect_transport(serial)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
         .map_err(|e| e.to_string())?;
@@ -25094,7 +25436,7 @@ impl Default for AppConfig {
             empresa_server_port: 7777,
             checkin_server_enabled: true,
             checkin_server_port: 8080,
-            tunnel_server_enabled: false,
+            tunnel_server_enabled: true,
             tunnel_server_port: 8888,
             mode: "empresa".to_string(),
         }
@@ -28619,6 +28961,7 @@ use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
+use tauri::Manager;
 
 fn get_db_path() -> String {
     let base_dir = std::env::var_os("LOCALAPPDATA")
@@ -28791,6 +29134,12 @@ pub fn run() {
             dispatcher::Dispatcher::start_worker(db_arc_clone.clone(), Some(app.handle().clone()));
             dispatcher::Dispatcher::start_persistent_adb_keepalive_loop(db_arc_clone.clone());
             adb_manager::AdbManager::start_status_monitor(db_arc_clone);
+            // No encerramento do app, limpa o estado do túnel reverso (evita túneis fantasmas).
+            let _ = app.on_window_event(|_window, event| {
+                if let tauri::WindowEvent::Destroyed = event {
+                    crate::tunnel_server::shutdown();
+                }
+            });
             Ok(())
         })
         .manage(AppState { db: db_arc, sessions, master_client })
@@ -28928,10 +29277,9 @@ pub fn run() {
             get_app_config,
             save_app_config,
         ])
+        .build(tauri::generate_context!())
+        .expect("Erro ao construir aplicação Tauri")
         .run(tauri::generate_context!());
-    if let Err(e) = result {
-        eprintln!("Erro ao iniciar aplicação Esfera v3: {}", e);
-    }
 }
 
 
@@ -29608,25 +29956,39 @@ mod tests {
 // Recebe conexões dos daemons Android (device-agent), faz o
 // handshake por Hardware UUID, mantém heartbeat L7 (ping/pong)
 // e descarta sockets obsoletos quando o aparelho reconecta.
+// Sobre a sessão ativa, aceita pedidos de PROXY TCP: o hub cria
+// uma ponte 127.0.0.1:0 e faz relay bidirecional entre o daemon
+// e o cliente local (adb_tcp), permitindo ADB completo em
+// aparelhos atrás de NAT sem rota direta ao IP:5555.
 // ============================================================
 
 use chrono::Utc;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{mpsc, oneshot};
 use crate::db::Database;
 
-/// Registro de conexões ativas por Hardware UUID.
-type ConnMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>;
+/// Pedido de proxy: o control loop negocia o JSON com o daemon e sinaliza o ack.
+struct ProxyRequest {
+    port: u16,
+    local_addr: SocketAddr,
+    ack: oneshot::Sender<Result<(), String>>,
+}
+
+type ConnMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<ProxyRequest>>>>;
+
+static REGISTRY: LazyLock<ConnMap> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 const ADB_PORT: u16 = 5555;
 const HEARTBEAT_GRACE_SECS: u64 = 45;
+const PROXY_ACK_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29644,8 +30006,38 @@ struct AgentHandshake {
     current_local_ip: String,
 }
 
+/// Leitor de linhas manual sobre o TcpStream (compartilhado via AsyncMutex),
+/// mantendo os bytes lidos além da linha em `buf` para repasse ao relay de proxy.
+struct LineReader {
+    stream: Arc<AsyncMutex<TcpStream>>,
+    buf: Vec<u8>,
+}
+
+impl LineReader {
+    async fn next_line(&mut self, timeout: Option<Duration>) -> Option<String> {
+        loop {
+            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&self.buf[..pos]).to_string();
+                self.buf.drain(..=pos);
+                return Some(line);
+            }
+            let mut guard = self.stream.lock().await;
+            let mut chunk = [0u8; 2048];
+            let read = tokio::time::timeout(
+                timeout.unwrap_or(Duration::from_secs(30)),
+                guard.read(&mut chunk),
+            );
+            match read.await {
+                Ok(Ok(n)) if n > 0 => self.buf.extend_from_slice(&chunk[..n]),
+                Ok(Ok(_)) => return None, // EOF
+                Ok(Err(_)) => return None,
+                Err(_) => return None,    // timeout de leitura
+            }
+        }
+    }
+}
+
 pub async fn start(db: Arc<Database>, port: u16, app_handle: Option<AppHandle>) {
-    let registry: ConnMap = Arc::new(Mutex::new(HashMap::new()));
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -29662,9 +30054,8 @@ pub async fn start(db: Arc<Database>, port: u16, app_handle: Option<AppHandle>) 
             Ok((stream, _peer)) => {
                 let db2 = db.clone();
                 let handle = app_handle.clone();
-                let reg = registry.clone();
                 tokio::spawn(async move {
-                    handle_agent(stream, db2, handle, reg).await;
+                    handle_agent(stream, db2, handle).await;
                 });
             }
             Err(_) => {
@@ -29674,18 +30065,17 @@ pub async fn start(db: Arc<Database>, port: u16, app_handle: Option<AppHandle>) 
     }
 }
 
-async fn handle_agent(
-    stream: tokio::net::TcpStream,
-    db: Arc<Database>,
-    app_handle: Option<AppHandle>,
-    registry: ConnMap,
-) {
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+async fn handle_agent(stream: TcpStream, db: Arc<Database>, app_handle: Option<AppHandle>) {
+    // Soquete compartilhado entre leitura (LineReader) e escrita (handshake/heartbeat/relay).
+    let shared = Arc::new(AsyncMutex::new(stream));
+    let mut reader = LineReader {
+        stream: shared.clone(),
+        buf: Vec::with_capacity(4096),
+    };
 
     // 1. Handshake na primeira linha (timeout 10s)
-    let first = match tokio::time::timeout(Duration::from_secs(10), lines.next_line()).await {
-        Ok(Ok(Some(l))) => l,
+    let first = match tokio::time::timeout(Duration::from_secs(10), reader.next_line(None)).await {
+        Ok(Some(l)) => l,
         _ => return,
     };
     let hs: AgentHandshake = match serde_json::from_str(&first) {
@@ -29697,15 +30087,18 @@ async fn handle_agent(
     };
 
     // 2. Confirma o handshake
-    if writer
-        .write_all(b"{\"type\":\"welcome\"}\n")
-        .await
-        .is_err()
     {
-        return;
+        let mut guard = shared.lock().await;
+        if guard
+            .write_all(b"{\"type\":\"welcome\"}\n")
+            .await
+            .is_err()
+        {
+            return;
+        }
     }
 
-    // 3. Check-in no DB (dispositivo online via túnel) + evento na UI
+    // 3. Check-in no DB (dispositivo online via túnel) + rota de túnel + evento na UI
     let ip = if hs.current_local_ip.is_empty() {
         "0.0.0.0".to_string()
     } else {
@@ -29727,6 +30120,7 @@ async fn handle_agent(
             }
         });
     }
+    crate::adb_tcp::register_tunnel_serial(&uuid);
 
     if let Some(ref app) = app_handle {
         let _ = app.emit(
@@ -29742,42 +30136,157 @@ async fn handle_agent(
     }
 
     // 4. Registra no mapa — substitui conexão antiga (socket obsoleto) do mesmo aparelho
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    registry.lock().unwrap().insert(uuid.clone(), tx);
+    let (tx, mut rx) = mpsc::unbounded_channel::<ProxyRequest>();
+    REGISTRY.lock().unwrap().insert(uuid.clone(), tx);
 
-    // 5. Loop de heartbeat L7: responde ping com pong; derruba se silencioso por 45s
+    // 5. Loop de heartbeat L7: responde ping com pong; derruba se silencioso por 45s.
+    //    Pedido de proxy interrompe o loop e entrega o soquete cru ao relay.
+    let mut pending_proxy: Option<ProxyRequest> = None;
+    let silent = Duration::from_secs(HEARTBEAT_GRACE_SECS);
+    let mut last_line = Instant::now();
     loop {
-        let silent = Duration::from_secs(HEARTBEAT_GRACE_SECS);
         tokio::select! {
-            line = lines.next_line() => {
+            line = reader.next_line(None) => {
                 let line = match line {
-                    Ok(Some(l)) => l,
-                    _ => break,
+                    Some(l) => l,
+                    None => break,
                 };
+                last_line = Instant::now();
                 let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or(serde_json::Value::Null);
                 if v.get("type").and_then(|t| t.as_str()) == Some("ping") {
-                    if writer.write_all(b"{\"type\":\"pong\"}\n").await.is_err() {
+                    let mut guard = shared.lock().await;
+                    if guard.write_all(b"{\"type\":\"pong\"}\n").await.is_err() {
                         break;
                     }
                 }
             }
-            outgoing = rx.recv() => {
-                match outgoing {
-                    Some(msg) => {
-                        if writer.write_all(msg.as_bytes()).await.is_err() {
-                            break;
-                        }
+            req = rx.recv() => {
+                match req {
+                    Some(r) => {
+                        pending_proxy = Some(r);
+                        break;
                     }
                     None => break,
                 }
             }
             _ = tokio::time::sleep(silent) => {
-                break;
+                if last_line.elapsed() >= silent {
+                    break;
+                }
             }
         }
     }
 
-    registry.lock().unwrap().remove(&uuid);
+    if let Some(req) = pending_proxy {
+        run_proxy_relay(&mut reader, shared, req).await;
+    }
+
+    REGISTRY.lock().unwrap().remove(&uuid);
+    crate::adb_tcp::unregister_tunnel_serial(&uuid);
+}
+
+/// Negocia o proxy com o daemon (JSON) e faz relay bidirecional bruto.
+async fn run_proxy_relay(
+    reader: &mut LineReader,
+    shared: Arc<AsyncMutex<TcpStream>>,
+    req: ProxyRequest,
+) {
+    // 1. Pedido ao daemon + ack (timeout 5s)
+    {
+        let mut guard = shared.lock().await;
+        let request = format!("{{\"type\":\"proxy\",\"port\":{}}}\n", req.port);
+        if guard.write_all(request.as_bytes()).await.is_err() {
+            let _ = req.ack.send(Err("falha ao enviar pedido de proxy ao daemon".to_string()));
+            return;
+        }
+    }
+    let ack = tokio::time::timeout(
+        Duration::from_secs(PROXY_ACK_TIMEOUT_SECS),
+        reader.next_line(None),
+    )
+    .await;
+
+    let ack_line = match ack {
+        Ok(Some(l)) => l,
+        _ => {
+            let _ = req.ack.send(Err("daemon não respondeu ao pedido de proxy".to_string()));
+            return;
+        }
+    };
+    let v: serde_json::Value =
+        serde_json::from_str(ack_line.trim()).unwrap_or(serde_json::Value::Null);
+    if v.get("type").and_then(|t| t.as_str()) != Some("proxy-ack") {
+        let err = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("daemon recusou o proxy");
+        let _ = req.ack.send(Err(format!("proxy recusado: {}", err)));
+        return;
+    }
+
+    // 2. Conecta na ponte local (o caller aceita o outro extremo)
+    let mut local = match TcpStream::connect(&req.local_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = req.ack.send(Err(format!("falha na ponte local: {}", e)));
+            return;
+        }
+    };
+
+    // 3. Libera o caller (o transporte está pronto)
+    if req.ack.send(Ok(())).is_err() {
+        return;
+    }
+
+    // 4. Relay bruto bidirecional (soquete cru do daemon + ponte local).
+    //    Sobras do buffer de controle pertencem ao fluxo daemon → local.
+    //    O soquete é o mesmo TcpStream compartilhado (lockado para o relay).
+    let leftover = std::mem::take(&mut reader.buf);
+    let mut guard = shared.lock().await;
+    if !leftover.is_empty() {
+        let _ = guard.write_all(&leftover).await;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut *guard, &mut local).await;
+}
+
+/// Abre uma ponte local de proxy para um dispositivo de túnel e devolve o
+/// TcpStream pronto para o protocolo ADB (chamado de thread de spawn_blocking).
+pub async fn open_proxy(uuid: &str, port: u16) -> Result<std::net::TcpStream, String> {
+    let sender = REGISTRY
+        .lock()
+        .unwrap()
+        .get(uuid)
+        .cloned()
+        .ok_or_else(|| format!("dispositivo '{}' sem sessão de túnel ativa", uuid))?;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
+
+    let (ack_tx, ack_rx) = oneshot::channel();
+    sender
+        .send(ProxyRequest {
+            port,
+            local_addr,
+            ack: ack_tx,
+        })
+        .map_err(|_| "sessão de túnel encerrada".to_string())?;
+
+    ack_rx
+        .await
+        .map_err(|_| "sessão de túnel encerrada durante handshake de proxy".to_string())??;
+
+    listener
+        .accept()
+        .map(|(s, _)| s)
+        .map_err(|e| format!("falha no aceite da ponte local: {}", e))
+}
+
+/// Encerra o servidor de túnel: limpa o registro de sessões ativas e o estado
+/// global de seriais virtuais em adb_tcp, evitando "túneis fantasmas" caso o
+/// servidor seja derrubado ou o app encerre.
+pub fn shutdown() {
+    REGISTRY.lock().unwrap().clear();
+    crate::adb_tcp::unregister_all_tunnel_serials();
 }
 
 
@@ -34899,6 +35408,94 @@ class EsferaAgentService : Service() {
 ```
 
 // ========================================================
+// ARQUIVO: docs\Build_Agente_Android.md
+// ========================================================
+
+# Build e Injeção do Agente Android (Esfera Agent) — Ambiente Windows sem Admin
+
+Passo-a-passo validado em 2026-08-03 numa máquina Windows onde o usuário **não tem privilégios de administrador** e o `winget install` de MSI (Temurin) falha com código 1602 (UAC). Tudo foi instalado via download de ZIP + extração em `D:\Programs` (sem tocar em `C:\Program Files`).
+
+## 1. Pré-requisitos (baixados de ZIP, extraídos em D:\Programs)
+
+- **JDK 17 (Temurin)**: `https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20%2B8/OpenJDK17U-jdk_x64_windows_hotspot_17.0.20_8.zip` → extrair para `D:\Programs\jdk17`.
+- **Android cmdline-tools**: `https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip` → extrair para `D:\Programs\android-sdk\cmdline-tools\latest` (o zip vem com uma pasta `cmdline-tools`; mover o conteúdo para `latest\`).
+- **Gradle 8.9**: `https://services.gradle.org/distributions/gradle-8.9-bin.zip` → extrair para `D:\Programs\gradle-8.9`.
+
+> O projeto `src-agent` **não tem** `gradlew`. Usa-se o Gradle binário direto. AGP 8.1.4 + Kotlin 1.9.10 + compileSdk 34 são compatíveis com Gradle 8.9.
+
+## 2. Instalar platform-34 + build-tools (o `cmd.exe //c` NÃO funciona sob MSYS)
+
+No MSYS/bash do Hermes, `cmd.exe //c "..."` abre o prompt interativo e **ignora** o comando. Por isso o `sdkmanager.bat` nunca rodou via `cmd`. Solução: invocar o `SdkManagerCli` **diretamente via java.exe**, com `cwd` em `lib/` e caminhos **Windows** (não Unix `/d/...`):
+
+```bat
+rem Criar licenças (hashes conhecidos) antes de instalar:
+mkdir D:\Programs\android-sdk\licenses
+echo 24333f8a63b6825ea9c5514f83c2829b004d1fee > D:\Programs\android-sdk\licenses\android-sdk-license
+echo 84831b9409646a918e30573bab4c9c91346d8abd > D:\Programs\android-sdk\licenses\android-sdk-preview-license
+```
+
+```bash
+cd /d/Programs/android-sdk/cmdline-tools/latest/lib
+/d/Programs/jdk17/bin/java.exe \
+  -Dcom.android.sdklib.toolsdir="D:/Programs/android-sdk/cmdline-tools/latest" \
+  -classpath "sdkmanager-classpath.jar" \
+  com.android.sdklib.tool.sdkmanager.SdkManagerCli \
+  --sdk_root="D:/Programs/android-sdk" \
+  "platforms;android-34" "build-tools;34.0.0"
+```
+
+## 3. Compilar e assinar o APK
+
+```bash
+cd /d/Novo/Esfera\ v3/src-agent
+export JAVA_HOME="D:/Programs/jdk17"
+export ANDROID_HOME="D:/Programs/android-sdk"
+export ANDROID_SDK_ROOT="D:/Programs/android-sdk"
+export PATH="/d/Programs/jdk17/bin:/d/Programs/gradle-8.9/bin:$PATH"
+/d/Programs/gradle-8.9/bin/gradle.bat assembleRelease --no-daemon
+```
+
+> O `build.gradle.kts` original tinha `isMinifyEnabled = true`, que quebrava o release com R8 (`Missing class org.slf4j.impl.StaticLoggerBinder`, dependência transitiva do Ktor). Foi alterado para `isMinifyEnabled = false` (APK de agente MDM interno — aceitável).
+
+APK gerado em `src-agent/app/build/outputs/apk/release/app-release-unsigned.apk`.
+
+Assinar (keytool/apksigner precisam de `JAVA_HOME` em caminho **Windows**):
+
+```bash
+export JAVA_HOME="D:\\Programs\\jdk17"
+/d/Programs/jdk17/bin/keytool.exe -genkey -v \
+  -keystore "D:\Programs\esfera-debug.keystore" -alias esfera \
+  -keyalg RSA -keysize 2048 -validity 10000 \
+  -storepass esfera123 -keypass esfera123 \
+  -dname "CN=Esfera,OU=Dev,O=Esfera,L=SP,ST=SP,C=BR"
+
+APK="D:\Novo\Esfera v3\public\Esfera_Agent_ADB.apk"
+KS="D:\Programs\esfera-debug.keystore"
+"D:\Programs\android-sdk\build-tools\34.0.0\apksigner.bat" sign \
+  --ks "$KS" --ks-key-alias esfera --ks-pass pass:esfera123 \
+  --key-pass pass:esfera123 --out "$APK" "$APK"
+"D:\Programs\android-sdk\build-tools\34.0.0\apksigner.bat" verify "$APK"
+```
+
+> IMPORTANTE: sempre usar caminhos `D:\...` (Windows) ao chamar `.bat` do Android SDK / keytool / apksigner. Caminhos `/d/...` (Unix) são convertidos errado pelo CMD.
+
+## 4. Injetar nos dispositivos
+
+O backend já faz o deploy automaticamente: `provision_device` → `install_agent_apk` faz `adb push` + `pm install -r -g` + start do service + keepalive + immunity. Ele procura o APK em:
+
+- `public/Esfera_Agent_ADB.apk` (prioridade)
+- `src-tauri/binaries/`, `src-tauri/`, `resources/`, etc. (fallback — ver `find_agent_apk_path` em `adb_manager.rs`)
+
+Basta copiar o APK assinado para `public/Esfera_Agent_ADB.apk` (já feito) e acionar o provisionamento pela UI (DevicesTab) ou comando Tauri `provision_device`.
+
+## 5. Verificação final (tudo compila junto)
+
+- Backend: `cd src-tauri && cargo build` → `Finished dev profile`.
+- Frontend: `cd .. && npm run build` → 1877 módulos, OK.
+- Agente: APK em `public/Esfera_Agent_ADB.apk`, `apksigner verify` OK.
+
+
+// ========================================================
 // ARQUIVO: docs\Legado_Win32_ListView_DanglingPointer.md
 // ========================================================
 
@@ -35189,6 +35786,288 @@ void touch_send_button(int socket_fd, int x, int y) {
 
 ---
 *Gerado por Antigravity AI para o projeto Esfera v3.*
+
+
+// ========================================================
+// ARQUIVO: docs\Reconciliacao_Conexao_Reversa.md
+// ========================================================
+
+# Reconciliação: Rascunho "Arquitetura de Conexão Reversa (Agente APK + WebSocket/Tunneling)" vs Código Real — Esfera v3
+
+Auditoria. O rascunho descreve uma topologia de **conexão reversa** (celular → servidor, túnel persistente, handshake por UUID, heartbeat, reconexão). Foi reconciliado contra:
+- `src-agent/.../EsferaAgentService.kt` (agente Android Kotlin)
+- `src-agent/.../BootReceiver.kt`
+- `src-tauri/src/tunnel_server.rs` (servidor de túnel reverso)
+- `src-tauri/src/checkin_server.rs` (listener UDP/HTTP inbound)
+- `src-tauri/src/config.rs`, `src-tauri/src/adb_manager.rs`
+
+---
+
+## 0. Resumo de Status
+
+| Afirmação do Rascunho | Veredito vs Código |
+|---|---|
+| Agente como Foreground Service + notificação persistente | **REAL** (EsferaAgentService.kt:88-94, 239-247) |
+| Auto-Start no Boot (ACTION_BOOT_COMPLETED) | **REAL** (BootReceiver.kt:9-11) |
+| Celular conecta ao servidor via socket reverso persistente (TCP/WebSocket) | **NÃO IMPLEMENTADO NO AGENTE** — agente faz polling HTTP 30s |
+| Servidor escuta porta fixa, recebe handshake por Hardware UUID, heartbeat L7, descarta socket obsoleto | **REAL NO BACKEND** (tunnel_server.rs) — porém DESLIGADO por padrão (config.rs:26) |
+| Túnel ADB reverso (adb reverse 5555) | **SUPORTE EXISTE NO BACKEND** (adb_manager.rs:2541) — não disparado pelo agente |
+| Reconexão instantânea via CONNECTIVITY_ACTION | **PARCIAL** — agente detecta mudança de IP (NetworkCallback) mas só loga; reconexão depende de poll 30s. Backend do túnel aceita reconexão, mas agente não o usa |
+| Imune a mudanças de IP (DHCP) | **PARCIAL/JÁ RESOLVIDO OUTRO CAMINHO** — imunidade vem do check-in por UUID + backend (process_checkin), não do túnel reverso em si |
+
+---
+
+## 1. O que o rascunho descreve está PARCIALMENTE IMPLEMENTADO — no servidor, não no agente
+
+O rascunho imagina uma arquitetura coesa "celular conecta no servidor via túnel reverso". A realidade do repo:
+
+- **Backend (`tunnel_server.rs`) JÁ IMPLEMENTA o servidor de túnel reverso.** Ele:
+  - Escuta na porta `tunnel_server_port` (default **8888**, config.rs:12-13, 26-27).
+  - Recebe `AgentHandshake` com `hardware_uuid` (tunnel_server.rs:28-40, 90).
+  - Responde `{"type":"welcome"}` (linha 95-101).
+  - Faz `process_checkin` no DB e emite evento `device-updated` com `viaTunnel: true` (linha 112-137).
+  - Mantém **heartbeat L7 ping/pong** (linha 153-157) e derruba socket silencioso por 45s (HEARTBEAT_GRACE_SECS, linha 24, 169-171).
+  - **Descarta socket obsoleto**: o registry por UUID substitui a conexão antiga quando o aparelho reconecta (linha 140-141). Exatamente o "servidor encerra a conexão antiga e acopla a nova rota transparentemente" do rascunho.
+
+  ✅ Isso bate quase palavra por palavra com a seção "Arquitetura de Comunicação por Túnel Inverso" do rascunho longo ("Conectividade Persistente Android").
+
+- **Porém `tunnel_server_enabled` default é `false`** (config.rs:26). Ou seja, o túnel reverso está **codificado mas desativado** por padrão. Precisa de `tunnel_server_enabled = true` para rodar.
+
+- **O agente Android NÃO usa o túnel.** `EsferaAgentService.kt` faz `POST {serverUrl}/api/devices/check-in` a cada `CHECK_IN_INTERVAL_MS = 30_000` (linha 56, 142-164). É modelo **Inbound/Polling HTTP**, não socket reverso. Não há `Socket`/`WebSocket`/`TcpStream` reverso no agente. O agente nem conhece a porta 8888 do túnel.
+
+**Conclusão:** o rascunho descreve o backend que existe (`tunnel_server.rs`) mas atribui ao agente um comportamento de túnel reverso que o agente **ainda não tem**. A peça faltante é o **cliente do túnel no agente Android** (conectar TCP/WebSocket na porta 8888, enviar `AgentHandshake`, manter heartbeat).
+
+---
+
+## 2. Foreground Service + Auto-Start — REAL
+
+- `EsferaAgentService` é `Service` com `startForeground(NOTIF_ID, notification)` e notificação `setOngoing(true)` (EsferaAgentService.kt:88-94, 239-247). ✅
+- `BootReceiver` escuta `ACTION_BOOT_COMPLETED` e chama `startService` (BootReceiver.kt:9-11). ✅
+- `onStartCommand` retorna `START_STICKY` (linha 93) — reinicia se o sistema matar. ✅
+- `acquireWakeLock` com `PARTIAL_WAKE_LOCK` (linha 204-211). ✅
+
+Tudo isso confere com o rascunho ("Foreground Service com notificação persistente", "Auto-Start no Boot").
+
+---
+
+## 3. Reconexão "em milissegundos" — PARCIAL (e o agente atual não entrega)
+
+O rascunho alega: "Se a Wi-Fi cair e voltar, a API de rede do Android avisa o app (CONNECTIVITY_ACTION), e ele reconecta em milissegundos."
+
+Código real:
+- O agente registra `ConnectivityManager.NetworkCallback` (registerNetworkCallback, linha 181-186) e implementa `onLinkPropertiesChanged` (linha 170-179), que **apenas loga** "IP mudou" — não dispara nada.
+- A reconexão de fato depende do `delay(CHECK_IN_INTERVAL_MS)` de 30s no loop (linha 161). No pior caso, o próximo check-in ocorre até 30s depois da queda.
+- `CONNECTIVITY_ACTION` (broadcast legado) não é usado; o agente usa a API moderna `NetworkCallback` (API 21+), o que está correto, mas o callback não acelera o reconect.
+
+**Veredito:** a infraestrutura de detecção existe, mas a **reconexão não é instantânea** — é limitada pelo poll de 30s. O backend do túnel (`tunnel_server.rs`) aceitaria reconexão imediata se o agente o usasse, mas o agente não conecta no túnel.
+
+**Correção recomendada (se for adotar túnel reverso de fato):** no `onLinkPropertiesChanged` (ou `onAvailable`), disparar reconexão imediata do túnel em vez de só logar. Isso entregaria a "reconexão em ms" do rascunho.
+
+---
+
+## 4. Túnel ADB Reverso — suporte existe no backend, não no agente
+
+- `adb_manager.rs:2541` tem `reverse_port(serial, port)` executando `adb reverse tcp:{port} tcp:{port}` (adb_manager.rs:2451 chama em algum fluxo).
+- Ou seja, o backend **pode** abrir túnel ADB reverso para um device já conectado via ADB.
+- O agente Android **não** abre `adb reverse` por conta própria (ele nem roda ADB; o ADB roda no host Windows). O rascunho diz "o aplicativo abre um túnel reverso apontando a porta local 5555 para a rede do servidor" — isso na prática seria o host fazendo `adb reverse` após o handshake, não o app. A afirmação confunde responsabilidades.
+
+---
+
+## 5. Imunidade a DHCP — já resolvida por OUTRO caminho
+
+O rascunho afirma que a imunidade a mudanças de IP vem do túnel reverso (o celular sempre sabe onde o servidor está). No Esfera v3 atual, a imunidade a DHCP já existe por um caminho diferente:
+- O agente envia `currentAdbAddress = ip` no check-in HTTP (EsferaAgentService.kt:152).
+- O backend `process_checkin` (`db.rs`) localiza o device por `EsferaDeviceId` (UUID) e atualiza o endereço corrente (e com meu P0, também `AdbDeviceId = ?1`).
+- O handshake faz `adb disconnect` preventivo (P0 implementado em checkin_server.rs).
+
+Ou seja, **mesmo sem túnel reverso, o backend já acompanha o IP por UUID**. O túnel reverso seria uma melhoria de latência/resiliência (reconexão em ms, sem poll), não um pré-requisito para imunidade a DHCP.
+
+---
+
+## 6. Recomendações
+
+Prioridade real para tornar o rascunho uma realidade coesa:
+
+- **[P2-A] Cliente de túnel no agente Android** — ✅ **IMPLEMENTADO** (EsferaAgentService.kt): `EsferaConfig` ganhou `tunnelEnabled`/`tunnelPort`; `startTunnelLoop` abre `Socket` TCP na porta 8888, envia `TunnelHandshake { hardwareUuid, currentLocalIp }` (camelCase, bate com `tunnel_server.rs`), mantém heartbeat ping a cada 10s, lê o `reader` para detectar EOF (reconexão) e faz backoff exponencial (1s→15s). `onLinkPropertiesChanged` relança o túnel em mudança de IP (reconexão em ~1s). Polling HTTP mantido como fallback.
+- **[P2-B] Ligar o túnel por padrão** — ✅ **IMPLEMENTADO** (config.rs:26 `tunnel_server_enabled: true`). `lib.rs:195-200` já inicia `tunnel_server::start` quando habilitado.
+- **[P2-C] Reconexão em `onLinkPropertiesChanged`** — ✅ **IMPLEMENTADO** (EsferaAgentService.kt:254-266).
+- **[P2-D] Manter o polling como fallback** — ✅ mantido (startCheckInLoop continua rodando).
+
+Aviso de validação:
+- Backend Rust (`cargo build`): ✅ **COMPILA** (verificado nesta sessão após correção de `tunnel_server.rs`). O servidor de túnel tinha 5 erros de compilação latentes (tokio 1.53 removeu `TcpStream::try_clone`; `?` sobre `Result` em fn que retorna `Option`; tipos do proxy relay). Foram corrigidos em `tunnel_server.rs`: `LineReader` passou a usar `Arc<AsyncMutex<TcpStream>>` compartilhado para leitura e escrita; o relay de proxy trava o guard do mutex e faz `copy_bidirectional` sobre o `TcpStream` cru. Após o fix, `cargo build` termina com `Finished dev profile` (apenas warnings FFI pré-existentes). O `tunnel_server_enabled: true` e o P0 (flush `adb disconnect` + `AdbDeviceId` no check-in) estão no binário.
+- Frontend (`npm run build`): ✅ compila.
+- Agente Android Kotlin (`EsferaAgentService.kt`): ✅ **COMPILADO E ASSINADO** nesta sessão. Toolchain instalado em `D:\Programs` sem privilégios de admin: JDK 17 (Temurin zip), Android SDK cmdline-tools + `platforms;android-34` + `build-tools;34.0.0` (via `sdkmanager` chamado direto por `java.exe`, pois `cmd.exe //c` não executa comandos sob MSYS), Gradle 8.9. Build: `gradle assembleRelease` (minify desligado para evitar erro R8 de classe `slf4j` transitiva do Ktor). APK assinado com keystore debug em `D:\Programs\esfera-debug.keystore` via `apksigner`, copiado para `D:\Novo\Esfera v3\public\Esfera_Agent_ADB.apk` (caminho consumido por `install_agent_apk`/`provision_device`). `apksigner verify` passou.
+- Passo-a-passo reproduzível: ver `docs/Build_Agente_Android.md`.
+
+### 6.1 Injeção nos dispositivos (deploy do agente)
+
+O mecanismo de "injetar nos dispositivos" **já existe** no backend e continua válido após a mudança:
+
+- `provision_device(serial, server_url)` (adb_manager.rs:12384 / comando Tauri `provision_device`) → chama `install_agent_apk` (adb_manager.rs:2680).
+- `install_agent_apk`: `adb push` do APK → `pm install -r -g` (grant automático de permissões) → `start_agent_service` + `deploy_keepalive` + `inject_device_immunity`.
+- `find_agent_apk_path` (adb_manager.rs:2627) procura `public/Esfera_Agent_ADB.apk` (ou `src-tauri/binaries/`).
+- Frontend: botões "Provisionar" em `DevicesTab.tsx:6768-7592` disparam `provision_device` via `api(...)`.
+
+Ou seja: ao compilar o agente com o cliente de túnel e colocá-lo no caminho esperado (`public/Esfera_Agent_ADB.apk`), o pipeline de injeção existente **distribui automaticamente** a versão com túnel reverso para todos os celulares conectados via ADB. Nenhuma alteração em `install_agent_apk` foi necessária.
+
+Itens do rascunho que **NÃO** exigem ação (já existem):
+- Foreground Service + notificação + auto-start no boot → já implementados.
+- Servidor de túnel reverso com handshake UUID + heartbeat + descarte de socket obsoleto → já implementado (`tunnel_server.rs`), agora ligado por padrão.
+
+---
+
+## 7. Conclusão
+
+O rascunho de "Conexão Reversa" descrevia uma arquitetura que o Esfera v3 **já tinha no backend** (`tunnel_server.rs`) mas que **faltava no agente**. Implementei o cliente de túnel no `EsferaAgentService.kt` (handshake por UUID, heartbeat L7, reconexão em mudança de IP) e liguei o servidor por padrão (`config.rs`). O pipeline de injeção nos dispositivos (`provision_device` → `install_agent_apk` via ADB) já existe e distribuirá o APK atualizado automaticamente. Resta apenas compilar o APK no ambiente Android (não possível nesta sessão) e validar o handshake ponta a ponta.
+
+
+// ========================================================
+// ARQUIVO: docs\Reconciliacao_Roteamento_Frontend.md
+// ========================================================
+
+# Reconciliação: Rascunho de Roteamento Front-End (App.tsx / AuthContext) vs Código Real — Esfera v3
+
+Documento de auditoria. O rascunho enviado ("Análise Arquitetural e de Segurança do Sistema de Roteamento Front-End") foi reconciliado linha a linha contra `src/App.tsx` e `src/context/AuthContext.tsx`. Várias afirmações do rascunho NÃO correspondem ao código atual — o rascunho analisou uma versão desatualizada do `CompanyGate`.
+
+Evidência primária:
+- `src/App.tsx` (192 linhas) — ProtectedRoute, RoleGate, CompanyGate, RootRedirect, AppRoutes.
+- `src/context/AuthContext.tsx` (261 linhas) — useAuth, hidratação de estado, fallback de usuários.
+
+---
+
+## 0. Resumo de Status
+
+| Afirmação do Rascunho | Veredito vs Código |
+|---|---|
+| Bypass de Tenant para não-master (CompanyGate só checa master) | **NÃO EXISTE** — código já trata não-master (App.tsx:54-61) |
+| Race condition por hidratação assíncrona (deep link expulso) | **PARCIAL** — estado vem de localStorage síncrono; risco baixo |
+| Redirect Bounce (RoleGate → / → RootRedirect) | **REAL** (App.tsx:37 + 78) |
+| Ausência de tela 403 | **REAL** |
+| Rotas declaradas manualmente (verbosas) | **REAL** — sugestão de metadados válida |
+| Matriz de permissões por rota | **EM SUA MAIORIA CORRETA**, mas baseada na premissa errada do CompanyGate |
+
+---
+
+## 1. CompanyGate — a "vulnerabilidade crítica" JÁ FOI CORRIGIDA
+
+O rascunho (seção "Vulnerabilidade de Ignorância de Tenant para Papéis Não-Master") cita este código como atual:
+
+```ts
+if (!user) return <Navigate to="/login" replace />;
+if (user.role === "master" && selectedCompanyId === null) {
+  return <Navigate to="/companies" replace />;
+}
+return <>{children}</>;
+```
+
+**O código real em `src/App.tsx:44-64` é diferente e já fecha a brecha:**
+
+```ts
+function CompanyGate({ children }: { children: ReactNode }) {
+  const { user, selectedCompanyId } = useAuth();
+  if (!user) return <Navigate to="/login" replace />;
+  // Master sem empresa selecionada → vai para companies
+  if (user.role === "master" && selectedCompanyId === null) {
+    return <Navigate to="/companies" replace />;
+  }
+  // Gestor ou Colaborador sem empresa → tenta restaurar do user.companyId ou redireciona ao login
+  if (user.role !== "master" && selectedCompanyId === null) {
+    if (user.companyId) {
+      return <Navigate to="/" replace />;   // safety net
+    }
+    return <Navigate to="/login" replace />;
+  }
+  return <>{children}</>;
+}
+```
+
+**Conclusão:** um `gestor` ou `colaborador` sem empresa NÃO monta a tela operacional. O ramo `user.role !== "master" && selectedCompanyId === null` intercepta e manda para `/login` (ou `/` se tiver `user.companyId`). A alegação de "montagem de ecrãs operacionais sem empresa para perfis gestor" é **falsa para o código atual**.
+
+**Risco residual real (diferente do rascunho):** o ramo `if (user.companyId) return <Navigate to="/" replace />` é uma *safety net* que, em vez de forçar seleção de empresa, joga o usuário na raiz — onde `RootRedirect` (`App.tsx:73-78`) o manda para `/devices` mesmo sem `selectedCompanyId` explícito (porque `RootRedirect` só checa master). Ou seja, para não-master com `user.companyId` mas `selectedCompanyId === null`, o fluxo depende de `RootRedirect` + do default `|| 1` do AuthContext. Funciona na prática (o `selectedCompanyId` inicializa com `1` via `|| 1`), mas a *lógica de safety net* é confusa. Recomendação: em vez de `<Navigate to="/" replace />`, redirecionar para `/companies` ou a uma tela de seleção de empresa. **Severidade: Baixa** (não é bypass de tenant).
+
+---
+
+## 2. Race Condition / Hidratação (alegação "Alta")
+
+O rascunho alega que `user`, `loggedIn` e `selectedCompanyId` são lidos de forma síncrona mas a hidratação é assíncrona (JWT/token/API no startup), causando expulsão prematura em deep links.
+
+**Código real (`AuthContext.tsx:68-69`):**
+
+```ts
+const [user, setUser] = useState<User | null>(() => loadFromStorage<User>(STORAGE_KEY_USER));
+const [selectedCompanyId, setSelectedCompanyId] = useState<number | null>(() => loadFromStorage<number>(STORAGE_KEY_COMPANY) || 1);
+```
+
+- O estado é **hidratado síncronamente do localStorage** no `useState` inicial (não via fetch assíncrono em startup).
+- `selectedCompanyId` **defaulta para `1`** (`|| 1`), nunca `null`, após o primeiro login.
+- `loggedIn = !!user` (`AuthContext.tsx:235`).
+
+**Conclusão:** o cenário "deep link com estado null durante hidratação assíncrona" tem **baixa probabilidade** no design atual, porque o localStorage é síncrono e o default de empresa é `1`. A única janela assíncrona real é `loadPermissions` (chamada após login / no `useEffect` de user), mas ela só popula permissões granulares — não blocos de roteamento. O `isLoading` sugerido pelo rascunho **não existe** no contexto, mas também **não é estritamente necessário** dado o modelo síncrono de localStorage.
+
+**Veredito:** PARCIAL. A recomendação de `isLoading` é boa prática defensiva, mas a vulnerabilidade descrita ("expulsão por hidratação incompleta") não se reproduz no código atual. Manter como melhoria opcional, não correção crítica.
+
+---
+
+## 3. Redirect Bounce (alegação "Média") — REAL
+
+`RoleGate` redireciona para `/` em falha de papel (`App.tsx:37`). A rota `/` é o `RootRedirect`, que reavalia e manda para `/devices` (não-master) ou `/companies` (master) (`App.tsx:73-78`).
+
+Exemplo real: `gestor` acessa `/permissions` (master only, `App.tsx:113`):
+1. RoleGate detecta papel inválido → `<Navigate to="/" replace />` (App.tsx:37).
+2. `/` monta RootRedirect → `<Navigate to="/devices" replace />` (App.tsx:78, pois gestor !== master).
+
+São 2 transições. O `replace` evita sujar o histórico, mas há re-render duplo + flickering. **Veredito: REAL.** Correção recomendada: RoleGate redirecionar direto para um destino por papel (ex.: `/devices` para operacionais, `/companies` para master) em vez de `/`.
+
+---
+
+## 4. Ausência de tela 403 (alegação "Baixa") — REAL
+
+Não há rota `/403` nem componente de "Acesso Negado". `RoleGate` e `RootRedirect` usam `Navigate` silencioso. **Veredito: REAL.** Melhoria de UX: adicionar `<Route path="/forbidden" element={<ForbiddenPage />} />` e RoleGate → `/forbidden` com mensagem de privilégios insuficientes.
+
+---
+
+## 5. Matriz de Rotas — correções vs rascunho
+
+O rascunho montou uma tabela (Mapeamento de Rotas). Reconciliada com `App.tsx`:
+
+| Rota | Auth | Roles (RoleGate) | CompanyGate | Redirecionamento em falha (real) |
+|---|---|---|---|---|
+| /login | Não | público | Não | N/A |
+| / (RootRedirect) | Sim* | todos | Não | → /login (sem user), /companies (master s/ empresa), /devices (caso contrário) |
+| /companies | Sim | master | Não | → / (RoleGate, App.tsx:37) |
+| /permissions | Sim | master | Não | → / (RoleGate) |
+| /dashboard | Sim | master, gestor, supervisor | Sim | → /companies se master s/ empresa (CompanyGate); → /login s/ user; RoleGate → / se papel inválido |
+| /devices | Sim | todos (sem RoleGate) | Sim | CompanyGate (App.tsx:135) |
+| /campaigns | Sim | master, gestor | Sim | RoleGate → /; CompanyGate → /login/companies |
+| /automations | Sim | master, gestor | Sim | igual /campaigns |
+| /logs | Sim | todos (sem RoleGate) | Sim | CompanyGate (App.tsx:163) |
+| /settings | Sim | master, gestor | Sim | igual /campaigns |
+| * (catch-all) | — | — | — | → / (App.tsx:181) |
+
+*RootRedirect não tem ProtectedRoute externo direto, mas checa `!user` → /login (App.tsx:70). Obs: `/` está DENTRO do `<ProtectedRoute><Layout/></ProtectedRoute>` (App.tsx:89-97), então já é protegido.
+
+**Nota importante:** o rascunho diz que `/devices`, `/logs`, `/dashboard` "exigem empresa apenas validado para master". FALSO — o `CompanyGate` envolve essas rotas (App.tsx:123, 135, 163) e, como mostrado na Seção 1, o CompanyGate real trata não-master também. A matriz do rascunho está correta quanto aos papéis, mas a premissa de que "não-master passa sem empresa" está errada.
+
+---
+
+## 6. Recomendações — o que vale implementar
+
+Prioridade real (baseada no código, não no rascunho):
+
+- **[BAIXA] Limpar a safety net do CompanyGate** (`App.tsx:55-59`): trocar `return <Navigate to="/" replace />` por redirecionamento explícito a `/companies` ou tela de seleção de empresa, para não depender do default `|| 1`.
+- **[MÉDIA] Eliminar Redirect Bounce** (`App.tsx:37`): RoleGate redirecionar ao destino final por papel em vez de `/`.
+- **[BAIXA] Tela 403** (`App.tsx` + nova rota): feedback explícito de acesso negado.
+- **[OPCIONAL] isLoading no AuthContext** (`AuthContext.tsx`): defensivo, mas não crítico dado o modelo síncrono de localStorage.
+- **[OPCIONAL] Metadados de rota**: reduz verbosidade, mas é refactor estético.
+
+Itens do rascunho que **NÃO** são ações válidas hoje:
+- "Corrigir Bypass de Tenant no CompanyGate" — já corrigido; o rascunho analisou código desatualizado.
+
+---
+
+## 7. Conclusão
+
+O rascunho é bem escrito e aplica padrões enterprise corretos, mas **parte substancial da auditoria de segurança está desatualizada**: a vulnerabilidade "Crítica" de bypass de tenant não existe mais no `CompanyGate` atual. As falhas realmente presentes são de **baixa/média severidade** (redirect bounce, ausência de 403, safety net confusa). Recomenda-se revisar o rascunho antes de qualquer refatoração, ancorando em `src/App.tsx` e `src/context/AuthContext.tsx`.
 
 
 // ========================================================
@@ -35597,6 +36476,398 @@ namespace EsferaHPC {
 ---
 *Documento salvo na raiz do projeto Esfera v3 para acompanhamento de tarefas de amanhã.*
 
+
+// ========================================================
+// ARQUIVO: docs\conselho\solucao_do_conselho.md
+// ========================================================
+
+# Tarefa Original: Com base nas reprovações anteriores do Conselho de IAs para o projeto em D:\Novo\Esfera, analise os seguintes problemas que foram encontrados e reprovados: 1) Parsing frágil do stderr no pylint_runner.py para extrair pontuação; 2) Uso ineficiente de list(path.glob()) que carrega tudo em memória no project_identifier.py; 3) Falta de tratamento robusto para JSON malformado nos runners; 4) Regressão lógica na detecção de projetos Python com estrutura src/; 5) Fallback identificava projetos apenas por presença de .py (falsos positivos). Proponha soluções concretas e implementáveis para cada um desses problemas.
+
+## 1. Visão do Arquiteto
+
+Entendido. A seguir, o plano de ação para corrigir as fragilidades e ineficiências apontadas pelo Conselho. O foco será em robustez, eficiência e manutenibilidade.
+
+### 1. Arquitetura Geral e Padrões
+
+Para resolver os problemas de forma coesa, adotaremos os seguintes princípios e padrões:
+
+1.  **Robust Data Interchange:** Substituiremos o parsing de saídas de texto (stdout/stderr) por formatos de intercâmbio de dados estruturados, como JSON, sempre que a ferramenta externa permitir. Isso elimina a fragilidade do parsing manual.
+2.  **Lazy Evaluation & Iterators:** Para operações de I/O em arquivos, utilizaremos iteradores e geradores em vez de carregar coleções inteiras de dados em memória. Isso resolve gargalos de memória e melhora a performance em projetos grandes.
+3.  **Strategy Pattern para Detecção:** A lógica de identificação de projetos será refatorada para usar o *Strategy Pattern*. Cada método de detecção (ex: `src/` layout, `pyproject.toml`, fallback) será uma "estratégia" separada e intercambiável. Isso torna o sistema mais modular, testável e fácil de estender ou reordenar.
+4.  **Error Handling Centralizado:** Implementaremos um tratamento de exceções consistente, especialmente para parsing de dados (JSON) e comunicação com processos externos, utilizando blocos `try-except` específicos e logging detalhado.
+
+### 2. Fluxo Lógico e Plano de Ação por Problema
+
+#### Problema 1: Parsing frágil do `pylint_runner.py`
+
+*   **Diagnóstico:** O script depende da estrutura de texto do `stderr` do Pylint, que pode mudar entre versões ou configurações.
+*   **Solução Proposta:** Modificar a chamada ao Pylint para que ele gere um relatório em formato JSON, que é estável e fácil de parsear.
+*   **Fluxo de Execução:**
+    1.  O `pylint_runner.py` invocará o Pylint com o argumento `--output-format=json`.
+    2.  A saída JSON será capturada do `stdout` (não `stderr`).
+    3.  O script usará a biblioteca `json` para carregar a string de saída em um dicionário Python.
+    4.  A pontuação será extraída de forma segura acessando a chave correspondente no dicionário (ex: `report['global_note']`).
+    5.  A chamada será encapsulada em um `try-except` para tratar possíveis erros na execução do subprocesso ou no parsing do JSON (conforme Problema 3).
+
+---
+
+#### Problema 2: Uso ineficiente de `list(path.glob())`
+
+*   **Diagnóstico:** `list()` força a avaliação imediata de todo o gerador retornado por `glob()`, consumindo memória proporcional ao número de arquivos no projeto.
+*   **Solução Proposta:** Processar o gerador de arquivos diretamente, sem convertê-lo para uma lista.
+*   **Fluxo de Execução:**
+    1.  Localize a linha `files = list(path.glob('**/*.py'))` em `project_identifier.py`.
+    2.  Altere para `file_generator = path.glob('**/*.py')`.
+    3.  Modifique o código subsequente que consome a variável `files` para iterar diretamente sobre `file_generator`.
+    4.  Se for necessário contar os arquivos, use um contador dentro do loop em vez de `len(files)`. Ex: `file_count = sum(1 for _ in path.glob('**/*.py'))`.
+
+---
+
+#### Problema 3: Falta de tratamento para JSON malformado
+
+*   **Diagnóstico:** Uma falha na comunicação ou um output corrompido da ferramenta externa pode gerar uma string que não é um JSON válido, quebrando o runner com uma exceção `json.JSONDecodeError`.
+*   **Solução Proposta:** Envolver todas as chamadas `json.loads()` em um bloco `try-except` robusto.
+*   **Fluxo de Execução:**
+    1.  Em todos os runners (`pylint_runner.py` e outros), localize as chamadas `json.loads(output)`.
+    2.  Encapsule a chamada da seguinte forma:
+        ```python
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError as e:
+            # Logar o erro e a string malformada para depuração
+            log.error(f"Falha ao parsear JSON: {e}")
+            log.debug(f"Output recebido: {output[:500]}") # Limita o tamanho do log
+            # Retornar um estado de falha ou um objeto vazio padronizado
+            return {"error": "JSON malformado", "success": False}
+        ```
+
+---
+
+#### Problema 4 & 5: Regressão lógica (`src/`) e Fallback fraco (`.py`)
+
+*   **Diagnóstico:** A lógica de detecção é provavelmente uma série de `if/elif/else`, tornando-a frágil e difícil de manter. O fallback é muito permissivo.
+*   **Solução Proposta:** Implementar o **Strategy Pattern**. Criar uma hierarquia de estratégias de detecção, da mais confiável para a menos confiável.
+*   **Fluxo de Execução:**
+    1.  O `ProjectIdentifier` principal receberá uma lista ordenada de estratégias de detecção.
+    2.  Ele iterará sobre as estratégias, chamando um método `detect(path)` em cada uma.
+    3.  A primeira estratégia que retornar um resultado positivo (identificando o projeto) encerra o processo e seu resultado é utilizado.
+    4.  A estratégia de fallback (baseada em arquivos `.py`) será a última da lista e terá sua lógica aprimorada.
+        *   **Lógica Aprimorada do Fallback:** Em vez de `any(.py)`, a estratégia deve exigir um limiar mínimo (ex: > 3 arquivos `.py`) E/OU verificar se os arquivos não estão todos no diretório raiz (indicando um projeto mais estruturado vs. scripts soltos).
+
+### 3. Estrutura de Arquivos, Funções e Bibliotecas
+
+**Bibliotecas Principais:** `pathlib`, `subprocess`, `json`, `typing` (para interfaces/protocols).
+
+---
+
+**`project_identifier.py`**
+
+```python
+# D:\Novo\Esfera\project_identifier.py
+
+from pathlib import Path
+from typing import Protocol, List, Optional
+
+class DetectionStrategy(Protocol):
+    """Interface para todas as estratégias de detecção."""
+    def detect(self, path: Path) -> Optional[str]:
+        """Se o projeto for detectado, retorna o tipo (ex: 'PYTHON'). Senão, None."""
+        ...
+
+class PyProjectTomlStrategy(DetectionStrategy):
+    def detect(self, path: Path) -> Optional[str]:
+        # Lógica: procurar por 'pyproject.toml' com [tool.poetry] ou [project]
+        ...
+
+class SrcLayoutStrategy(DetectionStrategy):
+    def detect(self, path: Path) -> Optional[str]:
+        # Lógica: procurar por 'src/<project_name>' e arquivos .py dentro
+        ...
+
+class PythonHeuristicStrategy(DetectionStrategy):
+    """Fallback aprimorado."""
+    def detect(self, path: Path) -> Optional[str]:
+        # Lógica: contar arquivos .py (usando gerador, não list)
+        # Se count > THRESHOLD (ex: 3), retorna 'PYTHON'
+        ...
+
+class ProjectIdentifier:
+    def __init__(self):
+        self.strategies: List[DetectionStrategy] = [
+            PyProjectTomlStrategy(),
+            SrcLayoutStrategy(),
+            # Outras estratégias de alta confiança aqui...
+            PythonHeuristicStrategy(), # Fallback por último
+        ]
+
+    def identify(self, project_path: Path) -> Optional[str]:
+        # Iterar sobre self.strategies e chamar detect()
+        # Retornar o primeiro resultado não-nulo
+        ...
+
+# O código que usa list(path.glob()) será refatorado para usar geradores
+# dentro das estratégias.
+```
+
+---
+
+**`runners/base_runner.py`** (Pode ser um novo arquivo para centralizar lógica)
+
+```python
+# D:\Novo\Esfera\runners\base_runner.py
+
+import json
+import logging
+
+class BaseRunner:
+    def _run_subprocess(self, command: list) -> str:
+        # Lógica de chamada ao subprocess.run, capturando stdout
+        ...
+
+    def _parse_json(self, json_string: str) -> dict:
+        # Implementar o bloco try-except robusto para json.JSONDecodeError
+        # conforme descrito no Problema 3.
+        ...
+```
+
+---
+
+**`runners/pylint_runner.py`**
+
+```python
+# D:\Novo\Esfera\runners\pylint_runner.py
+
+from .base_runner import BaseRunner
+
+class PylintRunner(BaseRunner):
+    def run(self, project_path: str) -> dict:
+        # Construir o comando com '--output-format=json'
+        command = ["pylint", "--output-format=json", project_path]
+        
+        # Chamar o subprocesso
+        output = self._run_subprocess(command)
+        
+        # Parsear a saída usando o método robusto da classe base
+        parsed_data = self._parse_json(output)
+        
+        # Extrair a pontuação e outras métricas do 'parsed_data'
+        # e retornar o resultado final.
+        ...
+```
+
+Este plano fornece um caminho claro para o desenvolvedor. Ele aborda cada problema com uma solução técnica específica, integrada a uma arquitetura mais ampla e robusta.
+
+## 2. Código Final (Iteração 1)
+
+```
+Aqui está o código, implementado de acordo com as diretrizes do Arquiteto para resolver os problemas apontados.
+
+### **`D:\Novo\Esfera\runners\base_runner.py`**
+Este é um novo arquivo base para centralizar a lógica de execução de subprocessos e parsing de JSON, garantindo robustez e reuso.
+
+```python
+# D:\Novo\Esfera\runners\base_runner.py
+
+import json
+import logging
+import subprocess
+from typing import Dict, List, Any
+
+# Configuração do logger para depuração de problemas nos runners
+log = logging.getLogger(__name__)
+
+class BaseRunner:
+    """
+    Classe base para runners que executam ferramentas externas via subprocesso
+    e parseiam a saída JSON. Centraliza o tratamento de erros e a comunicação.
+    """
+
+    def _run_subprocess(self, command: List[str]) -> str:
+        """
+        Executa um comando em um subprocesso e captura seu stdout.
+        Retorna uma string JSON de erro padronizada em caso de falha.
+        """
+        try:
+            # Executa o comando, capturando stdout/stderr e decodificando como UTF-8.
+            # check=True lança CalledProcessError se o processo retornar um código de erro.
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=True,
+                encoding='utf-8'
+            )
+            return result.stdout
+        except FileNotFoundError:
+            log.error(f"Comando não encontrado: '{command[0]}'. Verifique se está instalado e no PATH.")
+            return '{"error": "command_not_found", "success": false}'
+        except subprocess.CalledProcessError as e:
+            log.error(f"Erro ao executar '{' '.join(command)}'. Código: {e.returncode}")
+            log.debug(f"Stderr: {e.stderr.strip()}")
+            return '{"error": "execution_failed", "success": false}'
+        except Exception as e:
+            log.error(f"Erro inesperado ao executar o subprocesso: {e}")
+            return '{"error": "unknown_subprocess_error", "success": false}'
+
+    def _parse_json(self, json_string: str) -> Dict[str, Any]:
+        """
+        Parseia uma string JSON de forma robusta, tratando JSON malformado.
+        Retorna um dicionário de erro se o parsing falhar.
+        """
+        try:
+            return json.loads(json_string)
+        except json.JSONDecodeError as e:
+            log.error(f"Falha ao parsear a saída JSON: {e}")
+            log.debug(f"Output recebido (primeiros 500 chars): {json_string[:500]}")
+            return {"error": "malformed_json", "success": False}
+```
+
+### **`D:\Novo\Esfera\runners\pylint_runner.py`**
+Refatorado para herdar de `BaseRunner` e usar o formato de saída JSON do Pylint, eliminando o parsing frágil de `stderr`.
+
+```python
+# D:\Novo\Esfera\runners\pylint_runner.py
+
+from pathlib import Path
+from typing import Dict, Any
+from .base_runner import BaseRunner
+
+class PylintRunner(BaseRunner):
+    """
+    Executa o Pylint em um projeto Python e extrai a pontuação global
+    usando o formato de saída JSON, de forma robusta.
+    """
+
+    def run(self, project_path: Path) -> Dict[str, Any]:
+        """
+        Executa o Pylint e retorna um dicionário com a pontuação e status.
+        """
+        target = str(project_path.resolve())
+
+        # Comando para executar o Pylint com saída JSON para stdout.
+        command = ["pylint", "--output-format=json", target]
+
+        # Executa o comando usando o método seguro da classe base
+        raw_output = self._run_subprocess(command)
+
+        # Parseia a saída JSON usando o método robusto da classe base
+        parsed_data = self._parse_json(raw_output)
+
+        # Verifica se a execução ou o parsing falhou (retornou um dict de erro)
+        if parsed_data.get("success") is False:
+            return {"score": 0.0, "success": False, "error": parsed_data.get("error")}
+
+        # Extrai a pontuação global do relatório JSON de forma segura
+        try:
+            score = float(parsed_data["global_note"])
+            return {"score": score, "success": True, "error": None}
+        except (KeyError, TypeError, ValueError):
+            # Trata o caso onde o JSON é válido, mas não contém a chave/formato esperado
+            return {"score": 0.0, "success": False, "error": "formato_json_inesperado"}
+```
+
+### **`D:\Novo\Esfera\project_identifier.py`**
+Completamente refatorado para usar o *Strategy Pattern*, com estratégias de detecção modulares e eficientes, e um fallback aprimorado.
+
+```python
+# D:\Novo\Esfera\project_identifier.py
+
+import itertools
+from pathlib import Path
+from typing import Protocol, List, Optional, Generator
+
+# --- Interface (Protocolo) para as Estratégias ---
+
+class DetectionStrategy(Protocol):
+    """
+    Define a interface para uma estratégia de detecção de tipo de projeto.
+    """
+    def detect(self, path: Path) -> Optional[str]:
+        """
+        Tenta detectar o tipo de projeto. Retorna o tipo (ex: 'PYTHON') ou None.
+        """
+        ...
+
+# --- Estratégias de Detecção Concretas ---
+
+class PyProjectTomlStrategy:
+    """Detecta projetos Python baseados na presença de `pyproject.toml`."""
+    def detect(self, path: Path) -> Optional[str]:
+        pyproject_file = path / "pyproject.toml"
+        if pyproject_file.is_file():
+            content = pyproject_file.read_text(encoding='utf-8', errors='ignore')
+            if "[tool.poetry]" in content or "[project]" in content:
+                return "PYTHON"
+        return None
+
+class SrcLayoutStrategy:
+    """Detecta projetos Python que seguem a estrutura de layout 'src/'."""
+    def detect(self, path: Path) -> Optional[str]:
+        src_dir = path / "src"
+        if src_dir.is_dir():
+            # Usa um gerador para verificar eficientemente a existência de qualquer arquivo .py
+            try:
+                next(src_dir.glob("**/*.py"))
+                return "PYTHON"
+            except StopIteration:
+                return None # Diretório 'src' existe, mas não contém arquivos .py
+        return None
+
+class PythonHeuristicStrategy:
+    """Estratégia de fallback aprimorada com limiar e análise de estrutura."""
+    MIN_PY_FILES_THRESHOLD = 3
+
+    def detect(self, path: Path) -> Optional[str]:
+        # Usa um gerador para eficiência de memória, evitando list(path.glob(...))
+        py_files_generator: Generator[Path, None, None] = path.glob("**/*.py")
+
+        # Pega os primeiros N+1 arquivos para verificar se o limiar foi atingido
+        # `itertools.islice` consome o gerador de forma preguiçosa (lazy)
+        first_n_files = list(itertools.islice(py_files_generator, self.MIN_PY_FILES_THRESHOLD))
+
+        if len(first_n_files) < self.MIN_PY_FILES_THRESHOLD:
+            return None # Não atingiu o limiar mínimo de arquivos
+
+        # Heurística: se todos os arquivos encontrados estiverem na raiz,
+        # pode ser um conjunto de scripts soltos, não um projeto.
+        is_flat_structure = all(f.parent.resolve() == path.resolve() for f in first_n_files)
+        if is_flat_structure:
+            # Para ser considerado um projeto mesmo sendo plano, talvez precise de mais arquivos.
+            # Esta lógica pode ser expandida, mas já evita muitos falsos positivos.
+            return None
+
+        return "PYTHON"
+
+# --- Orquestrador Principal ---
+
+class ProjectIdentifier:
+    """
+    Identifica o tipo de um projeto usando uma lista ordenada de estratégias.
+    """
+    def __init__(self, strategies: Optional[List[DetectionStrategy]] = None):
+        """Inicializa com estratégias padrão ordenadas por confiabilidade."""
+        self.strategies: List[DetectionStrategy] = strategies or [
+            PyProjectTomlStrategy(),
+            SrcLayoutStrategy(),
+            PythonHeuristicStrategy(),  # Fallback por último
+        ]
+
+    def identify(self, project_path_str: str) -> Optional[str]:
+        """
+        Itera sobre as estratégias e retorna o tipo de projeto na primeira detecção.
+        """
+        project_path = Path(project_path_str)
+        if not project_path.is_dir():
+            return None
+
+        for strategy in self.strategies:
+            project_type = strategy.detect(project_path)
+            if project_type:
+                return project_type  # Retorna o primeiro resultado positivo
+
+        return None
+```
+```
 
 // ========================================================
 // ARQUIVO: .opencode\package-lock.json
