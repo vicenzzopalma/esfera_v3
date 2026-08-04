@@ -54,7 +54,20 @@ fn get_db_path() -> String {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+fn diag(s: &str) {
+    use std::io::Write;
+    let path = "D:/Novo/Esfera v3/esfera_runtime_debug.log";
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let _ = writeln!(f, "[{}] {}", ts, s);
+    }
+}
+
 pub fn run() {
+    std::panic::set_hook(Box::new(|info| {
+        diag(&format!("PANIC DETECTADO: {:?}", info));
+    }));
+    diag("ETAPA [1] main/run iniciado");
     let db_path = get_db_path();
     let db = match Database::init(&db_path) {
         Ok(d) => d,
@@ -67,6 +80,7 @@ pub fn run() {
         }
     };
     let db_arc = Arc::new(db);
+    diag("ETAPA [2] db iniciado");
 
     // Fila Única de Escrita Assíncrona (MPSC single-writer com transações em lote)
     let write_queue = write_queue::WriteQueue::spawn(db_arc.clone(), write_queue::QUEUE_CAPACITY);
@@ -80,6 +94,7 @@ pub fn run() {
 
     // Runtime de fundo único para servidores e clients (LAN, Hub, Master)
     let bg_runtime = tokio::runtime::Runtime::new().expect("Falha ao criar background runtime");
+    diag("ETAPA [3] bg_runtime criado");
 
     if app_config.empresa_server_enabled {
         let db_for_server = db_arc.clone();
@@ -181,6 +196,7 @@ pub fn run() {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
+            diag("ETAPA [4] setup iniciado");
             let caps = adb_manager::AdbManager::get_hardware_capabilities();
             let hwid = adb_manager::AdbManager::get_hardware_uuid();
             println!("[Esfera v3 HPC Engine] HWID: {}", hwid);
@@ -213,6 +229,7 @@ pub fn run() {
             dispatcher::Dispatcher::start_worker(db_arc_clone.clone(), Some(app.handle().clone()));
             dispatcher::Dispatcher::start_persistent_adb_keepalive_loop(db_arc_clone.clone());
             adb_manager::AdbManager::start_status_monitor(db_arc_clone);
+            diag("ETAPA [5] backend/servers iniciados no setup; setup retorna Ok");
             Ok(())
         })
         .manage(AppState { db: db_arc, sessions, master_client })
@@ -353,9 +370,18 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("Erro ao construir aplicação Tauri")
         .run(|_app, event| {
-            // No encerramento do app, limpa o estado do túnel reverso (evita túneis fantasmas).
-            if let tauri::RunEvent::WindowEvent { event: tauri::WindowEvent::Destroyed, .. } = event {
-                crate::tunnel_server::shutdown();
+            match &event {
+                tauri::RunEvent::ExitRequested { code, .. } => {
+                    diag(&format!("EVENTO TAURI: ExitRequested com código {:?}", code));
+                }
+                tauri::RunEvent::WindowEvent { event: tauri::WindowEvent::Destroyed, .. } => {
+                    diag("EVENTO TAURI: WindowEvent Destroyed");
+                    crate::tunnel_server::shutdown();
+                }
+                tauri::RunEvent::Ready => {
+                    diag("EVENTO TAURI: App Ready!");
+                }
+                _ => {}
             }
         });
 }

@@ -241,7 +241,7 @@ export default function CampaignsTab() {
       {/* KPI Stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <Card padding="md" className="flex items-center gap-4">
-          <div className="p-2.5 rounded-xl bg-violet-500/15 border border-violet-500/20 text-violet-400 shrink-0">
+          <div className="p-2.5 rounded-xl bg-[#5E6AD2]/10 border border-[#5E6AD2]/20 text-[#828DF7] shrink-0">
             <Megaphone size={20} />
           </div>
           <div>
@@ -409,7 +409,7 @@ export default function CampaignsTab() {
         <div className="space-y-4 text-xs">
           {/* CSV File Upload */}
           <div className="flex items-center gap-3 p-4 rounded-xl bg-white/[0.02] border border-border border-dashed">
-            <div className="p-2.5 rounded-xl bg-violet-500/15 border border-violet-500/20 text-violet-400">
+            <div className="p-2.5 rounded-xl bg-[#5E6AD2]/10 border border-[#5E6AD2]/20 text-[#828DF7]">
               <FileUp size={20} />
             </div>
             <div className="flex-1">

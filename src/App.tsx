@@ -69,12 +69,17 @@ function RootRedirect() {
 
   if (!user) return <Navigate to="/login" replace />;
 
-  // Master sem empresa → Companies
+  // Master sem empresa → Selecionar Empresa (/companies)
   if (user.role === "master" && selectedCompanyId === null) {
     return <Navigate to="/companies" replace />;
   }
 
-  // Com empresa selecionada → Devices
+  // Master com empresa → Dashboard
+  if (user.role === "master") {
+    return <Navigate to="/dashboard" replace />;
+  }
+
+  // Gestor, Supervisor, Colaborador → Dispositivos
   return <Navigate to="/devices" replace />;
 }
 

@@ -59,57 +59,49 @@ export default function DashboardTab() {
 
   const kpiCards = [
     {
-      label: "Mensagens Enviadas Hoje",
+      label: "Mensagens Enviadas",
       value: kpis?.sentToday ?? 0,
-      icon: <MessageSquare size={22} />,
-      color: "from-emerald-600 to-green-500",
-      shadowColor: "shadow-emerald-500/20",
+      icon: <MessageSquare size={18} className="text-[#828DF7]" />,
       trend: "+12%",
       trendUp: true,
     },
     {
       label: "Contatos Pendentes",
       value: kpis?.pendingContacts ?? 0,
-      icon: <Clock size={22} />,
-      color: "from-amber-600 to-orange-500",
-      shadowColor: "shadow-amber-500/20",
+      icon: <Clock size={18} className="text-amber-400" />,
       trend: "-5%",
       trendUp: false,
     },
     {
       label: "Chips Bloqueados",
       value: kpis?.blockedChips ?? 0,
-      icon: <AlertTriangle size={22} />,
-      color: "from-red-600 to-rose-500",
-      shadowColor: "shadow-red-500/20",
+      icon: <AlertTriangle size={18} className="text-red-400" />,
       trend: "+2",
       trendUp: true,
     },
     {
       label: "Alterações Hoje",
       value: kpis?.configChangesToday ?? 0,
-      icon: <Activity size={22} />,
-      color: "from-violet-600 to-indigo-500",
-      shadowColor: "shadow-violet-500/20",
-      trend: "Normal",
+      icon: <Activity size={18} className="text-emerald-400" />,
+      trend: "Estável",
       trendUp: true,
     },
   ];
 
   return (
-    <div className="space-y-6 animate-fade-in">
+    <div className="space-y-5 animate-fade-in font-sans text-zinc-100">
       {/* Header */}
       <div className="flex items-center justify-between gap-4">
         <div>
-          <h2 className="text-2xl font-extrabold text-primary tracking-tight">
-            Dashboard
+          <h2 className="text-lg font-bold text-zinc-100 tracking-tight">
+            Indicadores & Métricas
           </h2>
-          <p className="text-sm text-tertiary mt-1 leading-snug">
-            Visão geral do sistema — Indicadores em tempo real
+          <p className="text-xs text-zinc-400 mt-0.5">
+            Monitoramento de disparos e atividades em tempo real
           </p>
         </div>
-        <div className="flex items-center gap-3 shrink-0">
-          <span className="text-[10px] text-tertiary font-mono whitespace-nowrap">
+        <div className="flex items-center gap-2.5 shrink-0">
+          <span className="text-[10px] text-zinc-500 font-mono whitespace-nowrap">
             Atualizado: {lastRefresh.toLocaleTimeString("pt-BR")}
           </span>
           <Button
@@ -117,35 +109,35 @@ export default function DashboardTab() {
             size="sm"
             onClick={handleRefresh}
             loading={loading}
+            icon={<RefreshCw size={13} />}
           >
-            <RefreshCw size={14} />
             Atualizar
           </Button>
         </div>
       </div>
 
       {/* KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
         {kpiCards.map((kpi) => (
-          <Card key={kpi.label} hover glow padding="md">
+          <Card key={kpi.label} hover padding="sm">
             <div className="flex items-start justify-between">
               <div>
-                <p className="text-xs text-tertiary font-medium uppercase tracking-wider mb-2">
+                <p className="text-[11px] text-zinc-400 font-medium mb-1.5">
                   {kpi.label}
                 </p>
-                <p className="text-3xl font-extrabold text-primary tracking-tight">
+                <p className="text-2xl font-bold text-zinc-100 tracking-tight">
                   {loading ? (
-                    <span className="inline-block w-12 h-8 bg-white/5 rounded animate-pulse" />
+                    <span className="inline-block w-12 h-6 bg-white/[0.05] rounded animate-pulse" />
                   ) : (
                     kpi.value.toLocaleString("pt-BR")
                   )}
                 </p>
               </div>
-              <div className={`flex items-center justify-center w-11 h-11 rounded-xl bg-gradient-to-br ${kpi.color} ${kpi.shadowColor} shadow-lg`}>
-                <span className="text-white">{kpi.icon}</span>
+              <div className="flex items-center justify-center w-8 h-8 rounded-md bg-white/[0.04] border border-white/[0.06]">
+                {kpi.icon}
               </div>
             </div>
-            <div className="flex items-center gap-1.5 mt-3">
+            <div className="flex items-center gap-1 mt-2.5 text-[11px] font-medium text-zinc-400">
               {kpi.trendUp ? (
                 <TrendingUp size={12} className="text-emerald-400" />
               ) : (

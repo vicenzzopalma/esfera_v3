@@ -50,33 +50,33 @@ export default function Modal({ isOpen, onClose, title, children, footer, size =
       }}
     >
       {/* Overlay */}
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
 
       {/* Modal Content */}
       <div
-        className={`relative w-full ${sizeClasses[size]} rounded-2xl border
-          bg-card border-white/[0.08] shadow-2xl shadow-black/40 animate-scale-in`}
+        className={`relative w-full ${sizeClasses[size]} rounded-xl border
+          bg-[#141418] border-white/[0.08] shadow-2xl shadow-black/60 animate-scale-in`}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.06]">
-          <h2 className="text-lg font-bold text-primary tracking-tight">{title}</h2>
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-white/[0.06]">
+          <h2 className="text-sm font-semibold text-zinc-100 tracking-tight">{title}</h2>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-xl text-secondary hover:text-primary
-              hover:bg-white/10 transition-all"
+            className="p-1 rounded-md text-zinc-400 hover:text-zinc-100
+              hover:bg-white/[0.06] transition-all cursor-pointer"
           >
-            <X size={20} />
+            <X size={16} />
           </button>
         </div>
 
         {/* Body */}
-        <div className="px-6 py-5 max-h-[75vh] overflow-y-auto custom-scrollbar">
+        <div className="px-5 py-4 max-h-[75vh] overflow-y-auto custom-scrollbar">
           {children}
         </div>
 
         {/* Footer */}
         {footer && (
-          <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-white/[0.06]">
+          <div className="flex items-center justify-end gap-2.5 px-5 py-3 border-t border-white/[0.06]">
             {footer}
           </div>
         )}
