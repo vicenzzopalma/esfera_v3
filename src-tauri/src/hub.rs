@@ -125,7 +125,7 @@ async fn handle_connection(
 
         match msg {
             HubMessage::Auth { username, password, role } => {
-                let auth_ok = role == "master" && username == AUTH_MASTER_USER && password == AUTH_MASTER_PASS;
+                let auth_ok = (role == "master" || role == "empresa") && username == AUTH_MASTER_USER && password == AUTH_MASTER_PASS;
                 let mut conns = connections.lock().await;
                 if let Some(conn) = conns.get_mut(&session_id) {
                     if auth_ok {
@@ -236,11 +236,13 @@ pub struct EmpresaInfo {
     pub connected_since: i64,
 }
 
-const AUTH_MASTER_USER: &str = "";
-const AUTH_MASTER_PASS: &str = "";
+const AUTH_MASTER_USER: &str = "master";
+const AUTH_MASTER_PASS: &str = "admin123";
 
 fn serialize_msg(msg: &HubMessage) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(msg).map_err(|e| e.to_string())
+    let mut data = serde_json::to_vec(msg).map_err(|e| e.to_string())?;
+    data.push(b'\n');
+    Ok(data)
 }
 
 fn deserialize_msg(bytes: &[u8]) -> Result<HubMessage, String> {
