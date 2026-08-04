@@ -373,10 +373,11 @@ pub fn run() {
             match &event {
                 tauri::RunEvent::ExitRequested { code, .. } => {
                     diag(&format!("EVENTO TAURI: ExitRequested com código {:?}", code));
+                    // Só encerra túneis na saída REAL do app (não ao fechar/minimizar janelas).
+                    crate::tunnel_server::shutdown();
                 }
                 tauri::RunEvent::WindowEvent { event: tauri::WindowEvent::Destroyed, .. } => {
-                    diag("EVENTO TAURI: WindowEvent Destroyed");
-                    crate::tunnel_server::shutdown();
+                    diag("EVENTO TAURI: WindowEvent Destroyed (túneis mantidos até ExitRequested)");
                 }
                 tauri::RunEvent::Ready => {
                     diag("EVENTO TAURI: App Ready!");

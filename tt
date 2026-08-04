@@ -10090,12 +10090,8 @@ fn main() {
         .flag_if_supported("/std:c++17")
         .flag_if_supported("-std=c++17");
 
-    // Habilita vetorialização AVX2 universal no binário.
-    if builder.get_compiler().is_like_gnu() || builder.get_compiler().is_like_clang() {
-        builder.flag_if_supported("-mavx2");
-    } else if builder.get_compiler().is_like_msvc() {
-        builder.flag_if_supported("/arch:AVX2");
-    }
+    // Compile com instrucoes padrao x86-64/SSE. Runtime dispatching em C++ cuidara de selecionar a melhor implementacao.
+    // Nao forcar /arch:AVX2 globalmente para nao gerar crash (ILLEGAL INSTRUCTION) em CPUs sem AVX2.
 
     builder.compile("esfera_hpc");
 
@@ -25816,43 +25812,63 @@ impl<'a> std::ops::Deref for ConnGuard<'a> {
     }
 }
 
+fn db_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("D:/Novo/Esfera v3/esfera_runtime_debug.log") {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let _ = writeln!(f, "[{}] DB: {}", ts, msg);
+    }
+}
+
 impl Database {
     pub fn init(db_path: &str) -> Result<Self> {
-        // PRAGMAs por conexão: aplicados automaticamente a TODAS as conexões do pool
-        // (busy_timeout, synchronous, foreign_keys, cache_size, temp_store, mmap_size)
+        db_log(&format!("Iniciando DB em path: {}", db_path));
+        if let Some(parent) = std::path::Path::new(db_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let manager = SqliteConnectionManager::file(db_path).with_init(|conn| {
-            conn.execute_batch(
+            let _ = conn.execute_batch(
                 "PRAGMA busy_timeout=10000;
                  PRAGMA synchronous=NORMAL;
-                 PRAGMA foreign_keys=ON;
-                 PRAGMA cache_size=-64000;
-                 PRAGMA temp_store=MEMORY;
-                 PRAGMA mmap_size=268435456;",
-            )
+                 PRAGMA foreign_keys=ON;"
+            );
+            Ok(())
         });
-        let pool = Pool::builder()
-            .max_size(8)
-            .min_idle(Some(2))
-            .build(manager)
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-        // PRAGMAs de nível de arquivo: WAL + page_size (persistem no disco)
-        {
-            let conn = pool.get().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            conn.execute_batch("
-                PRAGMA journal_mode=WAL;
-                PRAGMA page_size=8192;
-            ").map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        db_log("Criando pool de conexões SQLite");
+        let pool = match Pool::builder().max_size(16).min_idle(Some(0)).build(manager) {
+            Ok(p) => p,
+            Err(e) => {
+                db_log(&format!("FATAL: Falha ao construir r2d2 pool: {:?}", e));
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
+            }
+        };
+        db_log("Pool criado com sucesso. Obtendo conexão para WAL...");
+        match pool.get() {
+            Ok(conn) => {
+                db_log("Conexão obtida. Executando PRAGMA journal_mode=WAL...");
+                match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+                    Ok(_) => db_log("WAL aplicado com sucesso."),
+                    Err(e) => db_log(&format!("Erro ao aplicar WAL: {:?}", e)),
+                }
+            }
+            Err(e) => {
+                db_log(&format!("Erro ao obter conexão do pool: {:?}", e));
+            }
         }
+        db_log("PRAGMAs aplicados.");
 
         let db = Database {
             pool,
             cached: Mutex::new(None),
             write_queue: Mutex::new(None),
         };
+        db_log("Criando tabelas...");
         db.create_tables()?;
+        db_log("Migrando tabelas...");
         db.migrate_existing_tables()?;
+        db_log("Seeding data...");
         db.seed_data()?;
+        db_log("DB init concluído com SUCESSO!");
         Ok(db)
     }
 
@@ -26359,7 +26375,7 @@ impl Database {
 
         if count == 0 {
             // Empresa Padrão REALESS
-            self.conn().execute(
+            conn.execute(
                 "INSERT INTO ESF_Company (CompanyId, CompanyName, DeviceLimit, UserLimit) VALUES (1, 'REALESS', 100, 50);",
                 [],
             )?;
@@ -26371,7 +26387,7 @@ impl Database {
             let hash_gestor2 = hash_password("gestor");
             let hash_colab = hash_password("colab");
 
-            self.conn().execute(
+            conn.execute(
                 "INSERT INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId) VALUES
                 (?1, ?2, 'Vicenzzo Master', 'master', NULL),
                 (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1),
@@ -26388,7 +26404,7 @@ impl Database {
             )?;
 
             // Permissões padrão para o gestor (UserId = 2)
-            self.conn().execute(
+            conn.execute(
                 "INSERT INTO ESF_Permission (UserId, PermissionKey, Enabled) VALUES
                 (2, 'allow_all_tabs', 1),
                 (2, 'allow_edit_devices', 1),
@@ -26399,7 +26415,7 @@ impl Database {
             )?;
 
             // Permissões de setor para o gestor
-            self.conn().execute(
+            conn.execute(
                 "INSERT INTO ESF_SectorPermission (UserId, Sector, CanView, CanConfigure) VALUES
                 (2, 'junior', 1, 1),
                 (2, 'senior', 1, 1),
@@ -26423,7 +26439,7 @@ impl Database {
 
             for (serial, name, brand, model, ip, num, sector) in default_devices {
                 let esfera_id = format!("ESF-LEGACY-{}", num);
-                let _ = self.conn().execute(
+                let _ = conn.execute(
                     "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId)
                     VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7, ?8)
                     ON CONFLICT(AdbDeviceId) DO NOTHING;",
@@ -28656,7 +28672,7 @@ async fn handle_connection(
 
         match msg {
             HubMessage::Auth { username, password, role } => {
-                let auth_ok = role == "master" && username == AUTH_MASTER_USER && password == AUTH_MASTER_PASS;
+                let auth_ok = (role == "master" || role == "empresa") && username == AUTH_MASTER_USER && password == AUTH_MASTER_PASS;
                 let mut conns = connections.lock().await;
                 if let Some(conn) = conns.get_mut(&session_id) {
                     if auth_ok {
@@ -28767,11 +28783,13 @@ pub struct EmpresaInfo {
     pub connected_since: i64,
 }
 
-const AUTH_MASTER_USER: &str = "";
-const AUTH_MASTER_PASS: &str = "";
+const AUTH_MASTER_USER: &str = "master";
+const AUTH_MASTER_PASS: &str = "admin123";
 
 fn serialize_msg(msg: &HubMessage) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(msg).map_err(|e| e.to_string())
+    let mut data = serde_json::to_vec(msg).map_err(|e| e.to_string())?;
+    data.push(b'\n');
+    Ok(data)
 }
 
 fn deserialize_msg(bytes: &[u8]) -> Result<HubMessage, String> {
@@ -29000,7 +29018,20 @@ fn get_db_path() -> String {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+fn diag(s: &str) {
+    use std::io::Write;
+    let path = "D:/Novo/Esfera v3/esfera_runtime_debug.log";
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let _ = writeln!(f, "[{}] {}", ts, s);
+    }
+}
+
 pub fn run() {
+    std::panic::set_hook(Box::new(|info| {
+        diag(&format!("PANIC DETECTADO: {:?}", info));
+    }));
+    diag("ETAPA [1] main/run iniciado");
     let db_path = get_db_path();
     let db = match Database::init(&db_path) {
         Ok(d) => d,
@@ -29013,6 +29044,7 @@ pub fn run() {
         }
     };
     let db_arc = Arc::new(db);
+    diag("ETAPA [2] db iniciado");
 
     // Fila Única de Escrita Assíncrona (MPSC single-writer com transações em lote)
     let write_queue = write_queue::WriteQueue::spawn(db_arc.clone(), write_queue::QUEUE_CAPACITY);
@@ -29026,6 +29058,7 @@ pub fn run() {
 
     // Runtime de fundo único para servidores e clients (LAN, Hub, Master)
     let bg_runtime = tokio::runtime::Runtime::new().expect("Falha ao criar background runtime");
+    diag("ETAPA [3] bg_runtime criado");
 
     if app_config.empresa_server_enabled {
         let db_for_server = db_arc.clone();
@@ -29127,6 +29160,7 @@ pub fn run() {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
+            diag("ETAPA [4] setup iniciado");
             let caps = adb_manager::AdbManager::get_hardware_capabilities();
             let hwid = adb_manager::AdbManager::get_hardware_uuid();
             println!("[Esfera v3 HPC Engine] HWID: {}", hwid);
@@ -29159,6 +29193,7 @@ pub fn run() {
             dispatcher::Dispatcher::start_worker(db_arc_clone.clone(), Some(app.handle().clone()));
             dispatcher::Dispatcher::start_persistent_adb_keepalive_loop(db_arc_clone.clone());
             adb_manager::AdbManager::start_status_monitor(db_arc_clone);
+            diag("ETAPA [5] backend/servers iniciados no setup; setup retorna Ok");
             Ok(())
         })
         .manage(AppState { db: db_arc, sessions, master_client })
@@ -29299,9 +29334,18 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("Erro ao construir aplicação Tauri")
         .run(|_app, event| {
-            // No encerramento do app, limpa o estado do túnel reverso (evita túneis fantasmas).
-            if let tauri::RunEvent::WindowEvent { event: tauri::WindowEvent::Destroyed, .. } = event {
-                crate::tunnel_server::shutdown();
+            match &event {
+                tauri::RunEvent::ExitRequested { code, .. } => {
+                    diag(&format!("EVENTO TAURI: ExitRequested com código {:?}", code));
+                }
+                tauri::RunEvent::WindowEvent { event: tauri::WindowEvent::Destroyed, .. } => {
+                    diag("EVENTO TAURI: WindowEvent Destroyed");
+                    crate::tunnel_server::shutdown();
+                }
+                tauri::RunEvent::Ready => {
+                    diag("EVENTO TAURI: App Ready!");
+                }
+                _ => {}
             }
         });
 }
@@ -29311,8 +29355,8 @@ pub fn run() {
 // ARQUIVO: src-tauri\src\main.rs
 // ========================================================
 
-// Temporariamente SEM windows_subsystem para ver o erro de runtime do Tauri no console.
-//#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
     esfera_v3_lib::run();
@@ -41503,11 +41547,21 @@ echo ============================================================
 echo.
 cd /d "%~dp0"
 
-echo [1/2] Verificando compilacao e iniciando aplicativo...
-start /b npx tauri dev
+if exist "%~dp0src-tauri\target\release\esfera_v3.exe" (
+    echo [1/2] Executavel de Release encontrado! Iniciando Esfera v3...
+    start "" "%~dp0src-tauri\target\release\esfera_v3.exe"
+    echo.
+    echo [SUCESSO] Esfera v3 iniciado!
+    timeout /t 2 >nul
+    exit
+)
+
+echo [1/2] Iniciando em Modo Desenvolvedor (Dev)...
+start "Esfera v3 Server" cmd /k "cd /d %~dp0 && npx tauri dev"
 
 echo.
-echo [SUCESSO] Esfera v3 iniciado! Esta janela pode ser minimizada.
+echo [SUCESSO] Esfera v3 iniciado em processo independente!
+timeout /t 3 >nul
 exit
 
 
