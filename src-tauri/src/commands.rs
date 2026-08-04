@@ -287,6 +287,24 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         }
 
         for dev in &mut refreshed_db {
+            // Devices só-túnel (identidade estável via EsferaDeviceId) com sessão ativa
+            // NÃO devem ser forçados a offline: o túnel reverso é a fonte de verdade da
+            // conexão. O loop anterior já marcou via_tunnel/online quando is_tunnel_active.
+            if dev.via_tunnel {
+                if let Some(ref uuid) = dev.esfera_device_id {
+                    if crate::tunnel_server::is_tunnel_active(uuid) {
+                        dev.status = "online".to_string();
+                    } else {
+                        // Sessão de túnel caiu (hub fechado/reabriu): mantém o device visível
+                        // como "connecting" em vez de sumir, e o agente reconecta sozinho.
+                        if dev.status == "online" {
+                            dev.status = "connecting".to_string();
+                        }
+                    }
+                }
+                continue;
+            }
+
             let is_active = active_adb_list.iter().any(|adb_d| adb_d.serial == dev.serial);
             if is_active {
                 dev.status = "online".to_string();

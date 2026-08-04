@@ -10,23 +10,30 @@ use crate::db::Database;
 pub struct CheckInPayload {
     pub esfera_device_id: String,
     pub current_adb_address: String,
+    #[serde(default)]
+    pub company_id: i32,
 }
 
 pub async fn start(db: Arc<Database>, port: u16) {
     let app = Router::new()
         .route("/api/devices/check-in", post(handle_checkin))
-        .with_state(db);
+        .with_state((db, port));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr).await
-        .expect("Falha ao bindar check-in server");
-    println!("Servidor HTTP Check-in rodando em http://0.0.0.0:{}", port);
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("AVISO: Check-in server na porta {} ja em uso: {}", port, e);
+            return;
+        }
+    };
+    println!("Servidor HTTP Check-in (canal KOTLIN) rodando em http://0.0.0.0:{}", port);
     axum::serve(listener, app).await
         .expect("Falha ao iniciar check-in server");
 }
 
 async fn handle_checkin(
-    State(db): State<Arc<Database>>,
+    State((db, _port)): State<(Arc<Database>, u16)>,
     Json(payload): Json<CheckInPayload>,
 ) -> &'static str {
     let now = Utc::now().to_rfc3339();
@@ -37,11 +44,26 @@ async fn handle_checkin(
         None => (adb_address.clone(), 5555),
     };
 
-    let updated = db.process_checkin(&payload.esfera_device_id, adb_address, &ip, port, &now);
+    // Grava com company_id para isolar a presença no VPS.
+    let updated = db.process_checkin(
+        &payload.esfera_device_id,
+        adb_address,
+        &ip,
+        port,
+        &now,
+        payload.company_id,
+    );
 
     match updated {
         Ok(0) => {
-            let _ = db.insert_unknown_device(&payload.esfera_device_id, adb_address, &ip, port, &now);
+            let _ = db.insert_unknown_device(
+                &payload.esfera_device_id,
+                adb_address,
+                &ip,
+                port,
+                &now,
+                payload.company_id,
+            );
         }
         Ok(_) => {}
         Err(e) => {

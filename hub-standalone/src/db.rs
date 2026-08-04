@@ -982,27 +982,42 @@ impl Database {
         Ok(())
     }
 
-    pub fn process_checkin(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
-        self.conn().execute(
+    pub fn process_checkin(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str, company_id: i32) -> Result<usize, String> {
+        // Primeiro tenta atualizar um device já conhecido (mantém company_id estável).
+        let updated = self.conn().execute(
             "UPDATE ESF_Device SET
                 CurrentAdbAddress = ?1,
                 Status = 'online',
                 LastSeenUTC = ?2,
                 DeviceIp = ?3,
-                DevicePort = ?4
+                DevicePort = ?4,
+                CompanyId = COALESCE((SELECT CompanyId FROM ESF_Device WHERE EsferaDeviceId = ?5), ?6)
              WHERE EsferaDeviceId = ?5",
-            params![adb_address, now, ip, port, device_id],
-        ).map_err(|e| e.to_string())
+            params![adb_address, now, ip, port, device_id, company_id],
+        ).map_err(|e| e.to_string())?;
+
+        if updated == 0 {
+            // Dispositivo novo: usa o company_id declarado (primeiro seen wins p/ isolamento).
+            return self.conn().execute(
+                "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
+                 VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?6, 0, 'junior', ?5, ?7)
+                 ON CONFLICT(EsferaDeviceId) DO UPDATE SET
+                 CurrentAdbAddress=excluded.CurrentAdbAddress, Status='online', LastSeenUTC=excluded.LastSeenUTC,
+                 DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, CompanyId=excluded.CompanyId",
+                params![format!("agent-{}", device_id), device_id, ip, port, adb_address, company_id, now],
+            ).map_err(|e| e.to_string());
+        }
+        Ok(updated)
     }
 
-    pub fn insert_unknown_device(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
+    pub fn insert_unknown_device(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str, company_id: i32) -> Result<usize, String> {
         self.conn().execute(
             "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
-             VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, 1, 0, 'junior', ?5, ?6)
+             VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?6, 0, 'junior', ?5, ?7)
              ON CONFLICT(EsferaDeviceId) DO UPDATE SET
              CurrentAdbAddress=excluded.CurrentAdbAddress, Status='online', LastSeenUTC=excluded.LastSeenUTC,
-             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort",
-            params![format!("agent-{}", device_id), device_id, ip, port, adb_address, now],
+             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, CompanyId=excluded.CompanyId",
+            params![format!("agent-{}", device_id), device_id, ip, port, adb_address, company_id, now],
         ).map_err(|e| e.to_string())
     }
 

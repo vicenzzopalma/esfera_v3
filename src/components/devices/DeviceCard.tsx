@@ -44,7 +44,7 @@ export const DeviceCard = memo(function DeviceCard({
   const menuRef = useRef<HTMLDivElement>(null);
 
   const displayName = device.name || device.serial;
-  const isUsbOnly = !device.serial.includes(":");
+  const isUsbOnly = !device.serial.includes(":") && !device.viaTunnel;
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
