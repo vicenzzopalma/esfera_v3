@@ -1,9 +1,9 @@
 /* ============================================================
-   Esfera v3 — Design System & Theme Engine
+   Esfera v3 — Design System & Theme Engine (Linear SaaS Theme)
    TailwindCSS v4 + Form Base Controls + Layout Offsets
    ============================================================ */
 
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
 @import "tailwindcss";
 
@@ -11,81 +11,60 @@
    THEME CONFIGURATION
    ============================================================ */
 @theme {
-  --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  --font-sans: 'Geist', system-ui, -apple-system, sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
 
   /* Animations */
-  --animate-fade-in: fade-in 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-  --animate-scale-in: scale-in 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-  --animate-slide-down: slide-down 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-  --animate-shake: shake 0.5s ease-in-out;
-  --animate-float: float 7s ease-in-out infinite;
-  --animate-float-delayed: float-delayed 9s ease-in-out infinite;
-  --animate-pulse-slow: pulse-slow 5s ease-in-out infinite;
-  --animate-glow-pulse: glow-pulse 3s ease-in-out infinite;
+  --animate-fade-in: fade-in 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-scale-in: scale-in 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-slide-down: slide-down 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-shake: shake 0.4s ease-in-out;
 
   @keyframes fade-in {
-    from { opacity: 0; transform: translateY(6px); }
+    from { opacity: 0; transform: translateY(4px); }
     to { opacity: 1; transform: translateY(0); }
   }
 
   @keyframes scale-in {
-    from { opacity: 0; transform: scale(0.97); }
+    from { opacity: 0; transform: scale(0.98); }
     to { opacity: 1; transform: scale(1); }
   }
 
   @keyframes slide-down {
-    from { opacity: 0; transform: translateY(-8px); }
+    from { opacity: 0; transform: translateY(-4px); }
     to { opacity: 1; transform: translateY(0); }
   }
 
   @keyframes shake {
     0%, 100% { transform: translateX(0); }
-    15%, 45%, 75% { transform: translateX(-4px); }
-    30%, 60%, 90% { transform: translateX(4px); }
-  }
-
-  @keyframes float {
-    0%, 100% { transform: translate(0, 0) rotate(0deg); }
-    33% { transform: translate(25px, -25px) rotate(4deg); }
-    66% { transform: translate(-15px, 15px) rotate(-3deg); }
-  }
-
-  @keyframes float-delayed {
-    0%, 100% { transform: translate(0, 0) rotate(0deg); }
-    33% { transform: translate(-20px, 20px) rotate(-4deg); }
-    66% { transform: translate(25px, -10px) rotate(5deg); }
-  }
-
-  @keyframes pulse-slow {
-    0%, 100% { opacity: 0.25; transform: scale(1); }
-    50% { opacity: 0.5; transform: scale(1.08); }
-  }
-
-  @keyframes glow-pulse {
-    0%, 100% { box-shadow: 0 0 15px rgba(124, 58, 237, 0.15); }
-    50% { box-shadow: 0 0 30px rgba(124, 58, 237, 0.35); }
+    20%, 60% { transform: translateX(-3px); }
+    40%, 80% { transform: translateX(3px); }
   }
 }
 
 /* ============================================================
-   DARK THEME (Default)
+   DARK THEME (Default Zinc-950 + Linear Blue Accent #5E6AD2)
    ============================================================ */
 :root,
 .dark {
-  --color-bg-primary: #07080d;
-  --color-bg-secondary: #0e1017;
-  --color-bg-card: rgba(18, 20, 31, 0.85);
-  --color-bg-card-hover: rgba(26, 29, 45, 0.95);
-  --color-bg-sidebar: #090a10;
-  --color-bg-header: rgba(9, 10, 16, 0.9);
+  --color-bg-primary: #09090b;
+  --color-bg-secondary: #121215;
+  --color-bg-card: #141418;
+  --color-bg-card-hover: #19191e;
+  --color-bg-sidebar: #0b0b0e;
+  --color-bg-header: rgba(11, 11, 14, 0.85);
   
-  --color-text-primary: #f1f5f9;
-  --color-text-secondary: #94a3b8;
-  --color-text-tertiary: #64748b;
+  --color-text-primary: #f4f4f5;
+  --color-text-secondary: #a1a1aa;
+  --color-text-tertiary: #71717a;
+
+  --color-accent: #5e6ad2;
+  --color-accent-hover: #4c57c6;
+  --color-accent-light: #828df7;
   
-  --color-border: rgba(255, 255, 255, 0.1);
-  --color-border-accent: rgba(139, 92, 246, 0.3);
+  --color-border: rgba(255, 255, 255, 0.07);
+  --color-border-strong: rgba(255, 255, 255, 0.14);
+  --color-border-accent: rgba(94, 106, 210, 0.35);
   
   color-scheme: dark;
 }
@@ -94,19 +73,24 @@
    LIGHT THEME
    ============================================================ */
 .light {
-  --color-bg-primary: #f8fafc;
-  --color-bg-secondary: #ffffff;
-  --color-bg-card: rgba(255, 255, 255, 0.9);
-  --color-bg-card-hover: #ffffff;
+  --color-bg-primary: #fcfcfd;
+  --color-bg-secondary: #f4f4f6;
+  --color-bg-card: #ffffff;
+  --color-bg-card-hover: #f9f9fb;
   --color-bg-sidebar: #ffffff;
-  --color-bg-header: rgba(255, 255, 255, 0.9);
+  --color-bg-header: rgba(255, 255, 255, 0.85);
   
-  --color-text-primary: #0f172a;
-  --color-text-secondary: #475569;
-  --color-text-tertiary: #94a3b8;
+  --color-text-primary: #09090b;
+  --color-text-secondary: #52525b;
+  --color-text-tertiary: #a1a1aa;
+
+  --color-accent: #5e6ad2;
+  --color-accent-hover: #4c57c6;
+  --color-accent-light: #828df7;
   
-  --color-border: rgba(0, 0, 0, 0.1);
-  --color-border-accent: rgba(124, 58, 237, 0.25);
+  --color-border: rgba(0, 0, 0, 0.08);
+  --color-border-strong: rgba(0, 0, 0, 0.16);
+  --color-border-accent: rgba(94, 106, 210, 0.25);
   
   color-scheme: light;
 }
@@ -128,32 +112,29 @@
   .border-border { border-color: var(--color-border); }
   .border-accent { border-color: var(--color-border-accent); }
 
-  /* Glassmorphism Panel */
+  /* Premium SaaS Clean Panel */
   .glass-panel {
     background-color: var(--color-bg-card);
-    backdrop-filter: blur(24px);
-    -webkit-backdrop-filter: blur(24px);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
     border: 1px solid var(--color-border);
-    box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.08),
-      0 10px 30px -10px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12), 0 8px 24px -4px rgba(0, 0, 0, 0.25);
   }
 
   .glass-header {
     background-color: var(--color-bg-header);
-    backdrop-filter: blur(24px);
-    -webkit-backdrop-filter: blur(24px);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
     border-bottom: 1px solid var(--color-border);
   }
 
-  /* Gradient Text */
+  /* Linear Accent Text */
   .gradient-text {
-    background: linear-gradient(135deg, #c084fc 0%, #818cf8 50%, #60a5fa 100%);
+    background: linear-gradient(135deg, #828df7 0%, #5e6ad2 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
   }
 
-  /* Icon alignment helper — use on parent of icon + text */
   .icon-aligned {
     display: inline-flex;
     align-items: center;
@@ -165,20 +146,20 @@
 }
 
 /* ============================================================
-   SIDEBAR & LAYOUT HARD-CODED OFFSETS
+   SIDEBAR & LAYOUT HARD-CODED OFFSETS (240px Width)
    ============================================================ */
 .sidebar-panel {
-  width: 256px !important;
-  min-width: 256px !important;
-  max-width: 256px !important;
+  width: 240px !important;
+  min-width: 240px !important;
+  max-width: 240px !important;
 }
 
 .layout-main-wrapper {
-  padding-left: 256px !important;
+  padding-left: 240px !important;
 }
 
 .statusbar-panel {
-  left: 256px !important;
+  left: 240px !important;
 }
 
 /* ============================================================

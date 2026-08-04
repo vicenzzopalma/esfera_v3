@@ -10,12 +10,8 @@ fn main() {
         .flag_if_supported("/std:c++17")
         .flag_if_supported("-std=c++17");
 
-    // Habilita vetorialização AVX2 universal no binário.
-    if builder.get_compiler().is_like_gnu() || builder.get_compiler().is_like_clang() {
-        builder.flag_if_supported("-mavx2");
-    } else if builder.get_compiler().is_like_msvc() {
-        builder.flag_if_supported("/arch:AVX2");
-    }
+    // Compile com instrucoes padrao x86-64/SSE. Runtime dispatching em C++ cuidara de selecionar a melhor implementacao.
+    // Nao forcar /arch:AVX2 globalmente para nao gerar crash (ILLEGAL INSTRUCTION) em CPUs sem AVX2.
 
     builder.compile("esfera_hpc");
 

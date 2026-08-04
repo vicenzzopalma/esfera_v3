@@ -331,43 +331,57 @@ impl<'a> std::ops::Deref for ConnGuard<'a> {
     }
 }
 
+fn db_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("D:/Novo/Esfera v3/esfera_runtime_debug.log") {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let _ = writeln!(f, "[{}] DB: {}", ts, msg);
+    }
+}
+
 impl Database {
     pub fn init(db_path: &str) -> Result<Self> {
-        // PRAGMAs por conexão: aplicados automaticamente a TODAS as conexões do pool
-        // (busy_timeout, synchronous, foreign_keys, cache_size, temp_store, mmap_size)
+        db_log(&format!("Iniciando DB em path: {}", db_path));
+        if let Some(parent) = std::path::Path::new(db_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let manager = SqliteConnectionManager::file(db_path).with_init(|conn| {
-            conn.execute_batch(
+            let _ = conn.execute_batch(
                 "PRAGMA busy_timeout=10000;
                  PRAGMA synchronous=NORMAL;
-                 PRAGMA foreign_keys=ON;
-                 PRAGMA cache_size=-64000;
-                 PRAGMA temp_store=MEMORY;
-                 PRAGMA mmap_size=268435456;",
-            )
+                 PRAGMA foreign_keys=ON;"
+            );
+            Ok(())
         });
-        let pool = Pool::builder()
-            .max_size(8)
-            .min_idle(Some(2))
-            .build(manager)
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        db_log("Criando pool de conexões SQLite");
+        let pool = match Pool::builder().max_size(16).min_idle(Some(0)).build(manager) {
+            Ok(p) => p,
+            Err(e) => {
+                db_log(&format!("FATAL: Falha ao construir r2d2 pool: {:?}", e));
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
+            }
+        };
+        db_log("Pool criado com sucesso. Aplicando WAL...");
 
-        // PRAGMAs de nível de arquivo: WAL + page_size (persistem no disco)
         {
-            let conn = pool.get().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            conn.execute_batch("
-                PRAGMA journal_mode=WAL;
-                PRAGMA page_size=8192;
-            ").map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            if let Ok(conn) = pool.get() {
+                let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+            }
         }
+        db_log("PRAGMAs aplicados.");
 
         let db = Database {
             pool,
             cached: Mutex::new(None),
             write_queue: Mutex::new(None),
         };
+        db_log("Criando tabelas...");
         db.create_tables()?;
+        db_log("Migrando tabelas...");
         db.migrate_existing_tables()?;
+        db_log("Seeding data...");
         db.seed_data()?;
+        db_log("DB init concluído com SUCESSO!");
         Ok(db)
     }
 
@@ -874,7 +888,7 @@ impl Database {
 
         if count == 0 {
             // Empresa Padrão REALESS
-            self.conn().execute(
+            conn.execute(
                 "INSERT INTO ESF_Company (CompanyId, CompanyName, DeviceLimit, UserLimit) VALUES (1, 'REALESS', 100, 50);",
                 [],
             )?;
@@ -886,7 +900,7 @@ impl Database {
             let hash_gestor2 = hash_password("gestor");
             let hash_colab = hash_password("colab");
 
-            self.conn().execute(
+            conn.execute(
                 "INSERT INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId) VALUES
                 (?1, ?2, 'Vicenzzo Master', 'master', NULL),
                 (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1),
@@ -903,7 +917,7 @@ impl Database {
             )?;
 
             // Permissões padrão para o gestor (UserId = 2)
-            self.conn().execute(
+            conn.execute(
                 "INSERT INTO ESF_Permission (UserId, PermissionKey, Enabled) VALUES
                 (2, 'allow_all_tabs', 1),
                 (2, 'allow_edit_devices', 1),
@@ -914,7 +928,7 @@ impl Database {
             )?;
 
             // Permissões de setor para o gestor
-            self.conn().execute(
+            conn.execute(
                 "INSERT INTO ESF_SectorPermission (UserId, Sector, CanView, CanConfigure) VALUES
                 (2, 'junior', 1, 1),
                 (2, 'senior', 1, 1),
@@ -938,7 +952,7 @@ impl Database {
 
             for (serial, name, brand, model, ip, num, sector) in default_devices {
                 let esfera_id = format!("ESF-LEGACY-{}", num);
-                let _ = self.conn().execute(
+                let _ = conn.execute(
                     "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId)
                     VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7, ?8)
                     ON CONFLICT(AdbDeviceId) DO NOTHING;",

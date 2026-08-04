@@ -6,7 +6,7 @@
     mergedManifest="build\intermediates\merged_manifest\release\AndroidManifest.xml"
     proguardFiles="build\intermediates\default_proguard_files\global\proguard-android-optimize.txt-8.1.4;proguard-rules.pro"
     partialResultsDir="build\intermediates\lint_vital_partial_results\release\out"
-    desugaredMethodsFiles="C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\08fcfe44934ebde1450fc6d69f4a6771\transformed\D8BackportedDesugaredMethods.txt">
+    desugaredMethodsFiles="C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\50233996ea4ad5efca764c3f438ce5a6\transformed\D8BackportedDesugaredMethods.txt">
   <buildFeatures
       namespacing="REQUIRED"/>
   <sourceProviders>
@@ -25,6 +25,6 @@
       applicationId="com.esfera.agent"
       generatedSourceFolders="build\generated\ap_generated_sources\release\out"
       generatedResourceFolders="build\generated\res\resValues\release"
-      desugaredMethodsFiles="C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\08fcfe44934ebde1450fc6d69f4a6771\transformed\D8BackportedDesugaredMethods.txt">
+      desugaredMethodsFiles="C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\50233996ea4ad5efca764c3f438ce5a6\transformed\D8BackportedDesugaredMethods.txt">
   </mainArtifact>
 </variant>

@@ -14,10 +14,10 @@ interface CardProps extends HTMLAttributes<HTMLDivElement> {
 
 const paddingClasses: Record<string, string> = {
   none: "",
-  xs: "p-3",
-  sm: "p-4",
-  md: "p-5 sm:p-6",
-  lg: "p-6 sm:p-8",
+  xs: "p-2.5",
+  sm: "p-3.5",
+  md: "p-4 sm:p-5",
+  lg: "p-5 sm:p-6",
 };
 
 export default function Card({
@@ -30,11 +30,11 @@ export default function Card({
 }: CardProps) {
   return (
     <div
-      className={`rounded-2xl glass-panel relative overflow-hidden transition-all duration-300 ${
+      className={`rounded-xl bg-[#141418] border border-white/[0.07] relative overflow-hidden transition-all duration-150 ${
         hover
-          ? "hover:border-violet-500/40 hover:-translate-y-1 hover:shadow-2xl hover:shadow-violet-500/15 cursor-pointer"
+          ? "hover:border-white/[0.15] hover:bg-[#18181d] cursor-pointer"
           : ""
-      } ${glow ? "border-violet-500/40 shadow-xl shadow-violet-500/20" : ""} ${
+      } ${glow ? "border-[#5E6AD2]/40 shadow-md shadow-[#5E6AD2]/10" : ""} ${
         paddingClasses[padding]
       } ${className}`}
       {...props}

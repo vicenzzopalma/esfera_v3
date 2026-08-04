@@ -7,7 +7,7 @@ import { useState, useEffect } from "react";
 import { useAuth } from "../context/AuthContext";
 import { api } from "../tauri";
 import type { Company, Device } from "../types";
-import { Wifi, WifiOff, Building2, Smartphone } from "lucide-react";
+import { Building2, Smartphone } from "lucide-react";
 
 export default function StatusBar() {
   const { selectedCompanyId } = useAuth();
@@ -42,44 +42,43 @@ export default function StatusBar() {
   }, [selectedCompanyId]);
 
   return (
-    <footer style={{ left: "256px" }} className="fixed bottom-0 right-0 h-8 z-30 bg-sidebar border-t border-border flex items-center justify-between px-4 text-xs text-tertiary">
-
-      <div className="flex items-center gap-4">
+    <footer style={{ left: "240px" }} className="fixed bottom-0 right-0 h-6 z-30 bg-[#0b0b0e] border-t border-white/[0.07] flex items-center justify-between px-3 text-[10px] text-zinc-400 select-none">
+      <div className="flex items-center gap-3">
         {/* Status de conexão */}
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1">
           {onlineCount > 0 ? (
             <>
-              <Wifi size={12} className="text-emerald-400" />
-              <span className="text-emerald-400">Conectado</span>
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              <span className="text-emerald-400 font-medium">Conectado</span>
             </>
           ) : (
             <>
-              <WifiOff size={12} className="text-slate-500" />
-              <span>Desconectado</span>
+              <span className="w-1.5 h-1.5 rounded-full bg-zinc-600" />
+              <span className="text-zinc-500 font-medium">Pronto</span>
             </>
           )}
         </div>
 
         {/* Empresa atual */}
         {company && (
-          <div className="flex items-center gap-1.5">
-            <Building2 size={12} />
-            <span>{company.name}</span>
+          <div className="flex items-center gap-1 text-zinc-400">
+            <Building2 size={11} className="text-zinc-500" />
+            <span className="truncate max-w-[150px]">{company.name}</span>
           </div>
         )}
       </div>
 
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-3">
         {/* Dispositivos online */}
         {selectedCompanyId && (
-          <div className="flex items-center gap-1.5">
-            <Smartphone size={12} />
+          <div className="flex items-center gap-1 text-zinc-400 font-mono">
+            <Smartphone size={11} className="text-zinc-500" />
             <span>{onlineCount}/{totalCount} online</span>
           </div>
         )}
 
         {/* Versão */}
-        <span className="opacity-50">Esfera v3.0</span>
+        <span className="font-mono text-zinc-600">v3.0.0</span>
       </div>
     </footer>
   );

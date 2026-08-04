@@ -66,7 +66,7 @@ export default function CompaniesTab() {
 
   const handleEnterCompany = (companyId: number) => {
     enterCompany(companyId);
-    navigate("/devices");
+    navigate("/dashboard");
   };
 
   const handleOpenEditModal = (company?: Company) => {

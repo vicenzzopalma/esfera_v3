@@ -1,19 +1,19 @@
-com.esfera.agent.app-lifecycle-viewmodel-savedstate-2.5.1-0 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\16322844bb7d98eeb0c1be49f98a8e48\transformed\lifecycle-viewmodel-savedstate-2.5.1\res
-com.esfera.agent.app-annotation-experimental-1.3.0-1 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\23c5385faa44de9164621c691e91a19d\transformed\annotation-experimental-1.3.0\res
-com.esfera.agent.app-core-1.10.1-2 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\3e37edfa99bafc36859ad12e7d646bef\transformed\core-1.10.1\res
-com.esfera.agent.app-savedstate-1.2.0-3 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\4186d1e31a760ff573fb6ded8f0d846d\transformed\savedstate-1.2.0\res
-com.esfera.agent.app-emoji2-1.2.0-4 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\47a3644321431e4496557e6c0d7c84f5\transformed\emoji2-1.2.0\res
-com.esfera.agent.app-appcompat-1.6.1-5 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\65902ca64e5fecbe8081a3f89ab5d5e8\transformed\appcompat-1.6.1\res
-com.esfera.agent.app-activity-1.6.0-6 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\84e9cf7dec015e90a25d5bdbc8b3e76a\transformed\activity-1.6.0\res
-com.esfera.agent.app-fragment-1.3.6-7 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\a7eb5bbc2f8d2821809e3acc5b917055\transformed\fragment-1.3.6\res
-com.esfera.agent.app-core-ktx-1.10.1-8 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\ad3e8ceebfd264b72ff0e47466637672\transformed\core-ktx-1.10.1\res
-com.esfera.agent.app-startup-runtime-1.1.1-9 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\c0ce5eeb88412f509f1487c72f8fd550\transformed\startup-runtime-1.1.1\res
-com.esfera.agent.app-lifecycle-runtime-2.5.1-10 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\c9f59e6eb8c7d91c37e2f9b85d9ef085\transformed\lifecycle-runtime-2.5.1\res
-com.esfera.agent.app-emoji2-views-helper-1.2.0-11 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\d4e082416f66f21f09b5eb96bef13c88\transformed\emoji2-views-helper-1.2.0\res
-com.esfera.agent.app-lifecycle-process-2.4.1-12 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\d56aa352ad2ab7a26d7e5e4a9f73964f\transformed\lifecycle-process-2.4.1\res
-com.esfera.agent.app-lifecycle-livedata-core-2.5.1-13 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\d6dc28d76c0053399ca0ed3796c44eb4\transformed\lifecycle-livedata-core-2.5.1\res
-com.esfera.agent.app-appcompat-resources-1.6.1-14 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\e348374f25de36193c4bebf050880633\transformed\appcompat-resources-1.6.1\res
-com.esfera.agent.app-lifecycle-viewmodel-2.5.1-15 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\e673f9772422a8f746f8f378faa1a7dd\transformed\lifecycle-viewmodel-2.5.1\res
+com.esfera.agent.app-emoji2-1.2.0-0 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\115882db0b2eaae15260ad738bf798b4\transformed\emoji2-1.2.0\res
+com.esfera.agent.app-appcompat-resources-1.6.1-1 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\1b1fad5e7781c24bc7516e427b41a5f9\transformed\appcompat-resources-1.6.1\res
+com.esfera.agent.app-fragment-1.3.6-2 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\1bf06762a965ba11a7521251b22982a1\transformed\fragment-1.3.6\res
+com.esfera.agent.app-lifecycle-runtime-2.5.1-3 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\2518f0d3b1c52cbe25df10f777ae9928\transformed\lifecycle-runtime-2.5.1\res
+com.esfera.agent.app-lifecycle-viewmodel-savedstate-2.5.1-4 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\2796b68bb736265efca7cde2ee9da336\transformed\lifecycle-viewmodel-savedstate-2.5.1\res
+com.esfera.agent.app-lifecycle-process-2.4.1-5 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\293b531577a29ff5e32bc9c9adef482a\transformed\lifecycle-process-2.4.1\res
+com.esfera.agent.app-emoji2-views-helper-1.2.0-6 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\2d4829c929e934e568a97a8debe6e042\transformed\emoji2-views-helper-1.2.0\res
+com.esfera.agent.app-core-1.10.1-7 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\4749b8e90fc7ab4659e3498fc1a358a7\transformed\core-1.10.1\res
+com.esfera.agent.app-appcompat-1.6.1-8 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\67672a98ec22f1c0ea2f513e0b60be79\transformed\appcompat-1.6.1\res
+com.esfera.agent.app-lifecycle-viewmodel-2.5.1-9 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\6f9bd4c3d0d599b31ef97fc5e995a59a\transformed\lifecycle-viewmodel-2.5.1\res
+com.esfera.agent.app-savedstate-1.2.0-10 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\83658286eb9eb43d92b65557ca149471\transformed\savedstate-1.2.0\res
+com.esfera.agent.app-lifecycle-livedata-core-2.5.1-11 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\c11dff4cc75ea21b056f58bdfeea8b93\transformed\lifecycle-livedata-core-2.5.1\res
+com.esfera.agent.app-activity-1.6.0-12 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\c59bb03f6f7b8287c0fe6c8443d3c95e\transformed\activity-1.6.0\res
+com.esfera.agent.app-startup-runtime-1.1.1-13 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\e87c22498448e59ae9e6243849fc2853\transformed\startup-runtime-1.1.1\res
+com.esfera.agent.app-core-ktx-1.10.1-14 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\edf8d1e1b92be552e6cf2ceb0e96b3a7\transformed\core-ktx-1.10.1\res
+com.esfera.agent.app-annotation-experimental-1.3.0-15 C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\fb922783f67778065a61f52b2e143d0a\transformed\annotation-experimental-1.3.0\res
 com.esfera.agent.app-pngs-16 D:\Novo\Esfera v3\src-agent\app\build\generated\res\pngs\release
 com.esfera.agent.app-resValues-17 D:\Novo\Esfera v3\src-agent\app\build\generated\res\resValues\release
 com.esfera.agent.app-packageReleaseResources-18 D:\Novo\Esfera v3\src-agent\app\build\intermediates\incremental\release\packageReleaseResources\merged.dir

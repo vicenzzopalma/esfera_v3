@@ -7,7 +7,7 @@ import { useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
-import { Zap, User, Lock, Eye, EyeOff, Loader2, Sun, Moon, Sparkles } from "lucide-react";
+import { User, Lock, Eye, EyeOff, Loader2, Sun, Moon, Sparkles } from "lucide-react";
 
 export default function LoginPage() {
   const { login, error } = useAuth();
@@ -43,40 +43,37 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center relative overflow-hidden bg-primary p-6">
-      {/* Background Ambient Lighting */}
-      <div className="absolute inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute -top-1/3 -left-1/3 w-2/3 h-2/3 bg-gradient-to-br from-violet-600/30 to-indigo-600/10 rounded-full blur-3xl animate-float" />
-        <div className="absolute -bottom-1/3 -right-1/3 w-2/3 h-2/3 bg-gradient-to-tl from-indigo-600/25 to-violet-600/10 rounded-full blur-3xl animate-float-delayed" />
-      </div>
+    <div className="min-h-screen flex items-center justify-center relative overflow-hidden bg-[#09090b] p-4 font-sans">
+      {/* Subtle Static Radial Gradient Background */}
+      <div className="absolute inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-[#5E6AD2]/15 via-[#09090b] to-[#09090b]" />
 
       {/* Theme Toggle Button */}
       <button
         onClick={toggleTheme}
-        className="absolute top-6 right-6 p-3 rounded-2xl bg-white/5 border border-border text-secondary hover:text-primary hover:bg-white/10 transition-all z-20 cursor-pointer shadow-lg"
+        className="absolute top-5 right-5 p-2 rounded-md bg-white/[0.04] border border-white/[0.08] text-zinc-400 hover:text-zinc-100 transition-all z-20 cursor-pointer text-xs"
         title="Alternar Tema"
       >
-        {isDark ? <Sun size={18} /> : <Moon size={18} />}
+        {isDark ? <Sun size={15} /> : <Moon size={15} />}
       </button>
 
       {/* Login Card Container */}
-      <div className={`relative w-full max-w-md ${shake ? "animate-shake" : "animate-scale-in"}`}>
-        <div className="rounded-3xl glass-panel shadow-2xl overflow-hidden border border-white/10 p-8 sm:p-10 space-y-6">
+      <div className={`relative w-full max-w-sm ${shake ? "animate-shake" : "animate-scale-in"}`}>
+        <div className="rounded-xl bg-[#141418] border border-white/[0.08] p-6 sm:p-7 space-y-5 shadow-2xl shadow-black/80">
           {/* Header */}
           <div className="text-center">
-            <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-violet-600 to-indigo-600 shadow-xl shadow-violet-500/30 mb-4 animate-glow-pulse">
-              <Zap size={32} className="text-white" />
+            <div className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-[#5E6AD2] text-white font-black text-base shadow-md shadow-[#5E6AD2]/25 mb-3">
+              E
             </div>
-            <h1 className="text-2xl font-extrabold text-primary tracking-tight">Esfera v3</h1>
-            <p className="text-xs text-secondary mt-1 font-medium">
-              Plataforma de Disparos e Gestão ADB
+            <h1 className="text-lg font-bold text-zinc-100 tracking-tight">Esfera Hub</h1>
+            <p className="text-xs text-zinc-400 mt-0.5">
+              Gestão ADB & Disparos Inteligentes
             </p>
           </div>
 
           {/* Form */}
-          <form onSubmit={handleSubmit} className="space-y-4">
+          <form onSubmit={handleSubmit} className="space-y-3.5">
             {error && (
-              <div className="flex items-center gap-2.5 px-4 py-3 rounded-xl bg-red-500/15 border border-red-500/30 text-red-400 text-xs font-medium animate-fade-in">
+              <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-medium animate-fade-in">
                 <span>⚠️</span>
                 <span>{error}</span>
               </div>
@@ -84,39 +81,39 @@ export default function LoginPage() {
 
             {/* Input Usuário */}
             <div>
-              <label htmlFor="login-username">Usuário de Acesso</label>
+              <label htmlFor="login-username" className="text-xs text-zinc-300 font-medium mb-1 block">Usuário</label>
               <div className="relative flex items-center">
-                <User size={18} className="absolute left-3.5 text-tertiary pointer-events-none z-10" />
+                <User size={15} className="absolute left-3 text-zinc-500 pointer-events-none z-10" />
                 <input
                   id="login-username"
                   type="text"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="Digite seu usuário..."
-                  className="input-with-icon-left"
+                  placeholder="Digite seu usuário"
+                  className="w-full h-9 pl-9 pr-3 text-xs bg-white/[0.03] border border-white/[0.08] rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-[#5E6AD2]"
                 />
               </div>
             </div>
 
             {/* Input Senha */}
             <div>
-              <label htmlFor="login-password">Senha de Acesso</label>
+              <label htmlFor="login-password font-medium" className="text-xs text-zinc-300 font-medium mb-1 block">Senha</label>
               <div className="relative flex items-center">
-                <Lock size={18} className="absolute left-3.5 text-tertiary pointer-events-none z-10" />
+                <Lock size={15} className="absolute left-3 text-zinc-500 pointer-events-none z-10" />
                 <input
                   id="login-password"
                   type={showPassword ? "text" : "password"}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Digite sua senha..."
-                  className="input-with-icon-left input-with-icon-right"
+                  placeholder="Digite sua senha"
+                  className="w-full h-9 pl-9 pr-9 text-xs bg-white/[0.03] border border-white/[0.08] rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-[#5E6AD2]"
                 />
                 <button
                   type="button"
                   onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3.5 text-tertiary hover:text-secondary transition-colors cursor-pointer z-10"
+                  className="absolute right-3 text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer z-10"
                 >
-                  {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                  {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
                 </button>
               </div>
             </div>
@@ -125,44 +122,42 @@ export default function LoginPage() {
             <button
               type="submit"
               disabled={loading || !username || !password}
-              className="w-full h-12 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 shadow-lg shadow-violet-500/25 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 cursor-pointer flex items-center justify-center gap-2 mt-4"
+              className="w-full h-9 rounded-md text-xs font-semibold text-white bg-[#5E6AD2] hover:bg-[#4C57C6] shadow-sm shadow-[#5E6AD2]/25 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-150 cursor-pointer flex items-center justify-center gap-2 mt-4"
             >
               {loading ? (
                 <>
-                  <Loader2 size={18} className="animate-spin" />
-                  <span>Autenticando...</span>
+                  <Loader2 size={15} className="animate-spin" />
+                  <span>Entrando...</span>
                 </>
               ) : (
-                <span>Acessar Plataforma</span>
+                <span>Entrar no Sistema</span>
               )}
             </button>
           </form>
 
           {/* Quick Credentials Widget — APENAS em modo de desenvolvimento */}
           {import.meta.env.DEV && (
-            <div className="pt-2">
-              <div className="rounded-2xl bg-white/[0.02] border border-border p-4">
-                <div className="flex items-center gap-1.5 text-[11px] font-bold text-tertiary uppercase tracking-wider mb-3">
-                  <Sparkles size={14} className="text-violet-400" />
-                  <span>Atalhos de Login (DEV)</span>
-                </div>
+            <div className="pt-2 border-t border-white/[0.06]">
+              <div className="flex items-center gap-1 text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">
+                <Sparkles size={12} className="text-[#828DF7]" />
+                <span>Atalhos DEV</span>
+              </div>
 
-                <div className="grid grid-cols-2 gap-2.5">
-                  <button
-                    type="button"
-                    onClick={() => fillCredentials("vicenzzo.master", "root123")}
-                    className="py-2.5 px-3 rounded-xl bg-violet-600/20 hover:bg-violet-600/30 text-xs font-semibold text-violet-300 border border-violet-500/30 transition-colors cursor-pointer text-center"
-                  >
-                    Vicenzzo Master
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => fillCredentials("vicenzzo.mastronikolis", "Ope@2025")}
-                    className="py-2.5 px-3 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-xs font-semibold text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer text-center"
-                  >
-                    Gestor Realess
-                  </button>
-                </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => fillCredentials("vicenzzo.master", "root123")}
+                  className="py-1.5 px-2 rounded-md bg-[#5E6AD2]/10 hover:bg-[#5E6AD2]/20 text-[11px] font-medium text-[#828DF7] border border-[#5E6AD2]/20 transition-colors cursor-pointer text-center truncate"
+                >
+                  Master
+                </button>
+                <button
+                  type="button"
+                  onClick={() => fillCredentials("vicenzzo.mastronikolis", "Ope@2025")}
+                  className="py-1.5 px-2 rounded-md bg-white/[0.04] hover:bg-white/[0.08] text-[11px] font-medium text-zinc-300 border border-white/[0.08] transition-colors cursor-pointer text-center truncate"
+                >
+                  Gestor
+                </button>
               </div>
             </div>
           )}

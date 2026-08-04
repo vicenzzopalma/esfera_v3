@@ -101,120 +101,114 @@ export default function Header() {
   };
 
   return (
-    <header className="sticky top-0 z-30 h-16 w-full glass-header flex items-center justify-between px-6 gap-4 transition-all">
-      {/* Left: Title & Context */}
-      <div className="flex items-center gap-4 min-w-0">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2.5">
-            <h1 className="text-base font-bold text-primary tracking-tight leading-tight">
-              {currentRoute.title}
-            </h1>
-            {selectedCompany && (
-              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-violet-500/10 text-violet-400 border border-violet-500/20 whitespace-nowrap shrink-0">
-                <Building2 size={11} className="shrink-0" />
-                {selectedCompany.name}
-              </span>
-            )}
-          </div>
-          <p className="text-xs text-tertiary hidden sm:block mt-0.5 leading-snug">{currentRoute.subtitle}</p>
-        </div>
-      </div>
-
-      {/* Right: Actions, Switcher & User */}
-      <div className="flex items-center gap-3">
-        {/* Engine ADB Status Badge */}
-        <div className="hidden lg:flex items-center gap-2 px-3.5 py-2 rounded-xl bg-white/[0.03] border border-white/[0.08] text-xs">
-          <Cpu size={14} className="text-indigo-400 shrink-0" />
-          <span className="text-tertiary whitespace-nowrap">ADB Engine:</span>
-          <span className="font-semibold text-emerald-400 flex items-center gap-1.5 whitespace-nowrap">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-            {onlineDevicesCount > 0 ? `${onlineDevicesCount} Online` : "Pronto"}
-          </span>
-        </div>
-
-        {/* Company Switcher Dropdown (Master only) */}
-        {user.role === "master" && (
+    <header className="sticky top-0 z-30 h-12 w-full glass-header flex items-center justify-between px-5 gap-4 transition-all bg-[#0b0b0e]/90 border-b border-white/[0.07]">
+      {/* Left: Breadcrumb & Context */}
+      <div className="flex items-center gap-2 min-w-0 text-xs">
+        {selectedCompany ? (
           <div className="relative" ref={companyDropdownRef}>
             <button
-              onClick={() => setCompanyDropdownOpen(!companyDropdownOpen)}
-              className="flex items-center gap-2.5 px-3.5 py-2 rounded-xl bg-white/5 border border-white/[0.08] hover:bg-white/10 text-xs font-medium text-primary transition-all cursor-pointer"
+              onClick={() => user.role === "master" && setCompanyDropdownOpen(!companyDropdownOpen)}
+              className={`flex items-center gap-1.5 font-medium text-zinc-400 hover:text-zinc-200 transition-colors ${
+                user.role === "master" ? "cursor-pointer" : "cursor-default"
+              }`}
             >
-              <Building2 size={14} className="text-violet-400 shrink-0" />
-              <span className="max-w-[120px] truncate" title={selectedCompany ? selectedCompany.name : "Selecionar Empresa"}>
-                {selectedCompany ? selectedCompany.name : "Selecionar Empresa"}
-              </span>
-              <ChevronDown size={14} className="text-tertiary shrink-0" />
+              <Building2 size={13} className="text-[#828DF7] shrink-0" />
+              <span className="truncate max-w-[130px] font-semibold text-zinc-200">{selectedCompany.name}</span>
+              {user.role === "master" && <ChevronDown size={12} className="text-zinc-500 shrink-0" />}
             </button>
 
-            {companyDropdownOpen && (
-              <div className="absolute right-0 mt-2 w-56 rounded-2xl glass-panel shadow-2xl p-1.5 z-50 animate-scale-in">
-                <div className="px-3 py-2 text-[10px] uppercase font-bold text-tertiary tracking-wider border-b border-border mb-1">
+            {companyDropdownOpen && user.role === "master" && (
+              <div className="absolute left-0 mt-1.5 w-52 rounded-lg glass-panel shadow-2xl p-1 z-50 animate-scale-in bg-[#141418] border border-white/[0.08]">
+                <div className="px-2.5 py-1.5 text-[9px] uppercase font-bold text-zinc-500 tracking-wider border-b border-white/[0.06] mb-1">
                   Trocar Empresa
                 </div>
                 {companies.length === 0 && (
-                  <div className="px-3 py-2 text-xs text-tertiary">Nenhuma empresa cadastrada</div>
+                  <div className="px-2.5 py-1.5 text-xs text-zinc-500">Nenhuma empresa</div>
                 )}
                 {companies.map((c) => (
                   <button
                     key={c.id}
                     onClick={() => handleCompanySelect(c.id)}
-                    className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs transition-colors cursor-pointer ${
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-xs transition-colors cursor-pointer ${
                       selectedCompanyId === c.id
-                        ? "bg-violet-600/20 text-violet-300 font-semibold"
-                        : "text-secondary hover:text-primary hover:bg-white/5"
+                        ? "bg-[#5E6AD2]/20 text-[#828DF7] font-semibold"
+                        : "text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.04]"
                     }`}
                   >
                     <span className="truncate">{c.name}</span>
-                    {selectedCompanyId === c.id && <CheckCircle2 size={13} className="text-violet-400" />}
+                    {selectedCompanyId === c.id && <CheckCircle2 size={12} className="text-[#828DF7]" />}
                   </button>
                 ))}
                 {selectedCompanyId !== null && (
                   <button
                     onClick={handleLeaveCompany}
-                    className="w-full text-left px-3 py-2 mt-1 border-t border-border text-xs text-red-400 hover:bg-red-500/10 rounded-xl transition-colors cursor-pointer"
+                    className="w-full text-left px-2.5 py-1.5 mt-1 border-t border-white/[0.06] text-xs text-red-400 hover:bg-red-500/10 rounded-md transition-colors cursor-pointer"
                   >
-                    Ver todas as empresas
+                    Todas as empresas
                   </button>
                 )}
               </div>
             )}
           </div>
+        ) : (
+          <span className="text-zinc-400 font-medium">Esfera</span>
         )}
 
-        {/* Theme Toggle */}
-        <button
-          onClick={toggleTheme}
-          className="p-2.5 rounded-xl bg-white/5 border border-white/[0.08] text-secondary hover:text-primary hover:bg-white/10 transition-all cursor-pointer"
-          title={isDark ? "Modo Claro" : "Modo Escuro"}
-        >
-          {isDark ? <Sun size={16} /> : <Moon size={16} />}
-        </button>
+        <span className="text-zinc-600 font-mono">/</span>
+        <h1 className="font-semibold text-zinc-100 tracking-tight truncate">
+          {currentRoute.title}
+        </h1>
+      </div>
+
+      {/* Right: Engine Badge & User Profile */}
+      <div className="flex items-center gap-3">
+        {/* ADB Engine Status Badge */}
+        <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white/[0.03] border border-white/[0.07] text-[11px]">
+          <Cpu size={12} className="text-[#828DF7] shrink-0" />
+          <span className="text-zinc-500">Engine:</span>
+          <span className="font-medium text-emerald-400 flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+            {onlineDevicesCount > 0 ? `${onlineDevicesCount} Online` : "Pronto"}
+          </span>
+        </div>
 
         {/* User Profile Menu */}
         <div className="relative" ref={userMenuRef}>
           <button
             onClick={() => setUserMenuOpen(!userMenuOpen)}
-            className="flex items-center gap-2 p-1 rounded-xl hover:bg-white/5 transition-all cursor-pointer"
+            className="flex items-center gap-1.5 p-1 rounded-md hover:bg-white/[0.05] transition-all cursor-pointer"
           >
-            <div className="flex items-center justify-center w-8 h-8 rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 text-white font-bold text-xs shadow-md shadow-violet-500/20">
+            <div className="flex items-center justify-center w-6 h-6 rounded bg-[#5E6AD2] text-white font-bold text-[11px] shadow-sm">
               {user.displayName.charAt(0).toUpperCase()}
             </div>
+            <ChevronDown size={12} className="text-zinc-500" />
           </button>
 
           {userMenuOpen && (
-            <div className="absolute right-0 mt-2 w-48 rounded-2xl glass-panel shadow-2xl p-2 z-50 animate-scale-in">
-              <div className="px-3 py-2 border-b border-border mb-1">
-                <p className="text-xs font-semibold text-primary truncate">{user.displayName}</p>
-                <p className="text-[10px] text-tertiary capitalize">{user.role}</p>
+            <div className="absolute right-0 mt-1.5 w-48 rounded-lg glass-panel shadow-2xl p-1 z-50 animate-scale-in bg-[#141418] border border-white/[0.08]">
+              <div className="px-2.5 py-1.5 border-b border-white/[0.06] mb-1">
+                <p className="text-xs font-semibold text-zinc-100 truncate">{user.displayName}</p>
+                <p className="text-[10px] text-zinc-500 capitalize">{user.role}</p>
               </div>
+              <button
+                onClick={() => {
+                  toggleTheme();
+                }}
+                className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-xs text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.04] transition-colors cursor-pointer"
+              >
+                <div className="flex items-center gap-2">
+                  {isDark ? <Sun size={13} /> : <Moon size={13} />}
+                  <span>{isDark ? "Modo Claro" : "Modo Escuro"}</span>
+                </div>
+              </button>
               <button
                 onClick={() => {
                   setUserMenuOpen(false);
                   navigate("/settings");
                 }}
-                className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-xs text-secondary hover:text-primary hover:bg-white/5 transition-colors cursor-pointer"
+                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-xs text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.04] transition-colors cursor-pointer"
               >
-                <UserCheck size={14} />
+                <UserCheck size={13} />
                 <span>Perfil & Ajustes</span>
               </button>
               <button
@@ -223,10 +217,10 @@ export default function Header() {
                   logout();
                   navigate("/login");
                 }}
-                className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-xs text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer mt-1"
+                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-xs text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer mt-1 border-t border-white/[0.06]"
               >
-                <LogOut size={14} />
-                <span>Sair da conta</span>
+                <LogOut size={13} />
+                <span>Sair</span>
               </button>
             </div>
           )}

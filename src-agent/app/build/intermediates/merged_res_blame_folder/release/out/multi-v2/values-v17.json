@@ -4,7 +4,7 @@
             "outputFile": "com.esfera.agent.app-mergeReleaseResources-18:/values-v17/values-v17.xml",
             "map": [
                 {
-                    "source": "C:\\Users\\vicenzzo.palma\\.gradle\\caches\\8.9\\transforms\\65902ca64e5fecbe8081a3f89ab5d5e8\\transformed\\appcompat-1.6.1\\res\\values-v17\\values-v17.xml",
+                    "source": "C:\\Users\\vicenzzo.palma\\.gradle\\caches\\8.9\\transforms\\67672a98ec22f1c0ea2f513e0b60be79\\transformed\\appcompat-1.6.1\\res\\values-v17\\values-v17.xml",
                     "from": {
                         "startLines": "2,5,9,12,15,18,22,25,29,33,37,40,43,46,50,53,57",
                         "startColumns": "4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4",

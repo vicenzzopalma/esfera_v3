@@ -10,18 +10,18 @@ import StatusBar from "./StatusBar";
 
 export default function Layout() {
   return (
-    <div className="min-h-screen bg-primary text-primary relative">
-      {/* Sidebar Fixa (Largura: 256px) */}
+    <div className="min-h-screen bg-primary text-primary relative font-sans">
+      {/* Sidebar Fixa (Largura: 240px) */}
       <Sidebar />
 
-      {/* Container Principal Deslocado Exatamente 256px para a direita via inline style */}
-      <div style={{ paddingLeft: "256px" }} className="min-h-screen flex flex-col min-w-0">
+      {/* Container Principal Deslocado Exatamente 240px para a direita via inline style */}
+      <div style={{ paddingLeft: "240px" }} className="min-h-screen flex flex-col min-w-0">
         {/* Header Global */}
         <Header />
 
         {/* Viewport de Conteúdo das Abas */}
-        <main className="flex-1 p-8 md:p-10 xl:p-12 pb-24 overflow-y-auto min-w-0">
-          <div className="max-w-7xl mx-auto w-full space-y-8">
+        <main className="flex-1 p-6 pb-14 overflow-y-auto min-w-0">
+          <div className="max-w-[1440px] mx-auto w-full space-y-6">
             <Outlet />
           </div>
         </main>

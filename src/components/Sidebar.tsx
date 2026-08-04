@@ -182,44 +182,43 @@ export default function Sidebar() {
   };
 
   return (
-    <aside style={{ width: "256px" }} className="fixed left-0 top-0 bottom-0 flex flex-col z-40 bg-[#0a0a0a] border-r border-white/[0.08]">
+    <aside style={{ width: "240px" }} className="fixed left-0 top-0 bottom-0 flex flex-col z-40 bg-[#0b0b0e] border-r border-white/[0.07]">
       {/* Brand Header */}
-      <div className="flex items-center justify-between px-5 h-16 border-b border-white/[0.08]">
-        <div className="flex items-center gap-3">
-          <div className="flex items-center justify-center w-9 h-9 rounded-xl bg-white text-black font-black text-sm shadow-none">
+      <div className="flex items-center justify-between px-4 h-14 border-b border-white/[0.07]">
+        <div className="flex items-center gap-2.5">
+          <div className="flex items-center justify-center w-7 h-7 rounded-lg bg-[#5E6AD2] text-white font-black text-xs shadow-md shadow-[#5E6AD2]/20">
             E
           </div>
           <div>
-            <h1 className="text-sm font-semibold text-white tracking-tight leading-tight">Esfera</h1>
-            <p className="text-[10px] text-slate-500 font-medium tracking-wider leading-none mt-0.5">v3</p>
+            <h1 className="text-xs font-bold text-white tracking-tight leading-tight">Esfera</h1>
           </div>
         </div>
       </div>
 
       {/* Empresa Ativa Widget */}
       {insideCompany && selectedCompany && (
-        <div className="mx-3 mt-3 p-3 rounded-xl border border-white/[0.08] bg-white/[0.02]">
+        <div className="mx-2.5 mt-2.5 p-2 rounded-lg border border-white/[0.07] bg-white/[0.02]">
           <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <Building2 size={16} className="text-slate-400 shrink-0" />
-              <span className="text-xs font-medium text-slate-200 truncate" title={selectedCompany.name}>{selectedCompany.name}</span>
+            <div className="flex items-center gap-2 min-w-0">
+              <Building2 size={14} className="text-zinc-400 shrink-0" />
+              <span className="text-xs font-medium text-zinc-200 truncate" title={selectedCompany.name}>{selectedCompany.name}</span>
             </div>
             {user.role === "master" && (
               <button
                 onClick={handleBackToCompanies}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
+                className="p-1 rounded text-zinc-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
                 title="Voltar às Empresas"
               >
-                <ChevronLeft size={16} />
+                <ChevronLeft size={14} />
               </button>
             )}
           </div>
         </div>
       )}
 
-      {/* Navigation List — Filtrado por role + permissões */}
-      <nav className="flex-1 px-3 py-5 space-y-6 overflow-y-auto custom-scrollbar">
-        {NAV_GROUPS.map((group) => {
+      {/* Navigation List — Compact Linear Style */}
+      <nav className="flex-1 px-2.5 py-3 space-y-3 overflow-y-auto custom-scrollbar">
+        {NAV_GROUPS.map((group, groupIdx) => {
           const visibleItems = group.items.filter((item) => {
             if (!item.roles.includes(user.role)) return false;
             if (item.requiresCompany && !insideCompany) return false;
@@ -232,28 +231,26 @@ export default function Sidebar() {
 
           return (
             <div key={group.groupName}>
-              <h3 className="px-3 text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-2.5">
-                {group.groupName}
-              </h3>
-              <div className="space-y-1">
+              {groupIdx > 0 && <hr className="my-2 border-white/[0.06]" />}
+              <div className="space-y-0.5">
                 {visibleItems.map((item) => {
                   const isActive = location.pathname === item.path;
                   return (
                     <button
                       key={item.id}
                       onClick={() => navigate(item.path)}
-                      className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium transition-all cursor-pointer ${
+                      className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-md text-xs font-medium transition-all cursor-pointer ${
                         isActive
-                          ? "bg-white text-black"
-                          : "text-slate-300 hover:text-white hover:bg-white/10"
+                          ? "bg-[#5E6AD2]/15 text-[#828DF7] font-semibold border-l-2 border-[#5E6AD2]"
+                          : "text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.04]"
                       }`}
                     >
-                      <span className={`shrink-0 ${isActive ? "text-black" : "text-slate-400"}`}>
+                      <span className={`shrink-0 ${isActive ? "text-[#828DF7]" : "text-zinc-400"}`}>
                         {item.icon}
                       </span>
                       <span className="flex-1 text-left truncate">{item.label}</span>
                       {item.badge && (
-                        <span className="px-1.5 py-0.5 text-[9px] rounded-md bg-white/10 text-slate-300 font-mono whitespace-nowrap shrink-0">
+                        <span className="px-1.5 py-0.5 text-[9px] rounded bg-white/10 text-zinc-300 font-mono whitespace-nowrap shrink-0">
                           {item.badge}
                         </span>
                       )}
@@ -267,23 +264,23 @@ export default function Sidebar() {
       </nav>
 
       {/* Footer Profile & Logout */}
-      <div className="border-t border-white/[0.08] p-3">
-        <div className="flex items-center justify-between p-2.5 rounded-xl bg-white/[0.02] border border-white/[0.06]">
-          <div className="flex items-center gap-2.5 min-w-0">
-            <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-white text-black font-bold text-xs shrink-0">
+      <div className="border-t border-white/[0.07] p-2.5">
+        <div className="flex items-center justify-between p-2 rounded-lg bg-white/[0.02] border border-white/[0.05]">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="flex items-center justify-center w-7 h-7 rounded-md bg-[#5E6AD2] text-white font-bold text-xs shrink-0">
               {user.displayName.charAt(0).toUpperCase()}
             </div>
             <div className="min-w-0">
-              <p className="text-xs font-medium text-slate-200 truncate leading-tight" title={user.displayName}>{user.displayName}</p>
-              <p className="text-[10px] text-slate-500 capitalize leading-tight mt-0.5">{user.role}</p>
+              <p className="text-xs font-medium text-zinc-200 truncate leading-tight" title={user.displayName}>{user.displayName}</p>
+              <p className="text-[10px] text-zinc-500 capitalize leading-tight mt-0.5">{user.role}</p>
             </div>
           </div>
           <button
             onClick={handleLogout}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
+            className="p-1 rounded text-zinc-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
             title="Sair"
           >
-            <LogOut size={16} />
+            <LogOut size={14} />
           </button>
         </div>
       </div>

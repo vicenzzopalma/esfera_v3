@@ -913,6 +913,29 @@ library {
     value: 1
   }
 }
+library {
+  maven_library {
+    groupId: "io.ktor"
+    artifactId: "ktor-client-websockets"
+    version: "2.3.6"
+  }
+  repo_index {
+    value: 1
+  }
+}
+library {
+  maven_library {
+    groupId: "io.ktor"
+    artifactId: "ktor-client-websockets-jvm"
+    version: "2.3.6"
+  }
+  digests {
+    sha256: "\245\021\224\272\263#-\357\234\230o\374]!\343o\n\373\032\001b\332\213Xm\031^\024\345C\242\242"
+  }
+  repo_index {
+    value: 1
+  }
+}
 library_dependencies {
   library_dep_index: 1
   library_dep_index: 4
@@ -1399,6 +1422,20 @@ library_dependencies {
   library_index: 76
   library_dep_index: 75
 }
+library_dependencies {
+  library_index: 77
+  library_dep_index: 78
+}
+library_dependencies {
+  library_index: 78
+  library_dep_index: 4
+  library_dep_index: 0
+  library_dep_index: 29
+  library_dep_index: 31
+  library_dep_index: 26
+  library_dep_index: 50
+  library_dep_index: 2
+}
 module_dependencies {
   module_name: "base"
   dependency_index: 0
@@ -1407,6 +1444,7 @@ module_dependencies {
   dependency_index: 48
   dependency_index: 66
   dependency_index: 68
+  dependency_index: 77
   dependency_index: 76
   dependency_index: 25
 }
