@@ -361,11 +361,17 @@ impl Database {
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
             }
         };
-        db_log("Pool criado com sucesso. Aplicando WAL...");
-
-        {
-            if let Ok(conn) = pool.get() {
-                let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+        db_log("Pool criado com sucesso. Obtendo conexão para WAL...");
+        match pool.get() {
+            Ok(conn) => {
+                db_log("Conexão obtida. Executando PRAGMA journal_mode=WAL...");
+                match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+                    Ok(_) => db_log("WAL aplicado com sucesso."),
+                    Err(e) => db_log(&format!("Erro ao aplicar WAL: {:?}", e)),
+                }
+            }
+            Err(e) => {
+                db_log(&format!("Erro ao obter conexão do pool: {:?}", e));
             }
         }
         db_log("PRAGMAs aplicados.");
