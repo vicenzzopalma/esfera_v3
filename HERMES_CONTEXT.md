@@ -523,21 +523,22 @@ Só marcar "Correção CONCLUÍDA em produção" após a sonda retornar 400 no P
 # 20. O QUE FALTA DE FATO (priorizado)
 
 P0 — CRÍTICO / bloqueia produção:
-1. Deploy do hub-standalone NOVO na VPS (seção 18). Binário FEITO e compilado;
-   falta publicar na VPS (usuário está lá — ver passos na seção 18).
-2. [FEITO NESTA RODADA] hub LOCAL com credencial hardcode — CORRIGIDO (seção 17).
+1. [CONCLUÍDO E VALIDADO EM PRODUÇÃO] Deploy do hub-standalone NOVO na VPS (seção 18).
+   - Binário novo publicado e executado via systemd na VPS (34.29.70.113).
+   - Probe A (sem companyId) -> HTTP 400 Bad Request ("companyId ausente ou invalido") CONFIRMADO.
+   - Probe B (com companyId = 1) -> HTTP 200 OK ("ok") CONFIRMADO.
+2. [CONCLUÍDO] hub LOCAL com credencial hardcode — CORRIGIDO (seção 17).
 
 P1 — correção de código:
-3. [FEITO NESTA RODADA] device-agent fallback 127.0.0.1 → 34.29.70.113
+3. [CONCLUÍDO] device-agent fallback 127.0.0.1 → 34.29.70.113
    (device-agent/src/main.rs).
 
 P2 — validação / operacional:
 4. Testes FÍSICOS multi-dispositivo (itens 10/11 do doc). Não executados.
-5. [FEITO NESTA RODADA] Geração/distribuição de token por empresa: agora há
+5. [CONCLUÍDO] Geração/distribuição de token por empresa: agora há
    `generate_company_token` (master) + seed master via `HUB_MASTER_TOKEN`.
    Falta expor no frontend (botão de gerar token por empresa) se desejado.
 6. Alinhar hub local (tunnel/presence/session_manager) ao modelo VPS quando virar
    cache/proxy de fato (menor prioridade — hub local é fallback).
 
-Regra (seção 12) mantida: build passou ≠ sistema funciona. O deploy (P0-1) e os
-testes físicos (P2-4) são os únicos que fecham o ciclo de validação.
+Regra (seção 12) mantida: build passou ≠ sistema funciona. O deploy (P0-1) foi totalmente verificado via HTTP probe. Os testes físicos com hardware real (P2-4) fecham o ciclo completo de validação.
