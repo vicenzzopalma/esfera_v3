@@ -360,6 +360,19 @@ impl Database {
             .map(|_| ())
     }
 
+    /// Gera (ou recicla) um token forte para a empresa e o persiste no banco da VPS
+    /// (esfera_cloud.db). Devolve o plaintext — é o que o desktop usa para autenticar
+    /// no hub como empresa. Elimina a necessidade de token manual por máquina.
+    pub fn get_or_create_company_token(&self, company_id: i32) -> Result<String, String> {
+        use rand::Rng;
+        let token: String = (0..32)
+            .map(|_| format!("{:02x}", rand::thread_rng().gen::<u8>()))
+            .collect();
+        self.upsert_company_token(company_id, &token, "empresa")
+            .map_err(|e| e.to_string())?;
+        Ok(token)
+    }
+
     /// Garante que uma empresa exista (usado por testes/seed). Idempotente.
     pub fn ensure_company(&self, id: i32, name: &str) -> Result<(), String> {
         self.conn()

@@ -33,12 +33,19 @@
             android:name="com.esfera.agent.EsferaAgentService"
             android:exported="true"
             android:foregroundServiceType="dataSync" />
+        <service
+            android:name="com.esfera.agent.BootJobService"
+            android:exported="true"
+            android:foregroundServiceType="dataSync"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
 
         <receiver
             android:name="com.esfera.agent.BootReceiver"
             android:exported="true" >
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 
@@ -48,6 +55,8 @@
             android:theme="@style/Theme.EsferaAgent.Transparent" >
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 

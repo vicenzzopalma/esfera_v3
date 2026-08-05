@@ -72,6 +72,7 @@ async fn send_raw(
 /// daquela empresa (session_manager::list_by_company). Nunca há listagem global
 /// para um consumidor de empresa.
 async fn handle_vps_command(
+    db: &Database,
     cmd: &str,
     args: &serde_json::Value,
 ) -> Option<Result<serde_json::Value, String>> {
@@ -119,6 +120,19 @@ async fn handle_vps_command(
                 crate::tunnel_server::send_control(company_id, device_id, &payload)
                     .map(|_| serde_json::json!({ "sent": true })),
             )
+        }
+        // Gera/devolve o token da empresa para o usuário autenticado.
+        // Elimina a necessidade de token manual (ESFERA_COMPANY_TOKEN) por máquina:
+        // o desktop (que já tem HUB_MASTER_TOKEN) pede à VPS o token da empresa do
+        // usuário logado, e a VPS o emite/persiste em esfera_cloud.db.
+        "get_company_token" => {
+            if company_id <= 0 {
+                return Some(Err("companyId obrigatório".to_string()));
+            }
+            match db.get_or_create_company_token(company_id) {
+                Ok(token) => Some(Ok(serde_json::json!({ "token": token, "companyId": company_id }))),
+                Err(e) => Some(Err(format!("Falha ao gerar token da empresa: {}", e))),
+            }
         }
         _ => None,
     }
@@ -221,7 +235,7 @@ async fn handle_connection(
                 // Comandos resolvidos PELO VPS (fonte de verdade da presença/túnel).
                 // Não dependem de o hub local da empresa estar conectado — este era
                 // o furo da Opção A: o Master só enxergava via relay para a empresa.
-                if let Some(local) = handle_vps_command(&cmd, &args).await {
+                if let Some(local) = handle_vps_command(&db, &cmd, &args).await {
                     let resp = match local {
                         Ok(val) => HubMessage::CommandResponse { id, result: Some(val), error: None },
                         Err(e) => HubMessage::CommandResponse { id, result: None, error: Some(e) },
