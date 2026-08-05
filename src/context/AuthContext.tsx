@@ -6,7 +6,7 @@
 
 import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from "react";
 import type { User, SessionState, Permission, SectorPermission } from "../types";
-import { api, setToken, getToken } from "../tauri";
+import { api, setToken, getToken, connectHub } from "../tauri";
 
 interface AuthContextType extends SessionState {
   login: (username: string, password: string) => Promise<boolean>;
@@ -19,6 +19,7 @@ interface AuthContextType extends SessionState {
   hasPermission: (key: string) => boolean;
   hasSectorPermission: (sector: string, type: "view" | "configure") => boolean;
   refreshPermissions: () => Promise<void>;
+  hubConnected: boolean;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
@@ -70,6 +71,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [permissions, setPermissions] = useState<Permission[]>([]);
   const [sectorPermissions, setSectorPermissions] = useState<SectorPermission[]>([]);
+  const [hubConnected, setHubConnected] = useState<boolean>(false);
 
   // Restaura o token de autenticação no startup
   useEffect(() => {
@@ -124,6 +126,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSelectedCompanyId(compId);
       saveToStorage(STORAGE_KEY_COMPANY, compId);
       await loadPermissions(res.user.id, res.user.role);
+      // Conexão ao Hub VPS APÓS o login: usa o company_id do usuário logado.
+      // Sem login = sem hub. Falha de conexão não deve bloquear o login local.
+      try {
+        await connectHub();
+        setHubConnected(true);
+      } catch (e) {
+        console.warn("Conexão ao Hub VPS falhou (app ainda funciona localmente):", e);
+        setHubConnected(false);
+      }
       return true;
     } catch (err: unknown) {
       console.warn("Tauri invoke login não disponível ou erro (modo navegador/preview):", err);
@@ -167,6 +178,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           saveToStorage(STORAGE_KEY_COMPANY, account.user.companyId);
         }
         await loadPermissions(account.user.id, account.user.role);
+        setHubConnected(false); // modo mock/navegador: sem hub real
         return true;
       }
 
@@ -183,6 +195,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setToken(null);
     setUser(null);
     setSelectedCompanyId(null);
+    setHubConnected(false);
     setError(null);
     setPermissions([]);
     setSectorPermissions([]);
@@ -245,6 +258,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         hasPermission,
         hasSectorPermission,
         refreshPermissions,
+        hubConnected,
       }}
     >
       {children}

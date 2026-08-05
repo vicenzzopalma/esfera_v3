@@ -554,3 +554,53 @@ P2 — validação / operacional:
    cache/proxy de fato (menor prioridade — hub local é fallback).
 
 Regra (seção 12) mantida: build passou ≠ sistema funciona. O deploy (P0-1) foi totalmente verificado via HTTP probe. Os testes físicos com hardware real (P2-4) fecham o ciclo completo de validação.
+
+---
+
+# 21. ARQUITETURA DE LOGIN → HUB VPS PÓS-LOGIN (corrigido 2026-08-05)
+
+## 21.1 PROBLEMA CORRIGIDO
+O app desktop conectava ao Hub no STARTUP usando `config.json` com `mode`
+hardcoded (`master`/`empresa`) e token global de env. Isso causava:
+- Dependência de "localhost aberto" (config apontava 127.0.0.1).
+- Um .exe "por config/máquina" — oposto do desejado.
+- Sem relação entre o USUÁRIO logado e a empresa do hub.
+
+## 21.2 NOVO FLUXO (Opção A — VPS central multi-tenant)
+1. Abrir o app → TELA DE LOGIN (usuário/senha).
+2. `login` valida no SQLite local → devolve `{ token, user }` com `user.companyId`.
+3. `AuthContext.login` chama `connectHub(token)` APÓS o login.
+4. `connect_hub` → `get_hub_credentials` → devolve:
+   - `hub_address` = 34.29.70.113:8555 (hub master VPS)
+   - `hub_token` = master: `HUB_MASTER_TOKEN` env; empresa: `ESFERA_COMPANY_TOKEN` env
+   - `company_id` + `company_name` do usuário logado
+5. `HubClient::connect` autentica no VPS e (se empresa) faz Register da própria company.
+6. UM ÚNICO .exe para todas as máquinas. Quem loga define a empresa. Sem login = sem hub.
+
+## 21.3 ARQUIVOS ALTERADOS
+- `src-tauri/src/lib.rs`: REMOVIDA a conexão ao hub no startup (bloco empresa+master).
+  AppState usa `hub_client: Arc<TokioMutex<Option<HubClient>>>`. `MasterClient`
+  removido (morto). `connect_hub`/`get_hub_credentials` no invoke_handler.
+- `src-tauri/src/hub_client.rs`: `connect` recebe `token`+`role`; `send_command`
+  recebe `to_company`. Autentica por token (não env).
+- `src-tauri/src/commands.rs`: `get_hub_credentials`, `connect_hub`, `hub_invoke`
+  usa `hub_client` e isola `to_company` pela sessão.
+- `src-tauri/src/config.rs`: default `hub_address` = 34.29.70.113:8555 (corrigido
+  de :8888 que era a porta do tunnel, não do hub master).
+- `src-tauri/src/db.rs`: `issue_hub_token`, `get_company_by_id` (suporte).
+- `src/tauri.ts`: `getHubCredentials`, `connectHub`.
+- `src/context/AuthContext.tsx`: `login` chama `connectHub` pós-login; `hubConnected`.
+- `config.json` do APPDATA: aponta 34.29.70.113:8555, mode master (não usado no boot).
+
+## 21.4 COMO TESTAR (master)
+O token master do VPS foi semeado no systemd (HUB_MASTER_TOKEN). Rode o exe com:
+    set HUB_MASTER_TOKEN=<token_master_vps>
+    src-tauri\target
+elease\esfera_v3.exe
+Logue com usuário master → o app conecta no VPS:8555 como master (vê todas empresas).
+Para gestor/empresa: `set ESFERA_COMPANY_TOKEN=<token_da_empresa>` (distribuído pelo master).
+
+NOTA DE SEGURANÇA: o token da empresa ainda é distribuído manualmente (env), não
+auto-emitido pela VPS para o usuário logado. Isso é o item P2-5 em aberto — o fluxo
+automático exige um endpoint na VPS que devolva o token da empresa para o usuário
+autenticado (não implementado ainda).

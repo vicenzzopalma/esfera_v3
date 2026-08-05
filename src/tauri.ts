@@ -43,3 +43,19 @@ export async function api<T>(cmd: string, args: Record<string, unknown> = {}): P
     throw err;
   }
 }
+
+export interface HubCredentials {
+  hubAddress: string;
+  hubToken: string;
+  companyId: number;
+  companyName: string;
+  role: string;
+}
+
+export async function getHubCredentials(): Promise<HubCredentials> {
+  return await invoke<HubCredentials>("get_hub_credentials", { token: _token || "default-token" });
+}
+
+export async function connectHub(): Promise<void> {
+  await invoke("connect_hub", { token: _token || "default-token" });
+}

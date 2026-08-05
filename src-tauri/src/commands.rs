@@ -10,7 +10,7 @@ use crate::db::{
     AiConfig, AutomationRule, Campaign, Chip, Company, Contact, Database, Device,
     DevicePackage, Permission, SectorPermission,
 };
-use crate::master_client::MasterClient;
+use crate::hub_client::HubClient;
 use crate::session::{LoginResponse, SessionManager};
 use std::sync::{Arc, Mutex};
 use tauri::State;
@@ -19,7 +19,7 @@ use tokio::sync::Mutex as TokioMutex;
 pub struct AppState {
     pub db: Arc<Database>,
     pub sessions: Arc<Mutex<SessionManager>>,
-    pub master_client: Arc<TokioMutex<Option<MasterClient>>>,
+    pub hub_client: Arc<TokioMutex<Option<HubClient>>>,
 }
 
 fn validate_session(
@@ -1718,9 +1718,86 @@ pub async fn hub_invoke(
     company_id: i32,
 ) -> Result<serde_json::Value, String> {
     validate_session(&state.sessions, &token)?;
-    let mc = state.master_client.lock().await;
-    let client = mc.as_ref().ok_or_else(|| "Hub não conectado. Verifique configurações.".to_string())?;
-    client.send_command(company_id, &cmd, args).await
+    let guard = state.hub_client.lock().await;
+    let client = guard.as_ref().ok_or_else(|| "Hub não conectado. Faça login novamente.".to_string())?;
+    // Empresa só pode comandar a própria company; master comanda qualquer uma.
+    let session = state.sessions.lock().ok().and_then(|s| s.validate_token(&token));
+    let target = match session {
+        Some(ref s) if s.role != "master" => s.company_id.unwrap_or(company_id),
+        _ => company_id,
+    };
+    client.send_command(target, &cmd, args).await
+}
+
+/// Devolve as credenciais de conexão ao Hub VPS para o usuário logado.
+/// O token do hub vem de env (master: HUB_MASTER_TOKEN; empresa: ESFERA_COMPANY_TOKEN),
+/// NUNCA hardcoded no código. O app conecta APÓS o login, isolado pela empresa.
+#[tauri::command]
+pub fn get_hub_credentials(
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<HubCredentials, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let company_id = session.company_id.unwrap_or(0);
+    let role = session.role.clone();
+
+    // Token do hub: master usa HUB_MASTER_TOKEN; empresa usa ESFERA_COMPANY_TOKEN.
+    // Esses tokens DEVEM bater com os semeados na VPS (esfera_cloud.db).
+    let hub_token = if role == "master" {
+        std::env::var("HUB_MASTER_TOKEN")
+            .or_else(|_| std::env::var("ESFERA_HUB_TOKEN"))
+            .map_err(|_| "HUB_MASTER_TOKEN não definido. O master deve rodar o app com o token da VPS.".to_string())?
+    } else {
+        std::env::var("ESFERA_COMPANY_TOKEN")
+            .map_err(|_| "ESFERA_COMPANY_TOKEN não definido para esta empresa. Solicite o token ao master.".to_string())?
+    };
+
+    let company_name = if company_id > 0 {
+        state
+            .db
+            .get_company_by_id(company_id)
+            .map(|c| c.name)
+            .unwrap_or_else(|| format!("Empresa {}", company_id))
+    } else {
+        "Master".to_string()
+    };
+    Ok(HubCredentials {
+        hub_address: std::env::var("ESFERA_HUB_ADDR")
+            .unwrap_or_else(|_| "34.29.70.113:8555".to_string()),
+        hub_token,
+        company_id,
+        company_name,
+        role,
+    })
+}
+
+/// Conecta ao Hub VPS usando as credenciais do usuário logado (pós-login).
+#[tauri::command]
+pub async fn connect_hub(
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let creds = get_hub_credentials(state.clone(), token.clone())?;
+    let client = HubClient::connect(
+        &creds.hub_address,
+        &creds.hub_token,
+        &creds.role,
+        creds.company_id,
+        &creds.company_name,
+    )
+    .await?;
+    *state.hub_client.lock().await = Some(client);
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct HubCredentials {
+    pub hub_address: String,
+    pub hub_token: String,
+    pub company_id: i32,
+    pub company_name: String,
+    pub role: String,
 }
 
 // ============================================================

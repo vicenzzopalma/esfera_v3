@@ -18,7 +18,10 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             hub_enabled: true,
-            hub_address: "34.29.70.113:8888".to_string(),
+            // Hub master na VPS (fonte de verdade — Opção A do HERMES_CONTEXT).
+            // Porta 8555 = hub TCP master (Auth/Command/Register). NÃO é a :8888
+            // (tunnel server do device-agent) nem localhost.
+            hub_address: "34.29.70.113:8555".to_string(),
             empresa_server_enabled: false,
             empresa_server_port: 7777,
             checkin_server_enabled: true,
