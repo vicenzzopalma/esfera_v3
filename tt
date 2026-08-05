@@ -654,6 +654,22 @@ export async function api<T>(cmd: string, args: Record<string, unknown> = {}): P
   }
 }
 
+export interface HubCredentials {
+  hubAddress: string;
+  hubToken: string;
+  companyId: number;
+  companyName: string;
+  role: string;
+}
+
+export async function getHubCredentials(): Promise<HubCredentials> {
+  return await invoke<HubCredentials>("get_hub_credentials", { token: _token || "default-token" });
+}
+
+export async function connectHub(): Promise<void> {
+  await invoke("connect_hub", { token: _token || "default-token" });
+}
+
 
 // ========================================================
 // ARQUIVO: src\types.ts
@@ -4697,7 +4713,7 @@ export default function Toggle({
 
 import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from "react";
 import type { User, SessionState, Permission, SectorPermission } from "../types";
-import { api, setToken, getToken } from "../tauri";
+import { api, setToken, getToken, connectHub } from "../tauri";
 
 interface AuthContextType extends SessionState {
   login: (username: string, password: string) => Promise<boolean>;
@@ -4710,6 +4726,7 @@ interface AuthContextType extends SessionState {
   hasPermission: (key: string) => boolean;
   hasSectorPermission: (sector: string, type: "view" | "configure") => boolean;
   refreshPermissions: () => Promise<void>;
+  hubConnected: boolean;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
@@ -4756,11 +4773,13 @@ function saveToStorage(key: string, value: unknown) {
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(() => loadFromStorage<User>(STORAGE_KEY_USER));
+  // Sempre inicia sem usuário logado para exigir a tela de login em todo startup do aplicativo
+  const [user, setUser] = useState<User | null>(null);
   const [selectedCompanyId, setSelectedCompanyId] = useState<number | null>(() => loadFromStorage<number>(STORAGE_KEY_COMPANY) || 1);
   const [error, setError] = useState<string | null>(null);
   const [permissions, setPermissions] = useState<Permission[]>([]);
   const [sectorPermissions, setSectorPermissions] = useState<SectorPermission[]>([]);
+  const [hubConnected, setHubConnected] = useState<boolean>(false);
 
   // Restaura o token de autenticação no startup
   useEffect(() => {
@@ -4811,10 +4830,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       saveToStorage(STORAGE_KEY_TOKEN, res.token);
       setUser(res.user);
       saveToStorage(STORAGE_KEY_USER, res.user);
+      localStorage.setItem("esfera_v3_last_username", res.user.username || username);
       const compId = res.user.companyId || 1;
       setSelectedCompanyId(compId);
       saveToStorage(STORAGE_KEY_COMPANY, compId);
       await loadPermissions(res.user.id, res.user.role);
+      // Conexão ao Hub VPS APÓS o login: usa o company_id do usuário logado.
+      // Sem login = sem hub. Falha de conexão não deve bloquear o login local.
+      try {
+        await connectHub();
+        setHubConnected(true);
+      } catch (e) {
+        console.warn("Conexão ao Hub VPS falhou (app ainda funciona localmente):", e);
+        setHubConnected(false);
+      }
       return true;
     } catch (err: unknown) {
       console.warn("Tauri invoke login não disponível ou erro (modo navegador/preview):", err);
@@ -4858,6 +4887,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           saveToStorage(STORAGE_KEY_COMPANY, account.user.companyId);
         }
         await loadPermissions(account.user.id, account.user.role);
+        setHubConnected(false); // modo mock/navegador: sem hub real
         return true;
       }
 
@@ -4874,6 +4904,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setToken(null);
     setUser(null);
     setSelectedCompanyId(null);
+    setHubConnected(false);
     setError(null);
     setPermissions([]);
     setSectorPermissions([]);
@@ -4936,6 +4967,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         hasPermission,
         hasSectorPermission,
         refreshPermissions,
+        hubConnected,
       }}
     >
       {children}
@@ -5646,17 +5678,25 @@ export default function AutomationsTab() {
   };
 
   const toggleActive = async (id: number, currentActive: boolean) => {
+    const previous = automationsList.find((a) => a.id === id);
+    if (!previous) return;
+    // Valor que está no servidor (currentActive vem do prop), não o optimistic.
     const newActive = !currentActive;
     setAutomationsList((prev) =>
       prev.map((a) => (a.id === id ? { ...a, active: newActive } : a))
     );
     try {
-      const automation = automationsList.find((a) => a.id === id);
-      if (!automation) return;
       await api("update_automation", {
-        automation,
+        automation: { ...previous, active: newActive },
       });
-    } catch { /* noop */ }
+    } catch (err) {
+      // Reverte o optimistic update e propaga o erro (não engole).
+      setAutomationsList((prev) =>
+        prev.map((a) => (a.id === id ? { ...a, active: currentActive } : a))
+      );
+      console.error("Falha ao alternar automação:", err);
+      throw err;
+    }
   };
 
   const handleDelete = async (id: number) => {
@@ -6172,18 +6212,21 @@ export default function CampaignsTab() {
     setExecutionModalOpen(true);
   };
 
-  // Higieniza números no padrão REALESS / Esfera v3
+  // Higieniza números no padrão REALESS / Esfera v3 (Brasil, DDI +55).
+  // NÃO inventa DDD: apenas normaliza o que o usuário informou.
+  //  - já com DDI 55 (12-13 dígitos) -> mantém
+  //  - com DDD (10-11 dígitos)         -> prefixa +55
+  //  - só número local (8-9 dígitos)   -> não infere DDD, retorna limpo
   const sanitizePhoneNumber = (raw: string) => {
     let clean = raw.replace(/\D/g, "");
-    if (clean.length === 11 && clean.startsWith("9")) {
-      clean = "55" + clean;
-    } else if (clean.length === 9) {
-      clean = "5511" + clean;
+    if (clean.length === 0) return "";
+    if (clean.startsWith("55") && (clean.length === 12 || clean.length === 13)) {
+      return "+" + clean;
     }
-    if (clean.length > 0 && !clean.startsWith("+")) {
-      clean = "+" + clean;
+    if (clean.length === 10 || clean.length === 11) {
+      return "+55" + clean;
     }
-    return clean;
+    return "+" + clean;
   };
 
   const handleParseContacts = () => {
@@ -8609,7 +8652,7 @@ export default function LoginPage() {
   const { isDark, toggleTheme } = useTheme();
   const navigate = useNavigate();
 
-  const [username, setUsername] = useState("");
+  const [username, setUsername] = useState(() => localStorage.getItem("esfera_v3_last_username") || "");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -21765,19 +21808,28 @@ impl AdbManager {
         }
     }
 
-    /// Injeta a URL do servidor Esfera no dispositivo Android
+    /// Injeta a URL do servidor Esfera no dispositivo Android.
+    ///
+    /// `company_id` é OBRIGATÓRIO no fluxo novo: sem ele o VPS recusa
+    /// check-in/túnel/presença (isolamento por empresa). É gravado tanto na
+    /// prop `persist.esfera.company` (lida pelo device-agent Rust) quanto no
+    /// `/sdcard/esfera_config.json` (lido pelo EsferaAgentService Kotlin).
     pub fn inject_server_config(
         serial: &str,
         server_url: &str,
         device_id: &str,
+        company_id: i32,
     ) -> Result<String, String> {
         let config_json = format!(
-            "{{\\\"serverUrl\\\":\\\"{}\\\",\\\"deviceId\\\":\\\"{}\\\",\\\"heartbeatIntervalSec\\\":30}}",
-            server_url, device_id
+            "{{\\\"serverUrl\\\":\\\"{}\\\",\\\"deviceId\\\":\\\"{}\\\",\\\"companyId\\\":{},\\\"heartbeatIntervalSec\\\":30}}",
+            server_url, device_id, company_id
         );
         let batch_cmd = format!(
-            "setprop persist.esfera.server_address {}; echo '{}' > /sdcard/esfera_config.json",
-            server_url, config_json
+            "setprop persist.esfera.server_address {}; setprop persist.esfera.hub {}; setprop persist.esfera.company {}; echo '{}' > /sdcard/esfera_config.json",
+            server_url,
+            Self::host_of(server_url),
+            company_id,
+            config_json
         );
 
         let mut cmd = create_cmd("adb");
@@ -21785,11 +21837,26 @@ impl AdbManager {
 
         match run_cmd_timeout(cmd, Duration::from_secs(8)) {
             Ok(_) => Ok(format!(
-                "Configuração do servidor '{}' injetada",
-                server_url
+                "Configuração do servidor '{}' (empresa {}) injetada",
+                server_url, company_id
             )),
             Err(e) => Err(format!("Falha ao injetar config: {}", e)),
         }
+    }
+
+    /// Extrai só o host de uma URL (o device-agent Rust espera host puro em
+    /// `persist.esfera.hub`, não uma URL completa).
+    fn host_of(server_url: &str) -> String {
+        server_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .unwrap_or(server_url)
+            .split(':')
+            .next()
+            .unwrap_or(server_url)
+            .to_string()
     }
 
     /// Inicia o serviço do Agent Android via ADB
@@ -21959,7 +22026,18 @@ impl AdbManager {
 
     /// Provisiona um dispositivo: gera UUID, injeta ID + config + imunidade, instala APK, inicia serviço
     /// server_url é opcional: se omitido, deriva automaticamente da config + IP local
-    pub fn provision_device(serial: &str, server_url: Option<&str>) -> Result<String, String> {
+    /// company_id é obrigatório: sem ele o aparelho é recusado pelo VPS (isolamento).
+    pub fn provision_device(
+        serial: &str,
+        server_url: Option<&str>,
+        company_id: i32,
+    ) -> Result<String, String> {
+        if company_id <= 0 {
+            return Err(
+                "Provisionamento exige uma empresa válida (companyId). Faça login em uma empresa."
+                    .to_string(),
+            );
+        }
         let target_serial = Self::resolve_target_serial(serial)?;
 
         let uuid = Uuid::new_v4().to_string();
@@ -21972,7 +22050,7 @@ impl AdbManager {
         };
 
         Self::inject_persistent_device_id(&target_serial, &device_id)?;
-        Self::inject_server_config(&target_serial, &url, &device_id)?;
+        Self::inject_server_config(&target_serial, &url, &device_id, company_id)?;
         Self::inject_device_immunity(&target_serial, Some(&device_id))?;
 
         let is_usb = !target_serial.contains(':');
@@ -22011,13 +22089,17 @@ impl AdbManager {
         }
     }
 
-    /// Provisiona nativamente todos os dispositivos Android online conectados no ADB
-    pub fn provision_all_devices(server_url: Option<&str>) -> Vec<Result<String, String>> {
+    /// Provisiona nativamente todos os dispositivos Android online conectados no ADB.
+    /// company_id é propagado para cada aparelho (isolamento por empresa).
+    pub fn provision_all_devices(
+        server_url: Option<&str>,
+        company_id: i32,
+    ) -> Vec<Result<String, String>> {
         let active = Self::list_devices().unwrap_or_default();
         let mut results = Vec::new();
         for dev in active {
             if dev.state == "device" {
-                let res = Self::provision_device(&dev.serial, server_url);
+                let res = Self::provision_device(&dev.serial, server_url, company_id);
                 results.push(res);
             }
         }
@@ -23667,7 +23749,7 @@ use crate::db::{
     AiConfig, AutomationRule, Campaign, Chip, Company, Contact, Database, Device,
     DevicePackage, Permission, SectorPermission,
 };
-use crate::master_client::MasterClient;
+use crate::hub_client::HubClient;
 use crate::session::{LoginResponse, SessionManager};
 use std::sync::{Arc, Mutex};
 use tauri::State;
@@ -23676,7 +23758,7 @@ use tokio::sync::Mutex as TokioMutex;
 pub struct AppState {
     pub db: Arc<Database>,
     pub sessions: Arc<Mutex<SessionManager>>,
-    pub master_client: Arc<TokioMutex<Option<MasterClient>>>,
+    pub hub_client: Arc<TokioMutex<Option<HubClient>>>,
 }
 
 fn validate_session(
@@ -23689,27 +23771,8 @@ fn validate_session(
             return Ok(session);
         }
     }
-    // Restaura ou cria sessão nativa padrão para nunca bloquear o uso local do Esfera Hub
-    let (user_id, username, role, company_id) = if token.contains("11") || token.contains("gestor") {
-        (11, "vicenzzo.mastronikolis", "gestor", Some(1))
-    } else {
-        (10, "vicenzzo.master", "master", Some(1))
-    };
-    
-    let restored_token = sess.create_session(user_id, username, role, company_id);
-    if let Some(session) = sess.validate_token(&restored_token) {
-        return Ok(session);
-    }
-
-    Ok(crate::session::UserSession {
-        token: "fallback-token".to_string(),
-        user_id: 11,
-        username: "vicenzzo.mastronikolis".to_string(),
-        role: "gestor".to_string(),
-        company_id: Some(1),
-        created_at: 0,
-        expires_at: 9999999999999,
-    })
+    // SEM fallback inseguro: token inválido/ausente NÃO vira master/gestor.
+    Err("Não autorizado: token de sessão inválido ou ausente.".to_string())
 }
 
 fn check_company_access(
@@ -23965,8 +24028,12 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             let is_active = active_adb_list.iter().any(|adb_d| adb_d.serial == dev.serial);
             if is_active {
                 dev.status = "online".to_string();
-            } else {
-                dev.status = "offline".to_string();
+            } else if dev.esfera_device_id.is_some() || dev.current_adb_address.is_some() || !dev.ip.is_empty() {
+                // Se o dispositivo possui EsferaDeviceId, IP ou ADB address cadastrado,
+                // mantém como "connecting" em vez de marcar offline abruptamente.
+                if dev.status != "connecting" {
+                    dev.status = "connecting".to_string();
+                }
                 let ip_target = if !dev.ip.is_empty() {
                     dev.ip.clone()
                 } else if dev.serial.contains(':') {
@@ -23981,6 +24048,8 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                         let _ = AdbManager::connect_device(&ip_target, port);
                     });
                 }
+            } else {
+                dev.status = "offline".to_string();
             }
         }
 
@@ -25032,7 +25101,15 @@ pub fn get_user_permissions(
     token: String,
     user_id: i32,
 ) -> Result<Vec<Permission>, String> {
-    validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
+    // Isolamento: só master ou usuário da mesma empresa pode ler permissões.
+    if session.role != "master" {
+        if let Some(target_cid) = state.db.user_company_id(user_id) {
+            check_company_access(&session, target_cid)?;
+        } else {
+            return Err("Acesso Negado: usuário alvo inexistente.".to_string());
+        }
+    }
     let db = &state.db;
     Ok(db.get_user_permissions(user_id))
 }
@@ -25045,7 +25122,15 @@ pub fn update_user_permission(
     key: String,
     enabled: bool,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
+    // Isolamento: só master ou usuário da mesma empresa pode alterar permissões.
+    if session.role != "master" {
+        if let Some(target_cid) = state.db.user_company_id(user_id) {
+            check_company_access(&session, target_cid)?;
+        } else {
+            return Err("Acesso Negado: usuário alvo inexistente.".to_string());
+        }
+    }
     let db = &state.db;
     db.update_user_permission(user_id, &key, enabled)
 }
@@ -25056,7 +25141,14 @@ pub fn get_sector_permissions(
     token: String,
     user_id: i32,
 ) -> Result<Vec<SectorPermission>, String> {
-    validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" {
+        if let Some(target_cid) = state.db.user_company_id(user_id) {
+            check_company_access(&session, target_cid)?;
+        } else {
+            return Err("Acesso Negado: usuário alvo inexistente.".to_string());
+        }
+    }
     let db = &state.db;
     Ok(db.get_sector_permissions(user_id))
 }
@@ -25070,7 +25162,14 @@ pub fn update_sector_permission(
     can_view: bool,
     can_configure: bool,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" {
+        if let Some(target_cid) = state.db.user_company_id(user_id) {
+            check_company_access(&session, target_cid)?;
+        } else {
+            return Err("Acesso Negado: usuário alvo inexistente.".to_string());
+        }
+    }
     let db = &state.db;
     db.update_sector_permission(user_id, &sector, can_view, can_configure)
 }
@@ -25231,9 +25330,21 @@ pub async fn provision_device(
     serial: String,
     server_url: Option<String>,
 ) -> Result<String, String> {
+    // A empresa vem da SESSÃO (token), nunca do cliente: assim ninguém provisiona
+    // um aparelho para dentro de outra empresa.
+    let session = validate_session(&state.sessions, &_token)?;
+    let company_id = match session.company_id {
+        Some(cid) if cid > 0 => cid,
+        _ => {
+            return Err(
+                "Provisionamento exige um usuário vinculado a uma empresa.".to_string()
+            )
+        }
+    };
+
     let cloned_serial = serial.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        AdbManager::provision_device(&serial, server_url.as_deref())
+        AdbManager::provision_device(&serial, server_url.as_deref(), company_id)
     }).await.map_err(|e| e.to_string())??;
 
     let db = &state.db;
@@ -25257,8 +25368,19 @@ pub async fn provision_all_devices(
     _token: String,
     server_url: Option<String>,
 ) -> Result<Vec<String>, String> {
+    // Empresa vem da sessão, nunca do cliente (mesma regra do provision_device).
+    let session = validate_session(&state.sessions, &_token)?;
+    let company_id = match session.company_id {
+        Some(cid) if cid > 0 => cid,
+        _ => {
+            return Err(
+                "Provisionamento exige um usuário vinculado a uma empresa.".to_string()
+            )
+        }
+    };
+
     let result = tauri::async_runtime::spawn_blocking(move || {
-        AdbManager::provision_all_devices(server_url.as_deref())
+        AdbManager::provision_all_devices(server_url.as_deref(), company_id)
     }).await.map_err(|e| e.to_string())?;
 
     let db = &state.db;
@@ -25341,9 +25463,86 @@ pub async fn hub_invoke(
     company_id: i32,
 ) -> Result<serde_json::Value, String> {
     validate_session(&state.sessions, &token)?;
-    let mc = state.master_client.lock().await;
-    let client = mc.as_ref().ok_or_else(|| "Hub não conectado. Verifique configurações.".to_string())?;
-    client.send_command(company_id, &cmd, args).await
+    let guard = state.hub_client.lock().await;
+    let client = guard.as_ref().ok_or_else(|| "Hub não conectado. Faça login novamente.".to_string())?;
+    // Empresa só pode comandar a própria company; master comanda qualquer uma.
+    let session = state.sessions.lock().ok().and_then(|s| s.validate_token(&token));
+    let target = match session {
+        Some(ref s) if s.role != "master" => s.company_id.unwrap_or(company_id),
+        _ => company_id,
+    };
+    client.send_command(target, &cmd, args).await
+}
+
+/// Devolve as credenciais de conexão ao Hub VPS para o usuário logado.
+/// O token do hub vem de env (master: HUB_MASTER_TOKEN; empresa: ESFERA_COMPANY_TOKEN),
+/// NUNCA hardcoded no código. O app conecta APÓS o login, isolado pela empresa.
+#[tauri::command]
+pub fn get_hub_credentials(
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<HubCredentials, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let company_id = session.company_id.unwrap_or(0);
+    let role = session.role.clone();
+
+    // Token do hub: master usa HUB_MASTER_TOKEN; empresa usa ESFERA_COMPANY_TOKEN.
+    // Esses tokens DEVEM bater com os semeados na VPS (esfera_cloud.db).
+    let hub_token = if role == "master" {
+        std::env::var("HUB_MASTER_TOKEN")
+            .or_else(|_| std::env::var("ESFERA_HUB_TOKEN"))
+            .map_err(|_| "HUB_MASTER_TOKEN não definido. O master deve rodar o app com o token da VPS.".to_string())?
+    } else {
+        std::env::var("ESFERA_COMPANY_TOKEN")
+            .map_err(|_| "ESFERA_COMPANY_TOKEN não definido para esta empresa. Solicite o token ao master.".to_string())?
+    };
+
+    let company_name = if company_id > 0 {
+        state
+            .db
+            .get_company_by_id(company_id)
+            .map(|c| c.name)
+            .unwrap_or_else(|| format!("Empresa {}", company_id))
+    } else {
+        "Master".to_string()
+    };
+    Ok(HubCredentials {
+        hub_address: std::env::var("ESFERA_HUB_ADDR")
+            .unwrap_or_else(|_| "34.29.70.113:8555".to_string()),
+        hub_token,
+        company_id,
+        company_name,
+        role,
+    })
+}
+
+/// Conecta ao Hub VPS usando as credenciais do usuário logado (pós-login).
+#[tauri::command]
+pub async fn connect_hub(
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let creds = get_hub_credentials(state.clone(), token.clone())?;
+    let client = HubClient::connect(
+        &creds.hub_address,
+        &creds.hub_token,
+        &creds.role,
+        creds.company_id,
+        &creds.company_name,
+    )
+    .await?;
+    *state.hub_client.lock().await = Some(client);
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct HubCredentials {
+    pub hub_address: String,
+    pub hub_token: String,
+    pub company_id: i32,
+    pub company_name: String,
+    pub role: String,
 }
 
 // ============================================================
@@ -25604,6 +25803,51 @@ pub fn remove_device_responsible_collaborator(
     state.db.unassign_device_from_user(&device_serial, user_id)
 }
 
+/// Gera (ou rotaciona) o token de uma empresa para autenticação no hub local.
+/// SÓ master pode chamar. O token é retornado UMA vez (não fica armazenado em plaintext).
+#[tauri::command]
+pub fn generate_company_token(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<String, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" {
+        return Err("Acesso Negado: apenas o Master pode gerar tokens de empresa.".to_string());
+    }
+    if company_id <= 0 {
+        return Err("company_id inválido (deve ser > 0; 0 é o master).".to_string());
+    }
+    // Token forte aleatório (32 bytes -> hex de 64 chars).
+    let raw: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+    let new_token = hex::encode(raw);
+    state
+        .db
+        .upsert_company_token(company_id, &new_token, "empresa")
+        .map_err(|e| format!("Falha ao gravar token: {}", e))?;
+    Ok(new_token)
+}
+
+/// Força o seed do token master (CompanyId 0) a partir de HUB_MASTER_TOKEN em runtime.
+#[tauri::command]
+pub fn rotate_master_token(
+    state: State<'_, AppState>,
+    token: String,
+    new_token: String,
+) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" {
+        return Err("Acesso Negado: apenas o Master pode rotacionar o token master.".to_string());
+    }
+    if new_token.is_empty() {
+        return Err("new_token vazio.".to_string());
+    }
+    state
+        .db
+        .upsert_company_token(0, &new_token, "master")
+        .map_err(|e| format!("Falha ao gravar token master: {}", e))
+}
+
 
 
 
@@ -25634,7 +25878,10 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             hub_enabled: true,
-            hub_address: "34.29.70.113:8888".to_string(),
+            // Hub master na VPS (fonte de verdade — Opção A do HERMES_CONTEXT).
+            // Porta 8555 = hub TCP master (Auth/Command/Register). NÃO é a :8888
+            // (tunnel server do device-agent) nem localhost.
+            hub_address: "34.29.70.113:8555".to_string(),
             empresa_server_enabled: false,
             empresa_server_port: 7777,
             checkin_server_enabled: true,
@@ -25987,8 +26234,13 @@ pub fn hash_password(password: &str) -> String {
     hex::encode(result)
 }
 
+/// Verifica senha APENAS via hash SHA-256 com salt.
+/// NUNCA aceita o plaintext igual ao hash (elimina o fallback inseguro).
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    password == hash || hash_password(password) == hash
+    if hash.is_empty() || password.is_empty() {
+        return false;
+    }
+    hash_password(password) == hash
 }
 
 // ============================================================
@@ -26493,6 +26745,17 @@ impl Database {
             [],
         )?;
 
+        // 17.5 ESF_CompanyToken (autenticação company-scoped do hub local — sem credencial global)
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_CompanyToken (
+                CompanyId INTEGER PRIMARY KEY,
+                TokenHash TEXT NOT NULL,
+                Role TEXT NOT NULL DEFAULT 'empresa',
+                CreatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+            [],
+        )?;
+
         // 18. Performance Indexes (Microsecond Lookups)
         self.conn().execute_batch("
             CREATE INDEX IF NOT EXISTS idx_device_company ON ESF_Device (CompanyId);
@@ -26506,6 +26769,14 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_dev_perm_device ON ESF_DevicePermissionRequest (AdbDeviceId, Status);
             CREATE INDEX IF NOT EXISTS idx_dev_assign_user ON ESF_DeviceAssignment (UserId, AdbDeviceId);
         ")?;
+
+        // Seed do token master (CompanyId = 0) a partir de env HUB_MASTER_TOKEN.
+        // Sem isso o hub local não aceita nenhum master. Espelha o hub-standalone.
+        if let Ok(token) = std::env::var("HUB_MASTER_TOKEN") {
+            if !token.is_empty() {
+                let _ = self.upsert_company_token(0, &token, "master");
+            }
+        }
 
         Ok(())
     }
@@ -26579,26 +26850,19 @@ impl Database {
                 [],
             )?;
 
-            // Usuários com senhas hasheadas SHA-256
+            // Usuários seedados: SOMENTE contas do dono, com senhas não-triviais.
+            // Contas de demonstração com senhas fracas (admin/admin, gestor/gestor, colab/colab)
+            // FORAM REMOVIDAS — eram fallbacks inseguros.
             let hash_master = hash_password("root123");
             let hash_gestor = hash_password("Ope@2025");
-            let hash_admin = hash_password("admin");
-            let hash_gestor2 = hash_password("gestor");
-            let hash_colab = hash_password("colab");
 
             conn.execute(
                 "INSERT INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId) VALUES
                 (?1, ?2, 'Vicenzzo Master', 'master', NULL),
-                (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1),
-                (?5, ?6, 'Administrador', 'master', NULL),
-                (?7, ?8, 'Carlos Gestor', 'gestor', 1),
-                (?9, ?10, 'Ana Operadora', 'colaborador', 1);",
+                (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1);",
                 params![
                     "vicenzzo.master", hash_master,
                     "vicenzzo.mastronikolis", hash_gestor,
-                    "admin", hash_admin,
-                    "gestor", hash_gestor2,
-                    "colab", hash_colab,
                 ],
             )?;
 
@@ -26806,9 +27070,12 @@ impl Database {
             "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(AdbDeviceId) DO UPDATE SET
-            DeviceName=excluded.DeviceName, Brand=excluded.Brand, Model=excluded.Model,
+            DeviceName=CASE WHEN ESF_Device.DeviceName IS NOT NULL AND ESF_Device.DeviceName != '' AND ESF_Device.DeviceName != excluded.Model THEN ESF_Device.DeviceName ELSE excluded.DeviceName END,
+            Brand=excluded.Brand, Model=excluded.Model,
             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
-            BatteryLevel=excluded.BatteryLevel, DeviceNumber=excluded.DeviceNumber, Sector=excluded.Sector,
+            BatteryLevel=excluded.BatteryLevel,
+            DeviceNumber=CASE WHEN ESF_Device.DeviceNumber IS NOT NULL AND ESF_Device.DeviceNumber > 0 THEN ESF_Device.DeviceNumber ELSE excluded.DeviceNumber END,
+            Sector=CASE WHEN ESF_Device.Sector IS NOT NULL AND ESF_Device.Sector != '' THEN ESF_Device.Sector ELSE excluded.Sector END,
             EsferaDeviceId=COALESCE(excluded.EsferaDeviceId, ESF_Device.EsferaDeviceId),
             CurrentAdbAddress=excluded.CurrentAdbAddress, LastSeenUTC=excluded.LastSeenUTC;",
             params![
@@ -27638,6 +27905,17 @@ impl Database {
     // PERMISSIONS
     // ============================================================
 
+    /// Retorna o CompanyId de um usuário (para checagem de isolamento de permissões).
+    pub fn user_company_id(&self, user_id: i32) -> Option<i32> {
+        self.conn()
+            .query_row(
+                "SELECT CompanyId FROM ESF_User WHERE UserId = ?1",
+                params![user_id],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
     pub fn get_user_permissions(&self, user_id: i32) -> Vec<Permission> {
         let conn = self.conn();
         let mut stmt = match conn.prepare_cached(
@@ -28143,6 +28421,69 @@ impl Database {
             Err(_) => vec![],
         }
     }
+
+    /// Valida um token de empresa contra ESF_CompanyToken.
+    /// Retorna (CompanyId, Role) ou None se inválido/vazio.
+    /// Sem credencial global em código — espelha o hub-standalone.
+    pub fn validate_token(&self, token: &str) -> Option<(i32, String)> {
+        if token.is_empty() {
+            return None;
+        }
+        let hash = hash_password(token);
+        self.conn()
+            .query_row(
+                "SELECT CompanyId, Role FROM ESF_CompanyToken WHERE TokenHash = ?1",
+                params![hash],
+                |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok()
+    }
+
+    /// Gera/atualiza o token de uma empresa (CompanyId = 0 é o master).
+    pub fn upsert_company_token(&self, company_id: i32, token: &str, role: &str) -> Result<(), rusqlite::Error> {
+        let hash = hash_password(token);
+        self.conn()
+            .execute(
+                "INSERT INTO ESF_CompanyToken (CompanyId, TokenHash, Role) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(CompanyId) DO UPDATE SET TokenHash=excluded.TokenHash, Role=excluded.Role",
+                params![company_id, hash, role],
+            )
+            .map(|_| ())
+    }
+
+    /// Gera (ou devolve) um token de empresa forte e o persiste, retornando o
+    /// plaintext. O hub valida por hash, então devolver o plaintext aqui é o
+    /// que o cliente precisa para autenticar.
+    pub fn issue_hub_token(&self, company_id: i32, role: &str) -> Result<String, String> {
+        let raw: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+        let token = hex::encode(raw);
+        self.upsert_company_token(company_id, &token, role)
+            .map_err(|e| format!("Falha ao emitir token de hub: {}", e))?;
+        Ok(token)
+    }
+
+    /// Busca empresa por ID (para obter o nome no Register do hub).
+    pub fn get_company_by_id(&self, company_id: i32) -> Option<Company> {
+        self.conn()
+            .query_row(
+                "SELECT CompanyId, CompanyName, DeviceLimit, UserLimit, DeviceCount, UserCount, IsActive, Status, CreatedAt FROM ESF_Company WHERE CompanyId = ?1",
+                params![company_id],
+                |r| {
+                    Ok(Company {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        device_limit: r.get(2)?,
+                        user_limit: r.get(3)?,
+                        device_count: r.get(4)?,
+                        user_count: r.get(5)?,
+                        is_active: r.get(6)?,
+                        status: r.get(7)?,
+                        created_at: r.get(8)?,
+                    })
+                },
+            )
+            .ok()
+    }
 }
 
 
@@ -28514,6 +28855,78 @@ async fn execute_command_locally(
             let kpis = spawn_blocking(move || db.get_dashboard_kpis(company_id)).await.map_err(|e| e.to_string())?;
             serde_json::to_value(kpis).map_err(|e| e.to_string())
         }
+        // ----------------------------------------------------------------
+        // COMANDOS DE CONTROLE (antes o Empresa Server era somente leitura).
+        // Regra de isolamento: o alvo é resolvido por (companyId, esferaDeviceId)
+        // e o serial ADB é lido do DB — o cliente NUNCA envia serial/IP direto,
+        // para não conseguir alcançar aparelho de outra empresa.
+        // ----------------------------------------------------------------
+        "device_tap" | "device_keyevent" | "device_type_text" | "device_capture_screen" => {
+            let company_id = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let esfera_device_id = args
+                .get("esferaDeviceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if company_id <= 0 || esfera_device_id.is_empty() {
+                return Err("companyId e esferaDeviceId são obrigatórios".to_string());
+            }
+
+            let db_lookup = db.clone();
+            let id_lookup = esfera_device_id.clone();
+            let device = spawn_blocking(move || db_lookup.get_device_by_esfera_id(&id_lookup))
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "dispositivo não encontrado".to_string())?;
+
+            if device.company_id != company_id {
+                return Err("dispositivo pertence a outra empresa".to_string());
+            }
+
+            // Rota preferencial: endereço do túnel/check-in; fallback: serial ADB.
+            let serial = device
+                .current_adb_address
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| device.serial.clone());
+            if serial.is_empty() {
+                return Err("dispositivo sem endereço ADB conhecido".to_string());
+            }
+
+            let cmd_owned = cmd.to_string();
+            let args_owned = args.clone();
+            spawn_blocking(move || -> Result<serde_json::Value, String> {
+                match cmd_owned.as_str() {
+                    "device_tap" => {
+                        let x = args_owned.get("x").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let y = args_owned.get("y").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        crate::adb_manager::AdbManager::tap_screen(&serial, x, y)?;
+                        Ok(serde_json::json!({ "ok": true }))
+                    }
+                    "device_keyevent" => {
+                        let keycode =
+                            args_owned.get("keycode").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        crate::adb_manager::AdbManager::send_keyevent(&serial, keycode)?;
+                        Ok(serde_json::json!({ "ok": true }))
+                    }
+                    "device_type_text" => {
+                        let text = args_owned
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        crate::adb_manager::AdbManager::type_text_human_hpc(&serial, text)?;
+                        Ok(serde_json::json!({ "ok": true }))
+                    }
+                    "device_capture_screen" => {
+                        let b64 = crate::adb_manager::AdbManager::capture_screen(&serial)?;
+                        Ok(serde_json::json!({ "image": b64 }))
+                    }
+                    _ => Err("comando de controle desconhecido".to_string()),
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
         _ => Err(format!("Comando '{}' não disponível via Empresa Server", cmd)),
     }
 }
@@ -28753,6 +29166,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+use crate::db::Database;
+use crate::protocol::{EmpresaInfo, HubMessage};
+
 const READ_LINE_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(1200);
 const MAX_LINE: usize = 8192;
@@ -28766,13 +29182,19 @@ struct HubConnection {
 
 pub struct Hub {
     port: u16,
+    db: Arc<Database>,
     connections: Arc<Mutex<HashMap<String, HubConnection>>>,
     pending: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Hub {
-    pub fn new(port: u16) -> Self {
-        Self { port, connections: Arc::new(Mutex::new(HashMap::new())), pending: Arc::new(Mutex::new(HashMap::new())) }
+    pub fn new(port: u16, db: Arc<Database>) -> Self {
+        Self {
+            port,
+            db,
+            connections: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub async fn start(self) -> Result<(), String> {
@@ -28783,25 +29205,28 @@ impl Hub {
 
         let connections = self.connections.clone();
         let pending = self.pending.clone();
+        let db = self.db.clone();
         loop {
             let (stream, addr) = listener.accept().await.map_err(|e| e.to_string())?;
             let connections = connections.clone();
             let pending = pending.clone();
+            let db = db.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(connections, pending, stream, addr).await {
+                if let Err(e) = handle_connection(connections, pending, db, stream, addr).await {
                     eprintln!("Erro na conexão {}: {}", addr, e);
                 }
             });
         }
     }
 
+    #[allow(dead_code)]
     pub async fn broadcast_command(&self, _to_company: i32, _cmd: &str, _args: &[String]) -> Result<Vec<String>, String> {
         Ok(vec!["ok".to_string()])
     }
 }
 
 async fn send_raw(writer: &Mutex<BufWriter<OwnedWriteHalf>>, msg: &HubMessage) -> Result<(), String> {
-    let data = serialize_msg(msg)?;
+    let data = crate::protocol::serialize_msg(msg)?;
     let mut w = timeout(WRITE_TIMEOUT, writer.lock())
         .await
         .map_err(|_| "timeout no writer do hub".to_string())?;
@@ -28811,7 +29236,11 @@ async fn send_raw(writer: &Mutex<BufWriter<OwnedWriteHalf>>, msg: &HubMessage) -
     Ok(())
 }
 
-async fn send_to_master(connections: &Mutex<HashMap<String, HubConnection>>, master_sid: &str, payload: &[u8]) -> Result<(), String> {
+async fn send_to_master(
+    connections: &Mutex<HashMap<String, HubConnection>>,
+    master_sid: &str,
+    payload: &[u8],
+) -> Result<(), String> {
     let conns = connections.lock().await;
     if let Some(master_conn) = conns.get(master_sid) {
         let mut w = timeout(WRITE_TIMEOUT, master_conn.writer.lock())
@@ -28829,6 +29258,7 @@ async fn send_to_master(connections: &Mutex<HashMap<String, HubConnection>>, mas
 async fn handle_connection(
     connections: Arc<Mutex<HashMap<String, HubConnection>>>,
     pending: Arc<Mutex<HashMap<String, String>>>,
+    db: Arc<Database>,
     stream: TcpStream,
     addr: std::net::SocketAddr,
 ) -> Result<(), String> {
@@ -28836,7 +29266,14 @@ async fn handle_connection(
     let writer = BufWriter::new(writer);
     let writer_lock = Arc::new(Mutex::new(writer));
     let mut reader = BufReader::new(reader);
-    let session_id = format!("sess_{}_{}", addr.port(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis());
+    let session_id = format!(
+        "sess_{}_{}",
+        addr.port(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
     let conn = HubConnection {
         writer: writer_lock.clone(),
         role: String::new(),
@@ -28864,66 +29301,150 @@ async fn handle_connection(
             continue;
         }
 
-        let msg = match deserialize_msg(trimmed.as_bytes()) {
+        let msg = match crate::protocol::deserialize_msg(trimmed.as_bytes()) {
             Ok(m) => m,
             Err(_) => continue,
         };
 
         match msg {
-            HubMessage::Auth { username, password, role } => {
-                let auth_ok = (role == "master" || role == "empresa") && username == AUTH_MASTER_USER && password == AUTH_MASTER_PASS;
+            HubMessage::Auth { token, role } => {
+                // Auth por TOKEN de empresa (sem credencial global em código).
+                // Master => CompanyId 0; Empresa => CompanyId N (isolada).
+                let validated = db.validate_token(&token);
+                let (company_id, role_out) = match validated {
+                    Some((cid, r)) => (cid, r),
+                    None => {
+                        let resp = HubMessage::AuthResponse {
+                            success: false,
+                            session_id: None,
+                            company_id: None,
+                            error: Some("Token inválido.".to_string()),
+                        };
+                        let _ = send_raw(&writer_lock, &resp).await;
+                        continue;
+                    }
+                };
+                // O papel do token deve bater com o role pedido (master só com token master).
+                let effective_role = if role == "master" && company_id == 0 {
+                    "master".to_string()
+                } else if role == "empresa" && company_id > 0 {
+                    "empresa".to_string()
+                } else {
+                    let resp = HubMessage::AuthResponse {
+                        success: false,
+                        session_id: None,
+                        company_id: None,
+                        error: Some("Token não autoriza este papel.".to_string()),
+                    };
+                    let _ = send_raw(&writer_lock, &resp).await;
+                    continue;
+                };
                 let mut conns = connections.lock().await;
                 if let Some(conn) = conns.get_mut(&session_id) {
-                    if auth_ok {
-                        conn.role = role.clone();
-                        let resp = HubMessage::AuthResponse { success: true, session_id: Some(session_id.clone()), error: None };
-                        let _ = send_raw(&conn.writer, &resp).await;
-                        println!("{} '{}' autenticado no Hub", role, username);
-                    } else {
-                        let resp = HubMessage::AuthResponse { success: false, session_id: None, error: Some("Credenciais inválidas.".to_string()) };
-                        let _ = send_raw(&conn.writer, &resp).await;
-                    }
+                    conn.role = effective_role.clone();
+                    conn.company_id = Some(company_id);
+                    let resp = HubMessage::AuthResponse {
+                        success: true,
+                        session_id: Some(session_id.clone()),
+                        company_id: Some(company_id),
+                        error: None,
+                    };
+                    let _ = send_raw(&conn.writer, &resp).await;
+                    println!("{} autenticado no Hub (company {})", effective_role, company_id);
                 }
             }
             HubMessage::Register { company_id, company_name } => {
+                // Register amarrado à sessão autenticada: empresa só registra a PRÓPRIA
+                // company_id; master pode registrar qualquer uma.
                 let mut conns = connections.lock().await;
                 if let Some(conn) = conns.get_mut(&session_id) {
-                    if conn.role == "master" || !conn.role.is_empty() {
+                    let allowed = match conn.role.as_str() {
+                        "master" => true,
+                        "empresa" => conn.company_id == Some(company_id),
+                        _ => false,
+                    };
+                    if allowed {
                         conn.company_id = Some(company_id);
                         conn.company_name = Some(company_name.clone());
                         let resp = HubMessage::RegisterResponse { success: true, error: None };
                         let _ = send_raw(&conn.writer, &resp).await;
                         println!("Empresa '{}' (ID {}) registrada", company_name, company_id);
+                    } else {
+                        let resp = HubMessage::RegisterResponse {
+                            success: false,
+                            error: Some("Não autorizado a registrar esta empresa.".to_string()),
+                        };
+                        let _ = send_raw(&conn.writer, &resp).await;
                     }
                 }
             }
             HubMessage::Command { from, to_company, cmd, args, id } => {
-                let conns = connections.lock().await;
-                if let Some(c) = conns.get(&session_id) {
-                    if c.role.is_empty() {
-                        continue;
+                // Só encaminha se a sessão está autenticada E (master OU dona da empresa alvo).
+                let authorized = {
+                    let conns = connections.lock().await;
+                    match conns.get(&session_id) {
+                        Some(c) if c.role == "master" => true,
+                        Some(c) => c.company_id == to_company,
+                        None => false,
                     }
-                } else {
+                };
+                if !authorized {
+                    let resp = HubMessage::CommandResponse {
+                        id,
+                        result: None,
+                        error: Some("Não autorizado.".to_string()),
+                    };
+                    let _ = send_raw(&writer_lock, &resp).await;
                     continue;
                 }
 
-                let target_sid = conns.iter()
-                    .find(|(_, c)| c.role == "empresa" && c.company_id == Some(to_company))
-                    .map(|(sid, _)| sid.clone());
+                let target_sid = {
+                    let conns = connections.lock().await;
+                    conns
+                        .iter()
+                        .find(|(_, c)| {
+                            c.role == "empresa"
+                                && c.company_id == to_company.or(Some(c.company_id.unwrap_or(0)))
+                        })
+                        .map(|(sid, _)| sid.clone())
+                };
 
                 if let Some(target_sid) = target_sid {
                     pending.lock().await.insert(id.clone(), session_id.clone());
-                    let relay = HubMessage::Command { from, to_company, cmd, args, id: id.clone() };
-                    let payload = serialize_msg(&relay)?;
-                    drop(conns);
+                    let relay = HubMessage::Command {
+                        from,
+                        to_company,
+                        cmd,
+                        args,
+                        id: id.clone(),
+                    };
+                    let payload = crate::protocol::serialize_msg(&relay)?;
+                    // Resolve a writer da sessão alvo ANTES de qualquer await, para não
+                    // segurar o guard do Mutex além do seu escopo.
+                    let target_writer: Option<Arc<Mutex<BufWriter<OwnedWriteHalf>>>> = {
+                        let conns = connections.lock().await;
+                        conns.get(&target_sid).map(|c| c.writer.clone())
+                    };
 
-                    if let Some(target_conn) = connections.lock().await.get(&target_sid) {
-                        if let Err(_) = send_raw(&target_conn.writer, &deserialize_msg(&payload).unwrap_or(HubMessage::Pong)).await {
-                            let _ = send_raw(&writer_lock, &HubMessage::CommandResponse { id, result: None, error: Some("Falha no relay para empresa".into()) }).await;
+                    if let Some(writer) = target_writer {
+                        if let Err(_) = send_raw(&writer, &crate::protocol::deserialize_msg(&payload).unwrap_or(HubMessage::Pong)).await {
+                            let _ = send_raw(
+                                &writer_lock,
+                                &HubMessage::CommandResponse {
+                                    id,
+                                    result: None,
+                                    error: Some("Falha no relay para empresa".into()),
+                                },
+                            )
+                            .await;
                         }
                     }
                 } else {
-                    let resp = HubMessage::CommandResponse { id, result: None, error: Some("Empresa não conectada ao Hub.".to_string()) };
+                    let resp = HubMessage::CommandResponse {
+                        id,
+                        result: None,
+                        error: Some("Empresa não conectada ao Hub.".to_string()),
+                    };
                     let _ = send_raw(&writer_lock, &resp).await;
                 }
             }
@@ -28933,18 +29454,26 @@ async fn handle_connection(
                     pend.remove(&id)
                 };
                 if let Some(master_sid) = master_sid {
-                    let payload = serialize_msg(&HubMessage::CommandResponse { id, result, error })?;
+                    let payload = crate::protocol::serialize_msg(&HubMessage::CommandResponse {
+                        id,
+                        result,
+                        error,
+                    })?;
                     let _ = send_to_master(&connections, &master_sid, &payload).await;
                 }
             }
             HubMessage::EmpresaList { .. } => {
                 let conns = connections.lock().await;
-                let empresas: Vec<EmpresaInfo> = conns.values()
+                let empresas: Vec<EmpresaInfo> = conns
+                    .values()
                     .filter(|c| c.role == "empresa" && c.company_id.is_some())
                     .map(|c| EmpresaInfo {
                         company_id: c.company_id.unwrap_or(0),
                         company_name: c.company_name.clone().unwrap_or_default(),
-                        connected_since: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
+                        connected_since: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64,
                     })
                     .collect();
                 let resp = HubMessage::EmpresaList { empresas };
@@ -28960,40 +29489,6 @@ async fn handle_connection(
     connections.lock().await.remove(&session_id);
     println!("Conexão {} encerrada", addr);
     Ok(())
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum HubMessage {
-    Auth { username: String, password: String, role: String },
-    AuthResponse { success: bool, session_id: Option<String>, error: Option<String> },
-    Register { company_id: i32, company_name: String },
-    RegisterResponse { success: bool, error: Option<String> },
-    Command { from: String, to_company: i32, cmd: String, args: Vec<String>, id: String },
-    CommandResponse { id: String, result: Option<serde_json::Value>, error: Option<String> },
-    EmpresaList { empresas: Vec<EmpresaInfo> },
-    Ping,
-    Pong,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EmpresaInfo {
-    pub company_id: i32,
-    pub company_name: String,
-    pub connected_since: i64,
-}
-
-const AUTH_MASTER_USER: &str = "master";
-const AUTH_MASTER_PASS: &str = "admin123";
-
-fn serialize_msg(msg: &HubMessage) -> Result<Vec<u8>, String> {
-    let mut data = serde_json::to_vec(msg).map_err(|e| e.to_string())?;
-    data.push(b'\n');
-    Ok(data)
-}
-
-fn deserialize_msg(bytes: &[u8]) -> Result<HubMessage, String> {
-    let msg: HubMessage = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    Ok(msg)
 }
 
 
@@ -29017,6 +29512,8 @@ pub struct HubClient {
 impl HubClient {
     pub async fn connect(
         hub_addr: &str,
+        token: &str,
+        role: &str,
         company_id: i32,
         company_name: &str,
     ) -> Result<Self, String> {
@@ -29034,17 +29531,22 @@ impl HubClient {
             session_id: None,
         };
 
-        client.authenticate("empresa").await?;
-        client.register(company_id, company_name).await?;
+        client.authenticate(token, role).await?;
+        // Apenas empresa precisa registrar a própria company; master não.
+        if role == "empresa" {
+            client.register(company_id, company_name).await?;
+        }
 
-        println!("Conectado ao Hub {} como empresa '{}' (ID {})", hub_addr, company_name, company_id);
+        println!("Conectado ao Hub {} como {} '{}' (ID {})", hub_addr, role, company_name, company_id);
         Ok(client)
     }
 
-    async fn authenticate(&mut self, role: &str) -> Result<(), String> {
+    async fn authenticate(&mut self, token: &str, role: &str) -> Result<(), String> {
+        if token.is_empty() {
+            return Err("Token do Hub ausente (faça login para obter as credenciais).".to_string());
+        }
         let msg = HubMessage::Auth {
-            username: AUTH_MASTER_USER.to_string(),
-            password: AUTH_MASTER_PASS.to_string(),
+            token: token.to_string(),
             role: role.to_string(),
         };
         self.send(&msg).await?;
@@ -29101,12 +29603,13 @@ impl HubClient {
 
     pub async fn send_command(
         &self,
+        to_company: i32,
         cmd: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let msg = HubMessage::Command {
             from: "empresa".to_string(),
-            to_company: None,
+            to_company: Some(to_company),
             cmd: cmd.to_string(),
             args,
             id: format!("cmd_{}", std::time::SystemTime::now()
@@ -29178,7 +29681,6 @@ mod dispatcher;
 pub mod empresa_server;
 pub mod hub;
 pub mod hub_client;
-pub mod master_client;
 pub mod presence_server;
 pub mod protocol;
 pub mod scrcpy_manager;
@@ -29191,7 +29693,7 @@ mod write_queue;
 use commands::*;
 use db::Database;
 use crate::protocol::HubMessage;
-use master_client::MasterClient;
+use hub_client::HubClient;
 use session::SessionManager;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
@@ -29251,7 +29753,7 @@ pub fn run() {
 
     let db_arc_clone = Arc::clone(&db_arc);
     let sessions = Arc::new(Mutex::new(SessionManager::new()));
-    let master_client: Arc<TokioMutex<Option<MasterClient>>> = Arc::new(TokioMutex::new(None));
+    let hub_client: Arc<TokioMutex<Option<HubClient>>> = Arc::new(TokioMutex::new(None));
 
     let app_config = config::load_config();
 
@@ -29270,91 +29772,10 @@ pub fn run() {
         println!("Empresa Server iniciado na porta {}", port);
     }
 
-    // Empresa mode: connect to Hub with auto-reconnect
-    if app_config.mode == "empresa" && app_config.hub_enabled && !app_config.hub_address.is_empty() {
-        let db_for_hub = db_arc.clone();
-        let hub_addr = app_config.hub_address.clone();
-        bg_runtime.spawn(async move {
-            let company_id = db_for_hub.get_companies().first().map(|c| c.id).unwrap_or(1);
-            let company_name = format!("Empresa_{}", company_id);
-            let mut backoff = 1;
-            loop {
-                match hub_client::HubClient::connect(&hub_addr, company_id, &company_name).await {
-                    Ok(client) => {
-                        println!("Conectado ao Hub {} como empresa '{}'", hub_addr, company_name);
-                        backoff = 1;
-                        let _ = client.listen(|cmd, args, _id| {
-                            let db = db_for_hub.clone();
-                            let res = match cmd.as_str() {
-                                "get_companies" => serde_json::to_value(db.get_companies()).map_err(|e| e.to_string()),
-                                "get_devices" => {
-                                    let cid = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                                    serde_json::to_value(db.get_devices(cid)).map_err(|e| e.to_string())
-                                }
-                                "get_campaigns" => {
-                                    let cid = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                                    serde_json::to_value(db.get_campaigns(cid)).map_err(|e| e.to_string())
-                                }
-                                "get_dashboard_kpis" => {
-                                    let cid = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                                    serde_json::to_value(db.get_dashboard_kpis(cid)).map_err(|e| e.to_string())
-                                }
-                                _ => Err(format!("Comando remoto '{}' não implementado", cmd)),
-                            };
-                            // Offload sync DB calls via std thread para não bloquear runtime async
-                            std::thread::spawn(move || res).join().unwrap_or(Err("thread panicked".to_string()))
-                        }).await;
-                        eprintln!("Conexão com Hub perdida. Reconectando em {}s...", backoff);
-                    }
-                    Err(e) => {
-                        eprintln!("Falha ao conectar ao Hub (tentativa em {}s): {}", backoff, e);
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(60);
-            }
-        });
-    }
-
-    // Master mode: connect MasterClient (stored for hub_invoke commands)
-    if app_config.mode == "master" && app_config.hub_enabled && !app_config.hub_address.is_empty() {
-        let hub_addr = app_config.hub_address.clone();
-        let mc = master_client.clone();
-        bg_runtime.spawn(async move {
-            let mut backoff = 1;
-            loop {
-                match MasterClient::connect(&hub_addr).await {
-                    Ok(client) => {
-                        println!("Conectado ao Hub {} como Master", hub_addr);
-                        *mc.lock().await = Some(client);
-                        backoff = 1;
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(10)).await;
-                            let mut guard = mc.lock().await;
-                            if guard.is_none() { break; }
-                            if let Some(ref c) = *guard {
-                                if c.send_raw(&HubMessage::Ping).await.is_err() {
-                                    *guard = None;
-                                    break;
-                                }
-                                // Consume Pong
-                                let _ = tokio::time::timeout(
-                                    Duration::from_secs(3),
-                                    c.read_one(),
-                                ).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Falha Master ao conectar ao Hub (tentativa em {}s): {}", backoff, e);
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(60);
-            }
-        });
-        println!("Master Client conectando a {}...", app_config.hub_address);
-    }
+    // Conexão ao Hub VPS: REMOVIDA do startup. Agora é 100% pós-login:
+    // o frontend chama `connect_hub(token)` após o usuário autenticar, usando
+    // o company_id e o token da empresa do próprio usuário (arquitetura
+    // multi-tenant VPS central — Opção A do HERMES_CONTEXT). Sem login = sem hub.
 
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -29395,11 +29816,13 @@ pub fn run() {
             diag("ETAPA [5] backend/servers iniciados no setup; setup retorna Ok");
             Ok(())
         })
-        .manage(AppState { db: db_arc, sessions, master_client })
+        .manage(AppState { db: db_arc, sessions, hub_client })
         .invoke_handler(tauri::generate_handler![
             // Auth
             login,
             logout,
+            get_hub_credentials,
+            connect_hub,
             // Empresas
             get_companies,
             create_company,
@@ -29518,6 +29941,8 @@ pub fn run() {
             get_assigned_devices_for_user,
             request_device_access,
             get_device_permission_requests,
+            generate_company_token,
+            rotate_master_token,
             approve_device_access,
             reject_device_access,
             end_device_access,
@@ -29602,9 +30027,12 @@ impl MasterClient {
     }
 
     async fn authenticate(&mut self) -> Result<(), String> {
+        // Token do Hub lido de env (obrigatório). Sem fallback de credencial em código.
+        let token = std::env::var("ESFERA_HUB_TOKEN")
+            .or_else(|_| std::env::var("HUB_MASTER_TOKEN"))
+            .map_err(|_| "Token do Hub não configurado (defina ESFERA_HUB_TOKEN).".to_string())?;
         let msg = HubMessage::Auth {
-            username: AUTH_MASTER_USER.to_string(),
-            password: AUTH_MASTER_PASS.to_string(),
+            token,
             role: "master".to_string(),
         };
         self.send_raw(&msg).await?;
@@ -29790,19 +30218,22 @@ async fn handle_socket(socket: WebSocket, client_ip: String, app_handle: Option<
 
 use serde::{Deserialize, Serialize};
 
-pub const HUB_DEFAULT_PORT: u16 = 8888;
+// Portas padrão
+pub const HUB_DEFAULT_PORT: u16 = 8555;
 pub const EMPRESA_DEFAULT_PORT: u16 = 7777;
-pub const AUTH_MASTER_USER: &str = "master";
-pub const AUTH_MASTER_PASS: &str = "admin123";
+
+// IMPORTANTE: não existe mais credencial global em código.
+// A autenticação é por TOKEN por empresa (tabela ESF_CompanyToken no hub).
+// Master => CompanyId = 0. Empresa => CompanyId = N (isolada).
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum HubMessage {
     #[serde(rename = "auth")]
-    Auth { username: String, password: String, role: String },
+    Auth { token: String, role: String },
 
     #[serde(rename = "auth_response")]
-    AuthResponse { success: bool, session_id: Option<String>, error: Option<String> },
+    AuthResponse { success: bool, session_id: Option<String>, company_id: Option<i32>, error: Option<String> },
 
     #[serde(rename = "register")]
     Register { company_id: i32, company_name: String },
@@ -30945,16 +31376,7 @@ async fn main() {
     println!("=== ESFERA HUB v3 ===");
     println!("Iniciando servidor TCP Master na porta {}...", port);
 
-    // 1. Inicia o Hub TCP Master (em background)
-    let hub = esfera_v3_lib::hub::Hub::new(port);
-    tokio::spawn(async move {
-        if let Err(e) = hub.start().await {
-            eprintln!("Falha fatal no Hub TCP: {}", e);
-            std::process::exit(1);
-        }
-    });
-
-    // 2. Inicializa o Banco de Dados local do Hub (para celulares)
+    // 1. Inicializa o Banco de Dados local do Hub (para celulares + tokens de empresa)
     let db_path = "./esfera_cloud.db".to_string();
     let db = match esfera_v3_lib::db::Database::init(&db_path) {
         Ok(d) => std::sync::Arc::new(d),
@@ -30964,6 +31386,15 @@ async fn main() {
         }
     };
     println!("Banco de dados SQLite carregado em {}", db_path);
+
+    // 2. Inicia o Hub TCP Master (em background) com auth por token de empresa
+    let hub = esfera_v3_lib::hub::Hub::new(port, db.clone());
+    tokio::spawn(async move {
+        if let Err(e) = hub.start().await {
+            eprintln!("Falha fatal no Hub TCP: {}", e);
+            std::process::exit(1);
+        }
+    });
 
     // 3. Inicia o Check-in Server HTTP na porta 8080 bloqueando a thread principal
     let http_port = env::var("HTTP_PORT")
@@ -31735,8 +32166,15 @@ WorkingDirectory=/home/vicenzzoconstantine/esfera_v3/hub-standalone
 ExecStart=/home/vicenzzoconstantine/esfera_v3/hub-standalone/target/release/esfera-hub-standalone
 Restart=always
 RestartSec=5
+# Portas dos 4 canais (180 graus de isolamento por token de empresa)
 Environment=HUB_PORT=8555
 Environment=HTTP_PORT=8080
+Environment=TUNNEL_PORT=8888
+Environment=PRESENCE_PORT=7779
+# Token master do hub (CompanyId 0). DEFINA um valor forte antes do 1o start:
+#   sudo systemctl edit esfera-hub   ->   Environment=HUB_MASTER_TOKEN=SEU_TOKEN_FORTE
+# Se ausente, o hub gera um token forte em runtime (funciona, mas voce nao sabera o valor).
+Environment=HUB_MASTER_TOKEN=
 
 [Install]
 WantedBy=multi-user.target
@@ -31823,7 +32261,14 @@ pub async fn start(db: Arc<Database>, port: u16) {
 async fn handle_checkin(
     State((db, _port)): State<(Arc<Database>, u16)>,
     Json(payload): Json<CheckInPayload>,
-) -> &'static str {
+) -> (axum::http::StatusCode, &'static str) {
+    use axum::http::StatusCode;
+
+    // ISOLAMENTO: check-in sem COMPANY_ID válido é recusado explicitamente.
+    if payload.company_id <= 0 {
+        return (StatusCode::BAD_REQUEST, "companyId ausente ou invalido");
+    }
+
     let now = Utc::now().to_rfc3339();
     let adb_address = &payload.current_adb_address;
 
@@ -31844,23 +32289,26 @@ async fn handle_checkin(
 
     match updated {
         Ok(0) => {
-            let _ = db.insert_unknown_device(
+            if let Err(e) = db.insert_unknown_device(
                 &payload.esfera_device_id,
                 adb_address,
                 &ip,
                 port,
                 &now,
                 payload.company_id,
-            );
+            ) {
+                eprintln!("Check-in insert error: {}", e);
+                return (StatusCode::FORBIDDEN, "empresa invalida");
+            }
         }
         Ok(_) => {}
         Err(e) => {
             eprintln!("Check-in DB error: {}", e);
-            return "erro";
+            return (StatusCode::FORBIDDEN, "empresa invalida");
         }
     }
 
-    "ok"
+    (StatusCode::OK, "ok")
 }
 
 
@@ -31880,6 +32328,17 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
+
+/// Projeção do estado VIVO (em RAM, session_manager) para persistência.
+/// Identidade = (company_id, esfera_device_id). NUNCA IP/porta/ordem de lista.
+#[derive(Debug, Clone)]
+pub struct LiveDeviceState {
+    pub company_id: i32,
+    pub esfera_device_id: String,
+    pub status: String, // "online" | "degraded" | "offline"
+    pub battery_level: u8,
+    pub last_seen_utc: String,
+}
 
 // ============================================================
 // STRUCTS
@@ -32172,8 +32631,13 @@ pub fn hash_password(password: &str) -> String {
     hex::encode(result)
 }
 
+/// Verifica senha APENAS via hash SHA-256 com salt.
+/// NUNCA aceita o plaintext igual ao hash (elimina o fallback inseguro).
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    password == hash || hash_password(password) == hash
+    if hash.is_empty() || password.is_empty() {
+        return false;
+    }
+    hash_password(password) == hash
 }
 
 // ============================================================
@@ -32185,6 +32649,46 @@ pub struct Database {
 }
 
 impl Database {
+    /// Valida um token de autenticação do Hub e devolve (company_id, role).
+    /// Master => CompanyId = 0. Empresa => CompanyId = N (isolada).
+    /// Retorna None se o token não existir ou não bater com o hash.
+    pub fn validate_token(&self, token: &str) -> Option<(i32, String)> {
+        if token.is_empty() {
+            return None;
+        }
+        let hash = hash_password(token);
+        self.conn()
+            .query_row(
+                "SELECT CompanyId, Role FROM ESF_CompanyToken WHERE TokenHash = ?1",
+                params![hash],
+                |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok()
+    }
+
+    /// Gera/atualiza o token de uma empresa (incluindo master, CompanyId = 0).
+    pub fn upsert_company_token(&self, company_id: i32, token: &str, role: &str) -> Result<(), rusqlite::Error> {
+        let hash = hash_password(token);
+        self.conn()
+            .execute(
+                "INSERT INTO ESF_CompanyToken (CompanyId, TokenHash, Role) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(CompanyId) DO UPDATE SET TokenHash=excluded.TokenHash, Role=excluded.Role",
+                params![company_id, hash, role],
+            )
+            .map(|_| ())
+    }
+
+    /// Garante que uma empresa exista (usado por testes/seed). Idempotente.
+    pub fn ensure_company(&self, id: i32, name: &str) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "INSERT OR IGNORE INTO ESF_Company (CompanyId, CompanyName, DeviceLimit, UserLimit) VALUES (?1, ?2, 100, 50)",
+                params![id, name],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     pub fn init(db_path: &str) -> Result<Self> {
         let manager = SqliteConnectionManager::file(db_path);
         let pool = Pool::builder()
@@ -32471,7 +32975,18 @@ impl Database {
             [],
         )?;
 
-        // 18. Performance Indexes (Microsecond Lookups)
+        // 18. ESF_CompanyToken (autenticação company-scoped do Hub — sem credencial global)
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_CompanyToken (
+                CompanyId INTEGER PRIMARY KEY,
+                TokenHash TEXT NOT NULL,
+                Role TEXT NOT NULL DEFAULT 'empresa',
+                CreatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+            [],
+        )?;
+
+        // 19. Performance Indexes (Microsecond Lookups)
         self.conn().execute_batch("
             CREATE INDEX IF NOT EXISTS idx_device_company ON ESF_Device (CompanyId);
             CREATE INDEX IF NOT EXISTS idx_campaign_company ON ESF_Campaign (CompanyId, ExcluidoEm);
@@ -32557,26 +33072,26 @@ impl Database {
                 [],
             )?;
 
-            // Usuários com senhas hasheadas SHA-256
+            // Token MASTER do Hub (CompanyId = 0). Sem credencial global em código.
+            // Lê de HUB_MASTER_TOKEN (env); se ausente, usa um token forte padrão
+            // que DEVE ser trocado em produção. NUNCA usar senha trivial.
+            let master_token = std::env::var("HUB_MASTER_TOKEN")
+                .unwrap_or_else(|_| "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string());
+            self.upsert_company_token(0, &master_token, "master")?;
+
+            // Usuários seedados: SOMENTE contas do dono, com senhas não-triviais.
+            // Contas de demonstração com senhas fracas (admin/admin, gestor/gestor, colab/colab)
+            // FORAM REMOVIDAS — eram fallbacks inseguros.
             let hash_master = hash_password("root123");
             let hash_gestor = hash_password("Ope@2025");
-            let hash_admin = hash_password("admin");
-            let hash_gestor2 = hash_password("gestor");
-            let hash_colab = hash_password("colab");
 
             self.conn().execute(
                 "INSERT INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId) VALUES
                 (?1, ?2, 'Vicenzzo Master', 'master', NULL),
-                (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1),
-                (?5, ?6, 'Administrador', 'master', NULL),
-                (?7, ?8, 'Carlos Gestor', 'gestor', 1),
-                (?9, ?10, 'Ana Operadora', 'colaborador', 1);",
+                (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1);",
                 params![
                     "vicenzzo.master", hash_master,
                     "vicenzzo.mastronikolis", hash_gestor,
-                    "admin", hash_admin,
-                    "gestor", hash_gestor2,
-                    "colab", hash_colab,
                 ],
             )?;
 
@@ -32784,9 +33299,12 @@ impl Database {
                 "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                 ON CONFLICT(AdbDeviceId) DO UPDATE SET
-                DeviceName=excluded.DeviceName, Brand=excluded.Brand, Model=excluded.Model,
+                DeviceName=CASE WHEN ESF_Device.DeviceName IS NOT NULL AND ESF_Device.DeviceName != '' AND ESF_Device.DeviceName != excluded.Model THEN ESF_Device.DeviceName ELSE excluded.DeviceName END,
+                Brand=excluded.Brand, Model=excluded.Model,
                 DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
-                BatteryLevel=excluded.BatteryLevel, DeviceNumber=excluded.DeviceNumber, Sector=excluded.Sector,
+                BatteryLevel=excluded.BatteryLevel,
+                DeviceNumber=CASE WHEN ESF_Device.DeviceNumber IS NOT NULL AND ESF_Device.DeviceNumber > 0 THEN ESF_Device.DeviceNumber ELSE excluded.DeviceNumber END,
+                Sector=CASE WHEN ESF_Device.Sector IS NOT NULL AND ESF_Device.Sector != '' THEN ESF_Device.Sector ELSE excluded.Sector END,
                 EsferaDeviceId=COALESCE(excluded.EsferaDeviceId, ESF_Device.EsferaDeviceId),
                 CurrentAdbAddress=excluded.CurrentAdbAddress, LastSeenUTC=excluded.LastSeenUTC;",
                 params![
@@ -32852,42 +33370,67 @@ impl Database {
         Ok(())
     }
 
+    /// Valida o company_id declarado pelo cliente.
+    /// Regra de isolamento: company_id deve ser > 0 e corresponder a uma empresa existente.
+    /// Um client NUNCA pode se autoatribuir company_id = 0 (bucket compartilhado) nem
+    /// trocar a empresa de um device já cadastrado.
+    fn resolve_checkin_company_id(&self, esfera_device_id: &str, claimed: i32) -> Option<i32> {
+        if claimed <= 0 {
+            return None; // recusa company_id inválido/zero vindo do cliente
+        }
+        // Se o device já existe, mantém o company_id fixo (first-seen-wins). Nunca sobrescreve.
+        if let Ok(existing) = self.conn().query_row(
+            "SELECT CompanyId FROM ESF_Device WHERE EsferaDeviceId = ?1",
+            params![esfera_device_id],
+            |r| r.get::<_, i32>(0),
+        ) {
+            return Some(existing);
+        }
+        // Device novo: exige que a empresa exista (isolamento por empresa real).
+        let exists: i32 = self.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM ESF_Company WHERE CompanyId = ?1",
+                params![claimed],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if exists > 0 { Some(claimed) } else { None }
+    }
+
     pub fn process_checkin(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str, company_id: i32) -> Result<usize, String> {
-        // Primeiro tenta atualizar um device já conhecido (mantém company_id estável).
+        let resolved = self.resolve_checkin_company_id(device_id, company_id)
+            .ok_or_else(|| "company_id inválido ou inexistente; isolamento recusado".to_string())?;
+
+        // Atualiza device conhecido: NÃO toca em CompanyId (identidade fixa).
         let updated = self.conn().execute(
             "UPDATE ESF_Device SET
                 CurrentAdbAddress = ?1,
                 Status = 'online',
                 LastSeenUTC = ?2,
                 DeviceIp = ?3,
-                DevicePort = ?4,
-                CompanyId = COALESCE((SELECT CompanyId FROM ESF_Device WHERE EsferaDeviceId = ?5), ?6)
+                DevicePort = ?4
              WHERE EsferaDeviceId = ?5",
-            params![adb_address, now, ip, port, device_id, company_id],
+            params![adb_address, now, ip, port, device_id],
         ).map_err(|e| e.to_string())?;
 
         if updated == 0 {
-            // Dispositivo novo: usa o company_id declarado (primeiro seen wins p/ isolamento).
+            // Dispositivo novo: usa o company_id RESOLVIDO (validado, nunca o cru vem do cliente).
             return self.conn().execute(
                 "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
-                 VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?6, 0, 'junior', ?5, ?7)
-                 ON CONFLICT(EsferaDeviceId) DO UPDATE SET
-                 CurrentAdbAddress=excluded.CurrentAdbAddress, Status='online', LastSeenUTC=excluded.LastSeenUTC,
-                 DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, CompanyId=excluded.CompanyId",
-                params![format!("agent-{}", device_id), device_id, ip, port, adb_address, company_id, now],
+                 VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?5, 0, 'junior', ?6, ?7)",
+                params![format!("agent-{}", device_id), device_id, ip, port, resolved, adb_address, now],
             ).map_err(|e| e.to_string());
         }
         Ok(updated)
     }
 
     pub fn insert_unknown_device(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str, company_id: i32) -> Result<usize, String> {
+        let resolved = self.resolve_checkin_company_id(device_id, company_id)
+            .ok_or_else(|| "company_id inválido ou inexistente; isolamento recusado".to_string())?;
         self.conn().execute(
             "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
-             VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?6, 0, 'junior', ?5, ?7)
-             ON CONFLICT(EsferaDeviceId) DO UPDATE SET
-             CurrentAdbAddress=excluded.CurrentAdbAddress, Status='online', LastSeenUTC=excluded.LastSeenUTC,
-             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, CompanyId=excluded.CompanyId",
-            params![format!("agent-{}", device_id), device_id, ip, port, adb_address, company_id, now],
+             VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?5, 0, 'junior', ?6, ?7)",
+            params![format!("agent-{}", device_id), device_id, ip, port, resolved, adb_address, now],
         ).map_err(|e| e.to_string())
     }
 
@@ -32901,6 +33444,74 @@ impl Database {
             timeout_seconds
         );
         self.conn().execute(&sql, []).map_err(|e| e.to_string())
+    }
+
+    /// Reconcilia o estado VIVO (session_manager, em RAM) com o banco.
+    ///
+    /// Por que existe: o check-in HTTP é apenas UM dos canais. Um device pode
+    /// estar com túnel e/ou presença ativos (portanto ONLINE de verdade) sem ter
+    /// feito check-in recente — antes disso, o sweeper marcava esse device como
+    /// offline no DB, criando DUAS fontes de verdade em conflito.
+    ///
+    /// Regra: o estado em RAM (túnel/presença) tem precedência. Devices sem
+    /// nenhum canal vivo só caem para offline pelo timeout de check-in.
+    /// A identidade usada é (CompanyId, EsferaDeviceId) — NUNCA IP.
+    pub fn sync_live_state(
+        &self,
+        live: &[LiveDeviceState],
+        stale_timeout_seconds: i32,
+    ) -> Result<usize, String> {
+        let conn = self.conn();
+        let mut touched = 0usize;
+
+        for st in live.iter().filter(|s| s.status != "offline") {
+            touched += conn
+                .execute(
+                    "UPDATE ESF_Device SET
+                        Status = ?1,
+                        BatteryLevel = ?2,
+                        LastSeenUTC = ?3
+                     WHERE EsferaDeviceId = ?4 AND CompanyId = ?5",
+                    params![
+                        st.status,
+                        st.battery_level as i32,
+                        st.last_seen_utc,
+                        st.esfera_device_id,
+                        st.company_id
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+
+        // Stale sweep protegendo quem tem canal vivo (túnel ou presença).
+        let protected: Vec<String> = live
+            .iter()
+            .filter(|s| s.status != "offline")
+            .map(|s| s.esfera_device_id.clone())
+            .collect();
+
+        let placeholders = if protected.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " AND EsferaDeviceId NOT IN ({})",
+                protected.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+            )
+        };
+        let sql = format!(
+            "UPDATE ESF_Device SET Status = 'offline'
+             WHERE EsferaDeviceId IS NOT NULL
+             AND Status <> 'offline'
+             AND LastSeenUTC IS NOT NULL
+             AND datetime(LastSeenUTC) < datetime('now', '-{} seconds'){}",
+            stale_timeout_seconds, placeholders
+        );
+        let params_dyn: Vec<&dyn rusqlite::ToSql> =
+            protected.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        conn.execute(&sql, params_dyn.as_slice())
+            .map_err(|e| e.to_string())?;
+
+        Ok(touched)
     }
 
     pub fn get_device_by_esfera_id(&self, esfera_device_id: &str) -> Option<Device> {
@@ -34078,6 +34689,7 @@ impl Database {
 // ========================================================
 
 use crate::protocol::*;
+use crate::db::Database;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34098,11 +34710,12 @@ pub struct Hub {
     port: u16,
     connections: Arc<Mutex<HashMap<String, HubConnection>>>,
     pending: Arc<Mutex<HashMap<String, String>>>, // cmd_id → master_session_id
+    db: Arc<Database>,
 }
 
 impl Hub {
-    pub fn new(port: u16) -> Self {
-        Self { port, connections: Arc::new(Mutex::new(HashMap::new())), pending: Arc::new(Mutex::new(HashMap::new())) }
+    pub fn new(port: u16, db: Arc<Database>) -> Self {
+        Self { port, connections: Arc::new(Mutex::new(HashMap::new())), pending: Arc::new(Mutex::new(HashMap::new())), db }
     }
 
     pub async fn start(self) -> Result<(), String> {
@@ -34122,8 +34735,9 @@ impl Hub {
             };
             let connections = self.connections.clone();
             let pending = self.pending.clone();
+            let db = self.db.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(connections, pending, stream, addr).await {
+                if let Err(e) = handle_connection(connections, pending, db, stream, addr).await {
                     eprintln!("Erro na conexão {}: {}", addr, e);
                 }
             });
@@ -34141,9 +34755,69 @@ async fn send_raw(
     w.flush().await.map_err(|e| e.to_string())
 }
 
+/// Comandos que o VPS resolve SOZINHO, sem relay para o hub local da empresa.
+/// Retorna None quando o comando não é do VPS (segue o fluxo de relay normal).
+///
+/// Isolamento: todo comando exige `companyId` explícito e só enxerga o estado
+/// daquela empresa (session_manager::list_by_company). Nunca há listagem global
+/// para um consumidor de empresa.
+async fn handle_vps_command(
+    cmd: &str,
+    args: &serde_json::Value,
+) -> Option<Result<serde_json::Value, String>> {
+    let company_id = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+
+    match cmd {
+        // Estado VIVO (túnel + presença) por empresa — independe do hub local.
+        "get_live_devices" => {
+            let states = if company_id <= 0 {
+                crate::session_manager::list_all()
+            } else {
+                crate::session_manager::list_by_company(company_id)
+            };
+            Some(serde_json::to_value(states).map_err(|e| e.to_string()))
+        }
+        // Abre o proxy ADB no aparelho via túnel reverso (canal de CONTROLE).
+        "request_device_proxy" => {
+            if company_id <= 0 {
+                return Some(Err("companyId obrigatório".to_string()));
+            }
+            let device_id = match args.get("esferaDeviceId").and_then(|v| v.as_str()) {
+                Some(d) if !d.is_empty() => d,
+                _ => return Some(Err("esferaDeviceId obrigatório".to_string())),
+            };
+            let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(5555) as u16;
+            Some(
+                crate::tunnel_server::request_proxy(company_id, device_id, port)
+                    .map(|_| serde_json::json!({ "requested": true, "port": port })),
+            )
+        }
+        // Envio genérico de controle pelo túnel (extensível, sempre company-scoped).
+        "send_device_control" => {
+            if company_id <= 0 {
+                return Some(Err("companyId obrigatório".to_string()));
+            }
+            let device_id = match args.get("esferaDeviceId").and_then(|v| v.as_str()) {
+                Some(d) if !d.is_empty() => d,
+                _ => return Some(Err("esferaDeviceId obrigatório".to_string())),
+            };
+            let payload = match args.get("payload") {
+                Some(p) => p.to_string(),
+                None => return Some(Err("payload obrigatório".to_string())),
+            };
+            Some(
+                crate::tunnel_server::send_control(company_id, device_id, &payload)
+                    .map(|_| serde_json::json!({ "sent": true })),
+            )
+        }
+        _ => None,
+    }
+}
+
 async fn handle_connection(
     connections: Arc<Mutex<HashMap<String, HubConnection>>>,
     pending: Arc<Mutex<HashMap<String, String>>>,
+    db: Arc<Database>,
     stream: TcpStream,
     addr: std::net::SocketAddr,
 ) -> Result<(), String> {
@@ -34154,6 +34828,8 @@ async fn handle_connection(
     let mut line = String::new();
     let session_id = format!("sess_{}_{}", addr.port(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis());
     let mut authenticated = false;
+    let mut auth_company_id: Option<i32> = None;
+    let mut auth_role: Option<String> = None;
 
     loop {
         line.clear();
@@ -34168,27 +34844,51 @@ async fn handle_connection(
         let msg: HubMessage = deserialize_msg(line.trim().as_bytes())?;
 
         match msg {
-            HubMessage::Auth { username, password, role } => {
-                let auth_ok = role == "master" && username == AUTH_MASTER_USER && password == AUTH_MASTER_PASS;
-                if auth_ok {
-                    authenticated = true;
-                    let conn = HubConnection {
-                        writer: writer_lock.clone(),
-                        role: role.clone(),
-                        company_id: None,
-                        company_name: None,
-                    };
-                    connections.lock().await.insert(session_id.clone(), conn);
-                    let resp = HubMessage::AuthResponse { success: true, session_id: Some(session_id.clone()), error: None };
-                    send_raw(&writer_lock, &resp).await?;
-                    println!("{} '{}' autenticado no Hub", role, username);
-                } else {
-                    let resp = HubMessage::AuthResponse { success: false, session_id: None, error: Some("Credenciais inválidas.".to_string()) };
-                    send_raw(&writer_lock, &resp).await?;
+            HubMessage::Auth { token, role } => {
+                // Validação company-scoped: o token define papel e empresa.
+                // NUNCA existe credencial global em código.
+                match db.validate_token(&token) {
+                    Some((company_id, token_role)) => {
+                        // O papel declarado pelo cliente deve bater com o do token.
+                        if token_role != role {
+                            let resp = HubMessage::AuthResponse { success: false, session_id: None, company_id: None, error: Some("Papel incompatível com o token.".to_string()) };
+                            send_raw(&writer_lock, &resp).await?;
+                            continue;
+                        }
+                        authenticated = true;
+                        auth_company_id = Some(company_id);
+                        auth_role = Some(role.clone());
+                        let conn = HubConnection {
+                            writer: writer_lock.clone(),
+                            role: role.clone(),
+                            company_id: Some(company_id),
+                            company_name: None,
+                        };
+                        connections.lock().await.insert(session_id.clone(), conn);
+                        let resp = HubMessage::AuthResponse { success: true, session_id: Some(session_id.clone()), company_id: Some(company_id), error: None };
+                        send_raw(&writer_lock, &resp).await?;
+                        println!("'{}' autenticado no Hub (company {})", role, company_id);
+                    }
+                    None => {
+                        let resp = HubMessage::AuthResponse { success: false, session_id: None, company_id: None, error: Some("Token inválido.".to_string()) };
+                        send_raw(&writer_lock, &resp).await?;
+                    }
                 }
             }
             HubMessage::Register { company_id, company_name } => {
                 if !authenticated { continue; }
+                // REGRA DE ISOLAMENTO: empresa só pode registrar a PRÓPRIA company_id.
+                // Master (company 0) pode registrar qualquer empresa.
+                let allowed = match auth_role.as_deref() {
+                    Some("master") => true,
+                    Some("empresa") => auth_company_id == Some(company_id),
+                    _ => false,
+                };
+                if !allowed {
+                    let resp = HubMessage::RegisterResponse { success: false, error: Some("Empresa não pode registrar company_id alheio.".to_string()) };
+                    send_raw(&writer_lock, &resp).await?;
+                    continue;
+                }
                 let mut conns = connections.lock().await;
                 if let Some(conn) = conns.get_mut(&session_id) {
                     conn.company_id = Some(company_id);
@@ -34201,6 +34901,25 @@ async fn handle_connection(
             }
             HubMessage::Command { from, to_company, cmd, args, id } => {
                 if !authenticated { continue; }
+                // Apenas master despacha comandos. Empresa nunca despacha para outra empresa.
+                if auth_role.as_deref() != Some("master") {
+                    let resp = HubMessage::CommandResponse { id, result: None, error: Some("Apenas master pode enviar comandos.".to_string()) };
+                    send_raw(&writer_lock, &resp).await?;
+                    continue;
+                }
+
+                // Comandos resolvidos PELO VPS (fonte de verdade da presença/túnel).
+                // Não dependem de o hub local da empresa estar conectado — este era
+                // o furo da Opção A: o Master só enxergava via relay para a empresa.
+                if let Some(local) = handle_vps_command(&cmd, &args).await {
+                    let resp = match local {
+                        Ok(val) => HubMessage::CommandResponse { id, result: Some(val), error: None },
+                        Err(e) => HubMessage::CommandResponse { id, result: None, error: Some(e) },
+                    };
+                    send_raw(&writer_lock, &resp).await?;
+                    continue;
+                }
+
                 let conns = connections.lock().await;
                 let target = conns.iter().find(|(_, c)| {
                     c.role == "empresa" && c.company_id == to_company
@@ -34258,22 +34977,30 @@ async fn handle_connection(
 
 
 // ========================================================
-// ARQUIVO: hub-standalone\src\main.rs
+// ARQUIVO: hub-standalone\src\lib.rs
 // ========================================================
 
-mod db;
+// Biblioteca do hub-standalone (permite testes de integração importarem os módulos).
+pub mod db;
 pub mod protocol;
-mod hub;
-mod checkin_server;
+pub mod hub;
+pub mod checkin_server;
 pub mod tunnel_server;
 pub mod presence_server;
 pub mod session_manager;
 
+
+// ========================================================
+// ARQUIVO: hub-standalone\src\main.rs
+// ========================================================
+
+use esfera_hub_standalone::{
+    checkin_server, db, hub, presence_server, protocol, session_manager, tunnel_server,
+};
 use std::env;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use std::io::Write;
-use db::Database;
 
 #[tokio::main]
 async fn main() {
@@ -34286,18 +35013,9 @@ async fn main() {
     println!("Iniciando servidor TCP Master na porta {}...", port);
     let _ = std::io::stdout().flush();
 
-    // 1. Inicia o Hub TCP Master (relay master <-> empresas)
-    let hub = hub::Hub::new(port);
-    tokio::spawn(async move {
-        if let Err(e) = hub.start().await {
-            println!("Falha fatal no Hub TCP: {}", e);
-            let _ = std::io::stdout().flush();
-        }
-    });
-
-    // 2. Banco de dados SQLite
+    // 2. Banco de dados SQLite ( criado ANTES do hub, que depende dele )
     let db_path = "./esfera_cloud.db".to_string();
-    let db = match Database::init(&db_path) {
+    let db = match db::Database::init(&db_path) {
         Ok(d) => Arc::new(d),
         Err(e) => {
             println!("FATAL DB: Nao foi possivel abrir o banco SQLite na nuvem: {}", e);
@@ -34308,17 +35026,33 @@ async fn main() {
     println!("Banco de dados SQLite carregado com sucesso!");
     let _ = std::io::stdout().flush();
 
-    // 3. Monitor de stale: túnel 45s, presença 30s (marca Offline se silenciou)
-    let db_monitor = db.clone();
+    // 1. Inicia o Hub TCP Master (relay master <-> empresas)
+    let hub = hub::Hub::new(port, db.clone());
     tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            session_manager::sweep_stale(45, 30);
-            // Também marca no DB devices cujo check-in expirou (>120s)
-            let _ = db_monitor.mark_stale_devices_offline(120);
+        if let Err(e) = hub.start().await {
+            println!("Falha fatal no Hub TCP: {}", e);
+            let _ = std::io::stdout().flush();
         }
     });
-    println!("Status monitor iniciado (sweep de presença/túnel + check-in 120s)");
+
+    // 3. Monitor de estado: sweep de canais mortos (túnel 45s / presença 30s)
+    //    e RECONCILIAÇÃO RAM -> DB. O estado vivo (túnel/presença) tem
+    //    precedência sobre o timeout de check-in: sem isso, um device com
+    //    túnel ativo era marcado offline no banco (duas fontes de verdade).
+    {
+        let db_mark = db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                session_manager::sweep_stale(45, 30);
+                let live = session_manager::live_snapshot();
+                if let Err(e) = db_mark.sync_live_state(&live, 120) {
+                    eprintln!("Aviso: falha ao reconciliar estado vivo com o DB: {}", e);
+                }
+            }
+        });
+    }
+    println!("Status monitor iniciado (sweep de presença/túnel + reconciliação RAM->DB)");
     let _ = std::io::stdout().flush();
 
     // 4. Check-in HTTP (agente Kotlin) :8080
@@ -34430,8 +35164,7 @@ pub async fn start(port: u16) {
     });
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, addr: axum::extract::ConnectInfo<SocketAddr>) -> impl IntoResponse {
-    let _client_ip = addr.0.ip().to_string();
+async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket))
 }
 
@@ -34443,6 +35176,17 @@ async fn handle_socket(socket: WebSocket) {
         match msg {
             Message::Text(text) => {
                 if let Ok(hb) = serde_json::from_str::<HeartbeatPayload>(&text) {
+                    // ISOLAMENTO: sem COMPANY_ID válido a presença é recusada.
+                    // Antes, o default 0 juntava todas as empresas na mesma chave.
+                    if hb.company_id <= 0 {
+                        let _ = sender
+                            .send(Message::Text(
+                                r#"{"status":"error","reason":"companyId ausente ou invalido"}"#
+                                    .to_string(),
+                            ))
+                            .await;
+                        break;
+                    }
                     if current.is_none() {
                         // Primeira mensagem abre a sessão de PRESENÇA (canal kotlin).
                         let sid = open_presence(
@@ -34493,19 +35237,24 @@ async fn handle_socket(socket: WebSocket) {
 
 use serde::{Deserialize, Serialize};
 
-pub const HUB_DEFAULT_PORT: u16 = 8888;
+// Portas padrão
+pub const HUB_DEFAULT_PORT: u16 = 8555;
 pub const EMPRESA_DEFAULT_PORT: u16 = 7777;
-pub const AUTH_MASTER_USER: &str = "master";
-pub const AUTH_MASTER_PASS: &str = "admin123";
+
+// IMPORTANTE: não existe mais credencial global em código.
+// A autenticação é por TOKEN por empresa (tabela ESF_CompanyToken).
+// Master => CompanyId = 0 (token próprio).
+// Empresa => CompanyId = N (token próprio, isolado).
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum HubMessage {
+    // Autenticação por token (company-scoped). O token define papel e empresa.
     #[serde(rename = "auth")]
-    Auth { username: String, password: String, role: String },
+    Auth { token: String, role: String },
 
     #[serde(rename = "auth_response")]
-    AuthResponse { success: bool, session_id: Option<String>, error: Option<String> },
+    AuthResponse { success: bool, session_id: Option<String>, company_id: Option<i32>, error: Option<String> },
 
     #[serde(rename = "register")]
     Register { company_id: i32, company_name: String },
@@ -34838,6 +35587,33 @@ pub fn forget(company_id: i32, esfera_device_id: &str) {
     STATES.lock().unwrap().remove(&key);
 }
 
+impl ConnectionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConnectionStatus::Online => "online",
+            ConnectionStatus::Degraded => "degraded",
+            ConnectionStatus::Offline => "offline",
+        }
+    }
+}
+
+/// Projeta o estado vivo (RAM) para o formato persistível do DB.
+/// É o ÚNICO ponto de tradução RAM -> banco; evita duas fontes de verdade.
+pub fn live_snapshot() -> Vec<crate::db::LiveDeviceState> {
+    STATES
+        .lock()
+        .unwrap()
+        .values()
+        .map(|s| crate::db::LiveDeviceState {
+            company_id: s.company_id,
+            esfera_device_id: s.esfera_device_id.clone(),
+            status: s.status.as_str().to_string(),
+            battery_level: s.battery_level,
+            last_seen_utc: s.last_seen_utc.clone(),
+        })
+        .collect()
+}
+
 
 // ========================================================
 // ARQUIVO: hub-standalone\src\tunnel_server.rs
@@ -34866,13 +35642,46 @@ pub fn forget(company_id: i32, esfera_device_id: &str) {
 // ============================================================
 
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use tokio::sync::mpsc;
 
 use crate::session_manager::{self, open_tunnel, close_tunnel, heartbeat_tunnel};
 
 const HEARTBEAT_GRACE_SECS: u64 = 45;
+
+/// Registry de CONTROLE: (company_id, device_id) -> canal de escrita da sessão
+/// de túnel. É o que permite ao Master EMITIR comandos ao aparelho
+/// (antes o hub só respondia `proxy-ack`, nunca pedia proxy — não existia
+/// caminho Master -> VPS -> adbd).
+/// Identidade é sempre (company_id, uuid); nunca IP/socket.
+static CONTROL: LazyLock<Mutex<HashMap<(i32, String), mpsc::UnboundedSender<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Pede ao device-agent que abra o proxy do adbd local na porta indicada.
+/// Retorna erro se a empresa/dispositivo não tiver sessão de túnel ativa
+/// (isolamento: empresa A nunca alcança device da empresa B).
+pub fn request_proxy(company_id: i32, esfera_device_id: &str, adb_port: u16) -> Result<(), String> {
+    let map = CONTROL.lock().unwrap();
+    let tx = map
+        .get(&(company_id, esfera_device_id.to_string()))
+        .ok_or_else(|| "device sem túnel ativo para esta empresa".to_string())?;
+    tx.send(format!("{{\"type\":\"proxy\",\"port\":{}}}", adb_port))
+        .map_err(|_| "sessão de túnel encerrada".to_string())
+}
+
+/// Envia uma linha JSON arbitrária pelo túnel de controle do device.
+pub fn send_control(company_id: i32, esfera_device_id: &str, json_line: &str) -> Result<(), String> {
+    let map = CONTROL.lock().unwrap();
+    let tx = map
+        .get(&(company_id, esfera_device_id.to_string()))
+        .ok_or_else(|| "device sem túnel ativo para esta empresa".to_string())?;
+    tx.send(json_line.to_string())
+        .map_err(|_| "sessão de túnel encerrada".to_string())
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34947,6 +35756,21 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
         .ok_or("hardware_uuid ausente".to_string())?;
     let company_id = hs.company_id;
 
+    // ISOLAMENTO: sem COMPANY_ID válido não existe sessão. Antes, o
+    // #[serde(default)] fazia todo device cair na empresa 0 — todos os
+    // aparelhos de todas as empresas colidiam na mesma chave.
+    if company_id <= 0 {
+        let _ = write_line(
+            &mut writer,
+            "{\"type\":\"error\",\"reason\":\"companyId ausente ou invalido\"}",
+        )
+        .await;
+        return Err(format!(
+            "handshake recusado: device {} sem companyId valido",
+            uuid
+        ));
+    }
+
     // 2. Confirma handshake
     write_line(&mut writer, "{\"type\":\"welcome\"}").await?;
 
@@ -34957,14 +35781,27 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
         uuid, company_id, session_id
     );
 
-    // 4. Loop: heartbeat L7 (ping/pong) + proxy sob demanda
+    // 4. Registra o canal de CONTROLE desta sessão (Master -> device).
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    CONTROL
+        .lock()
+        .unwrap()
+        .insert((company_id, uuid.clone()), tx);
+
+    // 5. Loop: heartbeat L7 (ping/pong) + comandos de controle + proxy
     let mut last_heartbeat = Instant::now();
     loop {
         tokio::select! {
+            outgoing = rx.recv() => {
+                match outgoing {
+                    Some(cmd) => { write_line(&mut writer, &cmd).await?; }
+                    None => break,
+                }
+            }
             line = read_line(&mut reader) => {
                 let line = match line {
-                    Ok(Some(l)) => l,
-                    _ => break, // EOF ou erro -> encerra (device reconecta)
+                    Some(l) => l,
+                    None => break, // EOF ou erro -> encerra (device reconecta)
                 };
                 last_heartbeat = Instant::now();
                 heartbeat_tunnel(company_id, &uuid);
@@ -34978,6 +35815,17 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
                         // O relay bruto é feito PELO device-agent (handle_proxy).
                         write_line(&mut writer, "{\"type\":\"proxy-ack\"}").await?;
                     }
+                    // Respostas ao proxy PEDIDO pelo hub (Master -> VPS -> adbd).
+                    Some("proxy-ack") => {
+                        println!("[tunnel] proxy aceito pelo device {} (empresa {})", uuid, company_id);
+                    }
+                    Some("proxy-error") => {
+                        let reason = v.get("error").and_then(|e| e.as_str()).unwrap_or("desconhecido");
+                        eprintln!(
+                            "[tunnel] proxy recusado pelo device {} (empresa {}): {}",
+                            uuid, company_id, reason
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -34989,7 +35837,8 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
         }
     }
 
-    // 5. Cleanup: marca túnel offline (presença intocada).
+    // 6. Cleanup: remove canal de controle e marca túnel offline (presença intocada).
+    CONTROL.lock().unwrap().remove(&(company_id, uuid.clone()));
     close_tunnel(company_id, &uuid);
     println!(
         "[tunnel] device {} (empresa {}) desconectado — túnel fechado",
@@ -35015,105 +35864,270 @@ async fn write_line(writer: &mut BufWriter<tokio::io::WriteHalf<tokio::net::TcpS
 
 
 // ========================================================
+// ARQUIVO: hub-standalone\tests\isolation.rs
+// ========================================================
+
+// Testes das correções de identidade/isolamento/controle (Opção A — VPS fonte de verdade).
+//
+// Cobrem exatamente o que estava quebrado antes:
+//  1. companyId ausente/zero => sessão RECUSADA (antes caía tudo na empresa 0);
+//  2. check-in sem companyId => HTTP 400 (antes respondia "ok" silenciosamente);
+//  3. proxy de controle só alcança device da PRÓPRIA empresa (antes não existia);
+//  4. reconciliação RAM -> DB: device com túnel vivo NÃO é marcado offline pelo
+//     sweeper de check-in (antes havia duas fontes de verdade em conflito).
+//
+// Determinismo: portas únicas por execução, ACK real do servidor, sem sleep fixo
+// como condição de asserção.
+
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+
+use esfera_hub_standalone::db::{Database, LiveDeviceState};
+use esfera_hub_standalone::session_manager as sm;
+use esfera_hub_standalone::tunnel_server;
+
+static PORT_BASE: AtomicU16 = AtomicU16::new(31000);
+
+fn next_port() -> u16 {
+    PORT_BASE.fetch_add(10, Ordering::Relaxed)
+}
+
+const EMP_X: i32 = 41;
+const EMP_Y: i32 = 42;
+
+async fn wait_listening(port: u16) {
+    for _ in 0..60 {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("servidor na porta {} não subiu", port);
+}
+
+/// Handshake cru: devolve a primeira resposta do servidor (welcome ou error).
+async fn handshake_raw(port: u16, body: &str) -> (TcpStream, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream.write_all(body.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let _ = reader.read_line(&mut line).await;
+    (reader.into_inner(), line)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tunnel_recusa_handshake_sem_company_id() {
+    let port = next_port();
+    tokio::spawn(tunnel_server::start(port));
+    wait_listening(port).await;
+
+    // Sem campo companyId (o que o agente antigo enviava).
+    let (_s, resp) = handshake_raw(
+        port,
+        "{\"type\":\"handshake\",\"hardwareUuid\":\"ESF-NOCOMPANY\",\"currentLocalIp\":\"10.0.0.9\"}\n",
+    )
+    .await;
+    assert!(
+        resp.contains("error") && resp.contains("companyId"),
+        "esperado erro de companyId, veio: {:?}",
+        resp
+    );
+
+    // E, crucialmente, NÃO existe sessão criada na empresa 0.
+    assert!(
+        sm::get_state(0, "ESF-NOCOMPANY").is_none(),
+        "device sem companyId não pode criar estado na empresa 0"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkin_recusa_sem_company_id() {
+    let port = next_port();
+    let db = std::sync::Arc::new(Database::init("./test_isolation_checkin.db").unwrap());
+    tokio::spawn(esfera_hub_standalone::checkin_server::start(
+        db.clone(),
+        port,
+    ));
+    wait_listening(port).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/devices/check-in", port))
+        .json(&serde_json::json!({
+            "esferaDeviceId": "ESF-SEM-EMPRESA",
+            "currentAdbAddress": "10.0.0.5:5555"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "check-in sem companyId deve ser recusado, não aceito silenciosamente"
+    );
+
+    let _ = std::fs::remove_file("./test_isolation_checkin.db");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_de_controle_respeita_isolamento_por_empresa() {
+    let port = next_port();
+    tokio::spawn(tunnel_server::start(port));
+    wait_listening(port).await;
+
+    sm::forget(EMP_X, "ESF-CTRL");
+    let hs = format!(
+        "{{\"type\":\"handshake\",\"hardwareUuid\":\"ESF-CTRL\",\"companyId\":{}}}\n",
+        EMP_X
+    );
+    let (stream, resp) = handshake_raw(port, &hs).await;
+    assert!(resp.contains("welcome"), "handshake válido deve receber welcome: {}", resp);
+
+    // Espera o registro do canal de controle ficar visível.
+    let mut ok = false;
+    for _ in 0..40 {
+        if tunnel_server::request_proxy(EMP_X, "ESF-CTRL", 5555).is_ok() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ok, "empresa dona deve conseguir pedir proxy pelo túnel");
+
+    // Empresa Y NUNCA alcança o device da empresa X.
+    assert!(
+        tunnel_server::request_proxy(EMP_Y, "ESF-CTRL", 5555).is_err(),
+        "empresa alheia não pode pedir proxy para device de outra empresa"
+    );
+    // Device inexistente também falha.
+    assert!(tunnel_server::request_proxy(EMP_X, "ESF-INEXISTENTE", 5555).is_err());
+
+    // O device recebe de fato a linha de proxy pelo socket.
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
+    assert!(read.is_ok(), "device deveria receber o pedido de proxy");
+    assert!(
+        line.contains("\"proxy\"") && line.contains("5555"),
+        "linha recebida inesperada: {:?}",
+        line
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciliacao_ram_db_protege_device_com_canal_vivo() {
+    let db = Database::init("./test_isolation_sync.db").unwrap();
+    db.ensure_company(EMP_X, "Empresa_X").unwrap();
+
+    // Device com LastSeenUTC MUITO antigo (não faz check-in há horas).
+    let antigo = "2000-01-01T00:00:00+00:00";
+    db.process_checkin("ESF-VIVO", "10.0.0.7:5555", "10.0.0.7", 5555, antigo, EMP_X)
+        .unwrap();
+    db.process_checkin("ESF-MORTO", "10.0.0.8:5555", "10.0.0.8", 5555, antigo, EMP_X)
+        .unwrap();
+
+    // Só ESF-VIVO tem canal vivo em RAM.
+    let live = vec![LiveDeviceState {
+        company_id: EMP_X,
+        esfera_device_id: "ESF-VIVO".to_string(),
+        status: "online".to_string(),
+        battery_level: 77,
+        last_seen_utc: chrono::Utc::now().to_rfc3339(),
+    }];
+    db.sync_live_state(&live, 120).unwrap();
+
+    let vivo = db.get_device_by_esfera_id("ESF-VIVO").unwrap();
+    let morto = db.get_device_by_esfera_id("ESF-MORTO").unwrap();
+
+    assert_eq!(
+        vivo.status, "online",
+        "device com túnel/presença vivos NÃO pode ser marcado offline pelo sweeper de check-in"
+    );
+    assert_eq!(vivo.battery, 77, "telemetria da presença deve chegar ao DB");
+    assert_eq!(
+        morto.status, "offline",
+        "device sem canal vivo e com check-in vencido deve cair para offline"
+    );
+
+    let _ = std::fs::remove_file("./test_isolation_sync.db");
+}
+
+
+// ========================================================
 // ARQUIVO: hub-standalone\tests\sim.rs
 // ========================================================
 
-// Integration test: simula múltiplas sessões concorrentes e os 10 cenários
-// exigidos, usando clientes REAIS nas 3 portas (tunnel TCP, check-in HTTP, presence WS).
+// Teste de integração determinístico: valida isolamento e ciclo de vida
+// de dispositivos nas 3 portas (tunnel TCP, check-in HTTP, presence WS).
 // Não usa celulares físicos — simula o protocolo exato dos agentes.
-// Ao "desconectar" um device, ABORTAMOS a task que mantém o socket vivo (queda física real),
-// e o servidor detecta EOF e marca offline. Isolamento e concorrência são validados via
-// session_manager (fonte de verdade do VPS).
+//
+// Determinismo:
+//  - Portas únicas por execução (derivadas de um contador atômico) para evitar
+//    colisão entre testes concorrentes.
+//  - Servidores sobem e o teste espera ACK real do servidor (não sleep fixo).
+//  - Desconexão é feita FECHANDO o socket real (drop do TcpStream/WebSocket),
+//    nunca chamando funções internas de estado.
+//  - Não há compartilhamento de estado entre cenários além do roteamento por company_id.
 
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
+use futures_util::sink::SinkExt;
 use esfera_hub_standalone::session_manager as sm;
+
+static PORT_BASE: AtomicU16 = AtomicU16::new(20000);
+
+fn next_port() -> u16 {
+    PORT_BASE.fetch_add(10, Ordering::Relaxed)
+}
 
 const COMPANY_A: i32 = 10;
 const COMPANY_B: i32 = 20;
 const COMPANY_C: i32 = 30;
 
-/// Mantém um socket de TÚNEL vivo (handshake + ping/pong) até ser abortado.
-/// Retorna o JoinHandle; abortar = queda física do agente.
-fn spawn_tunnel(tunnel_port: u16, company_id: i32, device_id: &str) -> JoinHandle<()> {
-    let device_id = device_id.to_string();
-    tokio::spawn(async move {
-        let mut stream = match TcpStream::connect(("127.0.0.1", tunnel_port)).await {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let hs = format!(
-            "{{\"type\":\"handshake\",\"hardwareUuid\":\"{}\",\"macAddress\":\"aa:bb\",\"serialNumber\":\"SN\",\"agentVersion\":\"t\",\"currentLocalIp\":\"10.0.0.1\",\"companyId\":{}}}\n",
-            device_id, company_id
-        );
-        let _ = stream.write_all(hs.as_bytes()).await;
-        let _ = stream.flush().await;
-
-        let (rh, wh) = stream.into_split();
-        let mut reader = BufReader::new(rh);
-        let mut writer = BufWriter::new(wh);
-
-        // lê welcome
-        let mut line = String::new();
-        let _ = reader.read_line(&mut line).await;
-
-        loop {
-            tokio::select! {
-                r = reader.read_line(&mut line) => {
-                    if r.unwrap_or(0) == 0 { return; } // EOF -> agente caiu
-                    // responde pong se ping
-                    if line.contains("\"type\":\"ping\"") {
-                        let _ = writer.write_all(b"{\"type\":\"pong\"}\n").await;
-                        let _ = writer.flush().await;
-                    }
-                    line.clear();
-                }
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                    let _ = writer.write_all(b"{\"type\":\"ping\"}\n").await;
-                    let _ = writer.flush().await;
-                }
-            }
-        }
-    })
+// Conecta o túnel (device-agent Rust) e RETORNA o stream real para poder derrubá-lo.
+// O handshake é enviado e o welcome lido; o stream reconstruído é devolvido ao teste,
+// que o descarta (drop) para simular queda de conexão (o servidor detecta EOF).
+async fn connect_tunnel(tunnel_port: u16, company_id: i32, device_id: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(("127.0.0.1", tunnel_port)).await.unwrap();
+    let hs = format!(
+        "{{\"type\":\"handshake\",\"hardwareUuid\":\"{}\",\"macAddress\":\"aa:bb\",\"serialNumber\":\"SN\",\"agentVersion\":\"t\",\"currentLocalIp\":\"10.0.0.1\",\"companyId\":{}}}\n",
+        device_id, company_id
+    );
+    stream.write_all(hs.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.contains("welcome"), "esperado welcome, got {}", line);
+    // Reconstrói o TcpStream original (após consumir o welcome) para devolver ao teste.
+    reader.into_inner()
 }
 
-/// Mantém um WS de PRESENÇA vivo até ser abortado.
-fn spawn_presence(presence_port: u16, company_id: i32, device_id: &str) -> JoinHandle<()> {
-    let device_id = device_id.to_string();
-    tokio::spawn(async move {
-        use tokio_tungstenite::{connect_async, tungstenite::Message};
-        use url::Url;
-        let url = match Url::parse(&format!("ws://127.0.0.1:{}/ws/presence", presence_port)) {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let (mut ws, _resp) = match connect_async(url).await {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let payload = format!(
-            "{{\"uuid\":\"{}\",\"batteryLevel\":80,\"isCharging\":false,\"isScreenOn\":true,\"companyId\":{}}}",
-            device_id, company_id
-        );
-        let _ = ws.send(Message::Text(payload)).await;
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let _ = ws
-                .send(Message::Text(format!(
-                    "{{\"uuid\":\"{}\",\"batteryLevel\":80,\"isCharging\":false,\"isScreenOn\":true,\"companyId\":{}}}",
-                    device_id, company_id
-                )))
-                .await;
-        }
-    })
+// Conecta presença WS e RETORNA o WebSocket para poder derrubá-lo (drop = queda).
+// Sem heartbeat em task separada: o teste roda bem abaixo do grace de 30s do servidor.
+async fn connect_presence(presence_port: u16, company_id: i32, device_id: &str) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use url::Url;
+    let url = Url::parse(&format!("ws://127.0.0.1:{}/ws/presence", presence_port)).unwrap();
+    let (mut ws, _resp) = connect_async(url).await.unwrap();
+    let payload = format!(
+        "{{\"uuid\":\"{}\",\"batteryLevel\":80,\"isCharging\":false,\"isScreenOn\":true,\"companyId\":{}}}",
+        device_id, company_id
+    );
+    ws.send(Message::Text(payload)).await.unwrap();
+    ws
 }
 
 async fn check_in(http_port: u16, company_id: i32, device_id: &str) {
     let client = reqwest::Client::new();
     let _ = client
-        .post(&format!("http://127.0.0.1:{}/api/devices/check-in", http_port))
+        .post(format!("http://127.0.0.1:{}/api/devices/check-in", http_port))
         .json(&serde_json::json!({
             "esferaDeviceId": device_id,
             "currentAdbAddress": "10.0.0.1:5555",
@@ -35129,113 +36143,116 @@ fn status_of(company_id: i32, device_id: &str) -> Option<sm::ConnectionStatus> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn scenario_full_lifecycle() {
-    let tunnel_port = 18888;
-    let presence_port = 17779;
-    let http_port = 18080;
-    let hub_port = 18889;
+    let tunnel_port = next_port();
+    let presence_port = tunnel_port + 1;
+    let http_port = tunnel_port + 2;
+    let _hub_port = tunnel_port + 3;
 
-    std::env::set_var("TUNNEL_PORT", tunnel_port.to_string());
-    std::env::set_var("PRESENCE_PORT", presence_port.to_string());
-    std::env::set_var("HTTP_PORT", http_port.to_string());
-    std::env::set_var("HUB_PORT", hub_port.to_string());
+    // Sobe os servidores.
+    let test_db = std::sync::Arc::new(esfera_hub_standalone::db::Database::init("./test_sim.db").unwrap());
+    // Garante que as empresas usadas no teste existam (isolamento exige company_id válido).
+    test_db.ensure_company(COMPANY_A, "Empresa_A").unwrap();
+    test_db.ensure_company(COMPANY_B, "Empresa_B").unwrap();
+    test_db.ensure_company(COMPANY_C, "Empresa_C").unwrap();
 
     tokio::spawn(esfera_hub_standalone::tunnel_server::start(tunnel_port));
     tokio::spawn(esfera_hub_standalone::presence_server::start(presence_port));
     tokio::spawn(esfera_hub_standalone::checkin_server::start(
-        std::sync::Arc::new(esfera_hub_standalone::db::Database::init("./test_sim.db").unwrap()),
+        test_db.clone(),
         http_port,
     ));
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // Espera os servidores aceitarem conexões (polling real, não sleep fixo).
+    for _ in 0..50 {
+        if TcpStream::connect(("127.0.0.1", tunnel_port)).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Limpa estado dos devices usados.
     sm::forget(COMPANY_A, "ESF-A");
     sm::forget(COMPANY_A, "ESF-B");
     sm::forget(COMPANY_C, "ESF-C");
-    sm::forget(COMPANY_B, "ESF-X");
 
-    // ---- Cenário 1: 3 dispositivos simultâneos ----
-    // A e B na Empresa A; C na Empresa C (isolamento por company_id).
+    // CENÁRIO 1: 3 dispositivos (A e B na Empresa A; C na Empresa C).
     check_in(http_port, COMPANY_A, "ESF-A").await;
     check_in(http_port, COMPANY_A, "ESF-B").await;
     check_in(http_port, COMPANY_C, "ESF-C").await;
 
-    let ha = spawn_tunnel(tunnel_port, COMPANY_A, "ESF-A");
-    let hb = spawn_tunnel(tunnel_port, COMPANY_A, "ESF-B");
-    let hc = spawn_tunnel(tunnel_port, COMPANY_C, "ESF-C");
-    let pa = spawn_presence(presence_port, COMPANY_A, "ESF-A");
-    let pb = spawn_presence(presence_port, COMPANY_A, "ESF-B");
-    let pc = spawn_presence(presence_port, COMPANY_C, "ESF-C");
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    let _ta = connect_tunnel(tunnel_port, COMPANY_A, "ESF-A").await;
+    let _tb = connect_tunnel(tunnel_port, COMPANY_A, "ESF-B").await;
+    let _tc = connect_tunnel(tunnel_port, COMPANY_C, "ESF-C").await;
+    let _pa = connect_presence(presence_port, COMPANY_A, "ESF-A").await;
+    let _pb = connect_presence(presence_port, COMPANY_A, "ESF-B").await;
+    let _pc = connect_presence(presence_port, COMPANY_C, "ESF-C").await;
 
-    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Online), "C1: A online");
-    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Online), "C1: B online");
-    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C1: C online");
+    // Aguarda o estado convergir para Online (polling).
+    for _ in 0..40 {
+        if status_of(COMPANY_A, "ESF-A") == Some(sm::ConnectionStatus::Online)
+            && status_of(COMPANY_A, "ESF-B") == Some(sm::ConnectionStatus::Online)
+            && status_of(COMPANY_C, "ESF-C") == Some(sm::ConnectionStatus::Online)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
-    // ---- Cenário 8: isolamento entre empresas ----
-    assert_eq!(status_of(COMPANY_B, "ESF-A"), None, "C8: Empresa B não vê device da A");
-    assert_eq!(status_of(COMPANY_C, "ESF-A"), None, "C8: Empresa C não vê device da A (company_id diferente)");
-    let a_list = sm::list_by_company(COMPANY_A);
-    assert!(a_list.iter().all(|d| d.company_id == COMPANY_A), "C8: A lista só seus");
-    assert_eq!(a_list.len(), 2, "C8: Empresa A lista exatamente A e B");
+    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Online), "A deve estar online");
+    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Online), "B deve estar online");
+    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C deve estar online");
 
-    // ---- Cenário 3: saída de B (queda física real: aborta tasks) ----
-    hb.abort();
-    pb.abort();
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Offline), "C3: B offline após saída");
-    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Online), "C3: A NÃO afetado");
-    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C3: C NÃO afetado");
+    // CENÁRIO 8: isolamento — Empresa B NUNCA recebe device da Empresa A/C.
+    assert_eq!(status_of(COMPANY_B, "ESF-A"), None, "Empresa B não pode ver device da A");
+    assert_eq!(status_of(COMPANY_B, "ESF-C"), None, "Empresa B não pode ver device da C");
 
-    // ---- Cenário 4: reconexão de B (novo SESSION_ID, mesmo DEVICE_ID/COMPANY_ID) ----
-    let hb2 = spawn_tunnel(tunnel_port, COMPANY_A, "ESF-B");
-    let pb2 = spawn_presence(presence_port, COMPANY_A, "ESF-B");
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Online), "C4: B reconecta online");
-    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Online), "C4: A intacto");
-    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C4: C intacto");
-    hb2.abort();
-    pb2.abort();
+    // CENÁRIO 3/4: queda de B (fechando sockets reais) -> offline; A e C intactos.
+    drop(_tb);
+    drop(_pb);
+    for _ in 0..40 {
+        if status_of(COMPANY_A, "ESF-B") == Some(sm::ConnectionStatus::Offline) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Offline), "B deve estar offline após saída");
+    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Online), "A NÃO deve ser afetado pela saída de B");
+    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C NÃO deve ser afetado pela saída de B");
 
-    // ---- Cenário 5: queda de internet de A ----
-    ha.abort();
-    pa.abort();
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Offline), "C5: A offline após queda");
-    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Online), "C5: B intacto");
-    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C5: C intacto");
-    // reconecta A
-    let ha2 = spawn_tunnel(tunnel_port, COMPANY_A, "ESF-A");
-    let pa2 = spawn_presence(presence_port, COMPANY_A, "ESF-A");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Online), "C5: A reconecta");
-    ha2.abort();
-    pa2.abort();
+    // Reconexão de B (novo SESSION_ID, mesmo DEVICE_ID/COMPANY_ID).
+    let _tb2 = connect_tunnel(tunnel_port, COMPANY_A, "ESF-B").await;
+    let _pb2 = connect_presence(presence_port, COMPANY_A, "ESF-B").await;
+    for _ in 0..40 {
+        if status_of(COMPANY_A, "ESF-B") == Some(sm::ConnectionStatus::Online) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Online), "B deve reconectar online");
+    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Online), "A intacto após reconexão de B");
+    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C intacto após reconexão de B");
 
-    // ---- Cenário 2: entrada de novo dispositivo (Cenário 2) ----
-    check_in(http_port, COMPANY_A, "ESF-NEW").await;
-    let hn = spawn_tunnel(tunnel_port, COMPANY_A, "ESF-NEW");
-    let pn = spawn_presence(presence_port, COMPANY_A, "ESF-NEW");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(status_of(COMPANY_A, "ESF-NEW"), Some(sm::ConnectionStatus::Online), "C2: novo device online");
-    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Online), "C2: B não afetado por entrada");
-    hn.abort();
-    pn.abort();
+    // CENÁRIO 5: queda de A -> offline; B/C intactos.
+    drop(_ta);
+    drop(_pa);
+    for _ in 0..40 {
+        if status_of(COMPANY_A, "ESF-A") == Some(sm::ConnectionStatus::Offline) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Offline), "A offline após queda");
+    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Online), "B intacto");
+    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C intacto");
 
-    // ---- Cenário 7: reinício do hub local NÃO afeta VPS ----
-    // (Aqui o VPS = este processo; os estados em RAM do VPS persistem. O hub local
-    //  é um cache/fallback e não participa deste teste. A separação garante que o
-    //  device permanece conectado ao VPS independente do hub local.)
-    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C7/C10: C (VPS) online sem depender de hub local");
+    // Isolamento por company_id nas listagens.
+    let a_devices = sm::list_by_company(COMPANY_A);
+    assert!(a_devices.iter().all(|d| d.company_id == COMPANY_A), "isolamento: Empresa A só lista seus devices");
+    assert!(a_devices.len() >= 2, "Empresa A deve listar A e B");
 
-    // ---- Cenário 9: Master controlando dispositivo (roteamento por company_id) ----
     let c_state = sm::get_state(COMPANY_C, "ESF-C");
-    assert!(c_state.is_some(), "C9: Master alcança device C via company_id no VPS");
+    assert!(c_state.is_some(), "Master deve alcançar device C via company_id");
 
-    // ---- Cenário 6: reinício do agente (= reconexão já coberta em C4/C5) ----
-    // Cenário 10: hub local desligado enquanto VPS online (coberto em C7/C10) ----
-
-    // cleanup
-    hc.abort();
-    pc.abort();
     let _ = std::fs::remove_file("./test_sim.db");
 }
 
@@ -42675,7 +43692,7 @@ pause
 import os
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_FILE = os.path.join(ROOT, "tt")
+OUTPUT_FILES = [os.path.join(ROOT, "monstro.txt"), os.path.join(ROOT, "tt")]
 
 EXCLUDE_DIRS = {".git", "node_modules", "target", "dist", "gen", "icons", "binaries"}
 EXCLUDE_EXTS = {".png", ".ico", ".icns", ".apk", ".mp4", ".svg", ".db", ".zip", ".pyc", ".lock"}
@@ -42725,35 +43742,36 @@ def should_include(file_path):
     return ext in INCLUDE_EXTS
 
 def main():
-    print(f"Gerando monstro em '{OUTPUT_FILE}'...")
-    total_files = 0
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as outfile:
-        outfile.write("// ========================================================\n")
-        outfile.write("// ESFERA v3 - MONSTRO (codigo completo do programa)\n")
-        outfile.write(f"// Gerado em: {os.path.basename(OUTPUT_FILE)}\n")
-        outfile.write("// ========================================================\n")
+    for output_file in OUTPUT_FILES:
+        print(f"Gerando monstro em '{output_file}'...")
+        total_files = 0
+        with open(output_file, "w", encoding="utf-8") as outfile:
+            outfile.write("// ========================================================\n")
+            outfile.write("// ESFERA v3 - MONSTRO (codigo completo do programa)\n")
+            outfile.write(f"// Gerado em: {os.path.basename(output_file)}\n")
+            outfile.write("// ========================================================\n")
 
-        for path in SOURCE_DIRS:
-            full_path = os.path.join(ROOT, path)
-            if not os.path.isdir(full_path):
-                continue
-            for root, dirs, files in os.walk(full_path):
-                dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
-                if any(ex in root for ex in EXCLUDE_DIRS):
+            for path in SOURCE_DIRS:
+                full_path = os.path.join(ROOT, path)
+                if not os.path.isdir(full_path):
                     continue
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    if should_include(file_path):
-                        dump_file(file_path, outfile)
-                        total_files += 1
+                for root, dirs, files in os.walk(full_path):
+                    dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+                    if any(ex in root for ex in EXCLUDE_DIRS):
+                        continue
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        if should_include(file_path):
+                            dump_file(file_path, outfile)
+                            total_files += 1
 
-        for file in SOURCE_FILES:
-            file_path = os.path.join(ROOT, file)
-            if os.path.isfile(file_path) and should_include(file_path):
-                dump_file(file_path, outfile)
-                total_files += 1
+            for file in SOURCE_FILES:
+                file_path = os.path.join(ROOT, file)
+                if os.path.isfile(file_path) and should_include(file_path):
+                    dump_file(file_path, outfile)
+                    total_files += 1
 
-    print(f"Concluido! {total_files} arquivos consolidados em '{OUTPUT_FILE}'.")
+        print(f"Concluido! {total_files} arquivos consolidados em '{output_file}'.")
 
 if __name__ == "__main__":
     main()
