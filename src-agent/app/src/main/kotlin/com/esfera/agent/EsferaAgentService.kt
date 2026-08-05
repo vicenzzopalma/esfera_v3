@@ -113,7 +113,10 @@ class EsferaAgentService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // Agenda o job persistente de auto-start (sobrevive a reboot, sem root).
+        BootJobService.schedule(this)
         createNotificationChannel()
+        val notification = buildNotification()
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         registerNetworkCallback()
