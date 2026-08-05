@@ -1585,9 +1585,21 @@ pub async fn provision_device(
     serial: String,
     server_url: Option<String>,
 ) -> Result<String, String> {
+    // A empresa vem da SESSÃO (token), nunca do cliente: assim ninguém provisiona
+    // um aparelho para dentro de outra empresa.
+    let session = validate_session(&state.sessions, &_token)?;
+    let company_id = match session.company_id {
+        Some(cid) if cid > 0 => cid,
+        _ => {
+            return Err(
+                "Provisionamento exige um usuário vinculado a uma empresa.".to_string()
+            )
+        }
+    };
+
     let cloned_serial = serial.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        AdbManager::provision_device(&serial, server_url.as_deref())
+        AdbManager::provision_device(&serial, server_url.as_deref(), company_id)
     }).await.map_err(|e| e.to_string())??;
 
     let db = &state.db;
@@ -1611,8 +1623,19 @@ pub async fn provision_all_devices(
     _token: String,
     server_url: Option<String>,
 ) -> Result<Vec<String>, String> {
+    // Empresa vem da sessão, nunca do cliente (mesma regra do provision_device).
+    let session = validate_session(&state.sessions, &_token)?;
+    let company_id = match session.company_id {
+        Some(cid) if cid > 0 => cid,
+        _ => {
+            return Err(
+                "Provisionamento exige um usuário vinculado a uma empresa.".to_string()
+            )
+        }
+    };
+
     let result = tauri::async_runtime::spawn_blocking(move || {
-        AdbManager::provision_all_devices(server_url.as_deref())
+        AdbManager::provision_all_devices(server_url.as_deref(), company_id)
     }).await.map_err(|e| e.to_string())?;
 
     let db = &state.db;

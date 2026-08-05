@@ -35,7 +35,14 @@ pub async fn start(db: Arc<Database>, port: u16) {
 async fn handle_checkin(
     State((db, _port)): State<(Arc<Database>, u16)>,
     Json(payload): Json<CheckInPayload>,
-) -> &'static str {
+) -> (axum::http::StatusCode, &'static str) {
+    use axum::http::StatusCode;
+
+    // ISOLAMENTO: check-in sem COMPANY_ID válido é recusado explicitamente.
+    if payload.company_id <= 0 {
+        return (StatusCode::BAD_REQUEST, "companyId ausente ou invalido");
+    }
+
     let now = Utc::now().to_rfc3339();
     let adb_address = &payload.current_adb_address;
 
@@ -56,21 +63,24 @@ async fn handle_checkin(
 
     match updated {
         Ok(0) => {
-            let _ = db.insert_unknown_device(
+            if let Err(e) = db.insert_unknown_device(
                 &payload.esfera_device_id,
                 adb_address,
                 &ip,
                 port,
                 &now,
                 payload.company_id,
-            );
+            ) {
+                eprintln!("Check-in insert error: {}", e);
+                return (StatusCode::FORBIDDEN, "empresa invalida");
+            }
         }
         Ok(_) => {}
         Err(e) => {
             eprintln!("Check-in DB error: {}", e);
-            return "erro";
+            return (StatusCode::FORBIDDEN, "empresa invalida");
         }
     }
 
-    "ok"
+    (StatusCode::OK, "ok")
 }

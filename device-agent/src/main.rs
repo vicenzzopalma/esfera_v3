@@ -26,6 +26,9 @@ struct AgentConfig {
     server: String,
     port: u16,
     hardware_uuid: String,
+    /// Identidade de isolamento (COMPANY_ID). Sem ela o hub recusa a sessão:
+    /// nunca derivamos empresa de IP/porta/ordem de conexão.
+    company_id: i32,
 }
 
 fn read_prop(prop: &str) -> String {
@@ -84,6 +87,7 @@ fn load_config() -> AgentConfig {
         server: read_prop("persist.esfera.hub"),
         port: DEFAULT_TUNNEL_PORT,
         hardware_uuid: fallback_uuid(),
+        company_id: read_prop("persist.esfera.company").parse().unwrap_or(0),
     };
     if cfg.server.is_empty() {
         cfg.server = "127.0.0.1".to_string();
@@ -103,6 +107,16 @@ fn load_config() -> AgentConfig {
                     cfg.hardware_uuid = u.to_string();
                 }
             }
+            // companyId: aceita número ou string numérica no config.json.
+            if let Some(c) = v.get("companyId") {
+                if let Some(n) = c.as_i64() {
+                    cfg.company_id = n as i32;
+                } else if let Some(s) = c.as_str() {
+                    if let Ok(n) = s.parse::<i32>() {
+                        cfg.company_id = n;
+                    }
+                }
+            }
         }
     }
     cfg
@@ -116,6 +130,7 @@ fn udp_handshake(cfg: &AgentConfig) {
     let _ = socket.set_broadcast(true);
     let payload = json!({
         "hardwareUuid": cfg.hardware_uuid,
+        "companyId": cfg.company_id,
         "ip": wlan_ip().unwrap_or_default(),
         "port": ADB_PORT,
     });
@@ -229,6 +244,7 @@ fn run_session(cfg: &AgentConfig) -> Result<(), String> {
     let handshake = json!({
         "type": "handshake",
         "hardwareUuid": cfg.hardware_uuid,
+        "companyId": cfg.company_id,
         "macAddress": mac_address().unwrap_or_default(),
         "serialNumber": read_prop("ro.serialno"),
         "agentVersion": env!("CARGO_PKG_VERSION"),

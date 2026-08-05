@@ -342,3 +342,88 @@ Testes físicos com múltiplos dispositivos:
 NÃO CONFIRMADOS
 
 Não declarar o problema como resolvido até os testes passarem.
+
+---
+
+# 16. ATUALIZAÇÃO — CORREÇÕES APLICADAS (auditoria code-vs-code)
+
+As seções 3, 4 e 7 acima estão DESATUALIZADAS. Estado verificado no código:
+
+## 16.1 JÁ ESTAVA FEITO (antes desta rodada)
+
+- `hub-standalone/src/main.rs:56-88` sobe os TRÊS canais no VPS:
+  :8080 check-in, :8888 tunnel, :7779 presence (env HTTP_PORT/TUNNEL_PORT/PRESENCE_PORT).
+- `hub-standalone/src/session_manager.rs` implementa o item 8 (identidade):
+  chave (COMPANY_ID, DEVICE_ID), SESSION_ID novo por reconexão, canais
+  exclusivos túnel(rust)/presença(kotlin), status Online/Degraded/Offline.
+
+## 16.2 CORRIGIDO AGORA
+
+1. COMPANY_ID ponta-a-ponta (o isolamento do item 9 era ilusório: todos os
+   agentes omitiam companyId e caíam na empresa 0):
+   - `device-agent/src/main.rs`: `AgentConfig.company_id`, lido de
+     `persist.esfera.company` ou `companyId` em `/data/adb/earlypoint/config.json`;
+     enviado no handshake TCP e no handshake UDP.
+   - `src-agent/.../EsferaAgentService.kt`: `EsferaConfig.companyId`,
+     propagado para `CheckInRequest`, `TunnelHandshake` e `PresenceClient`.
+   - `src-agent/.../PresenceClient.kt`: `companyId` no `HeartbeatPayload`.
+   - Servidores agora RECUSAM sessão sem companyId válido:
+     `tunnel_server.rs` (erro + close), `presence_server.rs` (erro + close),
+     `checkin_server.rs` (HTTP 400; antes respondia "ok" silenciosamente).
+
+2. Fonte de verdade única RAM -> DB (havia DUAS em conflito: o sweeper de
+   check-in marcava offline device com túnel vivo):
+   - `session_manager::live_snapshot()` projeta o estado vivo;
+   - `db::sync_live_state()` persiste status/bateria e faz o stale sweep
+     PROTEGENDO quem tem canal vivo;
+   - `main.rs` substituiu `mark_stale_devices_offline` por essa reconciliação.
+
+3. Canal de CONTROLE real (item 5/6). Antes o hub só respondia `proxy-ack`,
+   nunca PEDIA proxy — não existia caminho Master -> VPS -> adbd:
+   - `tunnel_server.rs`: registry CONTROL (company_id, device_id) -> canal de
+     escrita da sessão; `request_proxy()` e `send_control()`.
+   - `hub.rs::handle_vps_command`: comandos resolvidos PELO VPS, sem depender
+     do hub local — `get_live_devices`, `request_device_proxy`,
+     `send_device_control`. Todos exigem companyId e são company-scoped.
+
+4. `EmpresaServer` deixou de ser somente leitura (item 7.5):
+   `src-tauri/src/empresa_server.rs` ganhou `device_tap`, `device_keyevent`,
+   `device_type_text`, `device_capture_screen`. O alvo é resolvido por
+   (companyId, esferaDeviceId) e o serial vem do DB — o cliente nunca envia
+   serial/IP, então não alcança aparelho de outra empresa.
+
+5. Provisionamento grava a empresa no aparelho (sem isso os agentes novos
+   seriam corretamente RECUSADOS pelo VPS):
+   - `adb_manager::inject_server_config(..., company_id)` faz
+     `setprop persist.esfera.company`, `setprop persist.esfera.hub <host>` e
+     grava `companyId` em `/sdcard/esfera_config.json`;
+   - `provision_device` / `provision_all_devices` exigem company_id > 0;
+   - nos comandos Tauri o company_id vem da SESSÃO (token), nunca do cliente,
+     para ninguém provisionar aparelho para dentro de outra empresa.
+
+## 16.3 VERIFICAÇÃO EXECUTADA
+
+- `cargo check` hub-standalone: 0 erros.
+- `cargo check` src-tauri: 0 erros.
+- `cargo check` device-agent: 0 erros.
+- `cargo test --test sim`: 1/1 (ciclo de vida A/B/C + isolamento).
+- `cargo test --test isolation`: 4/4 (NOVO) — handshake sem companyId recusado,
+  check-in sem companyId = HTTP 400, proxy respeita isolamento por empresa,
+  reconciliação RAM->DB protege device com canal vivo.
+- `npm run build`: OK.
+- `gradle assembleRelease` (Kotlin): BUILD SUCCESSFUL; APK assinado e
+  `apksigner verify` OK em `public/Esfera_Agent_ADB.apk`.
+
+## 16.4 AINDA EM ABERTO
+
+- Testes FÍSICOS com celulares reais (itens 10 e 11): NÃO EXECUTADOS.
+  Os testes acima são de protocolo/integração, não substituem hardware.
+- Provisionamento do companyId nos aparelhos: RESOLVIDO no fluxo de
+  `provision_device` (ver 16.2 item 5). Aparelhos JÁ provisionados antes desta
+  mudança precisam ser reprovisionados (ou receber os setprops manualmente),
+  senão serão recusados pelo VPS.
+- `device-agent` ainda cai para `127.0.0.1` quando `persist.esfera.hub` está
+  vazio; o provisionamento agora grava essa prop, mas aparelhos antigos não a têm.
+- `src-tauri/src/{tunnel,presence,session_manager}.rs` (hub LOCAL) continuam
+  no modelo antigo de identidade por UUID puro, sem company_id. É fallback,
+  mas diverge do VPS — alinhar quando o hub local virar cache/proxy de fato.

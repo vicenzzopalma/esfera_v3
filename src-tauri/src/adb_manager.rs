@@ -2316,19 +2316,28 @@ impl AdbManager {
         }
     }
 
-    /// Injeta a URL do servidor Esfera no dispositivo Android
+    /// Injeta a URL do servidor Esfera no dispositivo Android.
+    ///
+    /// `company_id` é OBRIGATÓRIO no fluxo novo: sem ele o VPS recusa
+    /// check-in/túnel/presença (isolamento por empresa). É gravado tanto na
+    /// prop `persist.esfera.company` (lida pelo device-agent Rust) quanto no
+    /// `/sdcard/esfera_config.json` (lido pelo EsferaAgentService Kotlin).
     pub fn inject_server_config(
         serial: &str,
         server_url: &str,
         device_id: &str,
+        company_id: i32,
     ) -> Result<String, String> {
         let config_json = format!(
-            "{{\\\"serverUrl\\\":\\\"{}\\\",\\\"deviceId\\\":\\\"{}\\\",\\\"heartbeatIntervalSec\\\":30}}",
-            server_url, device_id
+            "{{\\\"serverUrl\\\":\\\"{}\\\",\\\"deviceId\\\":\\\"{}\\\",\\\"companyId\\\":{},\\\"heartbeatIntervalSec\\\":30}}",
+            server_url, device_id, company_id
         );
         let batch_cmd = format!(
-            "setprop persist.esfera.server_address {}; echo '{}' > /sdcard/esfera_config.json",
-            server_url, config_json
+            "setprop persist.esfera.server_address {}; setprop persist.esfera.hub {}; setprop persist.esfera.company {}; echo '{}' > /sdcard/esfera_config.json",
+            server_url,
+            Self::host_of(server_url),
+            company_id,
+            config_json
         );
 
         let mut cmd = create_cmd("adb");
@@ -2336,11 +2345,26 @@ impl AdbManager {
 
         match run_cmd_timeout(cmd, Duration::from_secs(8)) {
             Ok(_) => Ok(format!(
-                "Configuração do servidor '{}' injetada",
-                server_url
+                "Configuração do servidor '{}' (empresa {}) injetada",
+                server_url, company_id
             )),
             Err(e) => Err(format!("Falha ao injetar config: {}", e)),
         }
+    }
+
+    /// Extrai só o host de uma URL (o device-agent Rust espera host puro em
+    /// `persist.esfera.hub`, não uma URL completa).
+    fn host_of(server_url: &str) -> String {
+        server_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .unwrap_or(server_url)
+            .split(':')
+            .next()
+            .unwrap_or(server_url)
+            .to_string()
     }
 
     /// Inicia o serviço do Agent Android via ADB
@@ -2510,7 +2534,18 @@ impl AdbManager {
 
     /// Provisiona um dispositivo: gera UUID, injeta ID + config + imunidade, instala APK, inicia serviço
     /// server_url é opcional: se omitido, deriva automaticamente da config + IP local
-    pub fn provision_device(serial: &str, server_url: Option<&str>) -> Result<String, String> {
+    /// company_id é obrigatório: sem ele o aparelho é recusado pelo VPS (isolamento).
+    pub fn provision_device(
+        serial: &str,
+        server_url: Option<&str>,
+        company_id: i32,
+    ) -> Result<String, String> {
+        if company_id <= 0 {
+            return Err(
+                "Provisionamento exige uma empresa válida (companyId). Faça login em uma empresa."
+                    .to_string(),
+            );
+        }
         let target_serial = Self::resolve_target_serial(serial)?;
 
         let uuid = Uuid::new_v4().to_string();
@@ -2523,7 +2558,7 @@ impl AdbManager {
         };
 
         Self::inject_persistent_device_id(&target_serial, &device_id)?;
-        Self::inject_server_config(&target_serial, &url, &device_id)?;
+        Self::inject_server_config(&target_serial, &url, &device_id, company_id)?;
         Self::inject_device_immunity(&target_serial, Some(&device_id))?;
 
         let is_usb = !target_serial.contains(':');
@@ -2562,13 +2597,17 @@ impl AdbManager {
         }
     }
 
-    /// Provisiona nativamente todos os dispositivos Android online conectados no ADB
-    pub fn provision_all_devices(server_url: Option<&str>) -> Vec<Result<String, String>> {
+    /// Provisiona nativamente todos os dispositivos Android online conectados no ADB.
+    /// company_id é propagado para cada aparelho (isolamento por empresa).
+    pub fn provision_all_devices(
+        server_url: Option<&str>,
+        company_id: i32,
+    ) -> Vec<Result<String, String>> {
         let active = Self::list_devices().unwrap_or_default();
         let mut results = Vec::new();
         for dev in active {
             if dev.state == "device" {
-                let res = Self::provision_device(&dev.serial, server_url);
+                let res = Self::provision_device(&dev.serial, server_url, company_id);
                 results.push(res);
             }
         }

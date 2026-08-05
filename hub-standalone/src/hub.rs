@@ -65,6 +65,64 @@ async fn send_raw(
     w.flush().await.map_err(|e| e.to_string())
 }
 
+/// Comandos que o VPS resolve SOZINHO, sem relay para o hub local da empresa.
+/// Retorna None quando o comando não é do VPS (segue o fluxo de relay normal).
+///
+/// Isolamento: todo comando exige `companyId` explícito e só enxerga o estado
+/// daquela empresa (session_manager::list_by_company). Nunca há listagem global
+/// para um consumidor de empresa.
+async fn handle_vps_command(
+    cmd: &str,
+    args: &serde_json::Value,
+) -> Option<Result<serde_json::Value, String>> {
+    let company_id = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+
+    match cmd {
+        // Estado VIVO (túnel + presença) por empresa — independe do hub local.
+        "get_live_devices" => {
+            if company_id <= 0 {
+                return Some(Err("companyId obrigatório".to_string()));
+            }
+            let states = crate::session_manager::list_by_company(company_id);
+            Some(serde_json::to_value(states).map_err(|e| e.to_string()))
+        }
+        // Abre o proxy ADB no aparelho via túnel reverso (canal de CONTROLE).
+        "request_device_proxy" => {
+            if company_id <= 0 {
+                return Some(Err("companyId obrigatório".to_string()));
+            }
+            let device_id = match args.get("esferaDeviceId").and_then(|v| v.as_str()) {
+                Some(d) if !d.is_empty() => d,
+                _ => return Some(Err("esferaDeviceId obrigatório".to_string())),
+            };
+            let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(5555) as u16;
+            Some(
+                crate::tunnel_server::request_proxy(company_id, device_id, port)
+                    .map(|_| serde_json::json!({ "requested": true, "port": port })),
+            )
+        }
+        // Envio genérico de controle pelo túnel (extensível, sempre company-scoped).
+        "send_device_control" => {
+            if company_id <= 0 {
+                return Some(Err("companyId obrigatório".to_string()));
+            }
+            let device_id = match args.get("esferaDeviceId").and_then(|v| v.as_str()) {
+                Some(d) if !d.is_empty() => d,
+                _ => return Some(Err("esferaDeviceId obrigatório".to_string())),
+            };
+            let payload = match args.get("payload") {
+                Some(p) => p.to_string(),
+                None => return Some(Err("payload obrigatório".to_string())),
+            };
+            Some(
+                crate::tunnel_server::send_control(company_id, device_id, &payload)
+                    .map(|_| serde_json::json!({ "sent": true })),
+            )
+        }
+        _ => None,
+    }
+}
+
 async fn handle_connection(
     connections: Arc<Mutex<HashMap<String, HubConnection>>>,
     pending: Arc<Mutex<HashMap<String, String>>>,
@@ -158,6 +216,19 @@ async fn handle_connection(
                     send_raw(&writer_lock, &resp).await?;
                     continue;
                 }
+
+                // Comandos resolvidos PELO VPS (fonte de verdade da presença/túnel).
+                // Não dependem de o hub local da empresa estar conectado — este era
+                // o furo da Opção A: o Master só enxergava via relay para a empresa.
+                if let Some(local) = handle_vps_command(&cmd, &args).await {
+                    let resp = match local {
+                        Ok(val) => HubMessage::CommandResponse { id, result: Some(val), error: None },
+                        Err(e) => HubMessage::CommandResponse { id, result: None, error: Some(e) },
+                    };
+                    send_raw(&writer_lock, &resp).await?;
+                    continue;
+                }
+
                 let conns = connections.lock().await;
                 let target = conns.iter().find(|(_, c)| {
                     c.role == "empresa" && c.company_id == to_company
