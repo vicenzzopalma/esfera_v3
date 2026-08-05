@@ -19972,7 +19972,11 @@ pub fn create_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
+        // CREATE_NO_WINDOW (0x08000000) é exclusivo para ferramentas CLI sem janela (adb.exe).
+        // O scrcpy é uma aplicação gráfica (SDL2) e DEVE ser iniciado sem essa flag!
+        if name != "scrcpy" {
+            cmd.creation_flags(0x08000000);
+        }
     }
     if name == "adb" || name == "scrcpy" {
         if let Some(dir) = bundled_tools_dir() {
@@ -24063,23 +24067,31 @@ pub fn get_hpc_capabilities(_token: String) -> crate::adb_manager::EsferaHardwar
 }
 
 #[tauri::command]
-pub fn run_adb_diagnostic(_token: String) -> crate::adb_manager::EsferaAdbDiagnosticResult {
-    AdbManager::run_diagnostic()
+pub async fn run_adb_diagnostic(_token: String) -> Result<crate::adb_manager::EsferaAdbDiagnosticResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(AdbManager::run_diagnostic())
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn restart_adb_server(_token: String) -> Result<String, String> {
-    AdbManager::restart_server()
+pub async fn restart_adb_server(_token: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::restart_server()
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn scan_adb_subnet(_token: String, subnet_prefix: String) -> Vec<String> {
-    AdbManager::scan_subnet(&subnet_prefix)
+pub async fn scan_adb_subnet(_token: String, subnet_prefix: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(AdbManager::scan_subnet(&subnet_prefix))
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn deploy_adb_keepalive(_token: String, serial: String) -> Result<String, String> {
-    AdbManager::deploy_keepalive(&serial)
+pub async fn deploy_adb_keepalive(_token: String, serial: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::deploy_keepalive(&serial)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -24204,7 +24216,7 @@ pub fn get_hardware_uuid(_token: String) -> String {
 }
 
 #[tauri::command]
-pub fn connect_adb_device(
+pub async fn connect_adb_device(
     state: State<'_, AppState>,
     token: String,
     ip: String,
@@ -24216,55 +24228,57 @@ pub fn connect_adb_device(
 ) -> Result<String, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
-    // Se o usuário digitou/colou "192.168.1.82:9093", extrai o IP e a Porta automaticamente!
-    let (target_ip, target_port) = if ip.contains(':') {
-        let parts: Vec<&str> = ip.split(':').collect();
-        let parsed_port = parts.get(1).and_then(|p| p.trim().parse::<i32>().ok()).unwrap_or(if port <= 0 { 5555 } else { port });
-        (parts[0].trim().to_string(), parsed_port)
-    } else {
-        (ip.trim().to_string(), if port <= 0 { 5555 } else { port })
-    };
+    let state_db = state.db.clone();
 
-    let result = AdbManager::connect_device(&target_ip, target_port)?;
-    let db = &state.db;
-    let serial = format!("{}:{}", target_ip, target_port);
-    let (brand, model) = AdbManager::get_device_info(&serial);
-    let final_name = device_name
-        .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { target_ip.clone() });
-    let dev = Device {
-        id: 0,
-        serial: serial.clone(),
-        name: final_name,
-        brand,
-        model,
-        ip: target_ip,
-        port: target_port,
-        status: "online".to_string(),
-        battery: 90,
-        company_id,
-        device_number,
-        sector,
-        esfera_device_id: None,
-        current_adb_address: None,
-        last_seen_utc: None,
-        via_tunnel: false,
-    };
-    db.upsert_device(&dev)?;
-    let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
-    let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
-    let _ = AdbManager::deploy_keepalive(&serial);
-    db.queue_add_log(
-        company_id,
-        "info",
-        "ADB Engine",
-        &format!("Dispositivo {} conectado via wireless na porta {}.", serial, target_port),
-    );
-    Ok(result)
+    tauri::async_runtime::spawn_blocking(move || {
+        let (target_ip, target_port) = if ip.contains(':') {
+            let parts: Vec<&str> = ip.split(':').collect();
+            let parsed_port = parts.get(1).and_then(|p| p.trim().parse::<i32>().ok()).unwrap_or(if port <= 0 { 5555 } else { port });
+            (parts[0].trim().to_string(), parsed_port)
+        } else {
+            (ip.trim().to_string(), if port <= 0 { 5555 } else { port })
+        };
+
+        let result = AdbManager::connect_device(&target_ip, target_port)?;
+        let serial = format!("{}:{}", target_ip, target_port);
+        let (brand, model) = AdbManager::get_device_info(&serial);
+        let final_name = device_name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { target_ip.clone() });
+        let dev = Device {
+            id: 0,
+            serial: serial.clone(),
+            name: final_name,
+            brand,
+            model,
+            ip: target_ip,
+            port: target_port,
+            status: "online".to_string(),
+            battery: 90,
+            company_id,
+            device_number,
+            sector,
+            esfera_device_id: None,
+            current_adb_address: None,
+            last_seen_utc: None,
+            via_tunnel: false,
+        };
+        state_db.upsert_device(&dev)?;
+        let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
+        let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
+        let _ = AdbManager::deploy_keepalive(&serial);
+        state_db.queue_add_log(
+            company_id,
+            "info",
+            "ADB Engine",
+            &format!("Dispositivo {} conectado via wireless na porta {}.", serial, target_port),
+        );
+        Ok(result)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn pair_and_connect_adb_device(
+pub async fn pair_and_connect_adb_device(
     state: State<'_, AppState>,
     token: String,
     ip: String,
@@ -24278,48 +24292,50 @@ pub fn pair_and_connect_adb_device(
 ) -> Result<String, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
-    let db = &state.db;
-    let clean_ip = ip.split(':').next().unwrap_or(&ip).trim().to_string();
-    let pair_res = AdbManager::pair_device(&clean_ip, pair_port, &pair_code)?;
+    let state_db = state.db.clone();
 
-    let conn_port = if connect_port == 0 { 5555 } else { connect_port };
-    let connect_res = AdbManager::connect_device(&clean_ip, conn_port as i32)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let clean_ip = ip.split(':').next().unwrap_or(&ip).trim().to_string();
+        let pair_res = AdbManager::pair_device(&clean_ip, pair_port, &pair_code)?;
 
-    let wireless_serial = format!("{}:{}", clean_ip, conn_port);
-    let _ = crate::adb_manager::create_cmd("adb")
-        .args(["-s", &wireless_serial, "shell", "setprop", "persist.adb.tcp.port", "5555"])
-        .output();
-    let _ = AdbManager::deploy_keepalive(&wireless_serial);
-    let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
-    let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
+        let conn_port = if connect_port == 0 { 5555 } else { connect_port };
+        let connect_res = AdbManager::connect_device(&clean_ip, conn_port as i32)?;
 
-    let db = &state.db;
-    let (brand, model) = AdbManager::get_device_info(&wireless_serial);
-    let final_name = device_name
-        .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { clean_ip.clone() });
+        let wireless_serial = format!("{}:{}", clean_ip, conn_port);
+        let _ = crate::adb_manager::create_cmd("adb")
+            .args(["-s", &wireless_serial, "shell", "setprop", "persist.adb.tcp.port", "5555"])
+            .output();
+        let _ = AdbManager::deploy_keepalive(&wireless_serial);
+        let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
+        let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
 
-    let device = Device {
-        id: 0,
-        serial: wireless_serial,
-        name: final_name,
-        brand,
-        model,
-        ip: clean_ip,
-        port: conn_port as i32,
-        status: "online".to_string(),
-        battery: 100,
-        company_id,
-        device_number,
-        sector,
-        esfera_device_id: None,
-        current_adb_address: None,
-        last_seen_utc: None,
-        via_tunnel: false,
-    };
-    db.upsert_device(&device)?;
+        let (brand, model) = AdbManager::get_device_info(&wireless_serial);
+        let final_name = device_name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { clean_ip.clone() });
 
-    Ok(format!("🔥 Celular Pareado e Conectado com Sucesso! {} ({})", pair_res, connect_res))
+        let device = Device {
+            id: 0,
+            serial: wireless_serial,
+            name: final_name,
+            brand,
+            model,
+            ip: clean_ip,
+            port: conn_port as i32,
+            status: "online".to_string(),
+            battery: 100,
+            company_id,
+            device_number,
+            sector,
+            esfera_device_id: None,
+            current_adb_address: None,
+            last_seen_utc: None,
+            via_tunnel: false,
+        };
+        state_db.upsert_device(&device)?;
+
+        Ok(format!("Celular Pareado e Conectado com Sucesso! {} ({})", pair_res, connect_res))
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -24542,18 +24558,24 @@ pub fn clear_logs(state: State<'_, AppState>, token: String, company_id: i32) ->
 // ============================================================
 
 #[tauri::command]
-pub fn capture_device_screen(_token: String, serial: String) -> Result<String, String> {
-    AdbManager::capture_screen(&serial)
+pub async fn capture_device_screen(_token: String, serial: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::capture_screen(&serial)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn send_adb_tap(_token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
-    AdbManager::tap_screen(&serial, x, y)
+pub async fn send_adb_tap(_token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::tap_screen(&serial, x, y)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn send_adb_keyevent(_token: String, serial: String, keycode: u32) -> Result<(), String> {
-    AdbManager::send_keyevent(&serial, keycode)
+pub async fn send_adb_keyevent(_token: String, serial: String, keycode: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::send_keyevent(&serial, keycode)
+    }).await.map_err(|e| e.to_string())?
 }
 
 // ============================================================
@@ -25003,7 +25025,7 @@ pub fn inject_single_device_immunity(_token: String, serial: String) -> Result<S
 }
 
 #[tauri::command]
-pub fn force_enable_wireless_adb(
+pub async fn force_enable_wireless_adb(
     state: State<'_, AppState>,
     token: String,
     serial: String,
@@ -25014,58 +25036,61 @@ pub fn force_enable_wireless_adb(
 ) -> Result<String, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
-    let ip = AdbManager::get_device_wifi_ip(&serial).map_err(|e| {
-        format!("{} Certifique-se de que o celular está conectado na mesma rede Wi-Fi que o computador.", e)
-    })?;
+    let state_db = state.db.clone();
 
-    // 1. Gera e Injeta a ID permanente no Kernel do Celular (ex: ESFERA_DEV_001)
-    let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
-    let _ = AdbManager::inject_persistent_device_id(&serial, &persistent_id);
+    tauri::async_runtime::spawn_blocking(move || {
+        let ip = AdbManager::get_device_wifi_ip(&serial).map_err(|e| {
+            format!("{} Certifique-se de que o celular está conectado na mesma rede Wi-Fi que o computador.", e)
+        })?;
 
-    let _ = crate::adb_manager::create_cmd("adb")
-        .args(["-s", &serial, "shell", "setprop", "persist.adb.tcp.port", "5555"])
-        .output();
-    AdbManager::enable_tcpip(&serial, 5555)?;
-    std::thread::sleep(std::time::Duration::from_millis(300));
+        // 1. Gera e Injeta a ID permanente no Kernel do Celular (ex: ESFERA_DEV_001)
+        let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
+        let _ = AdbManager::inject_persistent_device_id(&serial, &persistent_id);
 
-    let connect_res = AdbManager::connect_device(&ip, 5555)?;
-    let (brand, model) = AdbManager::get_device_info(&serial);
-    let wireless_serial = format!("{}:5555", ip);
+        let _ = crate::adb_manager::create_cmd("adb")
+            .args(["-s", &serial, "shell", "setprop", "persist.adb.tcp.port", "5555"])
+            .output();
+        AdbManager::enable_tcpip(&serial, 5555)?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
 
-    // 2. Injeta Imunidade + MAC Físico + Kernel ID na conexão Wi-Fi
-    let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
-    let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
-    let _ = AdbManager::deploy_keepalive(&wireless_serial);
+        let connect_res = AdbManager::connect_device(&ip, 5555)?;
+        let (brand, model) = AdbManager::get_device_info(&serial);
+        let wireless_serial = format!("{}:5555", ip);
 
-    let db = &state.db;
-    let final_name = device_name
-        .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { ip.clone() });
+        // 2. Injeta Imunidade + MAC Físico + Kernel ID na conexão Wi-Fi
+        let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
+        let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
+        let _ = AdbManager::deploy_keepalive(&wireless_serial);
 
-    let device = Device {
-        id: 0,
-        serial: wireless_serial,
-        name: final_name,
-        brand,
-        model,
-        ip: ip.clone(),
-        port: 5555,
-        status: "online".to_string(),
-        battery: 100,
-        company_id,
-        device_number,
-        sector,
-        esfera_device_id: None,
-        current_adb_address: None,
-        last_seen_utc: None,
-        via_tunnel: false,
-    };
-    db.upsert_device(&device)?;
+        let final_name = device_name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { ip.clone() });
 
-    Ok(format!(
-        " Sucesso! Depuração Wi-Fi forçada e ativada no celular com IP {}! ({})",
-        ip, connect_res
-    ))
+        let device = Device {
+            id: 0,
+            serial: wireless_serial,
+            name: final_name,
+            brand,
+            model,
+            ip: ip.clone(),
+            port: 5555,
+            status: "online".to_string(),
+            battery: 100,
+            company_id,
+            device_number,
+            sector,
+            esfera_device_id: None,
+            current_adb_address: None,
+            last_seen_utc: None,
+            via_tunnel: false,
+        };
+        state_db.upsert_device(&device)?;
+
+        Ok(format!(
+            "Sucesso! Depuração Wi-Fi forçada e ativada no celular com IP {}! ({})",
+            ip, connect_res
+        ))
+    }).await.map_err(|e| e.to_string())?
 }
 
 // ============================================================
@@ -25251,69 +25276,85 @@ pub fn rewrite_message_ai(_token: String, message: String, contact_name: String)
 }
 
 #[tauri::command]
-pub fn launch_scrcpy_stream(_token: String, serial: String, turn_screen_off: Option<bool>) -> Result<String, String> {
-    let turn_off = turn_screen_off.unwrap_or(false);
-    AdbManager::launch_scrcpy(&serial, turn_off)
+pub async fn launch_scrcpy_stream(_token: String, serial: String, turn_screen_off: Option<bool>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let turn_off = turn_screen_off.unwrap_or(false);
+        AdbManager::launch_scrcpy(&serial, turn_off)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn launch_virtual_display_stream(
+pub async fn launch_virtual_display_stream(
     _token: String,
     serial: String,
     width: Option<u32>,
     height: Option<u32>,
     dpi: Option<u32>,
 ) -> Result<String, String> {
-    let w = width.unwrap_or(1080);
-    let h = height.unwrap_or(1920);
-    let d = dpi.unwrap_or(320);
-    AdbManager::launch_scrcpy_virtual_display(&serial, w, h, d)
+    tauri::async_runtime::spawn_blocking(move || {
+        let w = width.unwrap_or(1080);
+        let h = height.unwrap_or(1920);
+        let d = dpi.unwrap_or(320);
+        AdbManager::launch_scrcpy_virtual_display(&serial, w, h, d)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn send_intent_to_display(
+pub async fn send_intent_to_display(
     _token: String,
     serial: String,
     url: String,
     display_id: Option<u32>,
 ) -> Result<String, String> {
-    let disp = display_id.unwrap_or(1);
-    AdbManager::launch_intent_on_display(&serial, &url, disp)
+    tauri::async_runtime::spawn_blocking(move || {
+        let disp = display_id.unwrap_or(1);
+        AdbManager::launch_intent_on_display(&serial, &url, disp)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn launch_camera_stream(_token: String, serial: String, facing: Option<String>) -> Result<String, String> {
-    let camera_facing = facing.unwrap_or_else(|| "back".to_string());
-    AdbManager::launch_scrcpy_camera(&serial, &camera_facing)
+pub async fn launch_camera_stream(_token: String, serial: String, facing: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let camera_facing = facing.unwrap_or_else(|| "back".to_string());
+        AdbManager::launch_scrcpy_camera(&serial, &camera_facing)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn inject_virtual_camera(_token: String, serial: String, target_type: String) -> Result<String, String> {
-    AdbManager::inject_virtual_camera_feed(&serial, &target_type)
+pub async fn inject_virtual_camera(_token: String, serial: String, target_type: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::inject_virtual_camera_feed(&serial, &target_type)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn inject_virtual_camera_region(
+pub async fn inject_virtual_camera_region(
     serial: String,
     x: i32,
     y: i32,
     width: u32,
     height: u32,
 ) -> Result<String, String> {
-    AdbManager::inject_virtual_camera_region(&serial, x, y, width, height)
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::inject_virtual_camera_region(&serial, x, y, width, height)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn inject_base64_frame(
+pub async fn inject_base64_frame(
     serial: String,
     frame_data: String,
 ) -> Result<String, String> {
-    AdbManager::inject_base64_frame(&serial, &frame_data)
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::inject_base64_frame(&serial, &frame_data)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn optimize_device_hpc(_token: String, serial: String) -> Result<String, String> {
-    AdbManager::optimize_device_performance(&serial)
+pub async fn optimize_device_hpc(_token: String, serial: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::optimize_device_performance(&serial)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
