@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AgentDir = Join-Path $ProjectRoot "src-agent"
-$OutputDir = Join-Path $ProjectRoot "src-tauri" "binaries"
+$OutputDir = Join-Path (Join-Path $ProjectRoot "src-tauri") "binaries"
 
 Write-Host "=== Esfera Agent APK Build ===" -ForegroundColor Cyan
 Write-Host "Configuration: $Configuration" -ForegroundColor Cyan

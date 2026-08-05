@@ -27,3 +27,4 @@ opt-level = 1
 lto = false
 codegen-units = 16
 panic = "abort"
+rand = "0.8"
