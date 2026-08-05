@@ -9,8 +9,15 @@ WorkingDirectory=/home/vicenzzoconstantine/esfera_v3/hub-standalone
 ExecStart=/home/vicenzzoconstantine/esfera_v3/hub-standalone/target/release/esfera-hub-standalone
 Restart=always
 RestartSec=5
+# Portas dos 4 canais (180 graus de isolamento por token de empresa)
 Environment=HUB_PORT=8555
 Environment=HTTP_PORT=8080
+Environment=TUNNEL_PORT=8888
+Environment=PRESENCE_PORT=7779
+# Token master do hub (CompanyId 0). DEFINA um valor forte antes do 1o start:
+#   sudo systemctl edit esfera-hub   ->   Environment=HUB_MASTER_TOKEN=SEU_TOKEN_FORTE
+# Se ausente, o hub gera um token forte em runtime (funciona, mas voce nao sabera o valor).
+Environment=HUB_MASTER_TOKEN=
 
 [Install]
 WantedBy=multi-user.target
