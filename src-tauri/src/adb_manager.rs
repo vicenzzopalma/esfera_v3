@@ -480,7 +480,11 @@ pub fn create_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
+        // CREATE_NO_WINDOW (0x08000000) é exclusivo para ferramentas CLI sem janela (adb.exe).
+        // O scrcpy é uma aplicação gráfica (SDL2) e DEVE ser iniciado sem essa flag!
+        if name != "scrcpy" {
+            cmd.creation_flags(0x08000000);
+        }
     }
     if name == "adb" || name == "scrcpy" {
         if let Some(dir) = bundled_tools_dir() {

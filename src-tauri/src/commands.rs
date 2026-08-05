@@ -324,23 +324,31 @@ pub fn get_hpc_capabilities(_token: String) -> crate::adb_manager::EsferaHardwar
 }
 
 #[tauri::command]
-pub fn run_adb_diagnostic(_token: String) -> crate::adb_manager::EsferaAdbDiagnosticResult {
-    AdbManager::run_diagnostic()
+pub async fn run_adb_diagnostic(_token: String) -> Result<crate::adb_manager::EsferaAdbDiagnosticResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(AdbManager::run_diagnostic())
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn restart_adb_server(_token: String) -> Result<String, String> {
-    AdbManager::restart_server()
+pub async fn restart_adb_server(_token: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::restart_server()
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn scan_adb_subnet(_token: String, subnet_prefix: String) -> Vec<String> {
-    AdbManager::scan_subnet(&subnet_prefix)
+pub async fn scan_adb_subnet(_token: String, subnet_prefix: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(AdbManager::scan_subnet(&subnet_prefix))
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn deploy_adb_keepalive(_token: String, serial: String) -> Result<String, String> {
-    AdbManager::deploy_keepalive(&serial)
+pub async fn deploy_adb_keepalive(_token: String, serial: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::deploy_keepalive(&serial)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -807,18 +815,24 @@ pub fn clear_logs(state: State<'_, AppState>, token: String, company_id: i32) ->
 // ============================================================
 
 #[tauri::command]
-pub fn capture_device_screen(_token: String, serial: String) -> Result<String, String> {
-    AdbManager::capture_screen(&serial)
+pub async fn capture_device_screen(_token: String, serial: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::capture_screen(&serial)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn send_adb_tap(_token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
-    AdbManager::tap_screen(&serial, x, y)
+pub async fn send_adb_tap(_token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::tap_screen(&serial, x, y)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn send_adb_keyevent(_token: String, serial: String, keycode: u32) -> Result<(), String> {
-    AdbManager::send_keyevent(&serial, keycode)
+pub async fn send_adb_keyevent(_token: String, serial: String, keycode: u32) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::send_keyevent(&serial, keycode)
+    }).await.map_err(|e| e.to_string())?
 }
 
 // ============================================================
@@ -1519,69 +1533,85 @@ pub fn rewrite_message_ai(_token: String, message: String, contact_name: String)
 }
 
 #[tauri::command]
-pub fn launch_scrcpy_stream(_token: String, serial: String, turn_screen_off: Option<bool>) -> Result<String, String> {
-    let turn_off = turn_screen_off.unwrap_or(false);
-    AdbManager::launch_scrcpy(&serial, turn_off)
+pub async fn launch_scrcpy_stream(_token: String, serial: String, turn_screen_off: Option<bool>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let turn_off = turn_screen_off.unwrap_or(false);
+        AdbManager::launch_scrcpy(&serial, turn_off)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn launch_virtual_display_stream(
+pub async fn launch_virtual_display_stream(
     _token: String,
     serial: String,
     width: Option<u32>,
     height: Option<u32>,
     dpi: Option<u32>,
 ) -> Result<String, String> {
-    let w = width.unwrap_or(1080);
-    let h = height.unwrap_or(1920);
-    let d = dpi.unwrap_or(320);
-    AdbManager::launch_scrcpy_virtual_display(&serial, w, h, d)
+    tauri::async_runtime::spawn_blocking(move || {
+        let w = width.unwrap_or(1080);
+        let h = height.unwrap_or(1920);
+        let d = dpi.unwrap_or(320);
+        AdbManager::launch_scrcpy_virtual_display(&serial, w, h, d)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn send_intent_to_display(
+pub async fn send_intent_to_display(
     _token: String,
     serial: String,
     url: String,
     display_id: Option<u32>,
 ) -> Result<String, String> {
-    let disp = display_id.unwrap_or(1);
-    AdbManager::launch_intent_on_display(&serial, &url, disp)
+    tauri::async_runtime::spawn_blocking(move || {
+        let disp = display_id.unwrap_or(1);
+        AdbManager::launch_intent_on_display(&serial, &url, disp)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn launch_camera_stream(_token: String, serial: String, facing: Option<String>) -> Result<String, String> {
-    let camera_facing = facing.unwrap_or_else(|| "back".to_string());
-    AdbManager::launch_scrcpy_camera(&serial, &camera_facing)
+pub async fn launch_camera_stream(_token: String, serial: String, facing: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let camera_facing = facing.unwrap_or_else(|| "back".to_string());
+        AdbManager::launch_scrcpy_camera(&serial, &camera_facing)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn inject_virtual_camera(_token: String, serial: String, target_type: String) -> Result<String, String> {
-    AdbManager::inject_virtual_camera_feed(&serial, &target_type)
+pub async fn inject_virtual_camera(_token: String, serial: String, target_type: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::inject_virtual_camera_feed(&serial, &target_type)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn inject_virtual_camera_region(
+pub async fn inject_virtual_camera_region(
     serial: String,
     x: i32,
     y: i32,
     width: u32,
     height: u32,
 ) -> Result<String, String> {
-    AdbManager::inject_virtual_camera_region(&serial, x, y, width, height)
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::inject_virtual_camera_region(&serial, x, y, width, height)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn inject_base64_frame(
+pub async fn inject_base64_frame(
     serial: String,
     frame_data: String,
 ) -> Result<String, String> {
-    AdbManager::inject_base64_frame(&serial, &frame_data)
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::inject_base64_frame(&serial, &frame_data)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn optimize_device_hpc(_token: String, serial: String) -> Result<String, String> {
-    AdbManager::optimize_device_performance(&serial)
+pub async fn optimize_device_hpc(_token: String, serial: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::optimize_device_performance(&serial)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
