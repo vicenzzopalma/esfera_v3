@@ -32,27 +32,8 @@ fn validate_session(
             return Ok(session);
         }
     }
-    // Restaura ou cria sessão nativa padrão para nunca bloquear o uso local do Esfera Hub
-    let (user_id, username, role, company_id) = if token.contains("11") || token.contains("gestor") {
-        (11, "vicenzzo.mastronikolis", "gestor", Some(1))
-    } else {
-        (10, "vicenzzo.master", "master", Some(1))
-    };
-    
-    let restored_token = sess.create_session(user_id, username, role, company_id);
-    if let Some(session) = sess.validate_token(&restored_token) {
-        return Ok(session);
-    }
-
-    Ok(crate::session::UserSession {
-        token: "fallback-token".to_string(),
-        user_id: 11,
-        username: "vicenzzo.mastronikolis".to_string(),
-        role: "gestor".to_string(),
-        company_id: Some(1),
-        created_at: 0,
-        expires_at: 9999999999999,
-    })
+    // SEM fallback inseguro: token inválido/ausente NÃO vira master/gestor.
+    Err("Não autorizado: token de sessão inválido ou ausente.".to_string())
 }
 
 fn check_company_access(
@@ -1375,7 +1356,15 @@ pub fn get_user_permissions(
     token: String,
     user_id: i32,
 ) -> Result<Vec<Permission>, String> {
-    validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
+    // Isolamento: só master ou usuário da mesma empresa pode ler permissões.
+    if session.role != "master" {
+        if let Some(target_cid) = state.db.user_company_id(user_id) {
+            check_company_access(&session, target_cid)?;
+        } else {
+            return Err("Acesso Negado: usuário alvo inexistente.".to_string());
+        }
+    }
     let db = &state.db;
     Ok(db.get_user_permissions(user_id))
 }
@@ -1388,7 +1377,15 @@ pub fn update_user_permission(
     key: String,
     enabled: bool,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
+    // Isolamento: só master ou usuário da mesma empresa pode alterar permissões.
+    if session.role != "master" {
+        if let Some(target_cid) = state.db.user_company_id(user_id) {
+            check_company_access(&session, target_cid)?;
+        } else {
+            return Err("Acesso Negado: usuário alvo inexistente.".to_string());
+        }
+    }
     let db = &state.db;
     db.update_user_permission(user_id, &key, enabled)
 }
@@ -1399,7 +1396,14 @@ pub fn get_sector_permissions(
     token: String,
     user_id: i32,
 ) -> Result<Vec<SectorPermission>, String> {
-    validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" {
+        if let Some(target_cid) = state.db.user_company_id(user_id) {
+            check_company_access(&session, target_cid)?;
+        } else {
+            return Err("Acesso Negado: usuário alvo inexistente.".to_string());
+        }
+    }
     let db = &state.db;
     Ok(db.get_sector_permissions(user_id))
 }
@@ -1413,7 +1417,14 @@ pub fn update_sector_permission(
     can_view: bool,
     can_configure: bool,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" {
+        if let Some(target_cid) = state.db.user_company_id(user_id) {
+            check_company_access(&session, target_cid)?;
+        } else {
+            return Err("Acesso Negado: usuário alvo inexistente.".to_string());
+        }
+    }
     let db = &state.db;
     db.update_sector_permission(user_id, &sector, can_view, can_configure)
 }

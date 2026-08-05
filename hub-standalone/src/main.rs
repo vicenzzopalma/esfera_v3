@@ -1,16 +1,10 @@
-mod db;
-pub mod protocol;
-mod hub;
-mod checkin_server;
-pub mod tunnel_server;
-pub mod presence_server;
-pub mod session_manager;
-
+use esfera_hub_standalone::{
+    checkin_server, db, hub, presence_server, protocol, session_manager, tunnel_server,
+};
 use std::env;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use std::io::Write;
-use db::Database;
 
 #[tokio::main]
 async fn main() {
@@ -23,18 +17,9 @@ async fn main() {
     println!("Iniciando servidor TCP Master na porta {}...", port);
     let _ = std::io::stdout().flush();
 
-    // 1. Inicia o Hub TCP Master (relay master <-> empresas)
-    let hub = hub::Hub::new(port);
-    tokio::spawn(async move {
-        if let Err(e) = hub.start().await {
-            println!("Falha fatal no Hub TCP: {}", e);
-            let _ = std::io::stdout().flush();
-        }
-    });
-
-    // 2. Banco de dados SQLite
+    // 2. Banco de dados SQLite ( criado ANTES do hub, que depende dele )
     let db_path = "./esfera_cloud.db".to_string();
-    let db = match Database::init(&db_path) {
+    let db = match db::Database::init(&db_path) {
         Ok(d) => Arc::new(d),
         Err(e) => {
             println!("FATAL DB: Nao foi possivel abrir o banco SQLite na nuvem: {}", e);
@@ -45,15 +30,26 @@ async fn main() {
     println!("Banco de dados SQLite carregado com sucesso!");
     let _ = std::io::stdout().flush();
 
-    // 3. Monitor de stale: túnel 45s, presença 30s (marca Offline se silenciou)
+    // 1. Inicia o Hub TCP Master (relay master <-> empresas)
+    let hub = hub::Hub::new(port, db.clone());
     tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            session_manager::sweep_stale(45, 30);
-            // Também marca no DB devices cujo check-in expirou (>120s)
-            let _ = db.mark_stale_devices_offline(120);
+        if let Err(e) = hub.start().await {
+            println!("Falha fatal no Hub TCP: {}", e);
+            let _ = std::io::stdout().flush();
         }
     });
+
+    // 3. Monitor de stale: túnel 45s, presença 30s (marca Offline se silenciou)
+    {
+        let db_mark = db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                session_manager::sweep_stale(45, 30);
+                let _ = db_mark.mark_stale_devices_offline(120);
+            }
+        });
+    }
     println!("Status monitor iniciado (sweep de presença/túnel + check-in 120s)");
     let _ = std::io::stdout().flush();
 

@@ -62,8 +62,7 @@ pub async fn start(port: u16) {
     });
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, addr: axum::extract::ConnectInfo<SocketAddr>) -> impl IntoResponse {
-    let _client_ip = addr.0.ip().to_string();
+async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket))
 }
 

@@ -307,8 +307,13 @@ pub fn hash_password(password: &str) -> String {
     hex::encode(result)
 }
 
+/// Verifica senha APENAS via hash SHA-256 com salt.
+/// NUNCA aceita o plaintext igual ao hash (elimina o fallback inseguro).
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    password == hash || hash_password(password) == hash
+    if hash.is_empty() || password.is_empty() {
+        return false;
+    }
+    hash_password(password) == hash
 }
 
 // ============================================================
@@ -899,26 +904,19 @@ impl Database {
                 [],
             )?;
 
-            // Usuários com senhas hasheadas SHA-256
+            // Usuários seedados: SOMENTE contas do dono, com senhas não-triviais.
+            // Contas de demonstração com senhas fracas (admin/admin, gestor/gestor, colab/colab)
+            // FORAM REMOVIDAS — eram fallbacks inseguros.
             let hash_master = hash_password("root123");
             let hash_gestor = hash_password("Ope@2025");
-            let hash_admin = hash_password("admin");
-            let hash_gestor2 = hash_password("gestor");
-            let hash_colab = hash_password("colab");
 
             conn.execute(
                 "INSERT INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId) VALUES
                 (?1, ?2, 'Vicenzzo Master', 'master', NULL),
-                (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1),
-                (?5, ?6, 'Administrador', 'master', NULL),
-                (?7, ?8, 'Carlos Gestor', 'gestor', 1),
-                (?9, ?10, 'Ana Operadora', 'colaborador', 1);",
+                (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1);",
                 params![
                     "vicenzzo.master", hash_master,
                     "vicenzzo.mastronikolis", hash_gestor,
-                    "admin", hash_admin,
-                    "gestor", hash_gestor2,
-                    "colab", hash_colab,
                 ],
             )?;
 
@@ -1957,6 +1955,17 @@ impl Database {
     // ============================================================
     // PERMISSIONS
     // ============================================================
+
+    /// Retorna o CompanyId de um usuário (para checagem de isolamento de permissões).
+    pub fn user_company_id(&self, user_id: i32) -> Option<i32> {
+        self.conn()
+            .query_row(
+                "SELECT CompanyId FROM ESF_User WHERE UserId = ?1",
+                params![user_id],
+                |r| r.get(0),
+            )
+            .ok()
+    }
 
     pub fn get_user_permissions(&self, user_id: i32) -> Vec<Permission> {
         let conn = self.conn();

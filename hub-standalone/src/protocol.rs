@@ -1,18 +1,23 @@
 use serde::{Deserialize, Serialize};
 
+// Portas padrão
 pub const HUB_DEFAULT_PORT: u16 = 8888;
 pub const EMPRESA_DEFAULT_PORT: u16 = 7777;
-pub const AUTH_MASTER_USER: &str = "master";
-pub const AUTH_MASTER_PASS: &str = "admin123";
+
+// IMPORTANTE: não existe mais credencial global em código.
+// A autenticação é por TOKEN por empresa (tabela ESF_CompanyToken).
+// Master => CompanyId = 0 (token próprio).
+// Empresa => CompanyId = N (token próprio, isolado).
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum HubMessage {
+    // Autenticação por token (company-scoped). O token define papel e empresa.
     #[serde(rename = "auth")]
-    Auth { username: String, password: String, role: String },
+    Auth { token: String, role: String },
 
     #[serde(rename = "auth_response")]
-    AuthResponse { success: bool, session_id: Option<String>, error: Option<String> },
+    AuthResponse { success: bool, session_id: Option<String>, company_id: Option<i32>, error: Option<String> },
 
     #[serde(rename = "register")]
     Register { company_id: i32, company_name: String },

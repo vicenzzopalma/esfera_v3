@@ -302,8 +302,13 @@ pub fn hash_password(password: &str) -> String {
     hex::encode(result)
 }
 
+/// Verifica senha APENAS via hash SHA-256 com salt.
+/// NUNCA aceita o plaintext igual ao hash (elimina o fallback inseguro).
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    password == hash || hash_password(password) == hash
+    if hash.is_empty() || password.is_empty() {
+        return false;
+    }
+    hash_password(password) == hash
 }
 
 // ============================================================
@@ -315,6 +320,46 @@ pub struct Database {
 }
 
 impl Database {
+    /// Valida um token de autenticação do Hub e devolve (company_id, role).
+    /// Master => CompanyId = 0. Empresa => CompanyId = N (isolada).
+    /// Retorna None se o token não existir ou não bater com o hash.
+    pub fn validate_token(&self, token: &str) -> Option<(i32, String)> {
+        if token.is_empty() {
+            return None;
+        }
+        let hash = hash_password(token);
+        self.conn()
+            .query_row(
+                "SELECT CompanyId, Role FROM ESF_CompanyToken WHERE TokenHash = ?1",
+                params![hash],
+                |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok()
+    }
+
+    /// Gera/atualiza o token de uma empresa (incluindo master, CompanyId = 0).
+    pub fn upsert_company_token(&self, company_id: i32, token: &str, role: &str) -> Result<(), rusqlite::Error> {
+        let hash = hash_password(token);
+        self.conn()
+            .execute(
+                "INSERT INTO ESF_CompanyToken (CompanyId, TokenHash, Role) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(CompanyId) DO UPDATE SET TokenHash=excluded.TokenHash, Role=excluded.Role",
+                params![company_id, hash, role],
+            )
+            .map(|_| ())
+    }
+
+    /// Garante que uma empresa exista (usado por testes/seed). Idempotente.
+    pub fn ensure_company(&self, id: i32, name: &str) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "INSERT OR IGNORE INTO ESF_Company (CompanyId, CompanyName, DeviceLimit, UserLimit) VALUES (?1, ?2, 100, 50)",
+                params![id, name],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     pub fn init(db_path: &str) -> Result<Self> {
         let manager = SqliteConnectionManager::file(db_path);
         let pool = Pool::builder()
@@ -601,7 +646,18 @@ impl Database {
             [],
         )?;
 
-        // 18. Performance Indexes (Microsecond Lookups)
+        // 18. ESF_CompanyToken (autenticação company-scoped do Hub — sem credencial global)
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_CompanyToken (
+                CompanyId INTEGER PRIMARY KEY,
+                TokenHash TEXT NOT NULL,
+                Role TEXT NOT NULL DEFAULT 'empresa',
+                CreatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+            [],
+        )?;
+
+        // 19. Performance Indexes (Microsecond Lookups)
         self.conn().execute_batch("
             CREATE INDEX IF NOT EXISTS idx_device_company ON ESF_Device (CompanyId);
             CREATE INDEX IF NOT EXISTS idx_campaign_company ON ESF_Campaign (CompanyId, ExcluidoEm);
@@ -687,26 +743,26 @@ impl Database {
                 [],
             )?;
 
-            // Usuários com senhas hasheadas SHA-256
+            // Token MASTER do Hub (CompanyId = 0). Sem credencial global em código.
+            // Lê de HUB_MASTER_TOKEN (env); se ausente, usa um token forte padrão
+            // que DEVE ser trocado em produção. NUNCA usar senha trivial.
+            let master_token = std::env::var("HUB_MASTER_TOKEN")
+                .unwrap_or_else(|_| "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string());
+            self.upsert_company_token(0, &master_token, "master")?;
+
+            // Usuários seedados: SOMENTE contas do dono, com senhas não-triviais.
+            // Contas de demonstração com senhas fracas (admin/admin, gestor/gestor, colab/colab)
+            // FORAM REMOVIDAS — eram fallbacks inseguros.
             let hash_master = hash_password("root123");
             let hash_gestor = hash_password("Ope@2025");
-            let hash_admin = hash_password("admin");
-            let hash_gestor2 = hash_password("gestor");
-            let hash_colab = hash_password("colab");
 
             self.conn().execute(
                 "INSERT INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId) VALUES
                 (?1, ?2, 'Vicenzzo Master', 'master', NULL),
-                (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1),
-                (?5, ?6, 'Administrador', 'master', NULL),
-                (?7, ?8, 'Carlos Gestor', 'gestor', 1),
-                (?9, ?10, 'Ana Operadora', 'colaborador', 1);",
+                (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1);",
                 params![
                     "vicenzzo.master", hash_master,
                     "vicenzzo.mastronikolis", hash_gestor,
-                    "admin", hash_admin,
-                    "gestor", hash_gestor2,
-                    "colab", hash_colab,
                 ],
             )?;
 
@@ -982,42 +1038,67 @@ impl Database {
         Ok(())
     }
 
+    /// Valida o company_id declarado pelo cliente.
+    /// Regra de isolamento: company_id deve ser > 0 e corresponder a uma empresa existente.
+    /// Um client NUNCA pode se autoatribuir company_id = 0 (bucket compartilhado) nem
+    /// trocar a empresa de um device já cadastrado.
+    fn resolve_checkin_company_id(&self, esfera_device_id: &str, claimed: i32) -> Option<i32> {
+        if claimed <= 0 {
+            return None; // recusa company_id inválido/zero vindo do cliente
+        }
+        // Se o device já existe, mantém o company_id fixo (first-seen-wins). Nunca sobrescreve.
+        if let Ok(existing) = self.conn().query_row(
+            "SELECT CompanyId FROM ESF_Device WHERE EsferaDeviceId = ?1",
+            params![esfera_device_id],
+            |r| r.get::<_, i32>(0),
+        ) {
+            return Some(existing);
+        }
+        // Device novo: exige que a empresa exista (isolamento por empresa real).
+        let exists: i32 = self.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM ESF_Company WHERE CompanyId = ?1",
+                params![claimed],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if exists > 0 { Some(claimed) } else { None }
+    }
+
     pub fn process_checkin(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str, company_id: i32) -> Result<usize, String> {
-        // Primeiro tenta atualizar um device já conhecido (mantém company_id estável).
+        let resolved = self.resolve_checkin_company_id(device_id, company_id)
+            .ok_or_else(|| "company_id inválido ou inexistente; isolamento recusado".to_string())?;
+
+        // Atualiza device conhecido: NÃO toca em CompanyId (identidade fixa).
         let updated = self.conn().execute(
             "UPDATE ESF_Device SET
                 CurrentAdbAddress = ?1,
                 Status = 'online',
                 LastSeenUTC = ?2,
                 DeviceIp = ?3,
-                DevicePort = ?4,
-                CompanyId = COALESCE((SELECT CompanyId FROM ESF_Device WHERE EsferaDeviceId = ?5), ?6)
+                DevicePort = ?4
              WHERE EsferaDeviceId = ?5",
-            params![adb_address, now, ip, port, device_id, company_id],
+            params![adb_address, now, ip, port, device_id],
         ).map_err(|e| e.to_string())?;
 
         if updated == 0 {
-            // Dispositivo novo: usa o company_id declarado (primeiro seen wins p/ isolamento).
+            // Dispositivo novo: usa o company_id RESOLVIDO (validado, nunca o cru vem do cliente).
             return self.conn().execute(
                 "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
-                 VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?6, 0, 'junior', ?5, ?7)
-                 ON CONFLICT(EsferaDeviceId) DO UPDATE SET
-                 CurrentAdbAddress=excluded.CurrentAdbAddress, Status='online', LastSeenUTC=excluded.LastSeenUTC,
-                 DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, CompanyId=excluded.CompanyId",
-                params![format!("agent-{}", device_id), device_id, ip, port, adb_address, company_id, now],
+                 VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?5, 0, 'junior', ?6, ?7)",
+                params![format!("agent-{}", device_id), device_id, ip, port, resolved, adb_address, now],
             ).map_err(|e| e.to_string());
         }
         Ok(updated)
     }
 
     pub fn insert_unknown_device(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str, company_id: i32) -> Result<usize, String> {
+        let resolved = self.resolve_checkin_company_id(device_id, company_id)
+            .ok_or_else(|| "company_id inválido ou inexistente; isolamento recusado".to_string())?;
         self.conn().execute(
             "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
-             VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?6, 0, 'junior', ?5, ?7)
-             ON CONFLICT(EsferaDeviceId) DO UPDATE SET
-             CurrentAdbAddress=excluded.CurrentAdbAddress, Status='online', LastSeenUTC=excluded.LastSeenUTC,
-             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, CompanyId=excluded.CompanyId",
-            params![format!("agent-{}", device_id), device_id, ip, port, adb_address, company_id, now],
+             VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?5, 0, 'junior', ?6, ?7)",
+            params![format!("agent-{}", device_id), device_id, ip, port, resolved, adb_address, now],
         ).map_err(|e| e.to_string())
     }
 

@@ -21,7 +21,7 @@
 // ============================================================
 
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
 use serde::Deserialize;
 
@@ -118,8 +118,8 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
         tokio::select! {
             line = read_line(&mut reader) => {
                 let line = match line {
-                    Ok(Some(l)) => l,
-                    _ => break, // EOF ou erro -> encerra (device reconecta)
+                    Some(l) => l,
+                    None => break, // EOF ou erro -> encerra (device reconecta)
                 };
                 last_heartbeat = Instant::now();
                 heartbeat_tunnel(company_id, &uuid);
