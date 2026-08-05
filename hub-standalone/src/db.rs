@@ -981,9 +981,12 @@ impl Database {
                 "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                 ON CONFLICT(AdbDeviceId) DO UPDATE SET
-                DeviceName=excluded.DeviceName, Brand=excluded.Brand, Model=excluded.Model,
+                DeviceName=CASE WHEN ESF_Device.DeviceName IS NOT NULL AND ESF_Device.DeviceName != '' AND ESF_Device.DeviceName != excluded.Model THEN ESF_Device.DeviceName ELSE excluded.DeviceName END,
+                Brand=excluded.Brand, Model=excluded.Model,
                 DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
-                BatteryLevel=excluded.BatteryLevel, DeviceNumber=excluded.DeviceNumber, Sector=excluded.Sector,
+                BatteryLevel=excluded.BatteryLevel,
+                DeviceNumber=CASE WHEN ESF_Device.DeviceNumber IS NOT NULL AND ESF_Device.DeviceNumber > 0 THEN ESF_Device.DeviceNumber ELSE excluded.DeviceNumber END,
+                Sector=CASE WHEN ESF_Device.Sector IS NOT NULL AND ESF_Device.Sector != '' THEN ESF_Device.Sector ELSE excluded.Sector END,
                 EsferaDeviceId=COALESCE(excluded.EsferaDeviceId, ESF_Device.EsferaDeviceId),
                 CurrentAdbAddress=excluded.CurrentAdbAddress, LastSeenUTC=excluded.LastSeenUTC;",
                 params![
