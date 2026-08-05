@@ -604,3 +604,53 @@ NOTA DE SEGURANÇA: o token da empresa ainda é distribuído manualmente (env), 
 auto-emitido pela VPS para o usuário logado. Isso é o item P2-5 em aberto — o fluxo
 automático exige um endpoint na VPS que devolva o token da empresa para o usuário
 autenticado (não implementado ainda).
+
+---
+
+# 22. PERSISTÊNCIA E AUTO-START DO CELULAR (corrigido 2026-08-05)
+
+## 22.1 PROBLEMA RELATADO
+"Reiniciar o celular, ele não mantém conectado; ao reabrir o programa, o celular
+não volta." Causa raiz encontrada em teste real (moto_g22 + galaxy J2 via USB):
+
+1. Os celulares apontavam para o IP LOCAL do PC (192.168.1.77), não para a VPS.
+   Ao fechar o programa desktop, o agente ficava orfao. -> Corrigido: apontam
+   34.29.70.113 (VPS) com companyId=1.
+2. O agente Kotlin nao subia no boot: Android 12+ (Moto) bloqueia
+   startForegroundService disparado de BOOT_COMPLETED receiver em background.
+
+## 22.2 SOLUCAO IMPLEMENTADA (testada em reboot real)
+- EsferaAgentService.loadConfig prioriza props persist.esfera.* (device_id/company/
+  server) como fonte de verdade - sobrevivem a reboot.
+- BootJobService (JobScheduler setPersisted(true)) agendado no onCreate do Service.
+  O sistema executa o job APOS o reboot, iniciando o agente, sem root. Contorna o
+  bloqueio do BOOT_COMPLETED pela fabricante.
+- BootReceiver mantido como complemento (QUICKBOOT_POWERON + MY_PACKAGE_REPLACED).
+- TESTE: reboot do moto_g22 -> agente subiu sozinho (BootJobService: iniciando
+  agente apos boot no logcat) e reconectou na VPS (check-in HTTP 200 "ok").
+
+## 22.3 BUILD DO AGENTE ANDROID SEM ADMIN (ambiente sem SDK no PATH)
+Toolchain provisionado via ZIP em D:\Programs (nunca C:\Program Files):
+- JDK 17: D:\Programs\jdk17flat (pasta original jdk-17.0.10+7 renomeada p/ tirar +)
+- Android SDK: D:\Programs\android-sdk (cmdline-tools em cmdline-tools\latest)
+- Gradle 8.9: D:\Programs\gradle-8.9\bin\gradle.bat
+- Keystore: D:\Programs\esfera-debug.keystore (alias esfera, senha esfera123)
+Build: cd src-agent && cmd.exe /c runbuild.bat -> assinar com runsign.bat
+(apksigner sign do build-tools 34.0.0) -> app-release-signed.apk.
+IMPORTANTE: rodar .bat via cmd.exe /c runbuild.bat no CWD do projeto (NUNCA passar
+path absoluto do .bat como arg — git-bash corrompe D:\x em D:x).
+Ver detalhes em REGRA.md (secao de build do agente Android).
+
+## 22.4 ARQUIVOS ALTERADOS (commit 51505c5)
+- src-agent/app/src/main/kotlin/com/esfera/agent/BootJobService.kt (novo)
+- src-agent/app/src/main/AndroidManifest.xml (LAUNCHER + BootJobService + acoes boot)
+- src-agent/app/src/main/kotlin/com/esfera/agent/EsferaAgentService.kt (loadConfig props; schedule job)
+- src-agent/app/src/main/kotlin/com/esfera/agent/BootReceiver.kt (startForegroundService + acoes)
+- REGRA.md (secao de build do agente Android sem admin)
+
+## 22.5 VALIDACAO
+- cargo check --bin esfera_v3: OK (desktop)
+- npm run tauri build: OK (.exe + .msi validos, frontend empacotado)
+- gradle assembleRelease do src-agent: BUILD SUCCESSFUL (Kotlin/Manifest compilam)
+- APK assinado instalado nos 2 celulares; reboot do moto confirmou auto-start + reconexao VPS
+- NAO rootado (JobScheduler oficial); NAO houve tentativa de exploit/root.
