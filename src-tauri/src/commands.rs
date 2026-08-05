@@ -289,8 +289,12 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             let is_active = active_adb_list.iter().any(|adb_d| adb_d.serial == dev.serial);
             if is_active {
                 dev.status = "online".to_string();
-            } else {
-                dev.status = "offline".to_string();
+            } else if dev.esfera_device_id.is_some() || dev.current_adb_address.is_some() || !dev.ip.is_empty() {
+                // Se o dispositivo possui EsferaDeviceId, IP ou ADB address cadastrado,
+                // mantém como "connecting" em vez de marcar offline abruptamente.
+                if dev.status != "connecting" {
+                    dev.status = "connecting".to_string();
+                }
                 let ip_target = if !dev.ip.is_empty() {
                     dev.ip.clone()
                 } else if dev.serial.contains(':') {
@@ -305,6 +309,8 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                         let _ = AdbManager::connect_device(&ip_target, port);
                     });
                 }
+            } else {
+                dev.status = "offline".to_string();
             }
         }
 

@@ -80,10 +80,11 @@ async fn handle_vps_command(
     match cmd {
         // Estado VIVO (túnel + presença) por empresa — independe do hub local.
         "get_live_devices" => {
-            if company_id <= 0 {
-                return Some(Err("companyId obrigatório".to_string()));
-            }
-            let states = crate::session_manager::list_by_company(company_id);
+            let states = if company_id <= 0 {
+                crate::session_manager::list_all()
+            } else {
+                crate::session_manager::list_by_company(company_id)
+            };
             Some(serde_json::to_value(states).map_err(|e| e.to_string()))
         }
         // Abre o proxy ADB no aparelho via túnel reverso (canal de CONTROLE).
