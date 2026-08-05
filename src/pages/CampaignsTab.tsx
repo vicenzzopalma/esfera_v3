@@ -118,18 +118,21 @@ export default function CampaignsTab() {
     setExecutionModalOpen(true);
   };
 
-  // Higieniza números no padrão REALESS / Esfera v3
+  // Higieniza números no padrão REALESS / Esfera v3 (Brasil, DDI +55).
+  // NÃO inventa DDD: apenas normaliza o que o usuário informou.
+  //  - já com DDI 55 (12-13 dígitos) -> mantém
+  //  - com DDD (10-11 dígitos)         -> prefixa +55
+  //  - só número local (8-9 dígitos)   -> não infere DDD, retorna limpo
   const sanitizePhoneNumber = (raw: string) => {
     let clean = raw.replace(/\D/g, "");
-    if (clean.length === 11 && clean.startsWith("9")) {
-      clean = "55" + clean;
-    } else if (clean.length === 9) {
-      clean = "5511" + clean;
+    if (clean.length === 0) return "";
+    if (clean.startsWith("55") && (clean.length === 12 || clean.length === 13)) {
+      return "+" + clean;
     }
-    if (clean.length > 0 && !clean.startsWith("+")) {
-      clean = "+" + clean;
+    if (clean.length === 10 || clean.length === 11) {
+      return "+55" + clean;
     }
-    return clean;
+    return "+" + clean;
   };
 
   const handleParseContacts = () => {

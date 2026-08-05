@@ -39,9 +39,12 @@ impl HubClient {
     }
 
     async fn authenticate(&mut self, role: &str) -> Result<(), String> {
+        // Token da empresa (ou master) lido de env. Sem fallback de credencial em código.
+        let token = std::env::var("ESFERA_HUB_TOKEN")
+            .or_else(|_| std::env::var("HUB_MASTER_TOKEN"))
+            .map_err(|_| "Token do Hub não configurado (defina ESFERA_HUB_TOKEN).".to_string())?;
         let msg = HubMessage::Auth {
-            username: AUTH_MASTER_USER.to_string(),
-            password: AUTH_MASTER_PASS.to_string(),
+            token,
             role: role.to_string(),
         };
         self.send(&msg).await?;

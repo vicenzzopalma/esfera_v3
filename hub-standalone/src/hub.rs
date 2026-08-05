@@ -1,4 +1,5 @@
 use crate::protocol::*;
+use crate::db::Database;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,11 +20,12 @@ pub struct Hub {
     port: u16,
     connections: Arc<Mutex<HashMap<String, HubConnection>>>,
     pending: Arc<Mutex<HashMap<String, String>>>, // cmd_id → master_session_id
+    db: Arc<Database>,
 }
 
 impl Hub {
-    pub fn new(port: u16) -> Self {
-        Self { port, connections: Arc::new(Mutex::new(HashMap::new())), pending: Arc::new(Mutex::new(HashMap::new())) }
+    pub fn new(port: u16, db: Arc<Database>) -> Self {
+        Self { port, connections: Arc::new(Mutex::new(HashMap::new())), pending: Arc::new(Mutex::new(HashMap::new())), db }
     }
 
     pub async fn start(self) -> Result<(), String> {
@@ -43,8 +45,9 @@ impl Hub {
             };
             let connections = self.connections.clone();
             let pending = self.pending.clone();
+            let db = self.db.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(connections, pending, stream, addr).await {
+                if let Err(e) = handle_connection(connections, pending, db, stream, addr).await {
                     eprintln!("Erro na conexão {}: {}", addr, e);
                 }
             });
@@ -65,6 +68,7 @@ async fn send_raw(
 async fn handle_connection(
     connections: Arc<Mutex<HashMap<String, HubConnection>>>,
     pending: Arc<Mutex<HashMap<String, String>>>,
+    db: Arc<Database>,
     stream: TcpStream,
     addr: std::net::SocketAddr,
 ) -> Result<(), String> {
@@ -75,6 +79,8 @@ async fn handle_connection(
     let mut line = String::new();
     let session_id = format!("sess_{}_{}", addr.port(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis());
     let mut authenticated = false;
+    let mut auth_company_id: Option<i32> = None;
+    let mut auth_role: Option<String> = None;
 
     loop {
         line.clear();
@@ -89,27 +95,51 @@ async fn handle_connection(
         let msg: HubMessage = deserialize_msg(line.trim().as_bytes())?;
 
         match msg {
-            HubMessage::Auth { username, password, role } => {
-                let auth_ok = role == "master" && username == AUTH_MASTER_USER && password == AUTH_MASTER_PASS;
-                if auth_ok {
-                    authenticated = true;
-                    let conn = HubConnection {
-                        writer: writer_lock.clone(),
-                        role: role.clone(),
-                        company_id: None,
-                        company_name: None,
-                    };
-                    connections.lock().await.insert(session_id.clone(), conn);
-                    let resp = HubMessage::AuthResponse { success: true, session_id: Some(session_id.clone()), error: None };
-                    send_raw(&writer_lock, &resp).await?;
-                    println!("{} '{}' autenticado no Hub", role, username);
-                } else {
-                    let resp = HubMessage::AuthResponse { success: false, session_id: None, error: Some("Credenciais inválidas.".to_string()) };
-                    send_raw(&writer_lock, &resp).await?;
+            HubMessage::Auth { token, role } => {
+                // Validação company-scoped: o token define papel e empresa.
+                // NUNCA existe credencial global em código.
+                match db.validate_token(&token) {
+                    Some((company_id, token_role)) => {
+                        // O papel declarado pelo cliente deve bater com o do token.
+                        if token_role != role {
+                            let resp = HubMessage::AuthResponse { success: false, session_id: None, company_id: None, error: Some("Papel incompatível com o token.".to_string()) };
+                            send_raw(&writer_lock, &resp).await?;
+                            continue;
+                        }
+                        authenticated = true;
+                        auth_company_id = Some(company_id);
+                        auth_role = Some(role.clone());
+                        let conn = HubConnection {
+                            writer: writer_lock.clone(),
+                            role: role.clone(),
+                            company_id: Some(company_id),
+                            company_name: None,
+                        };
+                        connections.lock().await.insert(session_id.clone(), conn);
+                        let resp = HubMessage::AuthResponse { success: true, session_id: Some(session_id.clone()), company_id: Some(company_id), error: None };
+                        send_raw(&writer_lock, &resp).await?;
+                        println!("'{}' autenticado no Hub (company {})", role, company_id);
+                    }
+                    None => {
+                        let resp = HubMessage::AuthResponse { success: false, session_id: None, company_id: None, error: Some("Token inválido.".to_string()) };
+                        send_raw(&writer_lock, &resp).await?;
+                    }
                 }
             }
             HubMessage::Register { company_id, company_name } => {
                 if !authenticated { continue; }
+                // REGRA DE ISOLAMENTO: empresa só pode registrar a PRÓPRIA company_id.
+                // Master (company 0) pode registrar qualquer empresa.
+                let allowed = match auth_role.as_deref() {
+                    Some("master") => true,
+                    Some("empresa") => auth_company_id == Some(company_id),
+                    _ => false,
+                };
+                if !allowed {
+                    let resp = HubMessage::RegisterResponse { success: false, error: Some("Empresa não pode registrar company_id alheio.".to_string()) };
+                    send_raw(&writer_lock, &resp).await?;
+                    continue;
+                }
                 let mut conns = connections.lock().await;
                 if let Some(conn) = conns.get_mut(&session_id) {
                     conn.company_id = Some(company_id);
@@ -122,6 +152,12 @@ async fn handle_connection(
             }
             HubMessage::Command { from, to_company, cmd, args, id } => {
                 if !authenticated { continue; }
+                // Apenas master despacha comandos. Empresa nunca despacha para outra empresa.
+                if auth_role.as_deref() != Some("master") {
+                    let resp = HubMessage::CommandResponse { id, result: None, error: Some("Apenas master pode enviar comandos.".to_string()) };
+                    send_raw(&writer_lock, &resp).await?;
+                    continue;
+                }
                 let conns = connections.lock().await;
                 let target = conns.iter().find(|(_, c)| {
                     c.role == "empresa" && c.company_id == to_company

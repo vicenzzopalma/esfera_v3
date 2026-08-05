@@ -218,17 +218,25 @@ export default function AutomationsTab() {
   };
 
   const toggleActive = async (id: number, currentActive: boolean) => {
+    const previous = automationsList.find((a) => a.id === id);
+    if (!previous) return;
+    // Valor que está no servidor (currentActive vem do prop), não o optimistic.
     const newActive = !currentActive;
     setAutomationsList((prev) =>
       prev.map((a) => (a.id === id ? { ...a, active: newActive } : a))
     );
     try {
-      const automation = automationsList.find((a) => a.id === id);
-      if (!automation) return;
       await api("update_automation", {
-        automation,
+        automation: { ...previous, active: newActive },
       });
-    } catch { /* noop */ }
+    } catch (err) {
+      // Reverte o optimistic update e propaga o erro (não engole).
+      setAutomationsList((prev) =>
+        prev.map((a) => (a.id === id ? { ...a, active: currentActive } : a))
+      );
+      console.error("Falha ao alternar automação:", err);
+      throw err;
+    }
   };
 
   const handleDelete = async (id: number) => {
