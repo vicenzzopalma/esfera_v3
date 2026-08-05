@@ -1295,16 +1295,17 @@ impl AdbManager {
 
     /// Lança o Scrcpy H.264 nativo em 60 FPS com aceleração por hardware
     pub fn launch_scrcpy(serial: &str, turn_screen_off: bool) -> Result<String, String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         let mode_label = if turn_screen_off {
             " [Tela Desligada]"
         } else {
             ""
         };
-        let title = format!("Esfera v3 — Stream H.264 ({}){}", serial, mode_label);
+        let title = format!("Esfera v3 — Stream H.264 ({}){}", target_serial, mode_label);
         let mut cmd = create_cmd("scrcpy");
         cmd.args([
             "-s",
-            serial,
+            &target_serial,
             "--max-size",
             "1080",
             "--max-fps",
@@ -2530,6 +2531,23 @@ impl AdbManager {
                                 return Ok(rev_dev.serial.clone());
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // 6. ULTIMO RECURSO — DISPOSITIVO USB ÚNICO / ATIVO NO ADB:
+        // Se o IP solicitado no Wi-Fi não respondeu (ex: 192.168.1.83:5555), mas o celular está conectado via cabo USB
+        // (ex: 0082925603 ou 420012cad28ca5c7), redireciona automaticamente para o dispositivo USB ativo.
+        let ready_devices: Vec<&AdbDeviceInfo> = active_devices.iter().filter(|d| d.state == "device").collect();
+        if !ready_devices.is_empty() {
+            if ready_devices.len() == 1 {
+                return Ok(ready_devices[0].serial.clone());
+            }
+            for usb_dev in &ready_devices {
+                if let Ok(wifi_ip) = Self::get_device_wifi_ip(&usb_dev.serial) {
+                    if wifi_ip.contains(requested_ip) || requested_ip.contains(&wifi_ip) {
+                        return Ok(usb_dev.serial.clone());
                     }
                 }
             }
