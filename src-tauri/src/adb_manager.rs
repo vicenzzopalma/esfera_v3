@@ -1344,13 +1344,14 @@ impl AdbManager {
         height: u32,
         dpi: u32,
     ) -> Result<String, String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         let display_spec = format!("{}x{}/{}", width, height, dpi);
-        let title = format!("Esfera v3 — Área #2 [Disparos Isolados] ({})", serial);
+        let title = format!("Esfera v3 — Área #2 [Disparos Isolados] ({})", target_serial);
 
         let mut cmd = create_cmd("scrcpy");
         cmd.args([
             "-s",
-            serial,
+            &target_serial,
             &format!("--new-display={}", display_spec),
             "--max-fps",
             "60",
@@ -1366,7 +1367,7 @@ impl AdbManager {
         match result {
             Ok(_) => Ok(format!(
                 "🖥️ Área de Trabalho #2 (Display Virtual {}px) inicializada para o celular {}! O supervisor pode usar a tela física livremente.",
-                display_spec, serial
+                display_spec, target_serial
             )),
             Err(e) => Err(format!(
                 "Falha ao iniciar Display Virtual Secundário ({}). Certifique-se de que o Scrcpy v2.2+ esteja instalado.",
@@ -1381,18 +1382,19 @@ impl AdbManager {
         url: &str,
         display_id: u32,
     ) -> Result<String, String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         // Wi-Fi: protocolo ADB nativo em vez de adb.exe
-        if Self::use_native_adb(serial) {
+        if Self::use_native_adb(&target_serial) {
             let intent_cmd = format!(
                 "am start --display {} -a android.intent.action.VIEW -d '{}'",
                 display_id,
                 Self::shell_quote(url)
             );
-            match crate::adb_tcp::exec_shell_bytes(serial, &intent_cmd) {
+            match crate::adb_tcp::exec_shell_bytes(&target_serial, &intent_cmd) {
                 Ok((_, _, true)) => {
                     return Ok(format!(
                         "Intent aberto no Display #{} com sucesso no aparelho {}",
-                        display_id, serial
+                        display_id, target_serial
                     ));
                 }
                 Ok((_, _, false)) => {
@@ -1413,7 +1415,7 @@ impl AdbManager {
         let output = create_cmd("adb")
             .args([
                 "-s",
-                serial,
+                &target_serial,
                 "shell",
                 "am",
                 "start",
@@ -1430,7 +1432,7 @@ impl AdbManager {
         if output.status.success() {
             Ok(format!(
                 "Intent aberto no Display #{} com sucesso no aparelho {}",
-                display_id, serial
+                display_id, target_serial
             ))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1444,10 +1446,11 @@ impl AdbManager {
 
     /// Lança o fluxo de vídeo da Câmera (Traseira ou Frontal) do celular Android via Scrcpy
     pub fn launch_scrcpy_camera(serial: &str, facing: &str) -> Result<String, String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         let camera_arg = if facing == "front" { "front" } else { "back" };
         let title = format!(
             "Esfera v3 — Câmera Ao Vivo ({}) [{}]",
-            serial,
+            target_serial,
             camera_arg.to_uppercase()
         );
 
