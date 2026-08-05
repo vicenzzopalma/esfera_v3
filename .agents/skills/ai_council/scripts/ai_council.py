@@ -11,40 +11,79 @@ except ImportError:
     sys.exit(1)
 
 # ==========================================
-# CONFIGURAÇÃO DA API (VERTEX AI - CORPORATIVO)
+# CONFIGURAÇÃO DA API (NOUS PORTAL / VERTEX AI)
 # ==========================================
-# Como sua organização usa Vertex AI e Secure by Default, 
-# a biblioteca vai autenticar automaticamente usando o login do seu gcloud CLI.
 
-print("🔄 Autenticando no Google Cloud Vertex AI...")
-client = genai.Client(
-    vertexai=True, 
-    project="project-8fa27d2f-29ba-4213-973", 
-    location="us-central1"
-)
+AUTH_FILE = os.path.expanduser(r"~\AppData\Local\hermes\auth.json")
+nous_token = None
+nous_base_url = "https://inference-api.nousresearch.com/v1"
 
-# O modelo mais avançado e estável disponível na sua organização hoje
-MODEL_NAME = "gemini-2.5-pro"
+if os.path.exists(AUTH_FILE):
+    try:
+        with open(AUTH_FILE, "r", encoding="utf-8") as f:
+            auth_data = json.load(f)
+            nous_info = auth_data.get("providers", {}).get("nous", {})
+            nous_token = nous_info.get("access_token")
+            nous_base_url = nous_info.get("inference_base_url", nous_base_url)
+    except Exception:
+        pass
+
+use_openai = False
+client = None
+
+if nous_token:
+    print("🔄 Autenticando via Nous Portal (AI Gateway)...")
+    from openai import OpenAI
+    client = OpenAI(base_url=nous_base_url, api_key=nous_token)
+    MODEL_NAME = "tencent/hy3:free"
+    use_openai = True
+else:
+    print("🔄 Autenticando no Google Cloud Vertex AI...")
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(
+            vertexai=True, 
+            project="project-8fa27d2f-29ba-4213-973", 
+            location="us-central1"
+        )
+        MODEL_NAME = "gemini-2.5-pro"
+    except Exception:
+        from openai import OpenAI
+        client = OpenAI()
+        MODEL_NAME = "gpt-4o"
+        use_openai = True
 
 def call_agent(role_system_prompt, user_message, json_response=False):
-    """Função genérica para invocar um agente do conselho usando a nova SDK."""
-    
-    config_args = {
-        "temperature": 0.2,
-        "system_instruction": role_system_prompt
-    }
-    
-    if json_response:
-        # Força o modelo a responder apenas em JSON estruturado
-        config_args["response_mime_type"] = "application/json"
+    """Função genérica para invocar um agente do conselho."""
+    if use_openai:
+        messages = [
+            {"role": "system", "content": role_system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+        kwargs = {
+            "model": MODEL_NAME,
+            "messages": messages,
+            "temperature": 0.2
+        }
+        if json_response:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content
+    else:
+        config_args = {
+            "temperature": 0.2,
+            "system_instruction": role_system_prompt
+        }
+        if json_response:
+            config_args["response_mime_type"] = "application/json"
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=user_message,
-        config=types.GenerateContentConfig(**config_args)
-    )
-    
-    return response.text
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=user_message,
+            config=types.GenerateContentConfig(**config_args)
+        )
+        return response.text
 
 # ==========================================
 # DEFINIÇÃO DOS PAPÉIS (SYSTEM PROMPTS)

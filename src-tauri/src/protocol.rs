@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 // Portas padrão
-pub const HUB_DEFAULT_PORT: u16 = 8888;
+pub const HUB_DEFAULT_PORT: u16 = 8555;
 pub const EMPRESA_DEFAULT_PORT: u16 = 7777;
 
 // IMPORTANTE: não existe mais credencial global em código.
