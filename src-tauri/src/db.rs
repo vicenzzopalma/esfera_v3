@@ -1,3 +1,4 @@
+
 // ============================================================
 // Esfera v3 — Camada de Banco de Dados (SQLite Local)
 // Mapeamento 1:1 das tabelas ESF_* do Esfera v2
@@ -862,14 +863,18 @@ impl Database {
         let _ = self.conn().execute("ALTER TABLE ESF_Device ADD COLUMN EsferaDeviceId TEXT;", []);
         let _ = self.conn().execute("ALTER TABLE ESF_Device ADD COLUMN CurrentAdbAddress TEXT;", []);
         let _ = self.conn().execute("ALTER TABLE ESF_Device ADD COLUMN LastSeenUTC TEXT;", []);
-        // Popula EsferaDeviceId para devices existentes com ID determinístico baseado no DeviceNumber
+        // Identidade legada estável e sem colisão entre empresas.
         let _ = self.conn().execute(
-            "UPDATE ESF_Device SET EsferaDeviceId = 'ESF-LEGACY-' || DeviceNumber WHERE EsferaDeviceId IS NULL;",
+            "UPDATE ESF_Device
+             SET EsferaDeviceId = 'ESF-LEGACY-' || CompanyId || '-' || rowid
+             WHERE EsferaDeviceId IS NULL OR TRIM(EsferaDeviceId) = '';",
             [],
         );
-        // Índice único para EsferaDeviceId
+        let _ = self.conn().execute("DROP INDEX IF EXISTS idx_device_esfera_id;", []);
         let _ = self.conn().execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_device_esfera_id ON ESF_Device(EsferaDeviceId);",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_device_company_esfera_id
+             ON ESF_Device(CompanyId, EsferaDeviceId)
+             WHERE EsferaDeviceId IS NOT NULL AND TRIM(EsferaDeviceId) != '';",
             [],
         );
 
@@ -974,7 +979,7 @@ impl Database {
             ];
 
             for (serial, name, brand, model, ip, num, sector) in default_devices {
-                let esfera_id = format!("ESF-LEGACY-{}", num);
+                let esfera_id = format!("ESF-LEGACY-1-{}", num);
                 let _ = conn.execute(
                     "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId)
                     VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7, ?8)
@@ -1139,6 +1144,23 @@ impl Database {
 
     pub fn upsert_device(&self, device: &Device) -> Result<(), String> {
         let target_comp = if device.company_id <= 0 { 1 } else { device.company_id };
+
+        // EsferaDeviceId identifica o aparelho; IP:porta/USB são somente transporte.
+        if let Some(ref esfera_id) = device.esfera_device_id {
+            if !esfera_id.trim().is_empty() {
+                let affected = self.exec_retry(
+                    "UPDATE ESF_Device SET Brand=?1, Model=?2, DeviceIp=?3,
+                        DevicePort=?4, Status=?5, BatteryLevel=?6,
+                        CurrentAdbAddress=?7, LastSeenUTC=?8
+                     WHERE CompanyId=?9 AND EsferaDeviceId=?10",
+                    params![device.brand, device.model, device.ip, device.port,
+                        device.status, device.battery, device.current_adb_address,
+                        device.last_seen_utc, target_comp, esfera_id],
+                ).map_err(|e| e.to_string())?;
+                if affected > 0 { return Ok(()); }
+            }
+        }
+
         self.exec_retry(
             "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
@@ -1219,7 +1241,6 @@ impl Database {
         let upper_id = device_id.to_uppercase();
         let affected = self.exec_retry(
             "UPDATE ESF_Device SET
-                AdbDeviceId = ?1,
                 CurrentAdbAddress = ?1,
                 Status = 'online',
                 LastSeenUTC = ?2,
@@ -2558,5 +2579,7 @@ impl Database {
             .ok()
     }
 }
+
+
 
 
