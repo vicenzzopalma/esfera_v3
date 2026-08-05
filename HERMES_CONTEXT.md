@@ -463,33 +463,45 @@ ATIVA em runtime, não só em compilação. Agora corrigida.
 
 ---
 
-# 18. DEPLOY NA VPS — PROVADO: NÃO FOI FEITO (binário VELHO ainda no ar)
+# 18. DEPLOY NA VPS — CONCLUÍDO E VALIDADO (2026-08-05, sondado às 16:18 GMT)
 
-A VPS (34.29.70.113) tem as 4 portas ABERTAS no firewall
-(varredura 2026-08-05: :8080/:8888/:7779/:8555 todas abertas), MAS o serviço de
-pé é o BINÁRIO ANTIGO. Prova por sonda HTTP no check-in (path real
-`/api/devices/check-in`):
+A VPS (34.29.70.113) tem as 4 portas ABERTAS no firewall e roda o BINÁRIO NOVO.
+Validação por sonda HTTP no check-in (path real `/api/devices/check-in`),
+executada em 2026-08-05 16:18 GMT:
 
 - PROBE A — POST sem `companyId` (default 0):
-  - Binário NOVO esperado: `400 companyId ausente ou invalido`
-  - VPS retornou: `HTTP/1.1 200 OK` body `erro`  ← comportamento do binário VELHO
+  - RETORNOU: `HTTP/1.1 400 Bad Request` body `companyId ausente ou invalido`
+  - Esse é o comportamento do binário NOVO (o velho retornava `200 erro`).
 - PROBE B — POST com `companyId:1`:
-  - VPS retornou: `HTTP/1.1 200 OK` body `ok`  (igual novo, não distingue)
+  - RETORNOU: `HTTP/1.1 200 OK` body `ok`.
 
-Conclusão: o `cargo build --release` do hub-standalone NOVO NÃO foi publicado na
-VPS. O isolamento por companyId no check-in (item 16.2.1) NÃO está ativo em
-produção. O USUÁRIO ESTÁ DENTRO DA VPS — após o commit, executar:
+Conclusão: o `cargo build --release` do hub-standalone NOVO FOI publicado na VPS
+e o isolamento por companyId no check-in (item 16.2.1) ESTÁ ATIVO em produção.
+
+Passos executados (usuário dentro da VPS):
 
     cd ~/esfera_v3 && git pull
     cd hub-standalone && cargo build --release -j 1
     sudo systemctl restart esfera-hub
-    # conferir: systemctl status esfera-hub
-    # re-sondar: POST /api/devices/check-in sem companyId DEVE dar 400
+    # systemctl status esfera-hub -> active (running)
 
-Unit systemd presente: `hub-standalone/esfera-hub.service`.
-Só marcar "Correção CONCLUÍDA em produção" após a sonda retornar 400 no PROBE A.
+Unit systemd: `hub-standalone/esfera-hub.service` (4 portas + HUB_MASTER_TOKEN).
+Critério de aceitação atingido: sonda PROBE A retornou 400. Deploy validado.
 
 ---
+
+# 18.1 STATUS GERAL DE PRODUÇÃO (resumo)
+
+| Canal / Serviço            | Estado em produção      | Evidência |
+|----------------------------|-------------------------|------------|
+| :8080 check-in (VPS)       | NOVO + isolamento OK    | PROBE A = 400 |
+| :8888 tunnel (VPS)         | NOVO (compila/roda)     | porta aberta + tests |
+| :7779 presence (VPS)       | NOVO (compila/roda)     | porta aberta + tests |
+| :8555 hub TCP master (VPS) | NOVO (systemd)          | porta aberta |
+| hub LOCAL (esfera-hub)     | CORRIGIDO (auth token)  | cargo check OK |
+| device-agent               | aponta VPS (34.29.70.113)| cargo check OK |
+
+
 
 # 19. AUDITORIA CODE-VS-DOC (inverdades e imprecisões encontradas 2026-08-05)
 
@@ -541,4 +553,4 @@ P2 — validação / operacional:
 6. Alinhar hub local (tunnel/presence/session_manager) ao modelo VPS quando virar
    cache/proxy de fato (menor prioridade — hub local é fallback).
 
-Regra (seção 12) mantida: build passou ≠ sistema funciona. O deploy (P0-1) foi totalmente verificado via HTTP probe. Os testes físicos com hardware real (P2-4) fecham o ciclo completo de validação.
+Regra (seção 12) mantida: build passou ≠ sistema funciona. O deploy (P0-1) foi totalmente verificado via HTTP probe. Os testes físicos com hardware real (P2-4) fecham o ciclo completo de validação.
