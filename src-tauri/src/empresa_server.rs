@@ -103,6 +103,78 @@ async fn execute_command_locally(
             let kpis = spawn_blocking(move || db.get_dashboard_kpis(company_id)).await.map_err(|e| e.to_string())?;
             serde_json::to_value(kpis).map_err(|e| e.to_string())
         }
+        // ----------------------------------------------------------------
+        // COMANDOS DE CONTROLE (antes o Empresa Server era somente leitura).
+        // Regra de isolamento: o alvo é resolvido por (companyId, esferaDeviceId)
+        // e o serial ADB é lido do DB — o cliente NUNCA envia serial/IP direto,
+        // para não conseguir alcançar aparelho de outra empresa.
+        // ----------------------------------------------------------------
+        "device_tap" | "device_keyevent" | "device_type_text" | "device_capture_screen" => {
+            let company_id = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let esfera_device_id = args
+                .get("esferaDeviceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if company_id <= 0 || esfera_device_id.is_empty() {
+                return Err("companyId e esferaDeviceId são obrigatórios".to_string());
+            }
+
+            let db_lookup = db.clone();
+            let id_lookup = esfera_device_id.clone();
+            let device = spawn_blocking(move || db_lookup.get_device_by_esfera_id(&id_lookup))
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "dispositivo não encontrado".to_string())?;
+
+            if device.company_id != company_id {
+                return Err("dispositivo pertence a outra empresa".to_string());
+            }
+
+            // Rota preferencial: endereço do túnel/check-in; fallback: serial ADB.
+            let serial = device
+                .current_adb_address
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| device.serial.clone());
+            if serial.is_empty() {
+                return Err("dispositivo sem endereço ADB conhecido".to_string());
+            }
+
+            let cmd_owned = cmd.to_string();
+            let args_owned = args.clone();
+            spawn_blocking(move || -> Result<serde_json::Value, String> {
+                match cmd_owned.as_str() {
+                    "device_tap" => {
+                        let x = args_owned.get("x").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let y = args_owned.get("y").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        crate::adb_manager::AdbManager::tap_screen(&serial, x, y)?;
+                        Ok(serde_json::json!({ "ok": true }))
+                    }
+                    "device_keyevent" => {
+                        let keycode =
+                            args_owned.get("keycode").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        crate::adb_manager::AdbManager::send_keyevent(&serial, keycode)?;
+                        Ok(serde_json::json!({ "ok": true }))
+                    }
+                    "device_type_text" => {
+                        let text = args_owned
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        crate::adb_manager::AdbManager::type_text_human_hpc(&serial, text)?;
+                        Ok(serde_json::json!({ "ok": true }))
+                    }
+                    "device_capture_screen" => {
+                        let b64 = crate::adb_manager::AdbManager::capture_screen(&serial)?;
+                        Ok(serde_json::json!({ "image": b64 }))
+                    }
+                    _ => Err("comando de controle desconhecido".to_string()),
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
         _ => Err(format!("Comando '{}' não disponível via Empresa Server", cmd)),
     }
 }

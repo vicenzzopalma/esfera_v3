@@ -27,14 +27,17 @@ data class HeartbeatPayload(
     val uuid: String,
     val batteryLevel: Int,
     val isCharging: Boolean,
-    val isScreenOn: Boolean
+    val isScreenOn: Boolean,
+    // COMPANY_ID: isolamento obrigatório no VPS (presence_server.rs).
+    val companyId: Int = 0
 )
 
 class PresenceClient(
     private val context: Context,
     private val deviceId: String,
     private val serverHost: String,
-    private val wsPort: Int = 7779
+    private val wsPort: Int = 7779,
+    private val companyId: Int = 0
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + Job())
     private var job: Job? = null
@@ -65,7 +68,8 @@ class PresenceClient(
                                 uuid = deviceId,
                                 batteryLevel = batteryInfo.first,
                                 isCharging = batteryInfo.second,
-                                isScreenOn = screenOn
+                                isScreenOn = screenOn,
+                                companyId = companyId
                             )
 
                             val text = json.encodeToString(payload)

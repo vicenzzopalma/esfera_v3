@@ -21,13 +21,46 @@
 // ============================================================
 
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use tokio::sync::mpsc;
 
 use crate::session_manager::{self, open_tunnel, close_tunnel, heartbeat_tunnel};
 
 const HEARTBEAT_GRACE_SECS: u64 = 45;
+
+/// Registry de CONTROLE: (company_id, device_id) -> canal de escrita da sessão
+/// de túnel. É o que permite ao Master EMITIR comandos ao aparelho
+/// (antes o hub só respondia `proxy-ack`, nunca pedia proxy — não existia
+/// caminho Master -> VPS -> adbd).
+/// Identidade é sempre (company_id, uuid); nunca IP/socket.
+static CONTROL: LazyLock<Mutex<HashMap<(i32, String), mpsc::UnboundedSender<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Pede ao device-agent que abra o proxy do adbd local na porta indicada.
+/// Retorna erro se a empresa/dispositivo não tiver sessão de túnel ativa
+/// (isolamento: empresa A nunca alcança device da empresa B).
+pub fn request_proxy(company_id: i32, esfera_device_id: &str, adb_port: u16) -> Result<(), String> {
+    let map = CONTROL.lock().unwrap();
+    let tx = map
+        .get(&(company_id, esfera_device_id.to_string()))
+        .ok_or_else(|| "device sem túnel ativo para esta empresa".to_string())?;
+    tx.send(format!("{{\"type\":\"proxy\",\"port\":{}}}", adb_port))
+        .map_err(|_| "sessão de túnel encerrada".to_string())
+}
+
+/// Envia uma linha JSON arbitrária pelo túnel de controle do device.
+pub fn send_control(company_id: i32, esfera_device_id: &str, json_line: &str) -> Result<(), String> {
+    let map = CONTROL.lock().unwrap();
+    let tx = map
+        .get(&(company_id, esfera_device_id.to_string()))
+        .ok_or_else(|| "device sem túnel ativo para esta empresa".to_string())?;
+    tx.send(json_line.to_string())
+        .map_err(|_| "sessão de túnel encerrada".to_string())
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,6 +135,21 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
         .ok_or("hardware_uuid ausente".to_string())?;
     let company_id = hs.company_id;
 
+    // ISOLAMENTO: sem COMPANY_ID válido não existe sessão. Antes, o
+    // #[serde(default)] fazia todo device cair na empresa 0 — todos os
+    // aparelhos de todas as empresas colidiam na mesma chave.
+    if company_id <= 0 {
+        let _ = write_line(
+            &mut writer,
+            "{\"type\":\"error\",\"reason\":\"companyId ausente ou invalido\"}",
+        )
+        .await;
+        return Err(format!(
+            "handshake recusado: device {} sem companyId valido",
+            uuid
+        ));
+    }
+
     // 2. Confirma handshake
     write_line(&mut writer, "{\"type\":\"welcome\"}").await?;
 
@@ -112,10 +160,23 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
         uuid, company_id, session_id
     );
 
-    // 4. Loop: heartbeat L7 (ping/pong) + proxy sob demanda
+    // 4. Registra o canal de CONTROLE desta sessão (Master -> device).
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    CONTROL
+        .lock()
+        .unwrap()
+        .insert((company_id, uuid.clone()), tx);
+
+    // 5. Loop: heartbeat L7 (ping/pong) + comandos de controle + proxy
     let mut last_heartbeat = Instant::now();
     loop {
         tokio::select! {
+            outgoing = rx.recv() => {
+                match outgoing {
+                    Some(cmd) => { write_line(&mut writer, &cmd).await?; }
+                    None => break,
+                }
+            }
             line = read_line(&mut reader) => {
                 let line = match line {
                     Some(l) => l,
@@ -133,6 +194,17 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
                         // O relay bruto é feito PELO device-agent (handle_proxy).
                         write_line(&mut writer, "{\"type\":\"proxy-ack\"}").await?;
                     }
+                    // Respostas ao proxy PEDIDO pelo hub (Master -> VPS -> adbd).
+                    Some("proxy-ack") => {
+                        println!("[tunnel] proxy aceito pelo device {} (empresa {})", uuid, company_id);
+                    }
+                    Some("proxy-error") => {
+                        let reason = v.get("error").and_then(|e| e.as_str()).unwrap_or("desconhecido");
+                        eprintln!(
+                            "[tunnel] proxy recusado pelo device {} (empresa {}): {}",
+                            uuid, company_id, reason
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -144,7 +216,8 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
         }
     }
 
-    // 5. Cleanup: marca túnel offline (presença intocada).
+    // 6. Cleanup: remove canal de controle e marca túnel offline (presença intocada).
+    CONTROL.lock().unwrap().remove(&(company_id, uuid.clone()));
     close_tunnel(company_id, &uuid);
     println!(
         "[tunnel] device {} (empresa {}) desconectado — túnel fechado",

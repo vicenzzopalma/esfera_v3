@@ -52,19 +52,24 @@ data class EsferaConfig(
     val serverUrl: String = "",
     val deviceId: String = "",
     val tunnelEnabled: Boolean = true,
-    val tunnelPort: Int = 8888
+    val tunnelPort: Int = 8888,
+    // COMPANY_ID: identidade de isolamento. Sem ela o VPS recusa check-in
+    // (nunca derivamos empresa de IP/porta/ordem de conexão).
+    val companyId: Int = 0
 )
 
 @Serializable
 data class CheckInRequest(
     val esferaDeviceId: String,
-    val currentAdbAddress: String
+    val currentAdbAddress: String,
+    val companyId: Int = 0
 )
 
 @Serializable
 data class TunnelHandshake(
     val type: String = "handshake",
     val hardwareUuid: String = "",
+    val companyId: Int = 0,
     val macAddress: String = "",
     val serialNumber: String = "",
     val agentVersion: String = "1.0-tunnel",
@@ -157,7 +162,8 @@ class EsferaAgentService : Service() {
             val prefs = getSharedPreferences("esfera_agent", MODE_PRIVATE)
             EsferaConfig(
                 serverUrl = prefs.getString("serverUrl", "") ?: "",
-                deviceId = prefs.getString("deviceId", "") ?: ""
+                deviceId = prefs.getString("deviceId", "") ?: "",
+                companyId = prefs.getInt("companyId", 0)
             )
         }
 
@@ -196,7 +202,8 @@ class EsferaAgentService : Service() {
             context = this,
             deviceId = config.deviceId,
             serverHost = host,
-            wsPort = 7779
+            wsPort = 7779,
+            companyId = config.companyId
         ).apply { start() }
     }
 
@@ -214,7 +221,11 @@ class EsferaAgentService : Service() {
                     try {
                         val response: HttpResponse = httpClient.post("${config.serverUrl}/api/devices/check-in") {
                             contentType(ContentType.Application.Json)
-                            setBody(CheckInRequest(esferaDeviceId = config.deviceId, currentAdbAddress = ip))
+                            setBody(CheckInRequest(
+                                esferaDeviceId = config.deviceId,
+                                currentAdbAddress = ip,
+                                companyId = config.companyId
+                            ))
                         }
                         if (response.status.value == 200) {
                             android.util.Log.d("EsferaAgent", "Check-in OK: $ip")
@@ -247,7 +258,7 @@ class EsferaAgentService : Service() {
                     .substringBefore('/')
                     .ifEmpty { "127.0.0.1" }
                 try {
-                    openTunnel(host, config.tunnelPort, config.deviceId)
+                    openTunnel(host, config.tunnelPort, config.deviceId, config.companyId)
                     backoffMs = 5_000L // reset em caso de fechamento limpo
                 } catch (e: Exception) {
                     android.util.Log.w("EsferaAgent", "Túnel caiu: ${e.message}")
@@ -263,7 +274,7 @@ class EsferaAgentService : Service() {
         }
     }
 
-    private suspend fun openTunnel(host: String, port: Int, deviceId: String) {
+    private suspend fun openTunnel(host: String, port: Int, deviceId: String, companyId: Int) {
         val ip = resolveCurrentIp() ?: "0.0.0.0"
         val socket = Socket()
         socket.connect(InetSocketAddress(host, port), 10_000)
@@ -274,6 +285,7 @@ class EsferaAgentService : Service() {
         // 1. Handshake na primeira linha (hardware_uuid = deviceId do agente)
         val hs = TunnelHandshake(
             hardwareUuid = deviceId,
+            companyId = companyId,
             currentLocalIp = ip
         )
         writer.println(json.encodeToString(TunnelHandshake.serializer(), hs))

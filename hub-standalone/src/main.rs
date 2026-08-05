@@ -39,18 +39,24 @@ async fn main() {
         }
     });
 
-    // 3. Monitor de stale: túnel 45s, presença 30s (marca Offline se silenciou)
+    // 3. Monitor de estado: sweep de canais mortos (túnel 45s / presença 30s)
+    //    e RECONCILIAÇÃO RAM -> DB. O estado vivo (túnel/presença) tem
+    //    precedência sobre o timeout de check-in: sem isso, um device com
+    //    túnel ativo era marcado offline no banco (duas fontes de verdade).
     {
         let db_mark = db.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 session_manager::sweep_stale(45, 30);
-                let _ = db_mark.mark_stale_devices_offline(120);
+                let live = session_manager::live_snapshot();
+                if let Err(e) = db_mark.sync_live_state(&live, 120) {
+                    eprintln!("Aviso: falha ao reconciliar estado vivo com o DB: {}", e);
+                }
             }
         });
     }
-    println!("Status monitor iniciado (sweep de presença/túnel + check-in 120s)");
+    println!("Status monitor iniciado (sweep de presença/túnel + reconciliação RAM->DB)");
     let _ = std::io::stdout().flush();
 
     // 4. Check-in HTTP (agente Kotlin) :8080

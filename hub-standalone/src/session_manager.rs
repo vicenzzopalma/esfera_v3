@@ -284,3 +284,30 @@ pub fn forget(company_id: i32, esfera_device_id: &str) {
     let key = derive_device_key(company_id, esfera_device_id);
     STATES.lock().unwrap().remove(&key);
 }
+
+impl ConnectionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConnectionStatus::Online => "online",
+            ConnectionStatus::Degraded => "degraded",
+            ConnectionStatus::Offline => "offline",
+        }
+    }
+}
+
+/// Projeta o estado vivo (RAM) para o formato persistível do DB.
+/// É o ÚNICO ponto de tradução RAM -> banco; evita duas fontes de verdade.
+pub fn live_snapshot() -> Vec<crate::db::LiveDeviceState> {
+    STATES
+        .lock()
+        .unwrap()
+        .values()
+        .map(|s| crate::db::LiveDeviceState {
+            company_id: s.company_id,
+            esfera_device_id: s.esfera_device_id.clone(),
+            status: s.status.as_str().to_string(),
+            battery_level: s.battery_level,
+            last_seen_utc: s.last_seen_utc.clone(),
+        })
+        .collect()
+}

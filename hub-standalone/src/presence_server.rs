@@ -74,6 +74,17 @@ async fn handle_socket(socket: WebSocket) {
         match msg {
             Message::Text(text) => {
                 if let Ok(hb) = serde_json::from_str::<HeartbeatPayload>(&text) {
+                    // ISOLAMENTO: sem COMPANY_ID válido a presença é recusada.
+                    // Antes, o default 0 juntava todas as empresas na mesma chave.
+                    if hb.company_id <= 0 {
+                        let _ = sender
+                            .send(Message::Text(
+                                r#"{"status":"error","reason":"companyId ausente ou invalido"}"#
+                                    .to_string(),
+                            ))
+                            .await;
+                        break;
+                    }
                     if current.is_none() {
                         // Primeira mensagem abre a sessão de PRESENÇA (canal kotlin).
                         let sid = open_presence(

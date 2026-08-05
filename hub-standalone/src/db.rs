@@ -11,6 +11,17 @@ use r2d2_sqlite::SqliteConnectionManager;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 
+/// Projeção do estado VIVO (em RAM, session_manager) para persistência.
+/// Identidade = (company_id, esfera_device_id). NUNCA IP/porta/ordem de lista.
+#[derive(Debug, Clone)]
+pub struct LiveDeviceState {
+    pub company_id: i32,
+    pub esfera_device_id: String,
+    pub status: String, // "online" | "degraded" | "offline"
+    pub battery_level: u8,
+    pub last_seen_utc: String,
+}
+
 // ============================================================
 // STRUCTS
 // ============================================================
@@ -1112,6 +1123,74 @@ impl Database {
             timeout_seconds
         );
         self.conn().execute(&sql, []).map_err(|e| e.to_string())
+    }
+
+    /// Reconcilia o estado VIVO (session_manager, em RAM) com o banco.
+    ///
+    /// Por que existe: o check-in HTTP é apenas UM dos canais. Um device pode
+    /// estar com túnel e/ou presença ativos (portanto ONLINE de verdade) sem ter
+    /// feito check-in recente — antes disso, o sweeper marcava esse device como
+    /// offline no DB, criando DUAS fontes de verdade em conflito.
+    ///
+    /// Regra: o estado em RAM (túnel/presença) tem precedência. Devices sem
+    /// nenhum canal vivo só caem para offline pelo timeout de check-in.
+    /// A identidade usada é (CompanyId, EsferaDeviceId) — NUNCA IP.
+    pub fn sync_live_state(
+        &self,
+        live: &[LiveDeviceState],
+        stale_timeout_seconds: i32,
+    ) -> Result<usize, String> {
+        let conn = self.conn();
+        let mut touched = 0usize;
+
+        for st in live.iter().filter(|s| s.status != "offline") {
+            touched += conn
+                .execute(
+                    "UPDATE ESF_Device SET
+                        Status = ?1,
+                        BatteryLevel = ?2,
+                        LastSeenUTC = ?3
+                     WHERE EsferaDeviceId = ?4 AND CompanyId = ?5",
+                    params![
+                        st.status,
+                        st.battery_level as i32,
+                        st.last_seen_utc,
+                        st.esfera_device_id,
+                        st.company_id
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+
+        // Stale sweep protegendo quem tem canal vivo (túnel ou presença).
+        let protected: Vec<String> = live
+            .iter()
+            .filter(|s| s.status != "offline")
+            .map(|s| s.esfera_device_id.clone())
+            .collect();
+
+        let placeholders = if protected.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " AND EsferaDeviceId NOT IN ({})",
+                protected.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+            )
+        };
+        let sql = format!(
+            "UPDATE ESF_Device SET Status = 'offline'
+             WHERE EsferaDeviceId IS NOT NULL
+             AND Status <> 'offline'
+             AND LastSeenUTC IS NOT NULL
+             AND datetime(LastSeenUTC) < datetime('now', '-{} seconds'){}",
+            stale_timeout_seconds, placeholders
+        );
+        let params_dyn: Vec<&dyn rusqlite::ToSql> =
+            protected.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        conn.execute(&sql, params_dyn.as_slice())
+            .map_err(|e| e.to_string())?;
+
+        Ok(touched)
     }
 
     pub fn get_device_by_esfera_id(&self, esfera_device_id: &str) -> Option<Device> {

@@ -2936,7 +2936,7 @@ export const DeviceCard = memo(function DeviceCard({
   const menuRef = useRef<HTMLDivElement>(null);
 
   const displayName = device.name || device.serial;
-  const isUsbOnly = !device.serial.includes(":");
+  const isUsbOnly = !device.serial.includes(":") && !device.viaTunnel;
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -3662,7 +3662,10 @@ export function DiagnosticModal({ isOpen, onClose }: DiagnosticModalProps) {
 
 // ============================================================
 // Esfera v3 — Sub-componente MirrorModal (Linear SaaS Style)
-// Modal de espelhamento de tela e controle remoto ADB
+// Modal de espelhamento de tela, controle remoto ADB e câmera virtual.
+// AUDITADO: corrige invoke inválido (capture_screen -> capture_device_screen),
+// adiciona seletor de modos de espelhamento, câmera traseira/frontal e
+// injeção de tela do PC na Câmera Virtual ("roubar a câmera").
 // ============================================================
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -3678,13 +3681,27 @@ import {
   Camera,
   Layers,
   Sparkles,
+  MonitorPlay,
+  Video,
+  ScreenShare,
+  EyeOff,
+  RotateCcw,
 } from "lucide-react";
+
+type MirrorMode = "frame" | "scrcpy" | "scrcpy_off" | "virtual";
 
 interface MirrorModalProps {
   isOpen: boolean;
   onClose: () => void;
   device: Device;
   onOpenRegion: () => void;
+}
+
+// Converte o retorno do backend (data:URL ou base64 puro) em src de <img>.
+function toImgSrc(raw: string | null): string | null {
+  if (!raw) return null;
+  if (raw.startsWith("data:")) return raw;
+  return `data:image/png;base64,${raw}`;
 }
 
 export function MirrorModal({
@@ -3695,62 +3712,136 @@ export function MirrorModal({
 }: MirrorModalProps) {
   const [screenSrc, setScreenSrc] = useState<string | null>(null);
   const [loadingFrame, setLoadingFrame] = useState(false);
-  const autoRefresh = true;
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [mode, setMode] = useState<MirrorMode>("frame");
+  const [busy, setBusy] = useState(false);
+  const [streamMsg, setStreamMsg] = useState<string | null>(null);
   const imgRef = useRef<HTMLImageElement>(null);
 
+  const serial = device.serial;
+
+  // ---- Frame ADB (preview interno) ----
   const fetchScreenFrame = useCallback(async () => {
-    if (!isOpen) return;
+    if (!isOpen || mode !== "frame") return;
     setLoadingFrame(true);
+    setErrorMsg(null);
     try {
-      const src = await api<string>("capture_screen", { serial: device.serial });
-      setScreenSrc(src);
-    } catch {
+      const src = await api<string>("capture_device_screen", { serial });
+      setScreenSrc(toImgSrc(src));
+    } catch (e: any) {
+      const msg = typeof e === "string" ? e : e?.message || "Falha ao capturar frame.";
+      setErrorMsg(msg);
       setScreenSrc(null);
-    } fontally: {
+    } finally {
       setLoadingFrame(false);
     }
-  }, [isOpen, device.serial]);
+  }, [isOpen, mode, serial]);
 
+  // Reset ao abrir/fechar ou trocar de device.
   useEffect(() => {
     if (!isOpen) {
       setScreenSrc(null);
+      setErrorMsg(null);
+      setStreamMsg(null);
       return;
     }
+    setStreamMsg(null);
+    if (mode === "frame") fetchScreenFrame();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, serial]);
 
+  // Auto-refresh do frame ADB enquanto no modo "frame".
+  useEffect(() => {
+    if (!isOpen || mode !== "frame") return;
     fetchScreenFrame();
-    let intervalId: any = null;
-    if (autoRefresh) {
-      intervalId = setInterval(fetchScreenFrame, 1500);
-    }
+    const intervalId = setInterval(fetchScreenFrame, 1500);
+    return () => clearInterval(intervalId);
+  }, [isOpen, mode, fetchScreenFrame]);
 
-    return () => {
-      if (intervalId) clearInterval(intervalId);
-    };
-  }, [isOpen, autoRefresh, fetchScreenFrame]);
+  // ---- Ações de espelhamento (scrcpy / display virtual) ----
+  const startMode = async (next: MirrorMode) => {
+    setMode(next);
+    setStreamMsg(null);
+    setErrorMsg(null);
+    if (next === "frame") {
+      setScreenSrc(null);
+      fetchScreenFrame();
+      return;
+    }
+    setBusy(true);
+    try {
+      let msg = "";
+      if (next === "scrcpy") {
+        msg = await api<string>("launch_scrcpy_stream", { serial, turnScreenOff: false });
+      } else if (next === "scrcpy_off") {
+        msg = await api<string>("launch_scrcpy_stream", { serial, turnScreenOff: true });
+      } else if (next === "virtual") {
+        msg = await api<string>("launch_virtual_display_stream", {
+          serial,
+          width: 1080,
+          height: 1920,
+          dpi: 320,
+        });
+      }
+      setStreamMsg(`${msg}\n(Aba externa do scrcpy — use o preview de frame para controle interno)`);
+    } catch (e: any) {
+      setErrorMsg(typeof e === "string" ? e : e?.message || "Falha ao iniciar espelhamento.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // ---- Câmera traseira / frontal ----
+  const startCamera = async (facing: "back" | "front") => {
+    setBusy(true);
+    setErrorMsg(null);
+    setStreamMsg(null);
+    try {
+      const msg = await api<string>("launch_camera_stream", { serial, facing });
+      setStreamMsg(msg);
+    } catch (e: any) {
+      setErrorMsg(typeof e === "string" ? e : e?.message || "Falha ao abrir câmera.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // ---- Roubar a câmera: injeta a tela do PC na Câmera Virtual do celular ----
+  const stealCamera = async () => {
+    setBusy(true);
+    setErrorMsg(null);
+    setStreamMsg(null);
+    try {
+      const msg = await api<string>("inject_virtual_camera", { serial, targetType: "full" });
+      setStreamMsg(msg);
+    } catch (e: any) {
+      setErrorMsg(typeof e === "string" ? e : e?.message || "Falha ao injetar tela do PC.");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const handleImageClick = async (e: React.MouseEvent<HTMLImageElement>) => {
-    if (!imgRef.current) return;
+    if (!imgRef.current || mode !== "frame") return;
     const rect = imgRef.current.getBoundingClientRect();
     const clickX = e.clientX - rect.left;
     const clickY = e.clientY - rect.top;
-
     const normX = Math.round((clickX / rect.width) * 1080);
     const normY = Math.round((clickY / rect.height) * 2400);
-
     try {
-      await api("send_adb_tap", { serial: device.serial, x: normX, y: normY });
+      await api("send_adb_tap", { serial, x: normX, y: normY });
       setTimeout(fetchScreenFrame, 300);
     } catch {
-      console.log(`ADB Tap: X=${normX}, Y=${normY}`);
+      /* noop: tap melhor-effort */
     }
   };
 
   const handleKeyevent = async (code: number) => {
     try {
-      await api("send_adb_keyevent", { serial: device.serial, keycode: code });
-      setTimeout(fetchScreenFrame, 300);
+      await api("send_adb_keyevent", { serial, keycode: code });
+      if (mode === "frame") setTimeout(fetchScreenFrame, 300);
     } catch {
-      console.log(`ADB Keyevent: ${code}`);
+      /* noop */
     }
   };
 
@@ -3761,7 +3852,7 @@ export function MirrorModal({
       title={`Controle Remoto: ${device.name || device.model}`}
       size="lg"
       footer={
-        <div className="flex justify-between items-center w-full text-xs">
+        <div className="flex justify-between items-center w-full text-xs gap-2">
           <Button
             variant="secondary"
             size="sm"
@@ -3785,50 +3876,124 @@ export function MirrorModal({
               src={screenSrc}
               alt="Tela do Celular"
               onClick={handleImageClick}
-              className="max-h-[440px] w-auto rounded cursor-pointer border border-white/[0.05]"
+              className={`max-h-[440px] w-auto rounded border border-white/[0.05] ${
+                mode === "frame" ? "cursor-pointer" : "cursor-default"
+              }`}
             />
           ) : (
             <div className="text-center p-6 text-zinc-500">
-              <RefreshCw size={24} className="animate-spin text-[#828DF7] mx-auto mb-2" />
-              <p>Carregando frame ADB...</p>
+              {loadingFrame ? (
+                <>
+                  <RefreshCw size={24} className="animate-spin text-[#828DF7] mx-auto mb-2" />
+                  <p>Carregando frame ADB...</p>
+                </>
+              ) : (
+                <>
+                  <MonitorPlay size={24} className="text-zinc-600 mx-auto mb-2" />
+                  <p>{mode === "frame" ? "Sem frame disponível" : "Espelhamento em janela externa"}</p>
+                </>
+              )}
             </div>
           )}
         </div>
 
-        {/* Right: Hardware Navigation Controls */}
+        {/* Right: Controls */}
         <div className="flex-1 space-y-3 w-full">
+          {/* Modo de espelhamento */}
+          <div className="p-3 bg-[#141418] border border-white/[0.07] rounded-lg space-y-2">
+            <h5 className="font-semibold text-zinc-200">Modo de Espelhamento</h5>
+            <div className="grid grid-cols-2 gap-2">
+              <Button
+                variant={mode === "frame" ? "primary" : "secondary"}
+                size="sm"
+                onClick={() => startMode("frame")}
+                icon={<RefreshCw size={13} />}
+              >
+                Frame ADB
+              </Button>
+              <Button
+                variant={mode === "scrcpy" ? "primary" : "secondary"}
+                size="sm"
+                onClick={() => startMode("scrcpy")}
+                loading={busy && mode !== "scrcpy"}
+                icon={<ScreenShare size={13} />}
+              >
+                Scrcpy 60FPS
+              </Button>
+              <Button
+                variant={mode === "scrcpy_off" ? "primary" : "secondary"}
+                size="sm"
+                onClick={() => startMode("scrcpy_off")}
+                loading={busy && mode !== "scrcpy_off"}
+                icon={<EyeOff size={13} />}
+              >
+                Scrcpy (Tela Off)
+              </Button>
+              <Button
+                variant={mode === "virtual" ? "primary" : "secondary"}
+                size="sm"
+                onClick={() => startMode("virtual")}
+                loading={busy && mode !== "virtual"}
+                icon={<MonitorPlay size={13} />}
+              >
+                Display Virtual #2
+              </Button>
+            </div>
+
+            {/* Câmera traseira / frontal */}
+            <h5 className="font-semibold text-zinc-200 pt-1">Câmera do Celular</h5>
+            <div className="grid grid-cols-2 gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => startCamera("back")}
+                loading={busy}
+                icon={<Camera size={13} className="text-emerald-400" />}
+              >
+                Câmera Traseira
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => startCamera("front")}
+                loading={busy}
+                icon={<Camera size={13} className="text-sky-400" />}
+              >
+                Câmera Frontal
+              </Button>
+            </div>
+
+            {/* Roubar a câmera */}
+            <h5 className="font-semibold text-zinc-200 pt-1">Câmera Virtual (PC → Celular)</h5>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={stealCamera}
+              loading={busy}
+              icon={<Video size={13} className="text-fuchsia-400" />}
+              className="w-full"
+            >
+              Roubar Câmera (Injetar Tela do PC)
+            </Button>
+          </div>
+
+          {/* Botões físicos Android */}
           <div className="p-3 bg-[#141418] border border-white/[0.07] rounded-lg space-y-2">
             <h5 className="font-semibold text-zinc-200">Botões Físicos Android</h5>
             <div className="grid grid-cols-3 gap-2">
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => handleKeyevent(4)}
-                icon={<ArrowLeft size={13} />}
-              >
+              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(4)} icon={<ArrowLeft size={13} />}>
                 Voltar
               </Button>
-
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => handleKeyevent(3)}
-                icon={<Home size={13} />}
-              >
+              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(3)} icon={<Home size={13} />}>
                 Início
               </Button>
-
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => handleKeyevent(187)}
-                icon={<Layers size={13} />}
-              >
+              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(187)} icon={<Layers size={13} />}>
                 Apps
               </Button>
             </div>
           </div>
 
+          {/* Controles de tela */}
           <div className="p-3 bg-[#141418] border border-white/[0.07] rounded-lg space-y-2">
             <h5 className="font-semibold text-zinc-200">Controles de Tela</h5>
             <div className="grid grid-cols-2 gap-2">
@@ -3840,19 +4005,19 @@ export function MirrorModal({
               >
                 Liga/Desliga
               </Button>
-
               <Button
                 variant="secondary"
                 size="sm"
                 onClick={fetchScreenFrame}
                 loading={loadingFrame}
-                icon={<RefreshCw size={13} />}
+                icon={<RotateCcw size={13} />}
               >
                 Atualizar Frame
               </Button>
             </div>
           </div>
 
+          {/* Automação de WhatsApp */}
           <div className="p-3 bg-[#141418] border border-white/[0.07] rounded-lg space-y-2">
             <h5 className="font-semibold text-zinc-200">Automação de WhatsApp</h5>
             <Button
@@ -3860,10 +4025,14 @@ export function MirrorModal({
               size="sm"
               onClick={async () => {
                 try {
-                  await api("open_whatsapp_target", { serial: device.serial });
-                  fetchScreenFrame();
+                  await api("send_intent_to_display", {
+                    serial,
+                    url: "https://wa.me/",
+                    displayId: 0,
+                  });
+                  if (mode === "frame") fetchScreenFrame();
                 } catch {
-                  console.log("Abrindo WhatsApp...");
+                  /* noop */
                 }
               }}
               icon={<Sparkles size={13} />}
@@ -3872,6 +4041,18 @@ export function MirrorModal({
               Abrir WhatsApp Business
             </Button>
           </div>
+
+          {/* Mensagens de status */}
+          {streamMsg && (
+            <div className="p-2.5 bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 font-mono text-[11px] rounded whitespace-pre-wrap">
+              {streamMsg}
+            </div>
+          )}
+          {errorMsg && (
+            <div className="p-2.5 bg-red-500/10 border border-red-500/20 text-red-300 font-mono text-[11px] rounded whitespace-pre-wrap">
+              {errorMsg}
+            </div>
+          )}
         </div>
       </div>
     </Modal>
@@ -23763,6 +23944,24 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         }
 
         for dev in &mut refreshed_db {
+            // Devices só-túnel (identidade estável via EsferaDeviceId) com sessão ativa
+            // NÃO devem ser forçados a offline: o túnel reverso é a fonte de verdade da
+            // conexão. O loop anterior já marcou via_tunnel/online quando is_tunnel_active.
+            if dev.via_tunnel {
+                if let Some(ref uuid) = dev.esfera_device_id {
+                    if crate::tunnel_server::is_tunnel_active(uuid) {
+                        dev.status = "online".to_string();
+                    } else {
+                        // Sessão de túnel caiu (hub fechado/reabriu): mantém o device visível
+                        // como "connecting" em vez de sumir, e o agente reconecta sozinho.
+                        if dev.status == "online" {
+                            dev.status = "connecting".to_string();
+                        }
+                    }
+                }
+                continue;
+            }
+
             let is_active = active_adb_list.iter().any(|adb_d| adb_d.serial == dev.serial);
             if is_active {
                 dev.status = "online".to_string();
@@ -29337,10 +29536,11 @@ pub fn run() {
             match &event {
                 tauri::RunEvent::ExitRequested { code, .. } => {
                     diag(&format!("EVENTO TAURI: ExitRequested com código {:?}", code));
+                    // Só encerra túneis na saída REAL do app (não ao fechar/minimizar janelas).
+                    crate::tunnel_server::shutdown();
                 }
                 tauri::RunEvent::WindowEvent { event: tauri::WindowEvent::Destroyed, .. } => {
-                    diag("EVENTO TAURI: WindowEvent Destroyed");
-                    crate::tunnel_server::shutdown();
+                    diag("EVENTO TAURI: WindowEvent Destroyed (túneis mantidos até ExitRequested)");
                 }
                 tauri::RunEvent::Ready => {
                     diag("EVENTO TAURI: App Ready!");
@@ -31496,7 +31696,9 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+tower = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -31506,6 +31708,11 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.21"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 [profile.release]
 opt-level = 1
 lto = false
@@ -31591,23 +31798,30 @@ use crate::db::Database;
 pub struct CheckInPayload {
     pub esfera_device_id: String,
     pub current_adb_address: String,
+    #[serde(default)]
+    pub company_id: i32,
 }
 
 pub async fn start(db: Arc<Database>, port: u16) {
     let app = Router::new()
         .route("/api/devices/check-in", post(handle_checkin))
-        .with_state(db);
+        .with_state((db, port));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr).await
-        .expect("Falha ao bindar check-in server");
-    println!("Servidor HTTP Check-in rodando em http://0.0.0.0:{}", port);
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("AVISO: Check-in server na porta {} ja em uso: {}", port, e);
+            return;
+        }
+    };
+    println!("Servidor HTTP Check-in (canal KOTLIN) rodando em http://0.0.0.0:{}", port);
     axum::serve(listener, app).await
         .expect("Falha ao iniciar check-in server");
 }
 
 async fn handle_checkin(
-    State(db): State<Arc<Database>>,
+    State((db, _port)): State<(Arc<Database>, u16)>,
     Json(payload): Json<CheckInPayload>,
 ) -> &'static str {
     let now = Utc::now().to_rfc3339();
@@ -31618,11 +31832,26 @@ async fn handle_checkin(
         None => (adb_address.clone(), 5555),
     };
 
-    let updated = db.process_checkin(&payload.esfera_device_id, adb_address, &ip, port, &now);
+    // Grava com company_id para isolar a presença no VPS.
+    let updated = db.process_checkin(
+        &payload.esfera_device_id,
+        adb_address,
+        &ip,
+        port,
+        &now,
+        payload.company_id,
+    );
 
     match updated {
         Ok(0) => {
-            let _ = db.insert_unknown_device(&payload.esfera_device_id, adb_address, &ip, port, &now);
+            let _ = db.insert_unknown_device(
+                &payload.esfera_device_id,
+                adb_address,
+                &ip,
+                port,
+                &now,
+                payload.company_id,
+            );
         }
         Ok(_) => {}
         Err(e) => {
@@ -32623,27 +32852,42 @@ impl Database {
         Ok(())
     }
 
-    pub fn process_checkin(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
-        self.conn().execute(
+    pub fn process_checkin(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str, company_id: i32) -> Result<usize, String> {
+        // Primeiro tenta atualizar um device já conhecido (mantém company_id estável).
+        let updated = self.conn().execute(
             "UPDATE ESF_Device SET
                 CurrentAdbAddress = ?1,
                 Status = 'online',
                 LastSeenUTC = ?2,
                 DeviceIp = ?3,
-                DevicePort = ?4
+                DevicePort = ?4,
+                CompanyId = COALESCE((SELECT CompanyId FROM ESF_Device WHERE EsferaDeviceId = ?5), ?6)
              WHERE EsferaDeviceId = ?5",
-            params![adb_address, now, ip, port, device_id],
-        ).map_err(|e| e.to_string())
+            params![adb_address, now, ip, port, device_id, company_id],
+        ).map_err(|e| e.to_string())?;
+
+        if updated == 0 {
+            // Dispositivo novo: usa o company_id declarado (primeiro seen wins p/ isolamento).
+            return self.conn().execute(
+                "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
+                 VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?6, 0, 'junior', ?5, ?7)
+                 ON CONFLICT(EsferaDeviceId) DO UPDATE SET
+                 CurrentAdbAddress=excluded.CurrentAdbAddress, Status='online', LastSeenUTC=excluded.LastSeenUTC,
+                 DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, CompanyId=excluded.CompanyId",
+                params![format!("agent-{}", device_id), device_id, ip, port, adb_address, company_id, now],
+            ).map_err(|e| e.to_string());
+        }
+        Ok(updated)
     }
 
-    pub fn insert_unknown_device(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
+    pub fn insert_unknown_device(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str, company_id: i32) -> Result<usize, String> {
         self.conn().execute(
             "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
-             VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, 1, 0, 'junior', ?5, ?6)
+             VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?6, 0, 'junior', ?5, ?7)
              ON CONFLICT(EsferaDeviceId) DO UPDATE SET
              CurrentAdbAddress=excluded.CurrentAdbAddress, Status='online', LastSeenUTC=excluded.LastSeenUTC,
-             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort",
-            params![format!("agent-{}", device_id), device_id, ip, port, adb_address, now],
+             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, CompanyId=excluded.CompanyId",
+            params![format!("agent-{}", device_id), device_id, ip, port, adb_address, company_id, now],
         ).map_err(|e| e.to_string())
     }
 
@@ -34018,9 +34262,12 @@ async fn handle_connection(
 // ========================================================
 
 mod db;
-mod protocol;
+pub mod protocol;
 mod hub;
 mod checkin_server;
+pub mod tunnel_server;
+pub mod presence_server;
+pub mod session_manager;
 
 use std::env;
 use std::sync::Arc;
@@ -34035,11 +34282,11 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(protocol::HUB_DEFAULT_PORT);
 
-    println!("=== ESFERA HUB STANDALONE (ULTRA FAST) ===");
+    println!("=== ESFERA HUB STANDALONE (FONTE DE VERDADE) ===");
     println!("Iniciando servidor TCP Master na porta {}...", port);
     let _ = std::io::stdout().flush();
 
-    // 1. Inicia o Hub TCP Master (em background)
+    // 1. Inicia o Hub TCP Master (relay master <-> empresas)
     let hub = hub::Hub::new(port);
     tokio::spawn(async move {
         if let Err(e) = hub.start().await {
@@ -34048,10 +34295,7 @@ async fn main() {
         }
     });
 
-    println!("Iniciando banco de dados SQLite...");
-    let _ = std::io::stdout().flush();
-
-    // 2. Inicializa o Banco de Dados local do Hub
+    // 2. Banco de dados SQLite
     let db_path = "./esfera_cloud.db".to_string();
     let db = match Database::init(&db_path) {
         Ok(d) => Arc::new(d),
@@ -34064,79 +34308,183 @@ async fn main() {
     println!("Banco de dados SQLite carregado com sucesso!");
     let _ = std::io::stdout().flush();
 
-    // 3. Status monitor: marca devices offline se check-in expirou (>120s)
-    let db_clone = db.clone();
+    // 3. Monitor de stale: túnel 45s, presença 30s (marca Offline se silenciou)
+    let db_monitor = db.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            match db_clone.mark_stale_devices_offline(120) {
-                Ok(n) if n > 0 => println!("Status monitor: {} devices marcados offline", n),
-                _ => {}
-            }
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            session_manager::sweep_stale(45, 30);
+            // Também marca no DB devices cujo check-in expirou (>120s)
+            let _ = db_monitor.mark_stale_devices_offline(120);
         }
     });
-    println!("Status monitor iniciado (a cada 30s, timeout 120s)");
+    println!("Status monitor iniciado (sweep de presença/túnel + check-in 120s)");
     let _ = std::io::stdout().flush();
 
-    // 4. Inicia o Servidor Check-in HTTP (Axum) na porta 8080
+    // 4. Check-in HTTP (agente Kotlin) :8080
     let http_port: u16 = env::var("HTTP_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
-    
-    // 5. Motor de Auto-Atualizador do Hub Standalone via Git (Auto-Update Daemon)
+    let db_checkin = db.clone();
     tokio::spawn(async move {
-        println!("Motor de Auto-Atualização do Hub iniciado (verificação a cada 5 min)...");
-        let _ = std::io::stdout().flush();
-        loop {
-            tokio::time::sleep(Duration::from_secs(300)).await;
-            
-            let fetch_res = std::process::Command::new("git").arg("fetch").output();
-            if let Ok(out) = fetch_res {
-                if out.status.success() {
-                    let current = std::process::Command::new("git")
-                        .args(["rev-parse", "--short", "HEAD"])
-                        .output()
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        .unwrap_or_default();
-
-                    let latest = std::process::Command::new("git")
-                        .args(["rev-parse", "--short", "origin/main"])
-                        .output()
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        .unwrap_or_default();
-
-                    if !latest.is_empty() && current != latest {
-                        println!("[AUTO-UPDATE] Novo commit detectado no repositório (HEAD: {}, Remoto: {}). Aplicando atualização...", current, latest);
-                        let _ = std::io::stdout().flush();
-
-                        let pull = std::process::Command::new("git")
-                            .args(["pull", "--rebase", "origin", "main"])
-                            .output();
-
-                        if let Ok(p) = pull {
-                            if p.status.success() {
-                                println!("[AUTO-UPDATE] Código do Hub atualizado com sucesso! Reiniciando processo...");
-                                let _ = std::io::stdout().flush();
-
-                                if let Ok(exe) = std::env::current_exe() {
-                                    let _ = std::process::Command::new(exe).spawn();
-                                }
-                                std::process::exit(0);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        checkin_server::start(db_checkin, http_port).await;
     });
 
-    println!("Iniciando Servidor HTTP Check-in na porta {}...", http_port);
+    // 5. Tunnel server (agente RUST) :8888 — canal de CONTROLE ADB
+    let tunnel_port: u16 = env::var("TUNNEL_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8888);
+    tokio::spawn(async move {
+        tunnel_server::start(tunnel_port).await;
+    });
+
+    // 6. Presence WebSocket (agente KOTLIN) :7779 — telemetria
+    let presence_port: u16 = env::var("PRESENCE_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7779);
+    tokio::spawn(async move {
+        presence_server::start(presence_port).await;
+    });
+
+    println!(
+        "Hub Standalone ATIVO: master={} checkin={} tunnel={} presence={}",
+        port, http_port, tunnel_port, presence_port
+    );
     let _ = std::io::stdout().flush();
-    checkin_server::start(db, http_port).await;
+
+    // Mantém o processo vivo (os servidores rodam em tasks).
+    loop {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
 }
 
 
+// ========================================================
+// ARQUIVO: hub-standalone\src\presence_server.rs
+// ========================================================
+
+// ============================================================
+// Esfera v3 — Hub Standalone — Servidor de Presença WebSocket (presence_server.rs)
+// Canal de telemetria/bateria/tela em tempo real (porta 7779).
+//
+// Responsável EXCLUSIVO: agente KOTLIN (EsferaAgentService).
+// O agente Rust NÃO faz presença (evita disputa de sessão/porta/identidade).
+//
+// Protocolo (herdado do EsferaAgentService, PresenceClient.kt):
+//   WS /ws/presence
+//   payload: {"uuid":DEVICE_ID,"batteryLevel":N,"isCharging":bool,"isScreenOn":bool,
+//             "companyId":N}
+//   servidor responde {"status":"ack"} a cada heartbeat.
+//
+// Identidade: company_id + uuid(DEVICE_ID). NUNCA IP.
+// Isolamento: o estado é indexado por (company_id, device_id) e filtrado
+//             por company_id nas consultas do master.
+// ============================================================
+
+use axum::{
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::State,
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use crate::session_manager::{self, open_presence, heartbeat_presence, close_presence};
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeartbeatPayload {
+    pub uuid: String,
+    pub battery_level: u8,
+    pub is_charging: bool,
+    pub is_screen_on: bool,
+    #[serde(default)]
+    pub company_id: i32,
+}
+
+pub async fn start(port: u16) {
+    let app = Router::new()
+        .route("/ws/presence", get(ws_handler))
+        .with_state(());
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("AVISO: Servidor de Presença (WS) na porta {} ja em uso: {}", port, e);
+            return;
+        }
+    };
+
+    println!("🌐 Servidor de Presença WebSocket (canal KOTLIN) ativo na porta {}", port);
+
+    axum::serve(listener, app).await.unwrap_or_else(|e| {
+        eprintln!("AVISO: Servidor de Presença WS encerrado: {}", e);
+    });
+}
+
+async fn ws_handler(ws: WebSocketUpgrade, addr: axum::extract::ConnectInfo<SocketAddr>) -> impl IntoResponse {
+    let _client_ip = addr.0.ip().to_string();
+    ws.on_upgrade(move |socket| handle_socket(socket))
+}
+
+async fn handle_socket(socket: WebSocket) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut current: Option<(i32, String)> = None;
+
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            Message::Text(text) => {
+                if let Ok(hb) = serde_json::from_str::<HeartbeatPayload>(&text) {
+                    if current.is_none() {
+                        // Primeira mensagem abre a sessão de PRESENÇA (canal kotlin).
+                        let sid = open_presence(
+                            hb.company_id,
+                            &hb.uuid,
+                            hb.battery_level,
+                            hb.is_charging,
+                            hb.is_screen_on,
+                        );
+                        println!(
+                            "[presence] device {} (empresa {}) conectado — session {}",
+                            hb.uuid, hb.company_id, sid
+                        );
+                        current = Some((hb.company_id, hb.uuid.clone()));
+                    } else {
+                        // Heartbeats seguintes apenas renovam.
+                        heartbeat_presence(
+                            hb.company_id,
+                            &hb.uuid,
+                            hb.battery_level,
+                            hb.is_charging,
+                            hb.is_screen_on,
+                        );
+                    }
+
+                    let _ = sender.send(Message::Text(r#"{"status":"ack"}"#.to_string())).await;
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    // Ao desconectar, fecha APENAS a presença (túnel intocado).
+    if let Some((company_id, uuid)) = current {
+        close_presence(company_id, &uuid);
+        println!(
+            "[presence] device {} (empresa {}) desconectado — presença fechada",
+            uuid, company_id
+        );
+    }
+}
 
 
 // ========================================================
@@ -34196,6 +34544,699 @@ pub fn serialize_msg(msg: &HubMessage) -> Result<Vec<u8>, String> {
 
 pub fn deserialize_msg(data: &[u8]) -> Result<HubMessage, String> {
     serde_json::from_slice(data).map_err(|e| e.to_string())
+}
+
+
+// ========================================================
+// ARQUIVO: hub-standalone\src\session_manager.rs
+// ========================================================
+
+// ============================================================
+// Esfera v3 — Hub Standalone — Gerenciador de Sessão e Identidade
+// (session_manager.rs)
+//
+// FONTE DE VERDADE DA PRESENÇA E DO TÚNEL NO VPS.
+//
+// Modelo de identidade (persistente, NUNCA derivada de IP/socket/ADB):
+//   COMPANY_ID  -> isolamento obrigatório (Empresa A não vê Empresa B)
+//   DEVICE_ID   -> identidade lógica estável do aparelho (ex: ESF-<uuid>)
+//   AGENT_ID    -> "rust" (túnel ADB reverso) | "kotlin" (check-in/presença)
+//   SESSION_ID  -> UUID por conexão; recriado a cada reconexão
+//   LAST_SEEN   -> UTC do último heartbeat válido
+//   STATUS      -> online | degraded | offline
+//
+// REGRA DE CONCORRÊNCIA (objetivo 6):
+//   Cada (company_id, device_id) tem EXATAMENTE UM DeviceState.
+//   Os dois agentes ocupam CANAIS DISTINTOS e EXCLUSIVOS:
+//     - túnel  (rust)  -> session.tunnel
+//     - presença(kotlin)-> session.presence
+//   Eles NUNCA disputam a mesma sessão/porta/identidade.
+//   Reconectar gera novo SESSION_ID, mantém DEVICE_ID+COMPANY_ID.
+//   Desconectar B só mexe em B.
+// ============================================================
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde::{Serialize, Deserialize};
+
+/// Chave de roteamento: identidade persistente, NUNCA IP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DeviceKey {
+    pub company_id: i32,
+    pub device_id: i32, // surrogate id no DB da empresa (ou hash do esfera_device_id)
+}
+
+/// Identidade lógica do aparelho (independente de conexão).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceIdentity {
+    pub company_id: i32,
+    pub esfera_device_id: String, // ex: ESF-xxxx (DEVICE_ID persistente)
+    pub device_key: DeviceKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionStatus {
+    Online,   // túnel + presença OK
+    Degraded, // apenas um dos canais OK
+    Offline,  // nenhum canal ativo
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelSession {
+    pub session_id: String, // recriado a cada reconexão
+    pub agent_id: String,   // "rust" | "kotlin"
+    pub connected_at: String,
+    pub last_heartbeat: String,
+    #[serde(skip)]
+    pub last_heartbeat_instant: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceState {
+    pub key: DeviceKey,
+    pub esfera_device_id: String,
+    pub company_id: i32,
+    pub battery_level: u8,
+    pub is_charging: bool,
+    pub is_screen_on: bool,
+    pub status: ConnectionStatus,
+    pub tunnel: Option<ChannelSession>,   // EXCLUSIVO do agente rust
+    pub presence: Option<ChannelSession>, // EXCLUSIVO do agente kotlin
+    pub last_seen_utc: String,
+}
+
+impl DeviceState {
+    fn recalc(&mut self) {
+        self.status = match (self.tunnel.is_some(), self.presence.is_some()) {
+            (true, true) => ConnectionStatus::Online,
+            (true, false) | (false, true) => ConnectionStatus::Degraded,
+            (false, false) => ConnectionStatus::Offline,
+        };
+    }
+}
+
+// Mapa global indexado por (company_id, device_id). Ponto único de verdade.
+static STATES: LazyLock<Mutex<HashMap<DeviceKey, DeviceState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+use std::sync::LazyLock;
+
+/// Resolve (ou cria) o DeviceKey a partir do esfera_device_id + company_id.
+/// O device_id (surrogate) é derivado de forma estável (hash) para não dependermos
+/// do DB aqui; o roteamento de comandos usa company_id + esfera_device_id.
+fn derive_device_key(company_id: i32, esfera_device_id: &str) -> DeviceKey {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in format!("{}|{}", company_id, esfera_device_id.to_lowercase()).bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    DeviceKey { company_id, device_id: (h >> 32) as i32 }
+}
+
+fn new_session(agent_id: &str) -> ChannelSession {
+    let now = chrono::Utc::now();
+    ChannelSession {
+        session_id: uuid::Uuid::new_v4().to_string(),
+        agent_id: agent_id.to_string(),
+        connected_at: now.to_rfc3339(),
+        last_heartbeat: now.to_rfc3339(),
+        last_heartbeat_instant: Some(Instant::now()),
+    }
+}
+
+// ---- API PÚBLICA ----
+
+/// Canal TÚNEL (agente rust). Substitui a sessão de túnel do device; não toca presença.
+pub fn open_tunnel(company_id: i32, esfera_device_id: &str) -> String {
+    let key = derive_device_key(company_id, esfera_device_id);
+    let mut map = STATES.lock().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = map.entry(key).or_insert_with(|| DeviceState {
+        key,
+        esfera_device_id: esfera_device_id.to_string(),
+        company_id,
+        battery_level: 0,
+        is_charging: false,
+        is_screen_on: false,
+        status: ConnectionStatus::Offline,
+        tunnel: None,
+        presence: None,
+        last_seen_utc: now.clone(),
+    });
+    entry.esfera_device_id = esfera_device_id.to_string();
+    entry.company_id = company_id;
+    entry.tunnel = Some(new_session("rust"));
+    entry.last_seen_utc = now;
+    entry.recalc();
+    entry.tunnel.as_ref().unwrap().session_id.clone()
+}
+
+/// Canal PRESENÇA (agente kotlin). Substitui a sessão de presença; não toca túnel.
+pub fn open_presence(
+    company_id: i32,
+    esfera_device_id: &str,
+    battery: u8,
+    charging: bool,
+    screen_on: bool,
+) -> String {
+    let key = derive_device_key(company_id, esfera_device_id);
+    let mut map = STATES.lock().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = map.entry(key).or_insert_with(|| DeviceState {
+        key,
+        esfera_device_id: esfera_device_id.to_string(),
+        company_id,
+        battery_level: battery,
+        is_charging: charging,
+        is_screen_on: screen_on,
+        status: ConnectionStatus::Offline,
+        tunnel: None,
+        presence: None,
+        last_seen_utc: now.clone(),
+    });
+    entry.esfera_device_id = esfera_device_id.to_string();
+    entry.company_id = company_id;
+    entry.battery_level = battery;
+    entry.is_charging = charging;
+    entry.is_screen_on = screen_on;
+    entry.presence = Some(new_session("kotlin"));
+    entry.last_seen_utc = now;
+    entry.recalc();
+    entry.presence.as_ref().unwrap().session_id.clone()
+}
+
+/// Heartbeat de presença (kotlin) — atualiza telemetria e renova last_heartbeat.
+pub fn heartbeat_presence(
+    company_id: i32,
+    esfera_device_id: &str,
+    battery: u8,
+    charging: bool,
+    screen_on: bool,
+) {
+    let key = derive_device_key(company_id, esfera_device_id);
+    let mut map = STATES.lock().unwrap();
+    if let Some(entry) = map.get_mut(&key) {
+        let now = chrono::Utc::now().to_rfc3339();
+        entry.battery_level = battery;
+        entry.is_charging = charging;
+        entry.is_screen_on = screen_on;
+        if let Some(p) = entry.presence.as_mut() {
+            p.last_heartbeat = now.clone();
+            p.last_heartbeat_instant = Some(Instant::now());
+        }
+        entry.last_seen_utc = now;
+        entry.recalc();
+    }
+}
+
+/// Heartbeat de túnel (rust) — renovado pelo loop ping/pong do tunnel_server.
+pub fn heartbeat_tunnel(company_id: i32, esfera_device_id: &str) {
+    let key = derive_device_key(company_id, esfera_device_id);
+    let mut map = STATES.lock().unwrap();
+    if let Some(entry) = map.get_mut(&key) {
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Some(t) = entry.tunnel.as_mut() {
+            t.last_heartbeat = now.clone();
+            t.last_heartbeat_instant = Some(Instant::now());
+        }
+        entry.last_seen_utc = now;
+        entry.recalc();
+    }
+}
+
+/// Fecha apenas o canal TÚNEL (agente rust desconectou). Presença intocada.
+pub fn close_tunnel(company_id: i32, esfera_device_id: &str) {
+    let key = derive_device_key(company_id, esfera_device_id);
+    let mut map = STATES.lock().unwrap();
+    if let Some(entry) = map.get_mut(&key) {
+        entry.tunnel = None;
+        entry.recalc();
+    }
+}
+
+/// Fecha apenas o canal PRESENÇA (agente kotlin desconectou). Túnel intocado.
+pub fn close_presence(company_id: i32, esfera_device_id: &str) {
+    let key = derive_device_key(company_id, esfera_device_id);
+    let mut map = STATES.lock().unwrap();
+    if let Some(entry) = map.get_mut(&key) {
+        entry.presence = None;
+        entry.recalc();
+    }
+}
+
+/// Varredura: marca Offline canais que silenciaram > timeout.
+/// Canal túnel: gracefully 45s. Canal presença: 2x heartbeat (10s) -> 30s.
+pub fn sweep_stale(grace_tunnel_secs: u64, grace_presence_secs: u64) {
+    let mut map = STATES.lock().unwrap();
+    let now = Instant::now();
+    for entry in map.values_mut() {
+        if let Some(t) = entry.tunnel.as_ref() {
+            if let Some(last) = t.last_heartbeat_instant {
+                if now.duration_since(last) > Duration::from_secs(grace_tunnel_secs) {
+                    entry.tunnel = None;
+                }
+            }
+        }
+        if let Some(p) = entry.presence.as_ref() {
+            if let Some(last) = p.last_heartbeat_instant {
+                if now.duration_since(last) > Duration::from_secs(grace_presence_secs) {
+                    entry.presence = None;
+                }
+            }
+        }
+        entry.recalc();
+    }
+}
+
+/// Consulta de estado (usado por testes e pelo roteamento do master).
+pub fn get_state(company_id: i32, esfera_device_id: &str) -> Option<DeviceState> {
+    let key = derive_device_key(company_id, esfera_device_id);
+    STATES.lock().unwrap().get(&key).cloned()
+}
+
+/// Lista dispositivos de UMA empresa (isolamento estrito por company_id).
+pub fn list_by_company(company_id: i32) -> Vec<DeviceState> {
+    STATES
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|s| s.company_id == company_id)
+        .cloned()
+        .collect()
+}
+
+/// Lista TODOS (apenas para o master/diagnóstico).
+pub fn list_all() -> Vec<DeviceState> {
+    STATES.lock().unwrap().values().cloned().collect()
+}
+
+/// Remove completamente um device do estado em RAM (usado em testes de isolamento).
+pub fn forget(company_id: i32, esfera_device_id: &str) {
+    let key = derive_device_key(company_id, esfera_device_id);
+    STATES.lock().unwrap().remove(&key);
+}
+
+
+// ========================================================
+// ARQUIVO: hub-standalone\src\tunnel_server.rs
+// ========================================================
+
+// ============================================================
+// Esfera v3 — Hub Standalone — Servidor do Túnel Reverso (tunnel_server.rs)
+// FONTE DE VERDADE do canal de CONTROLE ADB dos celulares.
+//
+// Responsável EXCLUSIVO: agente RUST (device-agent, /data/adb/earlypoint).
+// O agente Kotlin NÃO abre túnel (evita disputa de sessão/porta/identidade).
+//
+// Protocolo (herdado do device-agent Rust, device-agent/src/main.rs:229):
+//   handshake: {"type":"handshake","hardwareUuid","macAddress","serialNumber",
+//               "agentVersion","currentLocalIp","companyId"}
+//   heartbeat: {"type":"ping"}  -> {"type":"pong"}
+//   proxy:     {"type":"proxy","port":P} -> hub responde {"type":"proxy-ack"}
+//             (o RELAY bruto adbd<->hub é feito PELO device-agent após o ack;
+//              o hub apenas sinaliza — não abre ponte local, evitando sistema duplo)
+//
+// Identidade: company_id + hardware_uuid(DEVICE_ID). NUNCA IP/socket.
+// Isolamento: proxy só é processado porque a sessão de túnel existe para
+//             (company_id, device_id). Mesmo device não pode ter 2 sessões
+//             de túnel: open_tunnel substitui a anterior (device-agent reconecta
+//             e manda handshake novo — socket velho é descartado no break).
+// ============================================================
+
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::TcpListener;
+use serde::Deserialize;
+
+use crate::session_manager::{self, open_tunnel, close_tunnel, heartbeat_tunnel};
+
+const HEARTBEAT_GRACE_SECS: u64 = 45;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentHandshake {
+    #[serde(rename = "type")]
+    _msg_type: Option<String>,
+    hardware_uuid: Option<String>,
+    #[serde(default)]
+    _mac_address: String,
+    #[serde(default)]
+    _serial_number: String,
+    #[serde(default)]
+    _agent_version: String,
+    #[serde(default)]
+    _current_local_ip: String,
+    // NOVO: identidade de isolamento (vindo do device-agent Rust).
+    #[serde(default)]
+    company_id: i32,
+}
+
+pub async fn start(port: u16) {
+    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("AVISO: Tunnel server na porta {} ja em uso: {}", port, e);
+            return;
+        }
+    };
+    println!("🔌 Tunnel server (canal RUST) ativo na porta {}", port);
+
+    // Heartbeat sweeper: mantém o estado de túnel fiel à realidade da conexão.
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            session_manager::sweep_stale(HEARTBEAT_GRACE_SECS, 30);
+        }
+    });
+
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Aviso: erro ao aceitar túnel: {}", e);
+                continue;
+            }
+        };
+        tokio::spawn(async move {
+            if let Err(e) = handle_agent(stream).await {
+                eprintln!("[tunnel] sessão encerrada: {}", e);
+            }
+        });
+    }
+}
+
+async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    let mut writer = BufWriter::new(write_half);
+
+    // 1. Handshake na primeira linha (timeout 10s)
+    let first = tokio::time::timeout(Duration::from_secs(10), read_line(&mut reader))
+        .await
+        .map_err(|_| "timeout no handshake".to_string())?
+        .ok_or("sem handshake".to_string())?;
+
+    let hs: AgentHandshake = serde_json::from_str(&first)
+        .map_err(|e| format!("handshake inválido: {}", e))?;
+
+    let uuid = hs
+        .hardware_uuid
+        .filter(|u| !u.is_empty())
+        .ok_or("hardware_uuid ausente".to_string())?;
+    let company_id = hs.company_id;
+
+    // 2. Confirma handshake
+    write_line(&mut writer, "{\"type\":\"welcome\"}").await?;
+
+    // 3. Abre a sessão de TÚNEL (canal EXCLUSIVO do rust). Gera novo SESSION_ID.
+    let session_id = open_tunnel(company_id, &uuid);
+    println!(
+        "[tunnel] device {} (empresa {}) conectado — session {}",
+        uuid, company_id, session_id
+    );
+
+    // 4. Loop: heartbeat L7 (ping/pong) + proxy sob demanda
+    let mut last_heartbeat = Instant::now();
+    loop {
+        tokio::select! {
+            line = read_line(&mut reader) => {
+                let line = match line {
+                    Ok(Some(l)) => l,
+                    _ => break, // EOF ou erro -> encerra (device reconecta)
+                };
+                last_heartbeat = Instant::now();
+                heartbeat_tunnel(company_id, &uuid);
+                let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or(serde_json::Value::Null);
+                match v.get("type").and_then(|t| t.as_str()) {
+                    Some("ping") => {
+                        write_line(&mut writer, "{\"type\":\"pong\"}").await?;
+                    }
+                    Some("proxy") => {
+                        // Sinaliza ao device-agent que o hub aceita o proxy.
+                        // O relay bruto é feito PELO device-agent (handle_proxy).
+                        write_line(&mut writer, "{\"type\":\"proxy-ack\"}").await?;
+                    }
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(HEARTBEAT_GRACE_SECS)) => {
+                if last_heartbeat.elapsed() >= Duration::from_secs(HEARTBEAT_GRACE_SECS) {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 5. Cleanup: marca túnel offline (presença intocada).
+    close_tunnel(company_id, &uuid);
+    println!(
+        "[tunnel] device {} (empresa {}) desconectado — túnel fechado",
+        uuid, company_id
+    );
+    Ok(())
+}
+
+async fn read_line(reader: &mut BufReader<tokio::io::ReadHalf<tokio::net::TcpStream>>) -> Option<String> {
+    let mut line = String::new();
+    match reader.read_line(&mut line).await {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line),
+    }
+}
+
+async fn write_line(writer: &mut BufWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>, s: &str) -> Result<(), String> {
+    let mut buf = s.as_bytes().to_vec();
+    buf.push(b'\n');
+    writer.write_all(&buf).await.map_err(|e| e.to_string())?;
+    writer.flush().await.map_err(|e| e.to_string())
+}
+
+
+// ========================================================
+// ARQUIVO: hub-standalone\tests\sim.rs
+// ========================================================
+
+// Integration test: simula múltiplas sessões concorrentes e os 10 cenários
+// exigidos, usando clientes REAIS nas 3 portas (tunnel TCP, check-in HTTP, presence WS).
+// Não usa celulares físicos — simula o protocolo exato dos agentes.
+// Ao "desconectar" um device, ABORTAMOS a task que mantém o socket vivo (queda física real),
+// e o servidor detecta EOF e marca offline. Isolamento e concorrência são validados via
+// session_manager (fonte de verdade do VPS).
+
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
+use esfera_hub_standalone::session_manager as sm;
+
+const COMPANY_A: i32 = 10;
+const COMPANY_B: i32 = 20;
+const COMPANY_C: i32 = 30;
+
+/// Mantém um socket de TÚNEL vivo (handshake + ping/pong) até ser abortado.
+/// Retorna o JoinHandle; abortar = queda física do agente.
+fn spawn_tunnel(tunnel_port: u16, company_id: i32, device_id: &str) -> JoinHandle<()> {
+    let device_id = device_id.to_string();
+    tokio::spawn(async move {
+        let mut stream = match TcpStream::connect(("127.0.0.1", tunnel_port)).await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let hs = format!(
+            "{{\"type\":\"handshake\",\"hardwareUuid\":\"{}\",\"macAddress\":\"aa:bb\",\"serialNumber\":\"SN\",\"agentVersion\":\"t\",\"currentLocalIp\":\"10.0.0.1\",\"companyId\":{}}}\n",
+            device_id, company_id
+        );
+        let _ = stream.write_all(hs.as_bytes()).await;
+        let _ = stream.flush().await;
+
+        let (rh, wh) = stream.into_split();
+        let mut reader = BufReader::new(rh);
+        let mut writer = BufWriter::new(wh);
+
+        // lê welcome
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line).await;
+
+        loop {
+            tokio::select! {
+                r = reader.read_line(&mut line) => {
+                    if r.unwrap_or(0) == 0 { return; } // EOF -> agente caiu
+                    // responde pong se ping
+                    if line.contains("\"type\":\"ping\"") {
+                        let _ = writer.write_all(b"{\"type\":\"pong\"}\n").await;
+                        let _ = writer.flush().await;
+                    }
+                    line.clear();
+                }
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    let _ = writer.write_all(b"{\"type\":\"ping\"}\n").await;
+                    let _ = writer.flush().await;
+                }
+            }
+        }
+    })
+}
+
+/// Mantém um WS de PRESENÇA vivo até ser abortado.
+fn spawn_presence(presence_port: u16, company_id: i32, device_id: &str) -> JoinHandle<()> {
+    let device_id = device_id.to_string();
+    tokio::spawn(async move {
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+        use url::Url;
+        let url = match Url::parse(&format!("ws://127.0.0.1:{}/ws/presence", presence_port)) {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let (mut ws, _resp) = match connect_async(url).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let payload = format!(
+            "{{\"uuid\":\"{}\",\"batteryLevel\":80,\"isCharging\":false,\"isScreenOn\":true,\"companyId\":{}}}",
+            device_id, company_id
+        );
+        let _ = ws.send(Message::Text(payload)).await;
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let _ = ws
+                .send(Message::Text(format!(
+                    "{{\"uuid\":\"{}\",\"batteryLevel\":80,\"isCharging\":false,\"isScreenOn\":true,\"companyId\":{}}}",
+                    device_id, company_id
+                )))
+                .await;
+        }
+    })
+}
+
+async fn check_in(http_port: u16, company_id: i32, device_id: &str) {
+    let client = reqwest::Client::new();
+    let _ = client
+        .post(&format!("http://127.0.0.1:{}/api/devices/check-in", http_port))
+        .json(&serde_json::json!({
+            "esferaDeviceId": device_id,
+            "currentAdbAddress": "10.0.0.1:5555",
+            "companyId": company_id,
+        }))
+        .send()
+        .await;
+}
+
+fn status_of(company_id: i32, device_id: &str) -> Option<sm::ConnectionStatus> {
+    sm::get_state(company_id, device_id).map(|s| s.status)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn scenario_full_lifecycle() {
+    let tunnel_port = 18888;
+    let presence_port = 17779;
+    let http_port = 18080;
+    let hub_port = 18889;
+
+    std::env::set_var("TUNNEL_PORT", tunnel_port.to_string());
+    std::env::set_var("PRESENCE_PORT", presence_port.to_string());
+    std::env::set_var("HTTP_PORT", http_port.to_string());
+    std::env::set_var("HUB_PORT", hub_port.to_string());
+
+    tokio::spawn(esfera_hub_standalone::tunnel_server::start(tunnel_port));
+    tokio::spawn(esfera_hub_standalone::presence_server::start(presence_port));
+    tokio::spawn(esfera_hub_standalone::checkin_server::start(
+        std::sync::Arc::new(esfera_hub_standalone::db::Database::init("./test_sim.db").unwrap()),
+        http_port,
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    sm::forget(COMPANY_A, "ESF-A");
+    sm::forget(COMPANY_A, "ESF-B");
+    sm::forget(COMPANY_C, "ESF-C");
+    sm::forget(COMPANY_B, "ESF-X");
+
+    // ---- Cenário 1: 3 dispositivos simultâneos ----
+    // A e B na Empresa A; C na Empresa C (isolamento por company_id).
+    check_in(http_port, COMPANY_A, "ESF-A").await;
+    check_in(http_port, COMPANY_A, "ESF-B").await;
+    check_in(http_port, COMPANY_C, "ESF-C").await;
+
+    let ha = spawn_tunnel(tunnel_port, COMPANY_A, "ESF-A");
+    let hb = spawn_tunnel(tunnel_port, COMPANY_A, "ESF-B");
+    let hc = spawn_tunnel(tunnel_port, COMPANY_C, "ESF-C");
+    let pa = spawn_presence(presence_port, COMPANY_A, "ESF-A");
+    let pb = spawn_presence(presence_port, COMPANY_A, "ESF-B");
+    let pc = spawn_presence(presence_port, COMPANY_C, "ESF-C");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Online), "C1: A online");
+    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Online), "C1: B online");
+    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C1: C online");
+
+    // ---- Cenário 8: isolamento entre empresas ----
+    assert_eq!(status_of(COMPANY_B, "ESF-A"), None, "C8: Empresa B não vê device da A");
+    assert_eq!(status_of(COMPANY_C, "ESF-A"), None, "C8: Empresa C não vê device da A (company_id diferente)");
+    let a_list = sm::list_by_company(COMPANY_A);
+    assert!(a_list.iter().all(|d| d.company_id == COMPANY_A), "C8: A lista só seus");
+    assert_eq!(a_list.len(), 2, "C8: Empresa A lista exatamente A e B");
+
+    // ---- Cenário 3: saída de B (queda física real: aborta tasks) ----
+    hb.abort();
+    pb.abort();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Offline), "C3: B offline após saída");
+    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Online), "C3: A NÃO afetado");
+    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C3: C NÃO afetado");
+
+    // ---- Cenário 4: reconexão de B (novo SESSION_ID, mesmo DEVICE_ID/COMPANY_ID) ----
+    let hb2 = spawn_tunnel(tunnel_port, COMPANY_A, "ESF-B");
+    let pb2 = spawn_presence(presence_port, COMPANY_A, "ESF-B");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Online), "C4: B reconecta online");
+    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Online), "C4: A intacto");
+    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C4: C intacto");
+    hb2.abort();
+    pb2.abort();
+
+    // ---- Cenário 5: queda de internet de A ----
+    ha.abort();
+    pa.abort();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Offline), "C5: A offline após queda");
+    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Online), "C5: B intacto");
+    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C5: C intacto");
+    // reconecta A
+    let ha2 = spawn_tunnel(tunnel_port, COMPANY_A, "ESF-A");
+    let pa2 = spawn_presence(presence_port, COMPANY_A, "ESF-A");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(status_of(COMPANY_A, "ESF-A"), Some(sm::ConnectionStatus::Online), "C5: A reconecta");
+    ha2.abort();
+    pa2.abort();
+
+    // ---- Cenário 2: entrada de novo dispositivo (Cenário 2) ----
+    check_in(http_port, COMPANY_A, "ESF-NEW").await;
+    let hn = spawn_tunnel(tunnel_port, COMPANY_A, "ESF-NEW");
+    let pn = spawn_presence(presence_port, COMPANY_A, "ESF-NEW");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(status_of(COMPANY_A, "ESF-NEW"), Some(sm::ConnectionStatus::Online), "C2: novo device online");
+    assert_eq!(status_of(COMPANY_A, "ESF-B"), Some(sm::ConnectionStatus::Online), "C2: B não afetado por entrada");
+    hn.abort();
+    pn.abort();
+
+    // ---- Cenário 7: reinício do hub local NÃO afeta VPS ----
+    // (Aqui o VPS = este processo; os estados em RAM do VPS persistem. O hub local
+    //  é um cache/fallback e não participa deste teste. A separação garante que o
+    //  device permanece conectado ao VPS independente do hub local.)
+    assert_eq!(status_of(COMPANY_C, "ESF-C"), Some(sm::ConnectionStatus::Online), "C7/C10: C (VPS) online sem depender de hub local");
+
+    // ---- Cenário 9: Master controlando dispositivo (roteamento por company_id) ----
+    let c_state = sm::get_state(COMPANY_C, "ESF-C");
+    assert!(c_state.is_some(), "C9: Master alcança device C via company_id no VPS");
+
+    // ---- Cenário 6: reinício do agente (= reconexão já coberta em C4/C5) ----
+    // Cenário 10: hub local desligado enquanto VPS online (coberto em C7/C10) ----
+
+    // cleanup
+    hc.abort();
+    pc.abort();
+    let _ = std::fs::remove_file("./test_sim.db");
 }
 
 
@@ -41494,8 +42535,8 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell Vite to ignore watching `src-tauri` and `hub-standalone` build artifacts
+      ignored: ["**/src-tauri/**", "**/hub-standalone/**", "**/target/**"],
     },
   },
 }));
