@@ -144,6 +144,16 @@ class EsferaAgentService : Service() {
     // Config
     // ----------------------------------------------------------------
 
+    private fun getProp(name: String): String {
+        return try {
+            val p = Runtime.getRuntime().exec(arrayOf("getprop", name))
+            val r = BufferedReader(InputStreamReader(p.inputStream))
+            val v = r.readLine()?.trim() ?: ""
+            p.waitFor()
+            v
+        } catch (e: Exception) { "" }
+    }
+
     private fun loadConfig(): EsferaConfig {
         val defaultAndroidId = try {
             Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "UNKNOWN_DEVICE"
@@ -151,8 +161,16 @@ class EsferaAgentService : Service() {
             "UNKNOWN_DEVICE"
         }
 
+        // FONTE DE VERDADE PRIORITÁRIA: props persist.esfera.* (sobrevivem a reboot,
+        // reinstalação do app e até wipe-leve). Só caímos no arquivo/SharedPreferences
+        // se a prop não existir. Isso garante que o celular NUNCA perca a identidade
+        // nem a empresa ao reiniciar ou reabrir o programa.
+        val propDeviceId = getProp("persist.esfera.device_id")
+        val propCompany = getProp("persist.esfera.company").toIntOrNull() ?: 0
+        val propServer = getProp("persist.esfera.server_address").ifEmpty { getProp("persist.esfera.hub") }
+
         val configFile = File(filesDir, "esfera_config.json")
-        val loadedConfig = if (configFile.exists()) {
+        val fileConfig = if (configFile.exists()) {
             try {
                 json.decodeFromString<EsferaConfig>(configFile.readText())
             } catch (e: Exception) {
@@ -167,13 +185,24 @@ class EsferaAgentService : Service() {
             )
         }
 
-        val finalDeviceId = if (loadedConfig.deviceId.isBlank() || loadedConfig.deviceId == "UNIQUE_DEVICE_ID") {
+        // Mescla: prop tem precedência; arquivo preenche o que faltar.
+        val resolvedDeviceId = propDeviceId.ifBlank { fileConfig.deviceId }
+        val resolvedCompany = if (propCompany > 0) propCompany else fileConfig.companyId
+        val resolvedServer = propServer.ifBlank { fileConfig.serverUrl }
+
+        val finalDeviceId = if (resolvedDeviceId.isBlank() || resolvedDeviceId == "UNIQUE_DEVICE_ID") {
             defaultAndroidId
         } else {
-            loadedConfig.deviceId
+            resolvedDeviceId
         }
 
-        return loadedConfig.copy(deviceId = finalDeviceId)
+        // Espelha a identidade resolvida de volta no arquivo/config para resiliência.
+        try {
+            val out = EsferaConfig(serverUrl = resolvedServer, deviceId = finalDeviceId, companyId = resolvedCompany)
+            configFile.writeText(json.encodeToString(EsferaConfig.serializer(), out))
+        } catch (_: Exception) {}
+
+        return EsferaConfig(serverUrl = resolvedServer, deviceId = finalDeviceId, companyId = resolvedCompany)
     }
 
     private fun loadConfigAndStart() {
