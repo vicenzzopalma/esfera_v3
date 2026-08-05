@@ -14,7 +14,7 @@ export default function LoginPage() {
   const { isDark, toggleTheme } = useTheme();
   const navigate = useNavigate();
 
-  const [username, setUsername] = useState("");
+  const [username, setUsername] = useState(() => localStorage.getItem("esfera_v3_last_username") || "");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);

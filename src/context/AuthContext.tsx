@@ -66,7 +66,8 @@ function saveToStorage(key: string, value: unknown) {
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(() => loadFromStorage<User>(STORAGE_KEY_USER));
+  // Sempre inicia sem usuário logado para exigir a tela de login em todo startup do aplicativo
+  const [user, setUser] = useState<User | null>(null);
   const [selectedCompanyId, setSelectedCompanyId] = useState<number | null>(() => loadFromStorage<number>(STORAGE_KEY_COMPANY) || 1);
   const [error, setError] = useState<string | null>(null);
   const [permissions, setPermissions] = useState<Permission[]>([]);
@@ -122,6 +123,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       saveToStorage(STORAGE_KEY_TOKEN, res.token);
       setUser(res.user);
       saveToStorage(STORAGE_KEY_USER, res.user);
+      localStorage.setItem("esfera_v3_last_username", res.user.username || username);
       const compId = res.user.companyId || 1;
       setSelectedCompanyId(compId);
       saveToStorage(STORAGE_KEY_COMPANY, compId);
