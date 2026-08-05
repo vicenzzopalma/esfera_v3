@@ -1,4 +1,5 @@
 
+
 // ============================================================
 // Esfera v3 — Hub de Gestão de Dispositivos ADB Celulares
 // Modularizado & Redesenhado em Linear SaaS Style
@@ -232,6 +233,7 @@ export default function DevicesTab() {
       refreshDevices();
       setTimeout(() => {
         setConnectModalOpen(false);
+        setLinkingSerial(null);
         setLinkingStatus(null);
       }, 2000);
     } catch (err: any) {
@@ -553,5 +555,7 @@ export default function DevicesTab() {
     </div>
   );
 }
+
+
 
 

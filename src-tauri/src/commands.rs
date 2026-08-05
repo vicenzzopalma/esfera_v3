@@ -1,4 +1,5 @@
 
+
 // ============================================================
 // Esfera v3 — Comandos Tauri IPC (commands.rs)
 // Pontes de comunicação entre o Front-end React e o Back-end Rust
@@ -2159,6 +2160,8 @@ pub fn rotate_master_token(
         .upsert_company_token(0, &new_token, "master")
         .map_err(|e| format!("Falha ao gravar token master: {}", e))
 }
+
+
 
 
 

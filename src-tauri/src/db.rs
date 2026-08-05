@@ -1,4 +1,5 @@
 
+
 // ============================================================
 // Esfera v3 — Camada de Banco de Dados (SQLite Local)
 // Mapeamento 1:1 das tabelas ESF_* do Esfera v2
@@ -2579,6 +2580,8 @@ impl Database {
             .ok()
     }
 }
+
+
 
 
 
