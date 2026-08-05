@@ -1,3 +1,4 @@
+
 // ============================================================
 // Esfera v3 — Comandos Tauri IPC (commands.rs)
 // Pontes de comunicação entre o Front-end React e o Back-end Rust
@@ -15,6 +16,7 @@ use crate::session::{LoginResponse, SessionManager};
 use std::sync::{Arc, Mutex};
 use tauri::State;
 use tokio::sync::Mutex as TokioMutex;
+use uuid::Uuid;
 
 pub struct AppState {
     pub db: Arc<Database>,
@@ -195,8 +197,12 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 "offline".to_string()
             };
 
+            let persistent_id = if adb_dev.state == "device" {
+                AdbManager::get_persistent_device_id(&adb_dev.serial)
+            } else { None };
             let existing_idx = db_devices.iter().position(|d| {
                 d.serial == adb_dev.serial
+                    || persistent_id.as_ref().is_some_and(|id| d.esfera_device_id.as_ref() == Some(id))
                     || (!ip_only.is_empty() && d.ip == ip_only)
                     || d.current_adb_address.as_deref() == Some(&adb_dev.serial)
                     || d.esfera_device_id.as_deref() == Some(&adb_dev.serial)
@@ -205,15 +211,19 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             if let Some(idx) = existing_idx {
                 let old_status = db_devices[idx].status.clone();
                 let old_battery = db_devices[idx].battery;
+                let old_address = db_devices[idx].current_adb_address.clone();
+                let old_ip = db_devices[idx].ip.clone();
+                let old_id = db_devices[idx].esfera_device_id.clone();
                 db_devices[idx].status = status;
-                if is_wireless && !ip_only.is_empty() {
-                    db_devices[idx].ip = ip_only.clone();
-                    db_devices[idx].current_adb_address = Some(adb_dev.serial.clone());
-                }
+                db_devices[idx].current_adb_address = Some(adb_dev.serial.clone());
+                if persistent_id.is_some() { db_devices[idx].esfera_device_id = persistent_id.clone(); }
+                if is_wireless && !ip_only.is_empty() { db_devices[idx].ip = ip_only.clone(); }
                 if adb_dev.state == "device" {
                     db_devices[idx].battery = get_cached_battery(&adb_dev.serial);
                 }
-                if old_status != db_devices[idx].status || old_battery != db_devices[idx].battery {
+                if old_status != db_devices[idx].status || old_battery != db_devices[idx].battery
+                    || old_address != db_devices[idx].current_adb_address
+                    || old_ip != db_devices[idx].ip || old_id != db_devices[idx].esfera_device_id {
                     let _ = state_db.upsert_device(&db_devices[idx]);
                     changed = true;
                 }
@@ -238,7 +248,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     company_id: target_company_id,
                     device_number: (db_devices.len() + 1) as i32,
                     sector: "junior".to_string(),
-                    esfera_device_id: None,
+                    esfera_device_id: persistent_id,
                     current_adb_address: Some(adb_dev.serial.clone()),
                     last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
                     via_tunnel: false,
@@ -502,6 +512,9 @@ pub async fn connect_adb_device(
         let final_name = device_name
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { target_ip.clone() });
+        let persistent_id = AdbManager::get_persistent_device_id(&serial)
+            .unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()));
+        let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
         let dev = Device {
             id: 0,
             serial: serial.clone(),
@@ -515,14 +528,12 @@ pub async fn connect_adb_device(
             company_id,
             device_number,
             sector,
-            esfera_device_id: None,
-            current_adb_address: None,
-            last_seen_utc: None,
+            esfera_device_id: Some(persistent_id.clone()),
+            current_adb_address: Some(serial.clone()),
+            last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
             via_tunnel: false,
         };
         state_db.upsert_device(&dev)?;
-        let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
-        let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
         let _ = AdbManager::deploy_keepalive(&serial);
         state_db.queue_add_log(
             company_id,
@@ -563,7 +574,8 @@ pub async fn pair_and_connect_adb_device(
             .args(["-s", &wireless_serial, "shell", "setprop", "persist.adb.tcp.port", "5555"])
             .output();
         let _ = AdbManager::deploy_keepalive(&wireless_serial);
-        let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
+        let persistent_id = AdbManager::get_persistent_device_id(&wireless_serial)
+            .unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()));
         let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
 
         let (brand, model) = AdbManager::get_device_info(&wireless_serial);
@@ -573,7 +585,7 @@ pub async fn pair_and_connect_adb_device(
 
         let device = Device {
             id: 0,
-            serial: wireless_serial,
+            serial: wireless_serial.clone(),
             name: final_name,
             brand,
             model,
@@ -584,9 +596,9 @@ pub async fn pair_and_connect_adb_device(
             company_id,
             device_number,
             sector,
-            esfera_device_id: None,
-            current_adb_address: None,
-            last_seen_utc: None,
+            esfera_device_id: Some(persistent_id),
+            current_adb_address: Some(wireless_serial),
+            last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
             via_tunnel: false,
         };
         state_db.upsert_device(&device)?;
@@ -1157,6 +1169,8 @@ pub async fn link_usb_to_wireless(
         let final_name = device_name
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { ip.clone() });
+        let persistent_id = AdbManager::get_persistent_device_id(&wireless_serial)
+            .unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()));
         let device = Device {
             id: 0,
             serial: wireless_serial.clone(),
@@ -1170,13 +1184,12 @@ pub async fn link_usb_to_wireless(
             company_id,
             device_number,
             sector,
-            esfera_device_id: None,
-            current_adb_address: None,
-            last_seen_utc: None,
+            esfera_device_id: Some(persistent_id.clone()),
+            current_adb_address: Some(wireless_serial.clone()),
+            last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
             via_tunnel: false,
         };
         state_db.upsert_device(&device)?;
-        let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
         let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
         let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
         let _ = AdbManager::deploy_keepalive(&wireless_serial);
@@ -1213,7 +1226,7 @@ pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -
             let pid = match existing_id {
                 Some(id) => id,
                 None => {
-                    let new_id = format!("ESFERA_DEV_{:03}", idx + 1);
+                    let new_id = format!("ESF-{}", Uuid::new_v4());
                     let _ = AdbManager::inject_persistent_device_id(&dev.serial, &new_id);
                     new_id
                 }
@@ -1251,9 +1264,9 @@ pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -
                         company_id: 1,
                         device_number: dev_num,
                         sector: "junior".to_string(),
-                        esfera_device_id: None,
-                        current_adb_address: None,
-                        last_seen_utc: None,
+                        esfera_device_id: Some(pid.clone()),
+                        current_adb_address: Some(dev.serial.clone()),
+                        last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
                         via_tunnel: false,
                     };
                     let _ = db_arc.upsert_device(&device_obj);
@@ -1273,7 +1286,7 @@ pub fn inject_single_device_immunity(_token: String, serial: String) -> Result<S
     let s = serial.clone();
     std::thread::spawn(move || {
         let existing_id = AdbManager::get_persistent_device_id(&s);
-        let pid = existing_id.unwrap_or_else(|| "ESFERA_DEV_001".to_string());
+        let pid = existing_id.unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()));
         if let Err(e) = AdbManager::inject_device_immunity(&s, Some(&pid)) {
             eprintln!("Falha ao injetar imunidade em {}: {}", s, e);
         }
@@ -1300,8 +1313,9 @@ pub async fn force_enable_wireless_adb(
             format!("{} Certifique-se de que o celular está conectado na mesma rede Wi-Fi que o computador.", e)
         })?;
 
-        // 1. Gera e Injeta a ID permanente no Kernel do Celular (ex: ESFERA_DEV_001)
-        let persistent_id = format!("ESFERA_DEV_{:03}", device_number);
+        // 1. Reutiliza a identidade existente ou cria UUID, nunca usa o slot como identidade.
+        let persistent_id = AdbManager::get_persistent_device_id(&serial)
+            .unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()));
         let _ = AdbManager::inject_persistent_device_id(&serial, &persistent_id);
 
         let _ = crate::adb_manager::create_cmd("adb")
@@ -1325,7 +1339,7 @@ pub async fn force_enable_wireless_adb(
 
         let device = Device {
             id: 0,
-            serial: wireless_serial,
+            serial: wireless_serial.clone(),
             name: final_name,
             brand,
             model,
@@ -1336,9 +1350,9 @@ pub async fn force_enable_wireless_adb(
             company_id,
             device_number,
             sector,
-            esfera_device_id: None,
-            current_adb_address: None,
-            last_seen_utc: None,
+            esfera_device_id: Some(persistent_id),
+            current_adb_address: Some(wireless_serial),
+            last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
             via_tunnel: false,
         };
         state_db.upsert_device(&device)?;
@@ -2145,6 +2159,8 @@ pub fn rotate_master_token(
         .upsert_company_token(0, &new_token, "master")
         .map_err(|e| format!("Falha ao gravar token master: {}", e))
 }
+
+
 
 
 

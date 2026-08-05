@@ -1,3 +1,4 @@
+
 // ============================================================
 // Esfera v3 — Gerenciador ADB Nativo (adb_manager.rs)
 // Comunicação nativa com o Android Debug Bridge CLI
@@ -3423,4 +3424,6 @@ impl AdbManager {
         }
     }
 }
+
+
 

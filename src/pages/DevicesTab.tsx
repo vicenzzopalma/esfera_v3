@@ -1,3 +1,4 @@
+
 // ============================================================
 // Esfera v3 — Hub de Gestão de Dispositivos ADB Celulares
 // Modularizado & Redesenhado em Linear SaaS Style
@@ -147,6 +148,7 @@ export default function DevicesTab() {
   }, [connectModalOpen]);
 
   const handleForceWirelessAdb = async (serial: string, deviceNumber: number, sector: string, deviceName: string) => {
+    if (linkingSerial) return;
     setLinkingSerial(serial);
     setLinkingStatus("⚡ Forçando ativação da porta 5555 TCP/IP e extraindo IP...");
     try {
@@ -172,6 +174,9 @@ export default function DevicesTab() {
   };
 
   const handleConnectDevice = async (ipAddress: string, portNumber: number, deviceNumber: number, sector: string, deviceName: string) => {
+    if (linkingSerial) return;
+    setLinkingSerial(ipAddress);
+    setLinkingStatus("🔌 Conectando sem bloquear a interface...");
     try {
       let finalIp = ipAddress.trim();
       let finalPort = portNumber;
@@ -195,6 +200,8 @@ export default function DevicesTab() {
     } catch (err: any) {
       const errMsg = typeof err === "string" ? err : err?.message || "Erro ao conectar por IP.";
       setLinkingStatus(`❌ Erro: ${errMsg}`);
+    } finally {
+      setLinkingSerial(null);
     }
   };
 
@@ -207,6 +214,8 @@ export default function DevicesTab() {
     sec: string,
     devName: string
   ) => {
+    if (linkingSerial) return;
+    setLinkingSerial(ip);
     setLinkingStatus("🔑 Enviando código de pareamento para o Android...");
     try {
       const result = await api<string>("pair_and_connect_adb_device", {
@@ -228,6 +237,7 @@ export default function DevicesTab() {
     } catch (err: any) {
       const errMsg = typeof err === "string" ? err : err?.message || "Erro no pareamento por código.";
       setLinkingStatus(`❌ Erro: ${errMsg}`);
+      setTimeout(() => setLinkingSerial(null), 4000);
     }
   };
 
@@ -543,3 +553,5 @@ export default function DevicesTab() {
     </div>
   );
 }
+
+
