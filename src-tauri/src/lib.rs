@@ -355,6 +355,8 @@ pub fn run() {
             get_assigned_devices_for_user,
             request_device_access,
             get_device_permission_requests,
+            generate_company_token,
+            rotate_master_token,
             approve_device_access,
             reject_device_access,
             end_device_access,

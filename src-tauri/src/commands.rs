@@ -1981,6 +1981,51 @@ pub fn remove_device_responsible_collaborator(
     state.db.unassign_device_from_user(&device_serial, user_id)
 }
 
+/// Gera (ou rotaciona) o token de uma empresa para autenticação no hub local.
+/// SÓ master pode chamar. O token é retornado UMA vez (não fica armazenado em plaintext).
+#[tauri::command]
+pub fn generate_company_token(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<String, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" {
+        return Err("Acesso Negado: apenas o Master pode gerar tokens de empresa.".to_string());
+    }
+    if company_id <= 0 {
+        return Err("company_id inválido (deve ser > 0; 0 é o master).".to_string());
+    }
+    // Token forte aleatório (32 bytes -> hex de 64 chars).
+    let raw: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+    let new_token = hex::encode(raw);
+    state
+        .db
+        .upsert_company_token(company_id, &new_token, "empresa")
+        .map_err(|e| format!("Falha ao gravar token: {}", e))?;
+    Ok(new_token)
+}
+
+/// Força o seed do token master (CompanyId 0) a partir de HUB_MASTER_TOKEN em runtime.
+#[tauri::command]
+pub fn rotate_master_token(
+    state: State<'_, AppState>,
+    token: String,
+    new_token: String,
+) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" {
+        return Err("Acesso Negado: apenas o Master pode rotacionar o token master.".to_string());
+    }
+    if new_token.is_empty() {
+        return Err("new_token vazio.".to_string());
+    }
+    state
+        .db
+        .upsert_company_token(0, &new_token, "master")
+        .map_err(|e| format!("Falha ao gravar token master: {}", e))
+}
+
 
 
 

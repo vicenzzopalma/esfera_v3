@@ -10,16 +10,7 @@ async fn main() {
     println!("=== ESFERA HUB v3 ===");
     println!("Iniciando servidor TCP Master na porta {}...", port);
 
-    // 1. Inicia o Hub TCP Master (em background)
-    let hub = esfera_v3_lib::hub::Hub::new(port);
-    tokio::spawn(async move {
-        if let Err(e) = hub.start().await {
-            eprintln!("Falha fatal no Hub TCP: {}", e);
-            std::process::exit(1);
-        }
-    });
-
-    // 2. Inicializa o Banco de Dados local do Hub (para celulares)
+    // 1. Inicializa o Banco de Dados local do Hub (para celulares + tokens de empresa)
     let db_path = "./esfera_cloud.db".to_string();
     let db = match esfera_v3_lib::db::Database::init(&db_path) {
         Ok(d) => std::sync::Arc::new(d),
@@ -29,6 +20,15 @@ async fn main() {
         }
     };
     println!("Banco de dados SQLite carregado em {}", db_path);
+
+    // 2. Inicia o Hub TCP Master (em background) com auth por token de empresa
+    let hub = esfera_v3_lib::hub::Hub::new(port, db.clone());
+    tokio::spawn(async move {
+        if let Err(e) = hub.start().await {
+            eprintln!("Falha fatal no Hub TCP: {}", e);
+            std::process::exit(1);
+        }
+    });
 
     // 3. Inicia o Check-in Server HTTP na porta 8080 bloqueando a thread principal
     let http_port = env::var("HTTP_PORT")
