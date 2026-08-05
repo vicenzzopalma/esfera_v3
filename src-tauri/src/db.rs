@@ -2520,6 +2520,40 @@ impl Database {
             )
             .map(|_| ())
     }
+
+    /// Gera (ou devolve) um token de empresa forte e o persiste, retornando o
+    /// plaintext. O hub valida por hash, então devolver o plaintext aqui é o
+    /// que o cliente precisa para autenticar.
+    pub fn issue_hub_token(&self, company_id: i32, role: &str) -> Result<String, String> {
+        let raw: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+        let token = hex::encode(raw);
+        self.upsert_company_token(company_id, &token, role)
+            .map_err(|e| format!("Falha ao emitir token de hub: {}", e))?;
+        Ok(token)
+    }
+
+    /// Busca empresa por ID (para obter o nome no Register do hub).
+    pub fn get_company_by_id(&self, company_id: i32) -> Option<Company> {
+        self.conn()
+            .query_row(
+                "SELECT CompanyId, CompanyName, DeviceLimit, UserLimit, DeviceCount, UserCount, IsActive, Status, CreatedAt FROM ESF_Company WHERE CompanyId = ?1",
+                params![company_id],
+                |r| {
+                    Ok(Company {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        device_limit: r.get(2)?,
+                        user_limit: r.get(3)?,
+                        device_count: r.get(4)?,
+                        user_count: r.get(5)?,
+                        is_active: r.get(6)?,
+                        status: r.get(7)?,
+                        created_at: r.get(8)?,
+                    })
+                },
+            )
+            .ok()
+    }
 }
 
 

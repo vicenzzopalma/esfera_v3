@@ -15,7 +15,6 @@ mod dispatcher;
 pub mod empresa_server;
 pub mod hub;
 pub mod hub_client;
-pub mod master_client;
 pub mod presence_server;
 pub mod protocol;
 pub mod scrcpy_manager;
@@ -28,7 +27,7 @@ mod write_queue;
 use commands::*;
 use db::Database;
 use crate::protocol::HubMessage;
-use master_client::MasterClient;
+use hub_client::HubClient;
 use session::SessionManager;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
@@ -88,7 +87,7 @@ pub fn run() {
 
     let db_arc_clone = Arc::clone(&db_arc);
     let sessions = Arc::new(Mutex::new(SessionManager::new()));
-    let master_client: Arc<TokioMutex<Option<MasterClient>>> = Arc::new(TokioMutex::new(None));
+    let hub_client: Arc<TokioMutex<Option<HubClient>>> = Arc::new(TokioMutex::new(None));
 
     let app_config = config::load_config();
 
@@ -107,91 +106,10 @@ pub fn run() {
         println!("Empresa Server iniciado na porta {}", port);
     }
 
-    // Empresa mode: connect to Hub with auto-reconnect
-    if app_config.mode == "empresa" && app_config.hub_enabled && !app_config.hub_address.is_empty() {
-        let db_for_hub = db_arc.clone();
-        let hub_addr = app_config.hub_address.clone();
-        bg_runtime.spawn(async move {
-            let company_id = db_for_hub.get_companies().first().map(|c| c.id).unwrap_or(1);
-            let company_name = format!("Empresa_{}", company_id);
-            let mut backoff = 1;
-            loop {
-                match hub_client::HubClient::connect(&hub_addr, company_id, &company_name).await {
-                    Ok(client) => {
-                        println!("Conectado ao Hub {} como empresa '{}'", hub_addr, company_name);
-                        backoff = 1;
-                        let _ = client.listen(|cmd, args, _id| {
-                            let db = db_for_hub.clone();
-                            let res = match cmd.as_str() {
-                                "get_companies" => serde_json::to_value(db.get_companies()).map_err(|e| e.to_string()),
-                                "get_devices" => {
-                                    let cid = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                                    serde_json::to_value(db.get_devices(cid)).map_err(|e| e.to_string())
-                                }
-                                "get_campaigns" => {
-                                    let cid = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                                    serde_json::to_value(db.get_campaigns(cid)).map_err(|e| e.to_string())
-                                }
-                                "get_dashboard_kpis" => {
-                                    let cid = args.get("companyId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                                    serde_json::to_value(db.get_dashboard_kpis(cid)).map_err(|e| e.to_string())
-                                }
-                                _ => Err(format!("Comando remoto '{}' não implementado", cmd)),
-                            };
-                            // Offload sync DB calls via std thread para não bloquear runtime async
-                            std::thread::spawn(move || res).join().unwrap_or(Err("thread panicked".to_string()))
-                        }).await;
-                        eprintln!("Conexão com Hub perdida. Reconectando em {}s...", backoff);
-                    }
-                    Err(e) => {
-                        eprintln!("Falha ao conectar ao Hub (tentativa em {}s): {}", backoff, e);
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(60);
-            }
-        });
-    }
-
-    // Master mode: connect MasterClient (stored for hub_invoke commands)
-    if app_config.mode == "master" && app_config.hub_enabled && !app_config.hub_address.is_empty() {
-        let hub_addr = app_config.hub_address.clone();
-        let mc = master_client.clone();
-        bg_runtime.spawn(async move {
-            let mut backoff = 1;
-            loop {
-                match MasterClient::connect(&hub_addr).await {
-                    Ok(client) => {
-                        println!("Conectado ao Hub {} como Master", hub_addr);
-                        *mc.lock().await = Some(client);
-                        backoff = 1;
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(10)).await;
-                            let mut guard = mc.lock().await;
-                            if guard.is_none() { break; }
-                            if let Some(ref c) = *guard {
-                                if c.send_raw(&HubMessage::Ping).await.is_err() {
-                                    *guard = None;
-                                    break;
-                                }
-                                // Consume Pong
-                                let _ = tokio::time::timeout(
-                                    Duration::from_secs(3),
-                                    c.read_one(),
-                                ).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Falha Master ao conectar ao Hub (tentativa em {}s): {}", backoff, e);
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(60);
-            }
-        });
-        println!("Master Client conectando a {}...", app_config.hub_address);
-    }
+    // Conexão ao Hub VPS: REMOVIDA do startup. Agora é 100% pós-login:
+    // o frontend chama `connect_hub(token)` após o usuário autenticar, usando
+    // o company_id e o token da empresa do próprio usuário (arquitetura
+    // multi-tenant VPS central — Opção A do HERMES_CONTEXT). Sem login = sem hub.
 
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -232,11 +150,13 @@ pub fn run() {
             diag("ETAPA [5] backend/servers iniciados no setup; setup retorna Ok");
             Ok(())
         })
-        .manage(AppState { db: db_arc, sessions, master_client })
+        .manage(AppState { db: db_arc, sessions, hub_client })
         .invoke_handler(tauri::generate_handler![
             // Auth
             login,
             logout,
+            get_hub_credentials,
+            connect_hub,
             // Empresas
             get_companies,
             create_company,

@@ -14,6 +14,8 @@ pub struct HubClient {
 impl HubClient {
     pub async fn connect(
         hub_addr: &str,
+        token: &str,
+        role: &str,
         company_id: i32,
         company_name: &str,
     ) -> Result<Self, String> {
@@ -31,20 +33,22 @@ impl HubClient {
             session_id: None,
         };
 
-        client.authenticate("empresa").await?;
-        client.register(company_id, company_name).await?;
+        client.authenticate(token, role).await?;
+        // Apenas empresa precisa registrar a própria company; master não.
+        if role == "empresa" {
+            client.register(company_id, company_name).await?;
+        }
 
-        println!("Conectado ao Hub {} como empresa '{}' (ID {})", hub_addr, company_name, company_id);
+        println!("Conectado ao Hub {} como {} '{}' (ID {})", hub_addr, role, company_name, company_id);
         Ok(client)
     }
 
-    async fn authenticate(&mut self, role: &str) -> Result<(), String> {
-        // Token da empresa (ou master) lido de env. Sem fallback de credencial em código.
-        let token = std::env::var("ESFERA_HUB_TOKEN")
-            .or_else(|_| std::env::var("HUB_MASTER_TOKEN"))
-            .map_err(|_| "Token do Hub não configurado (defina ESFERA_HUB_TOKEN).".to_string())?;
+    async fn authenticate(&mut self, token: &str, role: &str) -> Result<(), String> {
+        if token.is_empty() {
+            return Err("Token do Hub ausente (faça login para obter as credenciais).".to_string());
+        }
         let msg = HubMessage::Auth {
-            token,
+            token: token.to_string(),
             role: role.to_string(),
         };
         self.send(&msg).await?;
@@ -101,12 +105,13 @@ impl HubClient {
 
     pub async fn send_command(
         &self,
+        to_company: i32,
         cmd: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let msg = HubMessage::Command {
             from: "empresa".to_string(),
-            to_company: None,
+            to_company: Some(to_company),
             cmd: cmd.to_string(),
             args,
             id: format!("cmd_{}", std::time::SystemTime::now()
