@@ -1,7 +1,7 @@
 import os
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_FILE = os.path.join(ROOT, "tt")
+OUTPUT_FILES = [os.path.join(ROOT, "monstro.txt"), os.path.join(ROOT, "tt")]
 
 EXCLUDE_DIRS = {".git", "node_modules", "target", "dist", "gen", "icons", "binaries"}
 EXCLUDE_EXTS = {".png", ".ico", ".icns", ".apk", ".mp4", ".svg", ".db", ".zip", ".pyc", ".lock"}
@@ -51,35 +51,36 @@ def should_include(file_path):
     return ext in INCLUDE_EXTS
 
 def main():
-    print(f"Gerando monstro em '{OUTPUT_FILE}'...")
-    total_files = 0
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as outfile:
-        outfile.write("// ========================================================\n")
-        outfile.write("// ESFERA v3 - MONSTRO (codigo completo do programa)\n")
-        outfile.write(f"// Gerado em: {os.path.basename(OUTPUT_FILE)}\n")
-        outfile.write("// ========================================================\n")
+    for output_file in OUTPUT_FILES:
+        print(f"Gerando monstro em '{output_file}'...")
+        total_files = 0
+        with open(output_file, "w", encoding="utf-8") as outfile:
+            outfile.write("// ========================================================\n")
+            outfile.write("// ESFERA v3 - MONSTRO (codigo completo do programa)\n")
+            outfile.write(f"// Gerado em: {os.path.basename(output_file)}\n")
+            outfile.write("// ========================================================\n")
 
-        for path in SOURCE_DIRS:
-            full_path = os.path.join(ROOT, path)
-            if not os.path.isdir(full_path):
-                continue
-            for root, dirs, files in os.walk(full_path):
-                dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
-                if any(ex in root for ex in EXCLUDE_DIRS):
+            for path in SOURCE_DIRS:
+                full_path = os.path.join(ROOT, path)
+                if not os.path.isdir(full_path):
                     continue
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    if should_include(file_path):
-                        dump_file(file_path, outfile)
-                        total_files += 1
+                for root, dirs, files in os.walk(full_path):
+                    dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+                    if any(ex in root for ex in EXCLUDE_DIRS):
+                        continue
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        if should_include(file_path):
+                            dump_file(file_path, outfile)
+                            total_files += 1
 
-        for file in SOURCE_FILES:
-            file_path = os.path.join(ROOT, file)
-            if os.path.isfile(file_path) and should_include(file_path):
-                dump_file(file_path, outfile)
-                total_files += 1
+            for file in SOURCE_FILES:
+                file_path = os.path.join(ROOT, file)
+                if os.path.isfile(file_path) and should_include(file_path):
+                    dump_file(file_path, outfile)
+                    total_files += 1
 
-    print(f"Concluido! {total_files} arquivos consolidados em '{OUTPUT_FILE}'.")
+        print(f"Concluido! {total_files} arquivos consolidados em '{output_file}'.")
 
 if __name__ == "__main__":
     main()
