@@ -90,7 +90,11 @@ fn load_config() -> AgentConfig {
         company_id: read_prop("persist.esfera.company").parse().unwrap_or(0),
     };
     if cfg.server.is_empty() {
-        cfg.server = "127.0.0.1".to_string();
+        // Não cair para 127.0.0.1: o agente escuta o túnel localmente, então
+        // apontar para localhost nunca alcança o hub (e o VPS recusa companyId=0).
+        // Fallback seguro: hub VPS conhecido. O provisionamento grava
+        // persist.esfera.hub; aparelhos antigos sem a prop usam este default.
+        cfg.server = "34.29.70.113".to_string();
     }
     if let Ok(content) = std::fs::read_to_string(CONFIG_PATH) {
         if let Ok(v) = serde_json::from_str::<Value>(&content) {

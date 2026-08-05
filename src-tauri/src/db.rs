@@ -818,6 +818,17 @@ impl Database {
             [],
         )?;
 
+        // 17.5 ESF_CompanyToken (autenticação company-scoped do hub local — sem credencial global)
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_CompanyToken (
+                CompanyId INTEGER PRIMARY KEY,
+                TokenHash TEXT NOT NULL,
+                Role TEXT NOT NULL DEFAULT 'empresa',
+                CreatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+            [],
+        )?;
+
         // 18. Performance Indexes (Microsecond Lookups)
         self.conn().execute_batch("
             CREATE INDEX IF NOT EXISTS idx_device_company ON ESF_Device (CompanyId);
@@ -831,6 +842,14 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_dev_perm_device ON ESF_DevicePermissionRequest (AdbDeviceId, Status);
             CREATE INDEX IF NOT EXISTS idx_dev_assign_user ON ESF_DeviceAssignment (UserId, AdbDeviceId);
         ")?;
+
+        // Seed do token master (CompanyId = 0) a partir de env HUB_MASTER_TOKEN.
+        // Sem isso o hub local não aceita nenhum master. Espelha o hub-standalone.
+        if let Ok(token) = std::env::var("HUB_MASTER_TOKEN") {
+            if !token.is_empty() {
+                let _ = self.upsert_company_token(0, &token, "master");
+            }
+        }
 
         Ok(())
     }
@@ -2471,6 +2490,35 @@ impl Database {
             Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
             Err(_) => vec![],
         }
+    }
+
+    /// Valida um token de empresa contra ESF_CompanyToken.
+    /// Retorna (CompanyId, Role) ou None se inválido/vazio.
+    /// Sem credencial global em código — espelha o hub-standalone.
+    pub fn validate_token(&self, token: &str) -> Option<(i32, String)> {
+        if token.is_empty() {
+            return None;
+        }
+        let hash = hash_password(token);
+        self.conn()
+            .query_row(
+                "SELECT CompanyId, Role FROM ESF_CompanyToken WHERE TokenHash = ?1",
+                params![hash],
+                |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok()
+    }
+
+    /// Gera/atualiza o token de uma empresa (CompanyId = 0 é o master).
+    pub fn upsert_company_token(&self, company_id: i32, token: &str, role: &str) -> Result<(), rusqlite::Error> {
+        let hash = hash_password(token);
+        self.conn()
+            .execute(
+                "INSERT INTO ESF_CompanyToken (CompanyId, TokenHash, Role) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(CompanyId) DO UPDATE SET TokenHash=excluded.TokenHash, Role=excluded.Role",
+                params![company_id, hash, role],
+            )
+            .map(|_| ())
     }
 }
 
