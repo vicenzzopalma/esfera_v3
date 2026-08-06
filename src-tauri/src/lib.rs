@@ -234,6 +234,7 @@ pub fn run() {
             spintax_combinations,
             get_hardware_uuid,
             launch_scrcpy_stream,
+            scan_orphan_processes,
             launch_virtual_display_stream,
             send_intent_to_display,
             launch_camera_stream,

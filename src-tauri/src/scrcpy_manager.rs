@@ -40,6 +40,8 @@ fn local_jar_path() -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+pub static GLOBAL_SCRCPY_MANAGER: std::sync::LazyLock<ScrcpyManager> = std::sync::LazyLock::new(ScrcpyManager::new);
+
 impl ScrcpyManager {
     pub fn new() -> Self {
         Self {
@@ -177,5 +179,76 @@ impl ScrcpyManager {
             .output();
 
         Ok(())
+    }
+
+    /// Retorna os PIDs de todos os processos Scrcpy ativamente gerenciados
+    pub fn get_active_pids(&self) -> Vec<u32> {
+        let mut pids = Vec::new();
+        if let Ok(sessions) = self.sessions.lock() {
+            for sess in sessions.values() {
+                if let Some(ref child) = sess.process {
+                    pids.push(child.id());
+                }
+            }
+        }
+        pids
+    }
+}
+
+// ============================================================
+// AGENTE ÓRFÃO OTTO (OrphanOtto)
+// Monitor inteligente de processos órfãos (Scrcpy / ADB)
+// Regra: Detecta e registra órfãos SEM MATÁ-LOS AUTOMATICAMENTE
+// ============================================================
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct OrphanProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub detected_at: String,
+    pub status: String,
+    pub detail: String,
+}
+
+pub struct OrphanOtto;
+
+impl OrphanOtto {
+    /// Detecta processos scrcpy.exe / adb.exe órfãos no sistema sem matar automaticamente.
+    pub fn scan_orphans(managed_pids: &[u32]) -> Vec<OrphanProcessInfo> {
+        let mut orphans = Vec::new();
+
+        #[cfg(target_os = "windows")]
+        {
+            let targets = ["scrcpy.exe", "adb.exe"];
+            for target in targets {
+                let output = Command::new("tasklist")
+                    .args(["/FO", "CSV", "/NH", "/FI", &format!("IMAGENAME eq {target}")])
+                    .output();
+
+                if let Ok(out) = output {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    for line in stdout.lines() {
+                        let parts: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+                        if parts.len() >= 2 {
+                            if let Ok(pid) = parts[1].parse::<u32>() {
+                                // Se for scrcpy.exe e não estiver na lista de PIDs gerenciados
+                                if target == "scrcpy.exe" && !managed_pids.contains(&pid) {
+                                    eprintln!("🔍 [Agente Órfão Otto] Processo órfão detectado sem gestão: {} (PID: {})", target, pid);
+                                    orphans.push(OrphanProcessInfo {
+                                        pid,
+                                        name: target.to_string(),
+                                        detected_at: chrono::Utc::now().to_rfc3339(),
+                                        status: "ORPHAN_DETECTED".to_string(),
+                                        detail: format!("Processo {} rodando fora do ScrcpySessionManager (PID: {})", target, pid),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        orphans
     }
 }
