@@ -157,6 +157,7 @@ pub fn run() {
             logout,
             get_hub_credentials,
             connect_hub,
+            update_vps_hub,
             // Empresas
             get_companies,
             create_company,
