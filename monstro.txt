@@ -8086,6 +8086,7 @@ export default function DashboardTab() {
 // ========================================================
 
 
+
 // ============================================================
 // Esfera v3 — Hub de Gestão de Dispositivos ADB Celulares
 // Modularizado & Redesenhado em Linear SaaS Style
@@ -8319,6 +8320,7 @@ export default function DevicesTab() {
       refreshDevices();
       setTimeout(() => {
         setConnectModalOpen(false);
+        setLinkingSerial(null);
         setLinkingStatus(null);
       }, 2000);
     } catch (err: any) {
@@ -8640,6 +8642,8 @@ export default function DevicesTab() {
     </div>
   );
 }
+
+
 
 
 
@@ -19503,6 +19507,7 @@ rustflags = ["-C", "target-feature=+crt-static"]
 // ========================================================
 
 
+
 // ============================================================
 // Esfera v3 — Gerenciador ADB Nativo (adb_manager.rs)
 // Comunicação nativa com o Android Debug Bridge CLI
@@ -20798,16 +20803,17 @@ impl AdbManager {
 
     /// Lança o Scrcpy H.264 nativo em 60 FPS com aceleração por hardware
     pub fn launch_scrcpy(serial: &str, turn_screen_off: bool) -> Result<String, String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         let mode_label = if turn_screen_off {
             " [Tela Desligada]"
         } else {
             ""
         };
-        let title = format!("Esfera v3 — Stream H.264 ({}){}", serial, mode_label);
+        let title = format!("Esfera v3 — Stream H.264 ({}){}", target_serial, mode_label);
         let mut cmd = create_cmd("scrcpy");
         cmd.args([
             "-s",
-            serial,
+            &target_serial,
             "--max-size",
             "1080",
             "--max-fps",
@@ -20846,13 +20852,14 @@ impl AdbManager {
         height: u32,
         dpi: u32,
     ) -> Result<String, String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         let display_spec = format!("{}x{}/{}", width, height, dpi);
-        let title = format!("Esfera v3 — Área #2 [Disparos Isolados] ({})", serial);
+        let title = format!("Esfera v3 — Área #2 [Disparos Isolados] ({})", target_serial);
 
         let mut cmd = create_cmd("scrcpy");
         cmd.args([
             "-s",
-            serial,
+            &target_serial,
             &format!("--new-display={}", display_spec),
             "--max-fps",
             "60",
@@ -20868,7 +20875,7 @@ impl AdbManager {
         match result {
             Ok(_) => Ok(format!(
                 "🖥️ Área de Trabalho #2 (Display Virtual {}px) inicializada para o celular {}! O supervisor pode usar a tela física livremente.",
-                display_spec, serial
+                display_spec, target_serial
             )),
             Err(e) => Err(format!(
                 "Falha ao iniciar Display Virtual Secundário ({}). Certifique-se de que o Scrcpy v2.2+ esteja instalado.",
@@ -20883,18 +20890,19 @@ impl AdbManager {
         url: &str,
         display_id: u32,
     ) -> Result<String, String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         // Wi-Fi: protocolo ADB nativo em vez de adb.exe
-        if Self::use_native_adb(serial) {
+        if Self::use_native_adb(&target_serial) {
             let intent_cmd = format!(
                 "am start --display {} -a android.intent.action.VIEW -d '{}'",
                 display_id,
                 Self::shell_quote(url)
             );
-            match crate::adb_tcp::exec_shell_bytes(serial, &intent_cmd) {
+            match crate::adb_tcp::exec_shell_bytes(&target_serial, &intent_cmd) {
                 Ok((_, _, true)) => {
                     return Ok(format!(
                         "Intent aberto no Display #{} com sucesso no aparelho {}",
-                        display_id, serial
+                        display_id, target_serial
                     ));
                 }
                 Ok((_, _, false)) => {
@@ -20915,7 +20923,7 @@ impl AdbManager {
         let output = create_cmd("adb")
             .args([
                 "-s",
-                serial,
+                &target_serial,
                 "shell",
                 "am",
                 "start",
@@ -20932,7 +20940,7 @@ impl AdbManager {
         if output.status.success() {
             Ok(format!(
                 "Intent aberto no Display #{} com sucesso no aparelho {}",
-                display_id, serial
+                display_id, target_serial
             ))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -20946,10 +20954,11 @@ impl AdbManager {
 
     /// Lança o fluxo de vídeo da Câmera (Traseira ou Frontal) do celular Android via Scrcpy
     pub fn launch_scrcpy_camera(serial: &str, facing: &str) -> Result<String, String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         let camera_arg = if facing == "front" { "front" } else { "back" };
         let title = format!(
             "Esfera v3 — Câmera Ao Vivo ({}) [{}]",
-            serial,
+            target_serial,
             camera_arg.to_uppercase()
         );
 
@@ -22038,6 +22047,23 @@ impl AdbManager {
             }
         }
 
+        // 6. ULTIMO RECURSO — DISPOSITIVO USB ÚNICO / ATIVO NO ADB:
+        // Se o IP solicitado no Wi-Fi não respondeu (ex: 192.168.1.83:5555), mas o celular está conectado via cabo USB
+        // (ex: 0082925603 ou 420012cad28ca5c7), redireciona automaticamente para o dispositivo USB ativo.
+        let ready_devices: Vec<&AdbDeviceInfo> = active_devices.iter().filter(|d| d.state == "device").collect();
+        if !ready_devices.is_empty() {
+            if ready_devices.len() == 1 {
+                return Ok(ready_devices[0].serial.clone());
+            }
+            for usb_dev in &ready_devices {
+                if let Ok(wifi_ip) = Self::get_device_wifi_ip(&usb_dev.serial) {
+                    if wifi_ip.contains(requested_ip) || requested_ip.contains(&wifi_ip) {
+                        return Ok(usb_dev.serial.clone());
+                    }
+                }
+            }
+        }
+
         Err(format!("Dispositivo '{}' não está pronto no ADB. Certifique-se de que ele está conectado e com 'Depuração USB' autorizada.", requested))
     }
 
@@ -22933,6 +22959,8 @@ impl AdbManager {
 
 
 
+
+
 // ========================================================
 // ARQUIVO: src-tauri\src\adb_tcp.rs
 // ========================================================
@@ -23757,6 +23785,7 @@ async fn handle_checkin(
 // ========================================================
 
 
+
 // ============================================================
 // Esfera v3 — Comandos Tauri IPC (commands.rs)
 // Pontes de comunicação entre o Front-end React e o Back-end Rust
@@ -23917,6 +23946,7 @@ fn get_cached_battery(serial: &str) -> i32 {
 pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<Device>, String> {
     let state_db = state.db.clone();
     let state_sessions = state.sessions.clone();
+    let hub_client = state.hub_client.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         let session = validate_session(&state_sessions, &token)?;
@@ -24080,6 +24110,70 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             } else {
                 dev.status = "offline".to_string();
             }
+        }
+
+        // PONTE VPS -> LOCAL (Opção A): o app desktop é a "empresa" conectada ao Hub
+        // VPS. O agente Kotlin em qualquer rede faz check-in/túnel no VPS, que é a fonte
+        // de verdade. Precisamos mesclar os devices VIVOS do VPS na lista apresentada,
+        // senão celulares remotos (ex.: em casa, sem ADB local) NUNCA aparecem.
+        // Busca via HubClient (assíncrono) dentro do closure síncrono.
+        let live_vps: Vec<serde_json::Value> = {
+            let rt = tokio::runtime::Handle::try_current();
+            if let Ok(h) = rt {
+                tauri::async_runtime::block_on(async {
+                    let guard = hub_client.lock().await;
+                    if let Some(client) = guard.as_ref() {
+                        match client.send_command(target_company_id, "get_live_devices", serde_json::json!({"companyId": target_company_id})).await {
+                            Ok(val) => val.as_array().cloned().unwrap_or_default(),
+                            Err(_) => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                })
+            } else {
+                Vec::new()
+            }
+        };
+
+        for live in &live_vps {
+            let esfera_id = live.get("esfera_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if esfera_id.is_empty() { continue; }
+            let vps_status = live.get("status").and_then(|v| v.as_str()).unwrap_or("Offline");
+            let mapped_status = match vps_status {
+                "Online" => "online",
+                "Degraded" => "connecting",
+                _ => "offline",
+            }.to_string();
+            let battery = live.get("battery_level").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+
+            // Já existe localmente por esfera_device_id?
+            if let Some(pos) = refreshed_db.iter().position(|d| d.esfera_device_id.as_deref() == Some(esfera_id.as_str())) {
+                refreshed_db[pos].via_tunnel = true;
+                refreshed_db[pos].status = mapped_status.clone();
+                if battery > 0 { refreshed_db[pos].battery = battery; }
+                continue;
+            }
+            // Novo device remoto: usa esfera_device_id como identificador estável.
+            let new_dev = Device {
+                id: 0,
+                serial: esfera_id.clone(),
+                name: format!("Celular {}", &esfera_id),
+                brand: String::new(),
+                model: String::new(),
+                ip: String::new(),
+                port: 0,
+                status: mapped_status,
+                battery,
+                company_id: target_company_id,
+                device_number: (refreshed_db.len() as i32) + 1,
+                sector: "remote".to_string(),
+                esfera_device_id: Some(esfera_id.clone()),
+                current_adb_address: None,
+                last_seen_utc: live.get("last_seen_utc").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                via_tunnel: true,
+            };
+            refreshed_db.push(new_dev);
         }
 
         Ok(refreshed_db)
@@ -25926,6 +26020,8 @@ pub fn rotate_master_token(
 
 
 
+
+
 // ========================================================
 // ARQUIVO: src-tauri\src\config.rs
 // ========================================================
@@ -25996,6 +26092,7 @@ pub fn save_config(config: &AppConfig) -> Result<(), String> {
 // ========================================================
 // ARQUIVO: src-tauri\src\db.rs
 // ========================================================
+
 
 
 // ============================================================
@@ -28578,6 +28675,8 @@ impl Database {
             .ok()
     }
 }
+
+
 
 
 
@@ -32234,11 +32333,13 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
 
 [dev-dependencies]
 tokio-tungstenite = "0.21"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 [profile.release]
 opt-level = 1
 lto = false
@@ -32771,6 +32872,19 @@ impl Database {
                 params![company_id, hash, role],
             )
             .map(|_| ())
+    }
+
+    /// Gera (ou recicla) um token forte para a empresa e o persiste no banco da VPS
+    /// (esfera_cloud.db). Devolve o plaintext — é o que o desktop usa para autenticar
+    /// no hub como empresa. Elimina a necessidade de token manual por máquina.
+    pub fn get_or_create_company_token(&self, company_id: i32) -> Result<String, String> {
+        use rand::Rng;
+        let token: String = (0..32)
+            .map(|_| format!("{:02x}", rand::thread_rng().gen::<u8>()))
+            .collect();
+        self.upsert_company_token(company_id, &token, "empresa")
+            .map_err(|e| e.to_string())?;
+        Ok(token)
     }
 
     /// Garante que uma empresa exista (usado por testes/seed). Idempotente.
@@ -34857,6 +34971,7 @@ async fn send_raw(
 /// daquela empresa (session_manager::list_by_company). Nunca há listagem global
 /// para um consumidor de empresa.
 async fn handle_vps_command(
+    db: &Database,
     cmd: &str,
     args: &serde_json::Value,
 ) -> Option<Result<serde_json::Value, String>> {
@@ -34904,6 +35019,19 @@ async fn handle_vps_command(
                 crate::tunnel_server::send_control(company_id, device_id, &payload)
                     .map(|_| serde_json::json!({ "sent": true })),
             )
+        }
+        // Gera/devolve o token da empresa para o usuário autenticado.
+        // Elimina a necessidade de token manual (ESFERA_COMPANY_TOKEN) por máquina:
+        // o desktop (que já tem HUB_MASTER_TOKEN) pede à VPS o token da empresa do
+        // usuário logado, e a VPS o emite/persiste em esfera_cloud.db.
+        "get_company_token" => {
+            if company_id <= 0 {
+                return Some(Err("companyId obrigatório".to_string()));
+            }
+            match db.get_or_create_company_token(company_id) {
+                Ok(token) => Some(Ok(serde_json::json!({ "token": token, "companyId": company_id }))),
+                Err(e) => Some(Err(format!("Falha ao gerar token da empresa: {}", e))),
+            }
         }
         _ => None,
     }
@@ -35006,7 +35134,7 @@ async fn handle_connection(
                 // Comandos resolvidos PELO VPS (fonte de verdade da presença/túnel).
                 // Não dependem de o hub local da empresa estar conectado — este era
                 // o furo da Opção A: o Master só enxergava via relay para a empresa.
-                if let Some(local) = handle_vps_command(&cmd, &args).await {
+                if let Some(local) = handle_vps_command(&db, &cmd, &args).await {
                     let resp = match local {
                         Ok(val) => HubMessage::CommandResponse { id, result: Some(val), error: None },
                         Err(e) => HubMessage::CommandResponse { id, result: None, error: Some(e) },
