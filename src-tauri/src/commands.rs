@@ -962,6 +962,7 @@ pub async fn send_remote_adb_command(state: &AppState, company_id: i32, esfera_d
     let resp = client.send_command(company_id, "send_device_command", serde_json::json!({
         "esferaDeviceId": esfera_device_id,
         "command": command,
+        "companyId": company_id,
     })).await?;
     resp.get("output").and_then(|s| s.as_str()).map(|s| s.to_string())
         .ok_or_else(|| "resposta do device sem saída".to_string())

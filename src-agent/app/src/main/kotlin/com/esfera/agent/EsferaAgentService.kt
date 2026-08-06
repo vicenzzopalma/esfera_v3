@@ -44,6 +44,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
 import java.io.File
 import java.util.concurrent.TimeUnit
 
@@ -376,6 +377,24 @@ class EsferaAgentService : Service() {
                             writer.flush()
                             launch(Dispatchers.IO) { relayToLocal(socket, port) }
                         }
+                        line.contains("\"type\":\"adb_cmd\"") -> {
+                            // Comando remoto solicitado pelo app desktop via VPS.
+                            // Executa LOCALMENTE no aparelho (input/screencap/etc.) e
+                            // devolve a saída. Fecha a bifurcação A: celular remoto
+                            // (via_tunnel) passa a ser controlável sem root.
+                            val id = Regex("\"id\"\\s*:\\s*\"?([^\",}]+)\"?").find(line)
+                                ?.groupValues?.get(1)?.trim()
+                            val cmd = Regex("\"command\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(line)
+                                ?.groupValues?.get(1)
+                                ?.replace("\\\"", "\"")?.replace("\\\\", "\\")
+                            if (id != null && cmd != null) {
+                                launch(Dispatchers.IO) {
+                                    val out = runLocalCommand(cmd)
+                                    writer.println("""{"type":"adb_result","id":"$id","output":${JsonPrimitive(out)}}""")
+                                    writer.flush()
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -420,6 +439,25 @@ class EsferaAgentService : Service() {
             }
         } catch (_: Exception) {
             // EOF ou erro de leitura/escrita: encerra este sentido do relay.
+        }
+    }
+
+    /// Executa um comando localmente no aparelho (input tap/keyevent, screencap,
+    /// settings, etc.) e devolve a saída concatenada (stdout+stderr). Usado pelo
+    /// canal de controle remoto (adb_cmd) para fechar a bifurcação A sem root.
+    private fun runLocalCommand(command: String): String {
+        return try {
+            val p = Runtime.getRuntime().exec(command)
+            val out = p.inputStream.bufferedReader().readText()
+            val err = p.errorStream.bufferedReader().readText()
+            val code = try { p.waitFor() } catch (_: Exception) { -1 }
+            val sb = StringBuilder()
+            if (out.isNotBlank()) sb.append(out)
+            if (err.isNotBlank()) sb.append(err)
+            if (sb.isEmpty()) sb.append("exit=$code")
+            sb.toString().trim()
+        } catch (e: Exception) {
+            "ERR: ${e.message}"
         }
     }
 
