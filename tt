@@ -24152,18 +24152,49 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             }.to_string();
             let battery = live.get("battery_level").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
-            // Já existe localmente por esfera_device_id?
+            // Já existe localmente por esfera_device_id? O NOME é preservado
+            // (nunca sobrescrito por fonte externa — o VPS não envia nome).
             if let Some(pos) = refreshed_db.iter().position(|d| d.esfera_device_id.as_deref() == Some(esfera_id.as_str())) {
                 refreshed_db[pos].via_tunnel = true;
                 refreshed_db[pos].status = mapped_status.clone();
                 if battery > 0 { refreshed_db[pos].battery = battery; }
                 continue;
             }
-            // Novo device remoto: usa esfera_device_id como identificador estável.
+            // Device remoto AINDA NÃO está no banco local. O nome é PROTEGIDO:
+            // usa o nome já salvo (se o usuário renomeou antes) ou um default
+            // estável "Celular {esfera_id}" NA PRIMEIRA vez — e persiste no banco
+            // para que qualquer rename sobreviva a recargas (sem interferência do VPS).
+            let existing = state_db.get_device_by_esfera_id(&esfera_id);
+            let protected_name = match &existing {
+                Some(d) if !d.name.is_empty() => d.name.clone(),
+                _ => format!("Celular {}", &esfera_id),
+            };
+            if existing.is_none() {
+                let mut to_persist = Device {
+                    id: 0,
+                    serial: esfera_id.clone(),
+                    name: protected_name.clone(),
+                    brand: String::new(),
+                    model: String::new(),
+                    ip: String::new(),
+                    port: 0,
+                    status: mapped_status.clone(),
+                    battery,
+                    company_id: target_company_id,
+                    device_number: (refreshed_db.len() as i32) + 1,
+                    sector: "remote".to_string(),
+                    esfera_device_id: Some(esfera_id.clone()),
+                    current_adb_address: None,
+                    last_seen_utc: live.get("last_seen_utc").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    via_tunnel: true,
+                };
+                let _ = state_db.upsert_device(&to_persist);
+            }
+            // Adiciona à lista em memória com o nome PROTEGIDO.
             let new_dev = Device {
                 id: 0,
                 serial: esfera_id.clone(),
-                name: format!("Celular {}", &esfera_id),
+                name: protected_name,
                 brand: String::new(),
                 model: String::new(),
                 ip: String::new(),
@@ -27316,7 +27347,7 @@ impl Database {
             "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(AdbDeviceId) DO UPDATE SET
-            DeviceName=CASE WHEN ESF_Device.DeviceName IS NOT NULL AND ESF_Device.DeviceName != '' AND ESF_Device.DeviceName != excluded.Model THEN ESF_Device.DeviceName ELSE excluded.DeviceName END,
+            DeviceName=CASE WHEN excluded.DeviceName IS NOT NULL AND excluded.DeviceName != '' THEN excluded.DeviceName ELSE ESF_Device.DeviceName END,
             Brand=excluded.Brand, Model=excluded.Model,
             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
             BatteryLevel=excluded.BatteryLevel,
