@@ -7,7 +7,7 @@ import android.os.BatteryManager
 import android.os.PowerManager
 import android.util.Log
 import io.ktor.client.HttpClient
-import io.ktor.client.engine.android.Android
+import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.websocket.WebSockets
 import io.ktor.client.plugins.websocket.webSocket
 import io.ktor.websocket.Frame
@@ -43,7 +43,7 @@ class PresenceClient(
     private var job: Job? = null
     private val json = Json { ignoreUnknownKeys = true }
 
-    private val client = HttpClient(Android) {
+    private val client = HttpClient(OkHttp) {
         install(WebSockets)
     }
 
