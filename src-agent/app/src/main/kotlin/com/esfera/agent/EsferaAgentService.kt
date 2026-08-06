@@ -82,7 +82,6 @@ class EsferaAgentService : Service() {
         const val CHANNEL_ID = "esfera_agent_channel"
         const val NOTIF_ID = 1001
         const val CHECK_IN_INTERVAL_MS = 30_000L
-        const val CONFIG_FILE = "/sdcard/esfera_config.json"
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -126,6 +125,7 @@ class EsferaAgentService : Service() {
         val notification = buildNotification()
         startForeground(NOTIF_ID, notification)
         acquireWakeLock()
+        android.util.Log.d("EsferaAgent", "onStartCommand: iniciando loadConfigAndStart")
         loadConfigAndStart()
         return START_STICKY
     }
@@ -157,6 +157,29 @@ class EsferaAgentService : Service() {
         } catch (e: Exception) { "" }
     }
 
+    /**
+     * Resolve o arquivo de configuração. O app (Android 11+) NÃO tem permissão de
+     * ler /sdcard/ raiz sem MANAGE_EXTERNAL_STORAGE, mas TEM acesso total a
+     * getExternalFilesDir (sdcard/Android/data/com.esfera.agent/files) sem permissão
+     * extra. Tentamos, em ordem: (1) external-files do app, (2) /sdcard/esfera_config.json
+     * (legado, escrito pelo desktop via adb — exige permissão), (3) filesDir interno.
+     * O primeiro que existir vence; se nenhum existir, retorna o external-files (local
+     * padrão de escrita).
+     */
+    private fun resolveConfigFile(): File {
+        val ext = getExternalFilesDir(null)
+        if (ext != null) {
+            val f = File(ext, "esfera_config.json")
+            if (f.exists()) return f
+        }
+        val legacy = File("/sdcard/esfera_config.json")
+        if (legacy.exists()) return legacy
+        val internal = File(filesDir, "esfera_config.json")
+        if (internal.exists()) return internal
+        // Nenhum existe: usa external-files como padrão de escrita.
+        return if (ext != null) File(ext, "esfera_config.json") else internal
+    }
+
     private fun loadConfig(): EsferaConfig {
         val defaultAndroidId = try {
             Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "UNKNOWN_DEVICE"
@@ -164,15 +187,12 @@ class EsferaAgentService : Service() {
             "UNKNOWN_DEVICE"
         }
 
-        // FONTE DE VERDADE PRIORITÁRIA: props persist.esfera.* (sobrevivem a reboot,
-        // reinstalação do app e até wipe-leve). Só caímos no arquivo/SharedPreferences
-        // se a prop não existir. Isso garante que o celular NUNCA perca a identidade
-        // nem a empresa ao reiniciar ou reabrir o programa.
-        val propDeviceId = getProp("persist.esfera.device_id")
-        val propCompany = getProp("persist.esfera.company").toIntOrNull() ?: 0
-        val propServer = getProp("persist.esfera.server_address").ifEmpty { getProp("persist.esfera.hub") }
-
-        val configFile = File(filesDir, "esfera_config.json")
+        // FONTE DE VERDADE: arquivo de config resolvido por resolveConfigFile()
+        // (external-files do app, sem permissão especial; sobrevive a reboot e
+        // reinstalação do app). Props persist.esfera.* NÃO são graváveis em runtime
+        // sem root, então são apenas fallback secundário. O arquivo garante que o
+        // celular NUNCA perca a identidade nem a empresa ao reiniciar.
+        val configFile = resolveConfigFile()
         val fileConfig = if (configFile.exists()) {
             try {
                 json.decodeFromString<EsferaConfig>(configFile.readText())
@@ -188,10 +208,15 @@ class EsferaAgentService : Service() {
             )
         }
 
-        // Mescla: prop tem precedência; arquivo preenche o que faltar.
-        val resolvedDeviceId = propDeviceId.ifBlank { fileConfig.deviceId }
-        val resolvedCompany = if (propCompany > 0) propCompany else fileConfig.companyId
-        val resolvedServer = propServer.ifBlank { fileConfig.serverUrl }
+        // Fallback de prop (só funciona com root) — tem precedência MENOR que o arquivo.
+        val propDeviceId = getProp("persist.esfera.device_id")
+        val propCompany = getProp("persist.esfera.company").toIntOrNull() ?: 0
+        val propServer = getProp("persist.esfera.server_address").ifEmpty { getProp("persist.esfera.hub") }
+
+        // Mescla: arquivo tem precedência; prop preenche o que faltar (caso root).
+        val resolvedDeviceId = fileConfig.deviceId.ifBlank { propDeviceId }
+        val resolvedCompany = if (fileConfig.companyId > 0) fileConfig.companyId else propCompany
+        val resolvedServer = fileConfig.serverUrl.ifBlank { propServer }
 
         val finalDeviceId = if (resolvedDeviceId.isBlank() || resolvedDeviceId == "UNIQUE_DEVICE_ID") {
             defaultAndroidId
@@ -199,27 +224,13 @@ class EsferaAgentService : Service() {
             resolvedDeviceId
         }
 
-        // Espelha a identidade resolvida de volta no arquivo/config para resiliência.
+        // Espelha a identidade resolvida de volta no arquivo para resiliência cruzada.
         try {
             val out = EsferaConfig(serverUrl = resolvedServer, deviceId = finalDeviceId, companyId = resolvedCompany)
             configFile.writeText(json.encodeToString(EsferaConfig.serializer(), out))
         } catch (_: Exception) {}
 
         return EsferaConfig(serverUrl = resolvedServer, deviceId = finalDeviceId, companyId = resolvedCompany)
-    }
-
-    private fun loadConfigAndStart() {
-        val config = loadConfig()
-        if (config.serverUrl.isBlank() || config.deviceId.isBlank()) {
-            stopSelf()
-            return
-        }
-        agentConfig = config
-        startCheckInLoop(config)
-        if (config.tunnelEnabled) {
-            startTunnelLoop(config)
-        }
-        startPresenceLoop(config)
     }
 
     private fun startPresenceLoop(config: EsferaConfig) {
@@ -239,15 +250,30 @@ class EsferaAgentService : Service() {
         ).apply { start() }
     }
 
-    // ----------------------------------------------------------------
-    // Check-in loop
-    // ----------------------------------------------------------------
+    private fun loadConfigAndStart() {
+        android.util.Log.d("EsferaAgent", "loadConfigAndStart: lendo config")
+        val config = loadConfig()
+        android.util.Log.d("EsferaAgent", "loadConfigAndStart: serverUrl='${config.serverUrl}' deviceId='${config.deviceId}' companyId=${config.companyId}")
+        if (config.serverUrl.isBlank() || config.deviceId.isBlank()) {
+            android.util.Log.w("EsferaAgent", "loadConfigAndStart: config vazia, stopSelf")
+            stopSelf()
+            return
+        }
+        agentConfig = config
+        startCheckInLoop(config)
+        if (config.tunnelEnabled) {
+            startTunnelLoop(config)
+        }
+        startPresenceLoop(config)
+    }
 
     private fun startCheckInLoop(config: EsferaConfig) {
+        android.util.Log.d("EsferaAgent", "startCheckInLoop: iniciado")
         checkInJob?.cancel()
         checkInJob = scope.launch {
             while (isActive) {
                 val ip = resolveCurrentIp()
+                android.util.Log.d("EsferaAgent", "startCheckInLoop: ip=$ip")
                 if (ip != null) {
                     lastKnownIp = ip
                     try {
@@ -261,6 +287,8 @@ class EsferaAgentService : Service() {
                         }
                         if (response.status.value == 200) {
                             android.util.Log.d("EsferaAgent", "Check-in OK: $ip")
+                        } else {
+                            android.util.Log.w("EsferaAgent", "Check-in status ${response.status.value}: $ip")
                         }
                     } catch (e: Exception) {
                         android.util.Log.w("EsferaAgent", "Check-in falhou: ${e.message}")
@@ -403,7 +431,9 @@ class EsferaAgentService : Service() {
             if (ip != null && ip != lastKnownIp) {
                 lastKnownIp = ip
                 android.util.Log.d("EsferaAgent", "IP mudou: $ip — reconectando túnel reverso")
-                // Reconexão imediata do túnel (entrega "reconexão em ms" do design)
+                // Reconexão imediata do túnel (entrega "reconexão em ms" do design).
+                // Cancela o túnel anterior para não vazar/duplicar sockets.
+                tunnelJob?.cancel()
                 agentConfig?.let { startTunnelLoop(it) }
             }
         }
