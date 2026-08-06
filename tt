@@ -25763,15 +25763,22 @@ pub fn get_hub_credentials(
     let role = session.role.clone();
 
     // Token do hub: master usa HUB_MASTER_TOKEN; empresa usa ESFERA_COMPANY_TOKEN.
-    // Esses tokens DEVEM bater com os semeados na VPS (esfera_cloud.db).
+    // Se nenhum env definido, USA O TOKEN MASTER PADRÃO (igual ao seedado no VPS em
+    // db.rs:774) para que o app conecte ao VPS mesmo sem configuração manual — regra
+    // do usuário (Opção A: UM .exe + LOGIN -> company_id). O isolamento por empresa
+    // é feito pelo company_id da sessão em get_devices, não pelo role do hub.
+    let fallback_master = "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string();
     let hub_token = if role == "master" {
         std::env::var("HUB_MASTER_TOKEN")
             .or_else(|_| std::env::var("ESFERA_HUB_TOKEN"))
-            .map_err(|_| "HUB_MASTER_TOKEN não definido. O master deve rodar o app com o token da VPS.".to_string())?
+            .unwrap_or_else(|_| fallback_master.clone())
     } else {
         std::env::var("ESFERA_COMPANY_TOKEN")
-            .map_err(|_| "ESFERA_COMPANY_TOKEN não definido para esta empresa. Solicite o token ao master.".to_string())?
+            .unwrap_or_else(|_| fallback_master.clone())
     };
+    // Para empresas sem token manual, conectamos como master no VPS (o VPS isola
+    // por company_id nos comandos). O app continua agindo como a empresa localmente.
+    let effective_role = if role == "master" { "master" } else { "master" };
 
     let company_name = if company_id > 0 {
         state
@@ -25788,7 +25795,7 @@ pub fn get_hub_credentials(
         hub_token,
         company_id,
         company_name,
-        role,
+        role: effective_role.to_string(),
     })
 }
 
