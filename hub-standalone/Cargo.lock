@@ -271,6 +271,7 @@ dependencies = [
  "hex",
  "r2d2",
  "r2d2_sqlite",
+ "rand 0.8.7",
  "reqwest",
  "rusqlite",
  "serde",
