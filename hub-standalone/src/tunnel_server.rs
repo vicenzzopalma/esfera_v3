@@ -117,7 +117,8 @@ struct AgentHandshake {
 }
 
 pub async fn start(port: u16) {
-    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = match crate::bind_reuse(addr).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("AVISO: Tunnel server na porta {} ja em uso: {}", port, e);

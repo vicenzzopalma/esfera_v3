@@ -47,7 +47,7 @@ pub async fn start(port: u16) {
         .with_state(());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = match tokio::net::TcpListener::bind(addr).await {
+    let listener = match crate::bind_reuse(addr).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("AVISO: Servidor de Presença (WS) na porta {} ja em uso: {}", port, e);

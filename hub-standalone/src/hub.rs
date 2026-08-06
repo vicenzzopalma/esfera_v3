@@ -29,8 +29,9 @@ impl Hub {
     }
 
     pub async fn start(self) -> Result<(), String> {
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", self.port))
-            .await
+        let addr: std::net::SocketAddr = format!("0.0.0.0:{}", self.port).parse()
+            .map_err(|e| format!("Endereco invalido para Hub: {}", e))?;
+        let listener = crate::bind_reuse(addr).await
             .map_err(|e| format!("Falha ao iniciar Hub na porta {}: {}", self.port, e))?;
         println!("Hub iniciado na porta {}", self.port);
 
