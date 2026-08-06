@@ -24,7 +24,7 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
-import io.ktor.client.engine.android.Android
+import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.post
@@ -91,7 +91,7 @@ class EsferaAgentService : Service() {
     private var agentConfig: EsferaConfig? = null
 
     private val json = Json { ignoreUnknownKeys = true }
-    private val httpClient = HttpClient(Android) {
+    private val httpClient = HttpClient(OkHttp) {
         install(ContentNegotiation) {
             json(json)
         }
@@ -440,9 +440,11 @@ class EsferaAgentService : Service() {
     }
 
     private fun registerNetworkCallback() {
-        val request = android.net.NetworkRequest.Builder()
-            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI)
-            .build()
+        // Sem addTransportType: captura QUALQUER mudança de rede (Wi-Fi, dados móveis,
+        // VPN). Antes restringia a TRANSPORT_WIFI, o que fazia o túnel NÃO reconectar
+        // quando o celular usava 4G/5G (casa sem Wi-Fi, por ex.), deixando o celular
+        // invisível no app desktop.
+        val request = android.net.NetworkRequest.Builder().build()
         connectivityManager.registerNetworkCallback(request, networkCallback)
     }
 

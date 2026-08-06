@@ -349,6 +349,11 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 Vec::new()
             }
         };
+        // IDs que o VPS considera vivos (para marcar offline os que saíram).
+        let live_ids: std::collections::HashSet<String> = live_vps
+            .iter()
+            .filter_map(|v| v.get("esfera_device_id").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .collect();
 
         for live in &live_vps {
             let esfera_id = live.get("esfera_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -388,6 +393,19 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 via_tunnel: true,
             };
             refreshed_db.push(new_dev);
+        }
+
+        // Remove/marca offline devices remotos (via_tunnel E serial==esfera_device_id)
+        // que NÃO estão mais no VPS. Sem isso, um celular desconectado do VPS ficaria
+        // "online" eternamente na lista do app desktop.
+        for dev in &mut refreshed_db {
+            if dev.via_tunnel {
+                if let Some(ref id) = dev.esfera_device_id {
+                    if dev.serial == *id && !live_ids.contains(id) {
+                        dev.status = "offline".to_string();
+                    }
+                }
+            }
         }
 
         Ok(refreshed_db)
