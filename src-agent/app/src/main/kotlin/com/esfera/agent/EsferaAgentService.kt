@@ -141,7 +141,29 @@ class EsferaAgentService : Service() {
         presenceClient?.stop()
         scope.cancel()
         httpClient.close()
+        // RESPAWN DEFENSIVO: se o sistema (OEM/Moto) matar o service sem reboot,
+        // reagenda um Job one-shot em 5s para religar o agente. Garante que o
+        // celular continue reportando ao VPS MESMO SEM USB e SEM reboot (regra do
+        // usuário: "aparece mesmo reiniciando o WiFi e desplugado"). O BootJobService
+        // ja cuida do reboot; este cobre kill em runtime.
+        scheduleRespawn(this)
         super.onDestroy()
+    }
+
+    companion object {
+        private const val RESPAWN_JOB_ID = 4243
+        fun scheduleRespawn(context: Context) {
+            try {
+                val js = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+                if (js.getPendingJob(RESPAWN_JOB_ID) != null) return
+                val component = ComponentName(context, BootJobService::class.java)
+                val builder = JobInfo.Builder(RESPAWN_JOB_ID, component)
+                    .setMinimumLatency(5_000L)
+                    .setOverrideDeadline(15_000L)
+                    .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                js.schedule(builder.build())
+            } catch (_: Exception) {}
+        }
     }
 
     // ----------------------------------------------------------------
