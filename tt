@@ -24135,6 +24135,11 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 Vec::new()
             }
         };
+        // IDs que o VPS considera vivos (para marcar offline os que saíram).
+        let live_ids: std::collections::HashSet<String> = live_vps
+            .iter()
+            .filter_map(|v| v.get("esfera_device_id").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .collect();
 
         for live in &live_vps {
             let esfera_id = live.get("esfera_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -24174,6 +24179,19 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 via_tunnel: true,
             };
             refreshed_db.push(new_dev);
+        }
+
+        // Remove/marca offline devices remotos (via_tunnel E serial==esfera_device_id)
+        // que NÃO estão mais no VPS. Sem isso, um celular desconectado do VPS ficaria
+        // "online" eternamente na lista do app desktop.
+        for dev in &mut refreshed_db {
+            if dev.via_tunnel {
+                if let Some(ref id) = dev.esfera_device_id {
+                    if dev.serial == *id && !live_ids.contains(id) {
+                        dev.status = "offline".to_string();
+                    }
+                }
+            }
         }
 
         Ok(refreshed_db)
@@ -24686,17 +24704,53 @@ pub async fn capture_device_screen(_token: String, serial: String) -> Result<Str
 }
 
 #[tauri::command]
-pub async fn send_adb_tap(_token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
+pub async fn send_adb_tap(state: State<'_, AppState>, token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
+    // Bifurcação A: device remoto (via_tunnel) roteia comando para o VPS, que
+    // empurra pelo túnel até o agente Kotlin executar localmente (sem root).
+    if let Some(company_id) = resolve_remote_target(&state, &serial) {
+        let cmd = format!("input tap {} {}", x, y);
+        send_remote_adb_command(&state, company_id, &serial, &cmd).await?;
+        return Ok(());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::tap_screen(&serial, x, y)
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn send_adb_keyevent(_token: String, serial: String, keycode: u32) -> Result<(), String> {
+pub async fn send_adb_keyevent(state: State<'_, AppState>, token: String, serial: String, keycode: u32) -> Result<(), String> {
+    if let Some(company_id) = resolve_remote_target(&state, &serial) {
+        let cmd = format!("input keyevent {}", keycode);
+        send_remote_adb_command(&state, company_id, &serial, &cmd).await?;
+        return Ok(());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::send_keyevent(&serial, keycode)
     }).await.map_err(|e| e.to_string())?
+}
+
+/// Se `serial` for o esfera_device_id de um device remoto (via_tunnel), devolve o
+/// company_id para rotear ações via VPS. Caso contrário, None (ação local ADB).
+fn resolve_remote_target(state: &AppState, serial: &str) -> Option<i32> {
+    // serial de device remoto == esfera_device_id (definido no merge de get_devices).
+    if let Some(dev) = state.db.get_device_by_esfera_id(serial) {
+        if dev.via_tunnel {
+            return Some(dev.company_id);
+        }
+    }
+    None
+}
+
+/// Envia um comando para execução local no agente Kotlin via túnel VPS e devolve a saída.
+pub async fn send_remote_adb_command(state: &AppState, company_id: i32, esfera_device_id: &str, command: &str) -> Result<String, String> {
+    let guard = state.hub_client.lock().await;
+    let client = guard.as_ref().ok_or_else(|| "Hub não conectado. Faça login novamente.".to_string())?;
+    let resp = client.send_command(company_id, "send_device_command", serde_json::json!({
+        "esferaDeviceId": esfera_device_id,
+        "command": command,
+    })).await?;
+    resp.get("output").and_then(|s| s.as_str()).map(|s| s.to_string())
+        .ok_or_else(|| "resposta do device sem saída".to_string())
 }
 
 // ============================================================
@@ -35020,10 +35074,35 @@ async fn handle_vps_command(
                     .map(|_| serde_json::json!({ "sent": true })),
             )
         }
+        // Comando remoto que ESPERA a resposta do device (canal de controle, sem root).
+        // O agente Kotlin executa localmente e devolve `adb_result` via túnel.
+        // Fecha a bifurcação A: celular remoto (via_tunnel) passa a ser controlável.
+        "send_device_command" => {
+            if company_id <= 0 {
+                return Some(Err("companyId obrigatório".to_string()));
+            }
+            let device_id = match args.get("esferaDeviceId").and_then(|v| v.as_str()) {
+                Some(d) if !d.is_empty() => d,
+                _ => return Some(Err("esferaDeviceId obrigatório".to_string())),
+            };
+            let command = match args.get("command").and_then(|v| v.as_str()) {
+                Some(c) if !c.is_empty() => c,
+                _ => return Some(Err("command obrigatório".to_string())),
+            };
+            let cmd_id = format!("cmd_{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+            match crate::tunnel_server::request_adb_command(company_id, device_id, &cmd_id, command) {
+                Ok(rx) => {
+                    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                        Ok(Ok(output)) => Some(Ok(serde_json::json!({ "output": output }))),
+                        Ok(Err(_)) => Some(Err("device fechou o túnel antes de responder".to_string())),
+                        Err(_) => Some(Err("timeout (10s) aguardando resposta do device".to_string())),
+                    }
+                }
+                Err(e) => Some(Err(e)),
+            }
+        }
         // Gera/devolve o token da empresa para o usuário autenticado.
-        // Elimina a necessidade de token manual (ESFERA_COMPANY_TOKEN) por máquina:
-        // o desktop (que já tem HUB_MASTER_TOKEN) pede à VPS o token da empresa do
-        // usuário logado, e a VPS o emite/persiste em esfera_cloud.db.
         "get_company_token" => {
             if company_id <= 0 {
                 return Some(Err("companyId obrigatório".to_string()));
@@ -35906,6 +35985,41 @@ pub fn send_control(company_id: i32, esfera_device_id: &str, json_line: &str) ->
         .map_err(|_| "sessão de túnel encerrada".to_string())
 }
 
+/// Registry de RESULTADOS de comandos remotos: (company_id, device_id, cmd_id) -> sender.
+/// O hub.rs (send_device_command) aguarda neste canal até o device responder `adb_result`.
+static RESULTS: LazyLock<
+    Mutex<HashMap<(i32, String, String), tokio::sync::oneshot::Sender<String>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Solicita execução de um comando no device (canal de controle remoto, sem root).
+/// O device (agente Kotlin) executa localmente e devolve `adb_result` com o mesmo id.
+/// Retorna o Receiver que o hub.rs deve aguardar (com timeout).
+pub fn request_adb_command(
+    company_id: i32,
+    esfera_device_id: &str,
+    cmd_id: &str,
+    command: &str,
+) -> Result<tokio::sync::oneshot::Receiver<String>, String> {
+    let line = format!(
+        "{{\"type\":\"adb_cmd\",\"id\":\"{}\",\"command\":{}}}",
+        cmd_id,
+        serde_json::to_string(command).map_err(|e| e.to_string())?
+    );
+    {
+        let map = CONTROL.lock().unwrap();
+        let tx = map
+            .get(&(company_id, esfera_device_id.to_string()))
+            .ok_or_else(|| "device sem túnel ativo para esta empresa".to_string())?;
+        tx.send(line).map_err(|_| "sessão de túnel encerrada".to_string())?;
+    }
+    let (os_tx, os_rx) = tokio::sync::oneshot::channel::<String>();
+    RESULTS
+        .lock()
+        .unwrap()
+        .insert((company_id, esfera_device_id.to_string(), cmd_id.to_string()), os_tx);
+    Ok(os_rx)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentHandshake {
@@ -36048,6 +36162,26 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
                             "[tunnel] proxy recusado pelo device {} (empresa {}): {}",
                             uuid, company_id, reason
                         );
+                    }
+                    // Resultado de comando remoto (agente Kotlin executou localmente).
+                    Some("adb_result") => {
+                        let cmd_id = v
+                            .get("id")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let output = v
+                            .get("output")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if let Some(tx) = RESULTS
+                            .lock()
+                            .unwrap()
+                            .remove(&(company_id, uuid.clone(), cmd_id.clone()))
+                        {
+                            let _ = tx.send(output);
+                        }
                     }
                     _ => {}
                 }
