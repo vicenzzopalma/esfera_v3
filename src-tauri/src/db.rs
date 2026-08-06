@@ -1166,7 +1166,7 @@ impl Database {
             "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(AdbDeviceId) DO UPDATE SET
-            DeviceName=CASE WHEN ESF_Device.DeviceName IS NOT NULL AND ESF_Device.DeviceName != '' AND ESF_Device.DeviceName != excluded.Model THEN ESF_Device.DeviceName ELSE excluded.DeviceName END,
+            DeviceName=CASE WHEN excluded.DeviceName IS NOT NULL AND excluded.DeviceName != '' THEN excluded.DeviceName ELSE ESF_Device.DeviceName END,
             Brand=excluded.Brand, Model=excluded.Model,
             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
             BatteryLevel=excluded.BatteryLevel,
