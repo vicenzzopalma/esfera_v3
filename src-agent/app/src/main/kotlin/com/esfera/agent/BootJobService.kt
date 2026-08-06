@@ -15,8 +15,14 @@ import android.util.Log
  * BroadcastReceiver em background), o JobScheduler com setPersisted(true) é
  * executado pelo sistema APÓS o reboot, sem depender do app estar rodando.
  * É a forma oficial e sem-root de garantir auto-start do agente.
+ *
+ * CORREÇÃO DO LOOP (v3.4.1): onStartJob NÃO reagenda o próprio job e retorna
+ * `true` + jobFinished. O setPersisted(true) já garante execução pós-boot;
+ * reagendar no onStartJob criava disparos em cascata (10x/segundo) porque o
+ * JobScheduler via o job "não completado" (foreground async) e re-disparava.
  */
 class BootJobService : JobService() {
+
     override fun onStartJob(params: JobParameters?): Boolean {
         Log.i("EsferaAgent", "BootJobService: iniciando agente apos boot")
         val intent = android.content.Intent(this, EsferaAgentService::class.java)
@@ -29,9 +35,10 @@ class BootJobService : JobService() {
         } catch (e: Exception) {
             Log.w("EsferaAgent", "BootJobService falhou ao iniciar: ${e.message}")
         }
-        // Reagenda para o próximo boot (persistência contínua)
-        schedule(this)
-        return false
+        // Trabalho curto e síncrono: avisa o JobScheduler que terminamos.
+        // NÃO chamamos schedule() aqui — o job persiste por si só (setPersisted).
+        jobFinished(params, false)
+        return true
     }
 
     override fun onStopJob(params: JobParameters?): Boolean = false
@@ -39,17 +46,16 @@ class BootJobService : JobService() {
     companion object {
         const val JOB_ID = 4242
 
+        /** Agenda o job UMA vez. Idempotente: reagendar o mesmo JOB_ID só atualiza. */
         fun schedule(context: Context) {
             val js = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+            // Se já está agendado, não faz nada (evita duplicar/cascade).
+            if (js.getPendingJob(JOB_ID) != null) return
             val component = ComponentName(context, BootJobService::class.java)
             val builder = JobInfo.Builder(JOB_ID, component)
                 .setPersisted(true)          // sobrevive a reboot (requer RECEIVE_BOOT_COMPLETED)
                 .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-                .setBackoffCriteria(5000, JobInfo.BACKOFF_POLICY_LINEAR)
-            // Executa também em idle para garantir que rode logo após boot
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                builder.setRequiresCharging(false)
-            }
+                .setBackoffCriteria(30_000, JobInfo.BACKOFF_POLICY_LINEAR)
             try {
                 js.schedule(builder.build())
             } catch (e: Exception) {
