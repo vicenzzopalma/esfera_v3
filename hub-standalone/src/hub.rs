@@ -121,10 +121,35 @@ async fn handle_vps_command(
                     .map(|_| serde_json::json!({ "sent": true })),
             )
         }
+        // Comando remoto que ESPERA a resposta do device (canal de controle, sem root).
+        // O agente Kotlin executa localmente e devolve `adb_result` via túnel.
+        // Fecha a bifurcação A: celular remoto (via_tunnel) passa a ser controlável.
+        "send_device_command" => {
+            if company_id <= 0 {
+                return Some(Err("companyId obrigatório".to_string()));
+            }
+            let device_id = match args.get("esferaDeviceId").and_then(|v| v.as_str()) {
+                Some(d) if !d.is_empty() => d,
+                _ => return Some(Err("esferaDeviceId obrigatório".to_string())),
+            };
+            let command = match args.get("command").and_then(|v| v.as_str()) {
+                Some(c) if !c.is_empty() => c,
+                _ => return Some(Err("command obrigatório".to_string())),
+            };
+            let cmd_id = format!("cmd_{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+            match crate::tunnel_server::request_adb_command(company_id, device_id, &cmd_id, command) {
+                Ok(rx) => {
+                    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                        Ok(Ok(output)) => Some(Ok(serde_json::json!({ "output": output }))),
+                        Ok(Err(_)) => Some(Err("device fechou o túnel antes de responder".to_string())),
+                        Err(_) => Some(Err("timeout (10s) aguardando resposta do device".to_string())),
+                    }
+                }
+                Err(e) => Some(Err(e)),
+            }
+        }
         // Gera/devolve o token da empresa para o usuário autenticado.
-        // Elimina a necessidade de token manual (ESFERA_COMPANY_TOKEN) por máquina:
-        // o desktop (que já tem HUB_MASTER_TOKEN) pede à VPS o token da empresa do
-        // usuário logado, e a VPS o emite/persiste em esfera_cloud.db.
         "get_company_token" => {
             if company_id <= 0 {
                 return Some(Err("companyId obrigatório".to_string()));

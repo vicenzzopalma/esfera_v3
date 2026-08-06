@@ -62,6 +62,41 @@ pub fn send_control(company_id: i32, esfera_device_id: &str, json_line: &str) ->
         .map_err(|_| "sessão de túnel encerrada".to_string())
 }
 
+/// Registry de RESULTADOS de comandos remotos: (company_id, device_id, cmd_id) -> sender.
+/// O hub.rs (send_device_command) aguarda neste canal até o device responder `adb_result`.
+static RESULTS: LazyLock<
+    Mutex<HashMap<(i32, String, String), tokio::sync::oneshot::Sender<String>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Solicita execução de um comando no device (canal de controle remoto, sem root).
+/// O device (agente Kotlin) executa localmente e devolve `adb_result` com o mesmo id.
+/// Retorna o Receiver que o hub.rs deve aguardar (com timeout).
+pub fn request_adb_command(
+    company_id: i32,
+    esfera_device_id: &str,
+    cmd_id: &str,
+    command: &str,
+) -> Result<tokio::sync::oneshot::Receiver<String>, String> {
+    let line = format!(
+        "{{\"type\":\"adb_cmd\",\"id\":\"{}\",\"command\":{}}}",
+        cmd_id,
+        serde_json::to_string(command).map_err(|e| e.to_string())?
+    );
+    {
+        let map = CONTROL.lock().unwrap();
+        let tx = map
+            .get(&(company_id, esfera_device_id.to_string()))
+            .ok_or_else(|| "device sem túnel ativo para esta empresa".to_string())?;
+        tx.send(line).map_err(|_| "sessão de túnel encerrada".to_string())?;
+    }
+    let (os_tx, os_rx) = tokio::sync::oneshot::channel::<String>();
+    RESULTS
+        .lock()
+        .unwrap()
+        .insert((company_id, esfera_device_id.to_string(), cmd_id.to_string()), os_tx);
+    Ok(os_rx)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentHandshake {
@@ -204,6 +239,26 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
                             "[tunnel] proxy recusado pelo device {} (empresa {}): {}",
                             uuid, company_id, reason
                         );
+                    }
+                    // Resultado de comando remoto (agente Kotlin executou localmente).
+                    Some("adb_result") => {
+                        let cmd_id = v
+                            .get("id")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let output = v
+                            .get("output")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if let Some(tx) = RESULTS
+                            .lock()
+                            .unwrap()
+                            .remove(&(company_id, uuid.clone(), cmd_id.clone()))
+                        {
+                            let _ = tx.send(output);
+                        }
                     }
                     _ => {}
                 }
