@@ -830,12 +830,20 @@ impl AdbManager {
     }
 
     /// Obtém o endereço IP do wlan0 via shell único combinado (3 métodos em 1 chamada)
-    pub fn get_device_wifi_ip(serial: &str) -> Result<String, String> {
+    pub fn get_device_wifi_ip(requested_serial: &str) -> Result<String, String> {
+        let serial = Self::resolve_target_serial(requested_serial).unwrap_or_else(|_| requested_serial.to_string());
+
+        // Fast-path: Se o serial solicitado já é um IP (ex: 192.168.1.83 ou 192.168.1.83:5555), retorna o IP imediatamente!
+        let clean_ip = serial.split(':').next().unwrap_or(&serial).trim();
+        if clean_ip.contains('.') && clean_ip.split('.').count() == 4 && !clean_ip.starts_with("127.") {
+            return Ok(clean_ip.to_string());
+        }
+
         let shell_cmd = "getprop dhcp.wlan0.ipaddress; echo '---'; ip route; echo '---'; ip addr show wlan0";
 
         // Wi-Fi: protocolo ADB nativo em vez de adb.exe (evita "adb server" no hub)
-        if Self::use_native_adb(serial) {
-            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, shell_cmd) {
+        if Self::use_native_adb(&serial) {
+            if let Ok(stdout) = crate::adb_tcp::exec_shell(&serial, shell_cmd) {
                 if let Some(ip) = Self::parse_wifi_ip_from_shell(&stdout) {
                     return Ok(ip);
                 }
@@ -843,8 +851,8 @@ impl AdbManager {
         }
 
         let mut cmd = create_cmd("adb");
-        cmd.args(["-s", serial, "shell", shell_cmd]);
-        let output = run_cmd_timeout(cmd, Duration::from_secs(3))?;
+        cmd.args(["-s", &serial, "shell", shell_cmd]);
+        let output = run_cmd_timeout(cmd, Duration::from_secs(6))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if let Some(ip) = Self::parse_wifi_ip_from_shell(&stdout) {
