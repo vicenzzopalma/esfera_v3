@@ -160,6 +160,7 @@ fn get_cached_battery(serial: &str) -> i32 {
 pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<Device>, String> {
     let state_db = state.db.clone();
     let state_sessions = state.sessions.clone();
+    let hub_client = state.hub_client.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         let session = validate_session(&state_sessions, &token)?;
@@ -323,6 +324,70 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             } else {
                 dev.status = "offline".to_string();
             }
+        }
+
+        // PONTE VPS -> LOCAL (Opção A): o app desktop é a "empresa" conectada ao Hub
+        // VPS. O agente Kotlin em qualquer rede faz check-in/túnel no VPS, que é a fonte
+        // de verdade. Precisamos mesclar os devices VIVOS do VPS na lista apresentada,
+        // senão celulares remotos (ex.: em casa, sem ADB local) NUNCA aparecem.
+        // Busca via HubClient (assíncrono) dentro do closure síncrono.
+        let live_vps: Vec<serde_json::Value> = {
+            let rt = tokio::runtime::Handle::try_current();
+            if let Ok(h) = rt {
+                tauri::async_runtime::block_on(async {
+                    let guard = hub_client.lock().await;
+                    if let Some(client) = guard.as_ref() {
+                        match client.send_command(target_company_id, "get_live_devices", serde_json::json!({"companyId": target_company_id})).await {
+                            Ok(val) => val.as_array().cloned().unwrap_or_default(),
+                            Err(_) => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                })
+            } else {
+                Vec::new()
+            }
+        };
+
+        for live in &live_vps {
+            let esfera_id = live.get("esfera_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if esfera_id.is_empty() { continue; }
+            let vps_status = live.get("status").and_then(|v| v.as_str()).unwrap_or("Offline");
+            let mapped_status = match vps_status {
+                "Online" => "online",
+                "Degraded" => "connecting",
+                _ => "offline",
+            }.to_string();
+            let battery = live.get("battery_level").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+
+            // Já existe localmente por esfera_device_id?
+            if let Some(pos) = refreshed_db.iter().position(|d| d.esfera_device_id.as_deref() == Some(esfera_id.as_str())) {
+                refreshed_db[pos].via_tunnel = true;
+                refreshed_db[pos].status = mapped_status.clone();
+                if battery > 0 { refreshed_db[pos].battery = battery; }
+                continue;
+            }
+            // Novo device remoto: usa esfera_device_id como identificador estável.
+            let new_dev = Device {
+                id: 0,
+                serial: esfera_id.clone(),
+                name: format!("Celular {}", &esfera_id),
+                brand: String::new(),
+                model: String::new(),
+                ip: String::new(),
+                port: 0,
+                status: mapped_status,
+                battery,
+                company_id: target_company_id,
+                device_number: (refreshed_db.len() as i32) + 1,
+                sector: "remote".to_string(),
+                esfera_device_id: Some(esfera_id.clone()),
+                current_adb_address: None,
+                last_seen_utc: live.get("last_seen_utc").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                via_tunnel: true,
+            };
+            refreshed_db.push(new_dev);
         }
 
         Ok(refreshed_db)
