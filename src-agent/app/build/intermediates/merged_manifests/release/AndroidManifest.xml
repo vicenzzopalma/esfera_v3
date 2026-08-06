@@ -28,7 +28,8 @@
         android:appComponentFactory="androidx.core.app.CoreComponentFactory"
         android:extractNativeLibs="false"
         android:supportsRtl="true"
-        android:theme="@style/Theme.EsferaAgent.Transparent" >
+        android:theme="@style/Theme.EsferaAgent.Transparent"
+        android:usesCleartextTraffic="true" >
         <service
             android:name="com.esfera.agent.EsferaAgentService"
             android:exported="true"

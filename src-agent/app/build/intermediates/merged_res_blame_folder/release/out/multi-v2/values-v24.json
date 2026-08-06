@@ -4,7 +4,7 @@
             "outputFile": "com.esfera.agent.app-mergeReleaseResources-18:/values-v24/values-v24.xml",
             "map": [
                 {
-                    "source": "C:\\Users\\vicenzzo.palma\\.gradle\\caches\\8.9\\transforms\\67672a98ec22f1c0ea2f513e0b60be79\\transformed\\appcompat-1.6.1\\res\\values-v24\\values-v24.xml",
+                    "source": "C:\\Users\\vicenzzo.palma\\.gradle\\caches\\8.9\\transforms\\4fdeb5ae9c54c165bbefc24c27009d07\\transformed\\appcompat-1.6.1\\res\\values-v24\\values-v24.xml",
                     "from": {
                         "startLines": "2,3",
                         "startColumns": "4,4",

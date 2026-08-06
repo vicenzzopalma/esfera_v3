@@ -25,6 +25,6 @@
       applicationId="com.esfera.agent"
       generatedSourceFolders="build\generated\ap_generated_sources\release\out"
       generatedResourceFolders="build\generated\res\resValues\release"
-      desugaredMethodsFiles="C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\50233996ea4ad5efca764c3f438ce5a6\transformed\D8BackportedDesugaredMethods.txt">
+      desugaredMethodsFiles="C:\Users\vicenzzo.palma\.gradle\caches\8.9\transforms\18126f0def25d46038bbc00e2b3cea90\transformed\D8BackportedDesugaredMethods.txt">
   </mainArtifact>
 </variant>

@@ -1,4 +1,4 @@
-#Wed Aug 05 17:27:58 BRT 2026
+#Thu Aug 06 12:53:01 BRT 2026
 base.0=D\:\\Novo\\Esfera v3\\src-agent\\app\\build\\intermediates\\dex\\release\\mergeDexRelease\\classes.dex
 renamed.0=classes.dex
 path.0=classes.dex
