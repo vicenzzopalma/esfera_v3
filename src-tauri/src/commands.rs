@@ -2025,6 +2025,34 @@ pub async fn connect_hub(
     Ok(())
 }
 
+/// Empurra uma atualização do hub-standalone VPS via POST /admin/update.
+/// Recebe o binario em base64. O VPS faz swap + self-restart (sem SSH).
+#[tauri::command]
+pub async fn update_vps_hub(state: State<'_, AppState>, token: String, base64_bin: String) -> Result<String, String> {
+    let _session = validate_session(&state.sessions, &token)?;
+    let bin = base64::decode(&base64_bin).map_err(|e| format!("Falha ao decodificar base64: {}", e))?;
+    if bin.is_empty() { return Err("Binario vazio.".into()); }
+    let token_master = std::env::var("HUB_MASTER_TOKEN")
+        .unwrap_or_else(|_| "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string());
+    let vps = std::env::var("ESFERA_HUB_ADDR").unwrap_or_else(|_| "34.29.70.113:8555".to_string());
+    let host = vps.split(':').next().unwrap_or("34.29.70.113");
+    let url = format!("http://{}:8080/admin/update", host);
+    let client = reqwest::Client::new();
+    let resp = client.post(&url)
+        .header("X-Hub-Token", &token_master)
+        .body(bin)
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao enviar atualizacao ao VPS: {}", e))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        Ok("VPS atualizado. O hub reiniciou com a nova versao.".into())
+    } else {
+        Err(format!("VPS retornou {}: {}", status, txt))
+    }
+}
+
 #[derive(serde::Serialize)]
 pub struct HubCredentials {
     pub hub_address: String,
