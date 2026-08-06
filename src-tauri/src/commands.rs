@@ -918,17 +918,53 @@ pub async fn capture_device_screen(_token: String, serial: String) -> Result<Str
 }
 
 #[tauri::command]
-pub async fn send_adb_tap(_token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
+pub async fn send_adb_tap(state: State<'_, AppState>, token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
+    // Bifurcação A: device remoto (via_tunnel) roteia comando para o VPS, que
+    // empurra pelo túnel até o agente Kotlin executar localmente (sem root).
+    if let Some(company_id) = resolve_remote_target(&state, &serial) {
+        let cmd = format!("input tap {} {}", x, y);
+        send_remote_adb_command(&state, company_id, &serial, &cmd).await?;
+        return Ok(());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::tap_screen(&serial, x, y)
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn send_adb_keyevent(_token: String, serial: String, keycode: u32) -> Result<(), String> {
+pub async fn send_adb_keyevent(state: State<'_, AppState>, token: String, serial: String, keycode: u32) -> Result<(), String> {
+    if let Some(company_id) = resolve_remote_target(&state, &serial) {
+        let cmd = format!("input keyevent {}", keycode);
+        send_remote_adb_command(&state, company_id, &serial, &cmd).await?;
+        return Ok(());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::send_keyevent(&serial, keycode)
     }).await.map_err(|e| e.to_string())?
+}
+
+/// Se `serial` for o esfera_device_id de um device remoto (via_tunnel), devolve o
+/// company_id para rotear ações via VPS. Caso contrário, None (ação local ADB).
+fn resolve_remote_target(state: &AppState, serial: &str) -> Option<i32> {
+    // serial de device remoto == esfera_device_id (definido no merge de get_devices).
+    if let Some(dev) = state.db.get_device_by_esfera_id(serial) {
+        if dev.via_tunnel {
+            return Some(dev.company_id);
+        }
+    }
+    None
+}
+
+/// Envia um comando para execução local no agente Kotlin via túnel VPS e devolve a saída.
+pub async fn send_remote_adb_command(state: &AppState, company_id: i32, esfera_device_id: &str, command: &str) -> Result<String, String> {
+    let guard = state.hub_client.lock().await;
+    let client = guard.as_ref().ok_or_else(|| "Hub não conectado. Faça login novamente.".to_string())?;
+    let resp = client.send_command(company_id, "send_device_command", serde_json::json!({
+        "esferaDeviceId": esfera_device_id,
+        "command": command,
+    })).await?;
+    resp.get("output").and_then(|s| s.as_str()).map(|s| s.to_string())
+        .ok_or_else(|| "resposta do device sem saída".to_string())
 }
 
 // ============================================================
