@@ -162,6 +162,24 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
     let state_sessions = state.sessions.clone();
     let hub_client = state.hub_client.clone();
 
+    // AUTO-CONEXÃO DO HUB: se o cliente VPS não estiver conectado, tenta conectar
+    // usando as credenciais da sessão. Garante que o celular remoto (via_tunnel)
+    // apareça MESMO SEM o frontend chamar connect_hub explicitamente — regra do
+    // usuário: "aparece mesmo reiniciando o WiFi e desplugado".
+    {
+        let connected = hub_client.lock().await.is_some();
+        if !connected {
+            if let Ok(creds) = get_hub_credentials(state.clone(), token.clone()) {
+                if let Ok(client) = HubClient::connect(
+                    &creds.hub_address, &creds.hub_token, &creds.role,
+                    creds.company_id, &creds.company_name,
+                ).await {
+                    *hub_client.lock().await = Some(client);
+                }
+            }
+        }
+    }
+
     tauri::async_runtime::spawn_blocking(move || {
         let session = validate_session(&state_sessions, &token)?;
         let target_company_id = if session.role == "master" {
@@ -2223,6 +2241,14 @@ pub fn check_git_auto_update() -> Result<GitUpdateStatus, String> {
             commit_message: "Sistema atualizado.".to_string(),
         }),
     }
+}
+
+/// Comando do Agente Órfão Otto: Detecta processos órfãos (Scrcpy/ADB) sem matá-los automaticamente.
+#[tauri::command]
+pub fn scan_orphan_processes() -> Result<Vec<crate::scrcpy_manager::OrphanProcessInfo>, String> {
+    let active_pids = crate::scrcpy_manager::GLOBAL_SCRCPY_MANAGER.get_active_pids();
+    let orphans = crate::scrcpy_manager::OrphanOtto::scan_orphans(&active_pids);
+    Ok(orphans)
 }
 
 #[tauri::command]
