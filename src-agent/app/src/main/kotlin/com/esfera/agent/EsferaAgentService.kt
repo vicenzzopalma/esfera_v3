@@ -5,6 +5,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
+import android.content.ComponentName
+import android.app.job.JobInfo
+import android.app.job.JobScheduler
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -83,13 +86,33 @@ class EsferaAgentService : Service() {
         const val CHANNEL_ID = "esfera_agent_channel"
         const val NOTIF_ID = 1001
         const val CHECK_IN_INTERVAL_MS = 30_000L
+        private const val RESPAWN_JOB_ID = 4243
+
+        // RESPAWN DEFENSIVO: se o sistema (OEM/Moto) matar o service sem reboot,
+        // reagenda um Job one-shot em 5s para religar o agente. Garante que o
+        // celular continue reportando ao VPS MESMO SEM USB e SEM reboot (regra do
+        // usuário: "aparece mesmo reiniciando o WiFi e desplugado"). O BootJobService
+        // ja cuida do reboot; este cobre kill em runtime.
+        fun scheduleRespawn(context: Context) {
+            try {
+                val js = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+                if (js.getPendingJob(RESPAWN_JOB_ID) != null) return
+                val component = ComponentName(context, BootJobService::class.java)
+                val builder = JobInfo.Builder(RESPAWN_JOB_ID, component)
+                    .setMinimumLatency(5_000L)
+                    .setOverrideDeadline(15_000L)
+                    .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                js.schedule(builder.build())
+            } catch (_: Exception) {}
+        }
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // ----------------------------------------------------------------\n
     private var checkInJob: Job? = null
     private var tunnelJob: Job? = null
     private var lastKnownIp: String? = null
     private var agentConfig: EsferaConfig? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val json = Json { ignoreUnknownKeys = true }
     private val httpClient = HttpClient(OkHttp) {
@@ -150,24 +173,7 @@ class EsferaAgentService : Service() {
         super.onDestroy()
     }
 
-    companion object {
-        private const val RESPAWN_JOB_ID = 4243
-        fun scheduleRespawn(context: Context) {
-            try {
-                val js = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
-                if (js.getPendingJob(RESPAWN_JOB_ID) != null) return
-                val component = ComponentName(context, BootJobService::class.java)
-                val builder = JobInfo.Builder(RESPAWN_JOB_ID, component)
-                    .setMinimumLatency(5_000L)
-                    .setOverrideDeadline(15_000L)
-                    .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-                js.schedule(builder.build())
-            } catch (_: Exception) {}
-        }
-    }
-
-    // ----------------------------------------------------------------
-    // Config
+    // ----------------------------------------------------------------\n    // Config
     // ----------------------------------------------------------------
 
     private fun getProp(name: String): String {
