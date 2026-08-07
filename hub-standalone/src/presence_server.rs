@@ -62,11 +62,11 @@ pub async fn start(port: u16) {
     });
 }
 
-async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
+pub async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket))
 }
 
-async fn handle_socket(socket: WebSocket) {
+pub async fn handle_socket(socket: WebSocket) {
     let (mut sender, mut receiver) = socket.split();
     let mut current: Option<(i32, String)> = None;
 

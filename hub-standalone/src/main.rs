@@ -1,5 +1,5 @@
 use esfera_hub_standalone::{
-    checkin_server, db, hub, presence_server, protocol, session_manager, tunnel_server,
+    checkin_server, db, hub, presence_server, protocol, session_manager, tls_server, tunnel_server,
 };
 use std::env;
 use std::io::Write;
@@ -87,9 +87,22 @@ async fn main() {
         presence_server::start(presence_port).await;
     });
 
+    // 7. TLS 443 / Outbound Encrypted Tunnel (MDM Enterprise Edge) :443 (fallback 8443)
+    // Canal PRIMÁRIO criptografado para o agente Kotlin (HTTPS check-in + WSS presença).
+    // Reutiliza os handlers de checkin_server/presence_server sobre TLS.
+    // O 8080/7779 (HTTP/WS) permanece como FALLBACK.
+    let tls_port: u16 = env::var("TLS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8443);
+    let db_tls = db.clone();
+    tokio::spawn(async move {
+        tls_server::start(db_tls, tls_port).await;
+    });
+
     println!(
-        "Hub Standalone ATIVO: master={} checkin={} tunnel={} presence={}",
-        port, http_port, tunnel_port, presence_port
+        "Hub Standalone ATIVO: master={} checkin={} tunnel={} presence={} tls={}",
+        port, http_port, tunnel_port, presence_port, tls_port
     );
     let _ = std::io::stdout().flush();
 

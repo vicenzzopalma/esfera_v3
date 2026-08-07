@@ -25,6 +25,10 @@ import java.io.PrintWriter
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
+import javax.net.ssl.SSLContext
+import javax.net.ssl.X509TrustManager
+import java.security.cert.X509Certificate
+import okhttp3.OkHttpClient
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.OkHttp
@@ -154,7 +158,32 @@ class EsferaAgentService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val json = Json { ignoreUnknownKeys = true }
+
+    // Trust-all OkHttpClient (apenas para TESTE com cert self-signed do VPS).
+    // Em produção, substituir por certificado de CA real (load do KeyStore).
+    private fun trustAllOkHttp(): OkHttpClient {
+        return try {
+            val trustAll = arrayOf<X509TrustManager>(object : X509TrustManager {
+                override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+                override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+                override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+            })
+            val ssl = SSLContext.getInstance("TLS").apply {
+                init(null, trustAll, java.security.SecureRandom())
+            }
+            OkHttpClient.Builder()
+                .sslSocketFactory(ssl.socketFactory, trustAll[0])
+                .hostnameVerifier { _, _ -> true }
+                .build()
+        } catch (e: Exception) {
+            OkHttpClient.Builder().build()
+        }
+    }
+
     private val httpClient = HttpClient(OkHttp) {
+        engine {
+            preconfigured = trustAllOkHttp()
+        }
         install(ContentNegotiation) {
             json(json)
         }
@@ -318,18 +347,24 @@ class EsferaAgentService : Service() {
 
     private fun startPresenceLoop(config: EsferaConfig) {
         presenceClient?.stop()
-        val host = config.serverUrl
+        val cleaned = config.serverUrl
             .replace("http://", "")
             .replace("https://", "")
-            .substringBefore(':')
-            .substringBefore('/')
-            .ifEmpty { "127.0.0.1" }
+        val host = cleaned.substringBefore(':').substringBefore('/').ifEmpty { "127.0.0.1" }
+        val useTls = config.serverUrl.startsWith("https://")
+        // Se TLS, a porta vem do serverUrl (ex: https://host:8443); senão fixo 7779.
+        val wsPort = if (useTls) {
+            cleaned.substringAfter(':').substringBefore('/').toIntOrNull() ?: 8443
+        } else {
+            7779
+        }
         presenceClient = PresenceClient(
             context = this,
             deviceId = config.deviceId,
             serverHost = host,
-            wsPort = 7779,
-            companyId = config.companyId
+            wsPort = wsPort,
+            companyId = config.companyId,
+            useTls = useTls
         ).apply { start() }
     }
 
