@@ -128,18 +128,29 @@ class EsferaAgentService : Service() {
     private lateinit var powerManager: PowerManager
     private var wakeLock: PowerManager.WakeLock? = null
 
-    // ----------------------------------------------------------------
+    // ----------------------------------------------------------------\
     // Lifecycle
-    // ----------------------------------------------------------------
+    // ----------------------------------------------------------------\
 
     private var presenceClient: PresenceClient? = null
+
+    // Guarda de idempotência: loadConfigAndStart só roda UMA vez. O BootJobService
+    // (disparado pelo próprio onCreate) e múltiplas chamadas de onStartCommand criam
+    // coroutines duplicadas que se cancelam em cascata ("StandaloneCoroutine was
+    // cancelled"), matando a presença/túnel. Com este flag, reinvocações apenas
+    // retornam START_STICKY sem recriar jobs.
+    private val started = java.util.concurrent.atomic.AtomicBoolean(false)
 
     override fun onCreate() {
         super.onCreate()
         // Agenda o job persistente de auto-start (sobrevive a reboot, sem root).
         BootJobService.schedule(this)
+        // Keep-alive via AlarmManager: religa o agente se for morto por SIGKILL/OEM
+        // (cobrir kill em runtime que NAO chama onDestroy). Garante que o celular
+        // continue reportando ao VPS MESMO SEM USB, SEM reboot e SEM abrir o app.
+        KeepAliveReceiver.schedule(this)
         createNotificationChannel()
-        val notification = buildNotification()
+        buildNotification() // aquece o canal de notificação
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         registerNetworkCallback()
@@ -150,7 +161,11 @@ class EsferaAgentService : Service() {
         startForeground(NOTIF_ID, notification)
         acquireWakeLock()
         android.util.Log.d("EsferaAgent", "onStartCommand: iniciando loadConfigAndStart")
-        loadConfigAndStart()
+        if (started.compareAndSet(false, true)) {
+            loadConfigAndStart()
+        } else {
+            android.util.Log.d("EsferaAgent", "onStartCommand: ja iniciado, ignorando duplicata")
+        }
         return START_STICKY
     }
 
