@@ -489,10 +489,20 @@ class EsferaAgentService : Service() {
                         line.contains("\"type\":\"proxy\"") -> {
                             val port = Regex("\"port\"\\s*:\\s*(\\d+)").find(line)
                                 ?.groupValues?.get(1)?.toInt() ?: 5555
-                            // Sinaliza ack e abre o relay local (ADB do aparelho <-> túnel).
-                            writer.println("""{"type":"proxy-ack"}""")
-                            writer.flush()
-                            launch(Dispatchers.IO) { relayToLocal(socket, port) }
+                            // Garante que o adbd local escute em TCP antes de abrir o relay.
+                            // Sem isso o app trava em "processando ADB" (relay falha silenciosamente).
+                            ensureAdbdTcp(port)
+                            try {
+                                val local = Socket("127.0.0.1", port)
+                                // Só confirma o proxy APÓS a conexão local existir de verdade.
+                                writer.println("""{"type":"proxy-ack"}""")
+                                writer.flush()
+                                launch(Dispatchers.IO) { relayToLocal(local, socket) }
+                            } catch (e: Exception) {
+                                android.util.Log.e("EsferaAgent", "proxy falhou: adbd nao escuta em 127.0.0.1:$port (${e.message})")
+                                writer.println("""{"type":"proxy-error","message":"adbd nao escuta em 127.0.0.1:$port"}""")
+                                writer.flush()
+                            }
                         }
                         line.contains("\"type\":\"adb_cmd\"") -> {
                             // Comando remoto solicitado pelo app desktop via VPS.
@@ -539,19 +549,33 @@ class EsferaAgentService : Service() {
         }
     }
 
-    /// Relay bidirecional bruto entre o soquete do túnel e o ADB local do aparelho
-    /// (127.0.0.1:port). Chamado quando o servidor pede um proxy (ADB reverso via túnel).
-    private suspend fun relayToLocal(tunnel: Socket, port: Int) {
+    /// Relay bidirecional bruto entre o soquete do túnel e o ADB local do aparelho.
+    /// O `local` (127.0.0.1:port) já vem conectado de quem chamou (proxy handler),
+    /// que garantiu que o adbd escuta antes de confirmar o proxy-ack.
+    private suspend fun relayToLocal(local: Socket, tunnel: Socket) {
         try {
-            val local = Socket("127.0.0.1", port)
             coroutineScope {
                 launch { pump(tunnel.getInputStream(), local.getOutputStream()) }
                 launch { pump(local.getInputStream(), tunnel.getOutputStream()) }
             }
-            local.close()
         } catch (_: Exception) {
             // Relay encerrado (qualquer ponta fechou).
+        } finally {
+            try { local.close() } catch (_: Exception) {}
         }
+    }
+
+    /// Tenta deixar o adbd local escutando em TCP (porta `port`) antes de abrir o
+    /// relay. Sem isso o app desktop trava em "processando ADB" (relay falha silencioso).
+    /// Requer permissão de sistema/root; falha silenciosa se o aparelho não permitir.
+    private fun ensureAdbdTcp(port: Int) {
+        try { runLocalCommand("adb tcpip $port") } catch (_: Exception) {}
+        try {
+            runLocalCommand("setprop service.adb.tcp.port $port")
+            runLocalCommand("stop adbd; start adbd")
+        } catch (_: Exception) {}
+        // Pequena pausa para o adbd reiniciar em TCP.
+        try { Thread.sleep(1500) } catch (_: Exception) {}
     }
 
     /// Copia bytes de `src` para `dst` até EOF ou erro.
