@@ -640,24 +640,28 @@ pub async fn connect_adb_device(
         };
 
         // ── Bifurcação VPS ──────────────────────────────────────────────
-        // Se o IP pertence a um device com túnel ativo no VPS, o PC não
-        // alcança o IP interno do celular → retorna sucesso sem adb connect.
+        // Se o IP pertence a um device que já está conectado via VPS (via_tunnel),
+        // o PC não precisa tentar adb connect local (evita timeout de rede).
         {
             let all_devs = state_db.get_devices(company_id);
             for dev in &all_devs {
                 let ip_match = dev.ip == target_ip
+                    || dev.serial == target_ip
                     || dev.current_adb_address.as_deref()
                         .map(|a| a.starts_with(&format!("{}:", target_ip)))
                         .unwrap_or(false);
                 if ip_match {
-                    if let Some(ref eid) = dev.esfera_device_id {
-                        if crate::tunnel_server::is_tunnel_active(eid) {
-                            let label = if !dev.name.is_empty() { dev.name.clone() } else { target_ip.clone() };
-                            return Ok(format!(
-                                "✅ {} já conectado via túnel VPS — controle remoto ativo, adb connect local dispensado.",
-                                label
-                            ));
-                        }
+                    let is_tunnel = dev.via_tunnel
+                        || dev.status == "online"
+                        || dev.esfera_device_id.as_deref()
+                            .map(|eid| crate::tunnel_server::is_tunnel_active(eid))
+                            .unwrap_or(false);
+                    if is_tunnel {
+                        let label = if !dev.name.is_empty() { dev.name.clone() } else { target_ip.clone() };
+                        return Ok(format!(
+                            "✅ {} já está conectado e online via VPS Hub! O controle remoto já está ativo.",
+                            label
+                        ));
                     }
                 }
             }
