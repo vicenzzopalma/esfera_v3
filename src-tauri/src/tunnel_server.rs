@@ -336,10 +336,15 @@ pub async fn open_proxy(uuid: &str, port: u16) -> Result<std::net::TcpStream, St
         .await
         .map_err(|_| "sessão de túnel encerrada durante handshake de proxy".to_string())??;
 
-    listener
-        .accept()
-        .map(|(s, _)| s)
-        .map_err(|e| format!("falha no aceite da ponte local: {}", e))
+    // Timeout de aceite: se o agente não conectar a ponte local, não trava infinito.
+    match tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        listener.accept().map(|(s, _)| s)
+    }).await
+    {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => Err(format!("falha no aceite da ponte local: {}", e)),
+        Err(_) => Err("timeout (20s) aguardando o agente conectar a ponte ADB; verifique se o adbd do aparelho está em TCP".to_string()),
+    }
 }
 
 /// Encerra o servidor de túnel: limpa o registro de sessões ativas e o estado
