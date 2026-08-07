@@ -29365,10 +29365,16 @@ struct DeviceAssignmentRecord {
     bool is_primary;
 };
 
+struct DeviceModeInfo {
+    bool is_device_owner = false;
+    bool is_tls_443 = false;
+};
+
 class MemoryDeviceRouter {
 private:
     std::vector<DeviceAssignmentRecord> records;
     std::unordered_map<std::string, int32_t> primary_responsible_map;
+    std::unordered_map<std::string, DeviceModeInfo> device_mode_map;
     mutable std::mutex mutex;
 
 public:
@@ -29376,6 +29382,23 @@ public:
         std::lock_guard<std::mutex> lock(mutex);
         records.clear();
         primary_responsible_map.clear();
+        device_mode_map.clear();
+    }
+
+    void set_device_mode(const char* device_serial, bool is_device_owner, bool is_tls_443) {
+        if (!device_serial) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        device_mode_map[std::string(device_serial)] = { is_device_owner, is_tls_443 };
+    }
+
+    bool is_device_owner(const char* device_serial) const {
+        if (!device_serial) return false;
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = device_mode_map.find(std::string(device_serial));
+        if (it != device_mode_map.end()) {
+            return it->second.is_device_owner;
+        }
+        return false;
     }
 
     void add_assignment(int32_t user_id, const char* device_serial, bool is_primary) {
@@ -29547,6 +29570,14 @@ HPC_EXPORT bool hpc_is_user_authorized_for_device(int32_t user_id, const char* d
 
 HPC_EXPORT int32_t hpc_get_primary_responsible_user(const char* device_serial) {
     return g_router.get_primary_responsible(device_serial);
+}
+
+HPC_EXPORT void hpc_device_router_set_device_mode(const char* device_serial, int32_t is_device_owner, int32_t is_tls_443) {
+    g_router.set_device_mode(device_serial, is_device_owner != 0, is_tls_443 != 0);
+}
+
+HPC_EXPORT int32_t hpc_is_device_owner(const char* device_serial) {
+    return g_router.is_device_owner(device_serial) ? 1 : 0;
 }
 
 }
@@ -32602,6 +32633,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 futures-util = "0.3"
 tower = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -32711,7 +32743,7 @@ use crate::db::Database;
 /// hub-standalone via POST /admin/update (header X-Hub-Token = master). O hub
 /// salva como .new, faz swap atômico e reinicia a si mesmo — sem SSH manual.
 /// O SO_REUSEADDR nos listeners garante re-bind limpo no gap do restart.
-async fn handle_update(
+pub async fn handle_update(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> (axum::http::StatusCode, String) {
@@ -32784,7 +32816,7 @@ pub async fn start(db: Arc<Database>, port: u16) {
         .expect("Falha ao iniciar check-in server");
 }
 
-async fn handle_checkin(
+pub async fn handle_checkin(
     State((db, _port)): State<(Arc<Database>, u16)>,
     Json(payload): Json<CheckInPayload>,
 ) -> (axum::http::StatusCode, &'static str) {
@@ -35567,6 +35599,7 @@ pub mod checkin_server;
 pub mod tunnel_server;
 pub mod presence_server;
 pub mod session_manager;
+pub mod tls_server;
 
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpSocket};
@@ -35587,7 +35620,7 @@ pub async fn bind_reuse(addr: SocketAddr) -> std::io::Result<TcpListener> {
 // ========================================================
 
 use esfera_hub_standalone::{
-    checkin_server, db, hub, presence_server, protocol, session_manager, tunnel_server,
+    checkin_server, db, hub, presence_server, protocol, session_manager, tls_server, tunnel_server,
 };
 use std::env;
 use std::io::Write;
@@ -35675,9 +35708,22 @@ async fn main() {
         presence_server::start(presence_port).await;
     });
 
+    // 7. TLS 443 / Outbound Encrypted Tunnel (MDM Enterprise Edge) :443 (fallback 8443)
+    // Canal PRIMÁRIO criptografado para o agente Kotlin (HTTPS check-in + WSS presença).
+    // Reutiliza os handlers de checkin_server/presence_server sobre TLS.
+    // O 8080/7779 (HTTP/WS) permanece como FALLBACK.
+    let tls_port: u16 = env::var("TLS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8443);
+    let db_tls = db.clone();
+    tokio::spawn(async move {
+        tls_server::start(db_tls, tls_port).await;
+    });
+
     println!(
-        "Hub Standalone ATIVO: master={} checkin={} tunnel={} presence={}",
-        port, http_port, tunnel_port, presence_port
+        "Hub Standalone ATIVO: master={} checkin={} tunnel={} presence={} tls={}",
+        port, http_port, tunnel_port, presence_port, tls_port
     );
     let _ = std::io::stdout().flush();
 
@@ -35756,11 +35802,11 @@ pub async fn start(port: u16) {
     });
 }
 
-async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
+pub async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket))
 }
 
-async fn handle_socket(socket: WebSocket) {
+pub async fn handle_socket(socket: WebSocket) {
     let (mut sender, mut receiver) = socket.split();
     let mut current: Option<(i32, String)> = None;
 
@@ -36204,6 +36250,99 @@ pub fn live_snapshot() -> Vec<crate::db::LiveDeviceState> {
             last_seen_utc: s.last_seen_utc.clone(),
         })
         .collect()
+}
+
+
+// ========================================================
+// ARQUIVO: hub-standalone\src\tls_server.rs
+// ========================================================
+
+// ============================================================
+// Esfera v3 — Hub Standalone — Servidor TLS 443/8443 (MDM Edge)
+// Canal PRIMÁRIO criptografado para o agente Kotlin.
+// Combina check-in (HTTPS) + presença (WSS) numa única porta TLS,
+// reusando os handlers de checkin_server e presence_server.
+// O 8080/7779 (HTTP/WS) permanece como FALLBACK (canal atual).
+// ============================================================
+
+use axum::{
+    extract::{State, WebSocketUpgrade},
+    response::IntoResponse,
+    routing::{get, post},
+    Router,
+};
+use std::io::Write;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use crate::checkin_server::handle_checkin;
+use crate::checkin_server::handle_update;
+use crate::db::Database;
+use crate::presence_server::{handle_socket, ws_handler};
+
+type AppState = (Arc<Database>, u16);
+
+/// Wrapper de presença que aceita o State do TLS server (ignora) e faz
+/// upgrade do WebSocket, delegando ao handle_socket do presence_server.
+async fn ws_handler_tls(_state: State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket))
+}
+
+/// Inicia o listener TLS na porta `tls_port` (default 8443), servindo
+/// HTTPS (check-in + self-update) e WSS (presença) na mesma porta.
+///
+/// Certificado: paths via env TLS_CERT / TLS_KEY (default ./tls/cert.pem e
+/// ./tls/key.pem). Para teste, use cert self-signed (openssl x509).
+/// Em produção, cert de CA real (failover regional).
+pub async fn start(db: Arc<Database>, tls_port: u16) {
+    let cert_path = std::env::var("TLS_CERT").unwrap_or_else(|_| "tls/cert.pem".to_string());
+    let key_path = std::env::var("TLS_KEY").unwrap_or_else(|_| "tls/key.pem".to_string());
+
+    let cert = match std::fs::read(&cert_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "TLS: certificado nao encontrado em '{}' ({}). TLS desativado — use 8080/7779. Gere com: openssl req -x509 -newkey rsa:2048 -nodes -keyout {} -out {} -days 365 -subj \"/CN=localhost\"",
+                cert_path, e, key_path, cert_path
+            );
+            return;
+        }
+    };
+    let key = match std::fs::read(&key_path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("TLS: chave privada nao encontrada em '{}' ({}). TLS desativado.", key_path, e);
+            return;
+        }
+    };
+
+    let rustls_config = match axum_server::tls_rustls::RustlsConfig::from_pem(cert, key).await {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("TLS: falha ao carregar cert/key: {}. TLS desativado.", e);
+            return;
+        }
+    };
+
+    let app = Router::new()
+        .route("/api/devices/check-in", post(handle_checkin))
+        .route("/admin/update", post(handle_update))
+        .route("/ws/presence", get(ws_handler_tls))
+        .with_state((db, tls_port));
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], tls_port));
+    println!(
+        "🔐 Servidor TLS (canal KOTLIN primario) rodando em https://0.0.0.0:{} (WSS /ws/presence)",
+        tls_port
+    );
+    let _ = std::io::stdout().flush();
+
+    if let Err(e) = axum_server::bind_rustls(addr, rustls_config)
+        .serve(app.into_make_service())
+        .await
+    {
+        eprintln!("TLS: servidor encerrado: {}", e);
+    }
 }
 
 

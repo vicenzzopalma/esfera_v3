@@ -639,6 +639,37 @@ pub async fn connect_adb_device(
             (ip.trim().to_string(), if port <= 0 { 5555 } else { port })
         };
 
+        // ── Bifurcação VPS ──────────────────────────────────────────────
+        // Se o IP pertence a um device com túnel ativo no VPS, o PC não
+        // alcança o IP interno do celular → retorna sucesso sem adb connect.
+        {
+            let all_devs = state_db.get_devices(company_id);
+            for dev in &all_devs {
+                let ip_match = dev.ip == target_ip
+                    || dev.current_adb_address.as_deref()
+                        .map(|a| a.starts_with(&format!("{}:", target_ip)))
+                        .unwrap_or(false);
+                if ip_match {
+                    if let Some(ref eid) = dev.esfera_device_id {
+                        if crate::tunnel_server::is_tunnel_active(eid) {
+                            let label = if !dev.name.is_empty() { dev.name.clone() } else { target_ip.clone() };
+                            return Ok(format!(
+                                "✅ {} já conectado via túnel VPS — controle remoto ativo, adb connect local dispensado.",
+                                label
+                            ));
+                        }
+                    }
+                }
+            }
+            // Também verifica se o próprio IP é um esfera_device_id com túnel ativo.
+            if crate::tunnel_server::is_tunnel_active(&target_ip) {
+                return Ok(format!(
+                    "✅ Dispositivo {} já conectado via túnel VPS.",
+                    target_ip
+                ));
+            }
+        }
+
         let result = AdbManager::connect_device(&target_ip, target_port)?;
         let serial = format!("{}:{}", target_ip, target_port);
         let (brand, model) = AdbManager::get_device_info(&serial);
@@ -1479,6 +1510,15 @@ pub async fn force_enable_wireless_adb(
     let state_db = state.db.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
+        // ── Bifurcação VPS ──────────────────────────────────────────────
+        // Se o serial é um esfera_device_id com túnel ativo, não tenta ADB local.
+        if crate::tunnel_server::is_tunnel_active(&serial) {
+            return Ok(format!(
+                "✅ Dispositivo {} já conectado via túnel VPS — vinculação USB dispensada.",
+                serial
+            ));
+        }
+
         let ip = AdbManager::get_device_wifi_ip(&serial).map_err(|e| {
             format!("{} Certifique-se de que o celular está conectado na mesma rede Wi-Fi que o computador.", e)
         })?;

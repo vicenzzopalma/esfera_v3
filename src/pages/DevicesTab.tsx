@@ -152,6 +152,14 @@ export default function DevicesTab() {
     if (linkingSerial) return;
     setLinkingSerial(serial);
     setLinkingStatus("⚡ Forçando ativação da porta 5555 TCP/IP e extraindo IP...");
+
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      setLinkingStatus("⏰ Timeout (25s): dispositivo não respondeu. Se é remoto (VPS), já está conectado via túnel.");
+      setLinkingSerial(null);
+    }, 25000);
+
     try {
       const result = await api<string>("force_enable_wireless_adb", {
         serial,
@@ -160,17 +168,23 @@ export default function DevicesTab() {
         sector,
         deviceName: deviceName || serial,
       });
-      setLinkingStatus(result);
-      refreshDevices();
-      setTimeout(() => {
-        setConnectModalOpen(false);
-        setLinkingSerial(null);
-        setLinkingStatus(null);
-      }, 2000);
+      clearTimeout(timeoutId);
+      if (!timedOut) {
+        setLinkingStatus(result);
+        refreshDevices();
+        setTimeout(() => {
+          setConnectModalOpen(false);
+          setLinkingSerial(null);
+          setLinkingStatus(null);
+        }, 2000);
+      }
     } catch (err: any) {
-      const errMsg = typeof err === "string" ? err : err?.message || "Erro ao forçar depuração Wi-Fi.";
-      setLinkingStatus(`❌ Erro: ${errMsg}`);
-      setTimeout(() => setLinkingSerial(null), 4000);
+      clearTimeout(timeoutId);
+      if (!timedOut) {
+        const errMsg = typeof err === "string" ? err : err?.message || "Erro ao forçar depuração Wi-Fi.";
+        setLinkingStatus(`❌ Erro: ${errMsg}`);
+        setTimeout(() => setLinkingSerial(null), 4000);
+      }
     }
   };
 
@@ -178,6 +192,14 @@ export default function DevicesTab() {
     if (linkingSerial) return;
     setLinkingSerial(ipAddress);
     setLinkingStatus("🔌 Conectando sem bloquear a interface...");
+
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      setLinkingStatus("⏰ Timeout (25s): verifique se o IP está acessível na mesma rede.");
+      setLinkingSerial(null);
+    }, 25000);
+
     try {
       let finalIp = ipAddress.trim();
       let finalPort = portNumber;
@@ -196,13 +218,22 @@ export default function DevicesTab() {
         sector,
         deviceName: deviceName || finalIp,
       });
-      refreshDevices();
-      setConnectModalOpen(false);
+      clearTimeout(timeoutId);
+      if (!timedOut) {
+        refreshDevices();
+        setConnectModalOpen(false);
+      }
     } catch (err: any) {
-      const errMsg = typeof err === "string" ? err : err?.message || "Erro ao conectar por IP.";
-      setLinkingStatus(`❌ Erro: ${errMsg}`);
+      clearTimeout(timeoutId);
+      if (!timedOut) {
+        const errMsg = typeof err === "string" ? err : err?.message || "Erro ao conectar por IP.";
+        setLinkingStatus(`❌ Erro: ${errMsg}`);
+      }
     } finally {
-      setLinkingSerial(null);
+      clearTimeout(timeoutId);
+      if (!timedOut) {
+        setLinkingSerial(null);
+      }
     }
   };
 

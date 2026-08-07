@@ -57,6 +57,19 @@
                 <action android:name="com.esfera.agent.KEEP_ALIVE" />
             </intent-filter>
         </receiver>
+        <receiver
+            android:name="com.esfera.agent.AdminReceiver"
+            android:exported="true"
+            android:permission="android.permission.BIND_DEVICE_ADMIN" >
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                <action android:name="android.app.action.PROFILE_PROVISIONING_COMPLETE" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin" />
+        </receiver>
 
         <activity
             android:name="com.esfera.agent.MainActivity"

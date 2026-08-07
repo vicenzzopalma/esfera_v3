@@ -28,10 +28,16 @@ struct DeviceAssignmentRecord {
     bool is_primary;
 };
 
+struct DeviceModeInfo {
+    bool is_device_owner = false;
+    bool is_tls_443 = false;
+};
+
 class MemoryDeviceRouter {
 private:
     std::vector<DeviceAssignmentRecord> records;
     std::unordered_map<std::string, int32_t> primary_responsible_map;
+    std::unordered_map<std::string, DeviceModeInfo> device_mode_map;
     mutable std::mutex mutex;
 
 public:
@@ -39,6 +45,23 @@ public:
         std::lock_guard<std::mutex> lock(mutex);
         records.clear();
         primary_responsible_map.clear();
+        device_mode_map.clear();
+    }
+
+    void set_device_mode(const char* device_serial, bool is_device_owner, bool is_tls_443) {
+        if (!device_serial) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        device_mode_map[std::string(device_serial)] = { is_device_owner, is_tls_443 };
+    }
+
+    bool is_device_owner(const char* device_serial) const {
+        if (!device_serial) return false;
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = device_mode_map.find(std::string(device_serial));
+        if (it != device_mode_map.end()) {
+            return it->second.is_device_owner;
+        }
+        return false;
     }
 
     void add_assignment(int32_t user_id, const char* device_serial, bool is_primary) {
@@ -210,6 +233,14 @@ HPC_EXPORT bool hpc_is_user_authorized_for_device(int32_t user_id, const char* d
 
 HPC_EXPORT int32_t hpc_get_primary_responsible_user(const char* device_serial) {
     return g_router.get_primary_responsible(device_serial);
+}
+
+HPC_EXPORT void hpc_device_router_set_device_mode(const char* device_serial, int32_t is_device_owner, int32_t is_tls_443) {
+    g_router.set_device_mode(device_serial, is_device_owner != 0, is_tls_443 != 0);
+}
+
+HPC_EXPORT int32_t hpc_is_device_owner(const char* device_serial) {
+    return g_router.is_device_owner(device_serial) ? 1 : 0;
 }
 
 }
