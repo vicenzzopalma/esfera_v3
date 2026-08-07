@@ -338,7 +338,8 @@ class EsferaAgentService : Service() {
         // Espelha a identidade resolvida de volta no arquivo para resiliência cruzada.
         try {
             val out = EsferaConfig(serverUrl = resolvedServer, deviceId = finalDeviceId, companyId = resolvedCompany)
-            configFile.writeText(json.encodeToString(EsferaConfig.serializer(), out))
+            val writeTarget = resolveConfigCandidates().firstOrNull { it.exists() } ?: resolveConfigCandidates().first()
+            writeTarget.writeText(json.encodeToString(EsferaConfig.serializer(), out))
         } catch (_: Exception) {}
 
         return EsferaConfig(serverUrl = resolvedServer, deviceId = finalDeviceId, companyId = resolvedCompany)
