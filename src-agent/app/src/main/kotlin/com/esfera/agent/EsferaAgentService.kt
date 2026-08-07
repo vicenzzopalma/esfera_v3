@@ -270,26 +270,23 @@ class EsferaAgentService : Service() {
     }
 
     /**
-     * Resolve o arquivo de configuração. O app (Android 11+) NÃO tem permissão de
-     * ler /sdcard/ raiz sem MANAGE_EXTERNAL_STORAGE, mas TEM acesso total a
-     * getExternalFilesDir (sdcard/Android/data/com.esfera.agent/files) sem permissão
-     * extra. Tentamos, em ordem: (1) external-files do app, (2) /sdcard/esfera_config.json
-     * (legado, escrito pelo desktop via adb — exige permissão), (3) filesDir interno.
-     * O primeiro que existir vence; se nenhum existir, retorna o external-files (local
-     * padrão de escrita).
+     * Lista TODOS os caminhos candidatos de configuração, na ordem de precedência:
+     * (1) external-files do app (sem permissão especial), (2) /sdcard/esfera_config.json
+     * (legado, escrito pelo desktop via adb), (3) filesDir interno. O loadConfig()
+     * varre TODOS e usa o primeiro com configuração VÁLIDA (não apenas o primeiro
+     * que existe — um arquivo vazio não deve vencer um válido em outra ordem).
      */
-    private fun resolveConfigFile(): File {
+    private fun resolveConfigCandidates(): List<File> {
+        val list = mutableListOf<File>()
         val ext = getExternalFilesDir(null)
-        if (ext != null) {
-            val f = File(ext, "esfera_config.json")
-            if (f.exists()) return f
-        }
-        val legacy = File("/sdcard/esfera_config.json")
-        if (legacy.exists()) return legacy
-        val internal = File(filesDir, "esfera_config.json")
-        if (internal.exists()) return internal
-        // Nenhum existe: usa external-files como padrão de escrita.
-        return if (ext != null) File(ext, "esfera_config.json") else internal
+        if (ext != null) list.add(File(ext, "esfera_config.json"))
+        list.add(File("/sdcard/esfera_config.json"))
+        list.add(File(filesDir, "esfera_config.json"))
+        return list
+    }
+
+    private fun isConfigValid(c: EsferaConfig): Boolean {
+        return c.serverUrl.isNotBlank() && c.deviceId.isNotBlank()
     }
 
     private fun loadConfig(): EsferaConfig {
@@ -299,25 +296,27 @@ class EsferaAgentService : Service() {
             "UNKNOWN_DEVICE"
         }
 
-        // FONTE DE VERDADE: arquivo de config resolvido por resolveConfigFile()
-        // (external-files do app, sem permissão especial; sobrevive a reboot e
-        // reinstalação do app). Props persist.esfera.* NÃO são graváveis em runtime
-        // sem root, então são apenas fallback secundário. O arquivo garante que o
-        // celular NUNCA perca a identidade nem a empresa ao reiniciar.
-        val configFile = resolveConfigFile()
-        val fileConfig = if (configFile.exists()) {
-            try {
-                json.decodeFromString<EsferaConfig>(configFile.readText())
-            } catch (e: Exception) {
-                EsferaConfig()
+        // FONTE DE VERDADE: varre TODOS os caminhos candidatos e usa o primeiro
+        // com configuração VÁLIDA (serverUrl + deviceId). Um arquivo existente mas
+        // vazio NÃO deve vencer um válido em outra posição da lista.
+        var fileConfig = EsferaConfig()
+        for (candidate in resolveConfigCandidates()) {
+            if (candidate.exists()) {
+                try {
+                    val c = json.decodeFromString<EsferaConfig>(candidate.readText())
+                    if (isConfigValid(c)) { fileConfig = c; break }
+                } catch (_: Exception) {}
             }
-        } else {
+        }
+        // Se nenhum arquivo válido, tenta SharedPreferences (fallback).
+        if (!isConfigValid(fileConfig)) {
             val prefs = getSharedPreferences("esfera_agent", MODE_PRIVATE)
-            EsferaConfig(
+            val pc = EsferaConfig(
                 serverUrl = prefs.getString("serverUrl", "") ?: "",
                 deviceId = prefs.getString("deviceId", "") ?: "",
                 companyId = prefs.getInt("companyId", 0)
             )
+            if (isConfigValid(pc)) fileConfig = pc
         }
 
         // Fallback de prop (só funciona com root) — tem precedência MENOR que o arquivo.
