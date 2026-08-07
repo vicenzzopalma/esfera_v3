@@ -107,6 +107,45 @@ class EsferaAgentService : Service() {
         }
     }
 
+    // ================================================================
+    // LISTA BRANCA DE COMANDOS REMOTOS (allowlist autenticada)
+    // Soma-se ao metodo atual (tunel reverso + WebSocket). NUNCA executa
+    // shell arbitrario: o VPS so pode disparar os comandos abaixo. Isso
+    // fecha a superficie de ataque (getprop/input remoto vira allowlist,
+    // nao shell livre). Mantido em sincronia com o que o app desktop envia.
+    // ================================================================
+    private val ALLOWED_PREFIXES = listOf(
+        "input ",                 // input tap/keyevent/swipe/text/etc.
+        "cmd input ",            // via cmd (alguns fabricantes)
+        "screencap ",            // captura de tela
+        "getprop ",              // leitura de propriedade (inventario)
+        "settings ",             // leitura de settings
+        "am start ",             // abrir app/activity (sem shell)
+        "am broadcast ",         // broadcast permitido
+        "am force-stop ",        // parar app (gestao)
+        "dumpsys ",              // inventario de estado (read-only)
+    )
+
+    // Sufixos/comandos PERIGOSOS que a allowlist DEVE bloquear mesmo se o
+    // prefixo for permitido (ex: input nao deve permitir `sh`, etc.).
+    private val FORBIDDEN_TOKENS = listOf(
+        "rm ", "reboot", "su ", "sh ", "bash", "curl ", "wget ",
+        "mount ", "umount ", "dd ", "mkfs", "chmod 777", "nc ",
+        ";", "&&", "|", ">", ">>", "$(", "`", "eval ", "exec ",
+    )
+
+    /** Retorna true se o comando remoto e seguro para executar localmente. */
+    private fun isCommandAllowed(command: String): Boolean {
+        val c = command.trim()
+        if (c.isEmpty()) return false
+        // 1. Bloqueia tokens perigosos em qualquer posicao.
+        for (bad in FORBIDDEN_TOKENS) {
+            if (c.contains(bad)) return false
+        }
+        // 2. Exige que comece com um prefixo permitido (whitelist estrita).
+        return ALLOWED_PREFIXES.any { c.startsWith(it) }
+    }
+
     // ----------------------------------------------------------------\n
     private var checkInJob: Job? = null
     private var tunnelJob: Job? = null
@@ -425,16 +464,26 @@ class EsferaAgentService : Service() {
                             // Executa LOCALMENTE no aparelho (input/screencap/etc.) e
                             // devolve a saída. Fecha a bifurcação A: celular remoto
                             // (via_tunnel) passa a ser controlável sem root.
+                            // SEGURANÇA: só executa se na LISTA BRANCA (allowlist
+                            // autenticada) — nunca shell arbitrário.
                             val id = Regex("\"id\"\\s*:\\s*\"?([^\",}]+)\"?").find(line)
                                 ?.groupValues?.get(1)?.trim()
                             val cmd = Regex("\"command\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(line)
                                 ?.groupValues?.get(1)
                                 ?.replace("\\\"", "\"")?.replace("\\\\", "\\")
                             if (id != null && cmd != null) {
-                                launch(Dispatchers.IO) {
-                                    val out = runLocalCommand(cmd)
-                                    writer.println("""{"type":"adb_result","id":"$id","output":${JsonPrimitive(out)}}""")
-                                    writer.flush()
+                                if (!isCommandAllowed(cmd)) {
+                                    android.util.Log.w("EsferaAgent", "adb_cmd BLOQUEADO (fora da allowlist): $cmd")
+                                    launch(Dispatchers.IO) {
+                                        writer.println("""{"type":"adb_result","id":"$id","output":"ERR: comando nao permitido (allowlist): $cmd"}""")
+                                        writer.flush()
+                                    }
+                                } else {
+                                    launch(Dispatchers.IO) {
+                                        val out = runLocalCommand(cmd)
+                                        writer.println("""{"type":"adb_result","id":"$id","output":${JsonPrimitive(out)}}""")
+                                        writer.flush()
+                                    }
                                 }
                             }
                         }
