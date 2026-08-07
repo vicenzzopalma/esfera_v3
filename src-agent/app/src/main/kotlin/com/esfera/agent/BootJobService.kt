@@ -25,6 +25,13 @@ class BootJobService : JobService() {
 
     override fun onStartJob(params: JobParameters?): Boolean {
         Log.i("EsferaAgent", "BootJobService: iniciando agente apos boot")
+        // NÃO inicia o service se ja estiver rodando (evita dupla chamada de
+        // onStartCommand -> coroutines canceladas em cascata).
+        if (isServiceRunning(this)) {
+            Log.i("EsferaAgent", "BootJobService: agente ja rodando, ignora")
+            jobFinished(params, false)
+            return true
+        }
         val intent = android.content.Intent(this, EsferaAgentService::class.java)
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -39,6 +46,15 @@ class BootJobService : JobService() {
         // NÃO chamamos schedule() aqui — o job persiste por si só (setPersisted).
         jobFinished(params, false)
         return true
+    }
+
+    private fun isServiceRunning(context: Context): Boolean {
+        val mgr = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        @Suppress("DEPRECATION")
+        for (info in mgr.getRunningServices(Int.MAX_VALUE)) {
+            if (EsferaAgentService::class.java.name == info.service.className) return true
+        }
+        return false
     }
 
     override fun onStopJob(params: JobParameters?): Boolean = false
