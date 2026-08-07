@@ -566,16 +566,34 @@ class EsferaAgentService : Service() {
     }
 
     /// Tenta deixar o adbd local escutando em TCP (porta `port`) antes de abrir o
-    /// relay. Sem isso o app desktop trava em "processando ADB" (relay falha silencioso).
-    /// Requer permissão de sistema/root; falha silenciosa se o aparelho não permitir.
+    /// relay. AUTÔNOMO: não depende de passo manual (adb tcpip via USB). Tenta,
+    /// em ordem, os métodos disponíveis no aparelho (root/su, adb nativo, setprop).
+    /// Se nenhum funcionar, o relay vai falhar e o app recebe proxy-error (não trava).
     private fun ensureAdbdTcp(port: Int) {
-        try { runLocalCommand("adb tcpip $port") } catch (_: Exception) {}
-        try {
-            runLocalCommand("setprop service.adb.tcp.port $port")
-            runLocalCommand("stop adbd; start adbd")
-        } catch (_: Exception) {}
-        // Pequena pausa para o adbd reiniciar em TCP.
+        val cmds = listOf(
+            "su -c 'setprop service.adb.tcp.port $port; stop adbd; start adbd'",
+            "su 0 setprop service.adb.tcp.port $port; su 0 stop adbd; su 0 start adbd",
+            "adb tcpip $port",
+            "setprop service.adb.tcp.port $port; stop adbd; start adbd"
+        )
+        for (c in cmds) {
+            try { runLocalCommand(c) } catch (_: Exception) {}
+            // Se a porta já abriu, para (não precisa tentar o resto).
+            if (isAdbdListening(port)) break
+            try { Thread.sleep(800) } catch (_: Exception) {}
+        }
+        // Pequena pausa extra para o adbd reiniciar em TCP.
         try { Thread.sleep(1500) } catch (_: Exception) {}
+    }
+
+    /// Verifica se o adbd local já aceita conexões TCP na porta indicada.
+    private fun isAdbdListening(port: Int): Boolean {
+        return try {
+            val s = Socket()
+            s.connect(InetSocketAddress("127.0.0.1", port), 800)
+            s.close()
+            true
+        } catch (_: Exception) { false }
     }
 
     /// Copia bytes de `src` para `dst` até EOF ou erro.
