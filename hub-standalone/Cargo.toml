@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 futures-util = "0.3"
 tower = "0.4"
 serde = { version = "1", features = ["derive"] }

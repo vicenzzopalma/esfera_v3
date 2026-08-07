@@ -6,6 +6,10 @@ import android.content.IntentFilter
 import android.os.BatteryManager
 import android.os.PowerManager
 import android.util.Log
+import javax.net.ssl.SSLContext
+import javax.net.ssl.X509TrustManager
+import java.security.cert.X509Certificate
+import okhttp3.OkHttpClient
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.websocket.WebSockets
@@ -37,13 +41,31 @@ class PresenceClient(
     private val deviceId: String,
     private val serverHost: String,
     private val wsPort: Int = 7779,
-    private val companyId: Int = 0
+    private val companyId: Int = 0,
+    private val useTls: Boolean = false
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + Job())
     private var job: Job? = null
     private val json = Json { ignoreUnknownKeys = true }
 
+    // Trust-all para WSS com cert self-signed (TESTE). Producao: CA real.
+    private fun trustAllOkHttp(): okhttp3.OkHttpClient {
+        return try {
+            val trustAll = arrayOf<X509TrustManager>(object : X509TrustManager {
+                override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+                override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+                override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+            })
+            val ssl = SSLContext.getInstance("TLS").apply { init(null, trustAll, java.security.SecureRandom()) }
+            okhttp3.OkHttpClient.Builder()
+                .sslSocketFactory(ssl.socketFactory, trustAll[0])
+                .hostnameVerifier { _, _ -> true }
+                .build()
+        } catch (e: Exception) { okhttp3.OkHttpClient.Builder().build() }
+    }
+
     private val client = HttpClient(OkHttp) {
+        engine { preconfigured = trustAllOkHttp() }
         install(WebSockets)
     }
 
@@ -53,7 +75,8 @@ class PresenceClient(
             var backoffMs = 5_000L
             while (isActive) {
                 try {
-                    val url = "ws://$serverHost:$wsPort/ws/presence"
+                    val scheme = if (useTls) "wss" else "ws"
+                    val url = "$scheme://$serverHost:$wsPort/ws/presence"
                     Log.d("PresenceClient", "Conectando ao Presence WS: $url")
                     
                     client.webSocket(urlString = url) {

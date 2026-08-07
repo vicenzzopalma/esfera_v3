@@ -9,7 +9,7 @@ use crate::db::Database;
 /// hub-standalone via POST /admin/update (header X-Hub-Token = master). O hub
 /// salva como .new, faz swap atômico e reinicia a si mesmo — sem SSH manual.
 /// O SO_REUSEADDR nos listeners garante re-bind limpo no gap do restart.
-async fn handle_update(
+pub async fn handle_update(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> (axum::http::StatusCode, String) {
@@ -82,7 +82,7 @@ pub async fn start(db: Arc<Database>, port: u16) {
         .expect("Falha ao iniciar check-in server");
 }
 
-async fn handle_checkin(
+pub async fn handle_checkin(
     State((db, _port)): State<(Arc<Database>, u16)>,
     Json(payload): Json<CheckInPayload>,
 ) -> (axum::http::StatusCode, &'static str) {
