@@ -355,7 +355,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 tauri::async_runtime::block_on(async {
                     let guard = hub_client.lock().await;
                     if let Some(client) = guard.as_ref() {
-                        match client.send_command(target_company_id, "get_live_devices", serde_json::json!({"companyId": target_company_id})).await {
+                        match client.send_command(0, "get_live_devices", serde_json::json!({"companyId": 0})).await {
                             Ok(val) => val.as_array().cloned().unwrap_or_default(),
                             Err(_) => Vec::new(),
                         }
