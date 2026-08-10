@@ -1,5 +1,11 @@
 # Configuration for 100% Self-Contained Offline Standalone Windows Executable
-# Statically links the C/C++ Runtime (CRT) into the binary
+# Statically links the C/C++ Runtime (CRT / MinGW GCC) into the binary
 
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    "-C", "link-args=-static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic"
+]
+
