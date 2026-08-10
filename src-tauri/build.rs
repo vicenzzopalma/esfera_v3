@@ -19,5 +19,14 @@ fn main() {
     println!("cargo:rerun-if-changed={}/src/native_hpc/esfera_hpc.h", manifest_dir);
     println!("cargo:rerun-if-changed={}/src/hpc_device_router.cpp", manifest_dir);
     println!("cargo:rerun-if-changed={}/src/hpc_device_router.hpp", manifest_dir);
+
+    if std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() == "gnu" {
+        println!("cargo:rustc-link-arg=-static-libgcc");
+        println!("cargo:rustc-link-arg=-static-libstdc++");
+        println!("cargo:rustc-link-arg=-Wl,-Bstatic");
+        println!("cargo:rustc-link-arg=-lwinpthread");
+        println!("cargo:rustc-link-arg=-Wl,-Bdynamic");
+    }
+
     tauri_build::build();
 }
