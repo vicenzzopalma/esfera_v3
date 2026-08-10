@@ -414,7 +414,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     battery,
                     company_id: target_company_id,
                     device_number: (refreshed_db.len() as i32) + 1,
-                    sector: "remote".to_string(),
+                    sector: "junior".to_string(),
                     esfera_device_id: Some(esfera_id.clone()),
                     current_adb_address: None,
                     last_seen_utc: live.get("last_seen_utc").and_then(|v| v.as_str()).map(|s| s.to_string()),
@@ -435,13 +435,14 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 battery,
                 company_id: target_company_id,
                 device_number: (refreshed_db.len() as i32) + 1,
-                sector: "remote".to_string(),
+                sector: "junior".to_string(),
                 esfera_device_id: Some(esfera_id.clone()),
                 current_adb_address: None,
                 last_seen_utc: live.get("last_seen_utc").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 via_tunnel: true,
             };
             refreshed_db.push(new_dev);
+
         }
 
         // Remove/marca offline devices remotos (via_tunnel E serial==esfera_device_id)

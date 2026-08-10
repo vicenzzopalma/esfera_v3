@@ -251,16 +251,10 @@ async fn handle_connection(
             }
             HubMessage::Command { from, to_company, cmd, args, id } => {
                 if !authenticated { continue; }
-                // Apenas master despacha comandos. Empresa nunca despacha para outra empresa.
-                if auth_role.as_deref() != Some("master") {
-                    let resp = HubMessage::CommandResponse { id, result: None, error: Some("Apenas master pode enviar comandos.".to_string()) };
-                    send_raw(&writer_lock, &resp).await?;
-                    continue;
-                }
 
                 // Comandos resolvidos PELO VPS (fonte de verdade da presença/túnel).
-                // Não dependem de o hub local da empresa estar conectado — este era
-                // o furo da Opção A: o Master só enxergava via relay para a empresa.
+                // Não dependem de o hub local da empresa estar conectado e servem tanto
+                // para o master quanto para a empresa (isolados por companyId em handle_vps_command).
                 if let Some(local) = handle_vps_command(&db, &cmd, &args).await {
                     let resp = match local {
                         Ok(val) => HubMessage::CommandResponse { id, result: Some(val), error: None },
@@ -269,6 +263,14 @@ async fn handle_connection(
                     send_raw(&writer_lock, &resp).await?;
                     continue;
                 }
+
+                // Apenas master despacha comandos de relay para o hub de outra empresa.
+                if auth_role.as_deref() != Some("master") {
+                    let resp = HubMessage::CommandResponse { id, result: None, error: Some("Apenas master pode enviar comandos de relay.".to_string()) };
+                    send_raw(&writer_lock, &resp).await?;
+                    continue;
+                }
+
 
                 let conns = connections.lock().await;
                 let target = conns.iter().find(|(_, c)| {
