@@ -277,6 +277,7 @@ export interface SectorPermission {
 export interface AppConfig {
   hub_enabled: boolean;
   hub_address: string;
+  hub_token: string;
   empresa_server_enabled: boolean;
   empresa_server_port: number;
   checkin_server_enabled: boolean;

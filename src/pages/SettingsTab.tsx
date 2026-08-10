@@ -4,7 +4,7 @@
 // Layout com Menu Lateral Interno e Espaçamento Aprimorado
 // ============================================================
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useAuth } from "../context/AuthContext";
 import Card from "../components/ui/Card";
 import Button from "../components/ui/Button";
@@ -21,6 +21,7 @@ import {
   RefreshCw,
   Wifi,
   Sparkles,
+  Cpu,
 } from "lucide-react";
 
 type SettingsSection = "geral" | "notificacoes" | "adb" | "hub" | "ia" | "seguranca";
@@ -55,7 +56,8 @@ export default function SettingsTab() {
 
   // Hub config
   const [hubEnabled, setHubEnabled] = useState(true);
-  const [hubAddress, setHubAddress] = useState("34.29.70.113:8888");
+  const [hubAddress, setHubAddress] = useState("34.29.70.113:8555");
+  const [hubToken, setHubToken] = useState("EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b");
   const [customIpOverride, setCustomIpOverride] = useState(false);
   const [empresaServerEnabled, setEmpresaServerEnabled] = useState(false);
   const [empresaServerPort, setEmpresaServerPort] = useState(7777);
@@ -63,6 +65,10 @@ export default function SettingsTab() {
   const [tunnelServerPort, setTunnelServerPort] = useState(8888);
   const [appMode, setAppMode] = useState<"local" | "empresa" | "master">("empresa");
   const [hubStatus, setHubStatus] = useState("");
+  // Atualizar VPS (self-update remoto, sem SSH) — master only
+  const [updatingVps, setUpdatingVps] = useState(false);
+  const [updateVpsMsg, setUpdateVpsMsg] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // IA / LLM local
   const [aiProvider, setAiProvider] = useState("ollama");
@@ -80,7 +86,8 @@ export default function SettingsTab() {
       .then((cfg) => {
         if (!mounted || !cfg) return;
         setHubEnabled(cfg.hub_enabled);
-        setHubAddress(cfg.hub_address || "34.29.70.113:8888");
+        setHubAddress(cfg.hub_address || "34.29.70.113:8555");
+        setHubToken(cfg.hub_token || "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b");
         setEmpresaServerEnabled(cfg.empresa_server_enabled);
         setEmpresaServerPort(cfg.empresa_server_port);
         setTunnelServerEnabled(cfg.tunnel_server_enabled ?? false);
@@ -135,6 +142,7 @@ export default function SettingsTab() {
       await api("save_app_config", {
         hub_enabled: hubEnabled,
         hub_address: hubAddress,
+        hub_token: hubToken,
         empresa_server_enabled: empresaServerEnabled,
         empresa_server_port: empresaServerPort,
         tunnel_server_enabled: tunnelServerEnabled,
@@ -143,6 +151,28 @@ export default function SettingsTab() {
       });
       setHubStatus("Configurações salvas com sucesso!");
     } catch { /* noop */ }
+  };
+
+  // Atualizar VPS (self-update remoto do hub-standalone) — master only
+  const handleUpdateVpsClick = () => {
+    fileInputRef.current?.click();
+  };
+  const handleVpsFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUpdatingVps(true);
+    setUpdateVpsMsg(null);
+    try {
+      const buf = await file.arrayBuffer();
+      const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+      const res = await api<string>("update_vps_hub", { base64_bin: b64 });
+      setUpdateVpsMsg(res || "VPS atualizado.");
+    } catch (err: any) {
+      setUpdateVpsMsg("Erro: " + (err?.message || err));
+    } finally {
+      setUpdatingVps(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
   };
 
   const menuItems = [
@@ -311,6 +341,44 @@ export default function SettingsTab() {
                         )}
                       </div>
                       <ToggleRow label="Habilitar Conexão Contínua" desc="Manter heartbeat em tempo real com o servidor central" checked={hubEnabled} onChange={setHubEnabled} />
+
+                      {isMasterUser && (
+                        <div className="space-y-2 pt-4 border-t border-border">
+                          <label className="block font-semibold text-secondary mb-2 text-sm">Token do Hub (Master)</label>
+                          <input
+                            type="password"
+                            value={hubToken}
+                            onChange={(e) => setHubToken(e.target.value)}
+                            placeholder="EsferaHubMaster_..."
+                            className="w-full input-setting font-mono text-sm"
+                          />
+                          <p className="text-[11px] text-amber-400 font-medium">
+                            Alinhe com HUB_MASTER_TOKEN da VPS. Se vazio, usa o default embutido. Sem ele, os celulares remotos não aparecem.
+                          </p>
+                          <div className="flex items-center gap-3 pt-2">
+                            <button
+                              type="button"
+                              onClick={handleUpdateVpsClick}
+                              disabled={updatingVps}
+                              className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#5E6AD2]/15 border border-[#5E6AD2]/30 text-[12px] text-[#828DF7] hover:bg-[#5E6AD2]/25 transition-colors cursor-pointer disabled:opacity-50"
+                              title="Selecione o esfera-hub-standalone.exe para atualizar o VPS remotamente"
+                            >
+                              <Cpu size={13} className="shrink-0" />
+                              {updatingVps ? "Atualizando..." : "Atualizar VPS"}
+                            </button>
+                            <input
+                              ref={fileInputRef}
+                              type="file"
+                              accept=".exe"
+                              className="hidden"
+                              onChange={handleVpsFile}
+                            />
+                            {updateVpsMsg && (
+                              <span className="text-[11px] text-zinc-400 max-w-[220px] truncate" title={updateVpsMsg}>{updateVpsMsg}</span>
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
 

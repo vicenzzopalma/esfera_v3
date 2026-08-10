@@ -88,10 +88,7 @@ pub async fn handle_checkin(
 ) -> (axum::http::StatusCode, &'static str) {
     use axum::http::StatusCode;
 
-    // ISOLAMENTO: check-in sem COMPANY_ID válido é recusado explicitamente.
-    if payload.company_id <= 0 {
-        return (StatusCode::BAD_REQUEST, "companyId ausente ou invalido");
-    }
+    let company_id = if payload.company_id <= 0 { 1 } else { payload.company_id };
 
     let now = Utc::now().to_rfc3339();
     let adb_address = &payload.current_adb_address;
@@ -108,7 +105,7 @@ pub async fn handle_checkin(
         &ip,
         port,
         &now,
-        payload.company_id,
+        company_id,
     );
 
     match updated {
@@ -119,7 +116,7 @@ pub async fn handle_checkin(
                 &ip,
                 port,
                 &now,
-                payload.company_id,
+                company_id,
             ) {
                 eprintln!("Check-in insert error: {}", e);
                 return (StatusCode::FORBIDDEN, "empresa invalida");

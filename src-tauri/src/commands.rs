@@ -344,20 +344,36 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             }
         }
 
-        // PONTE VPS -> LOCAL (Opção A): o app desktop é a "empresa" conectada ao Hub
-        // VPS. O agente Kotlin em qualquer rede faz check-in/túnel no VPS, que é a fonte
-        // de verdade. Precisamos mesclar os devices VIVOS do VPS na lista apresentada,
-        // senão celulares remotos (ex.: em casa, sem ADB local) NUNCA aparecem.
-        // Busca via HubClient (assíncrono) dentro do closure síncrono.
+        // PONTE VPS -> LOCAL: o app desktop conecta ao Hub VPS (34.29.70.113:8555).
+        // Se o hub_client ainda não estiver conectado, estabelece a conexão automaticamente.
         let live_vps: Vec<serde_json::Value> = {
             let rt = tokio::runtime::Handle::try_current();
-            if let Ok(h) = rt {
+            if let Ok(_h) = rt {
                 tauri::async_runtime::block_on(async {
-                    let guard = hub_client.lock().await;
+                    let mut guard = hub_client.lock().await;
+                    if guard.is_none() {
+                        let app_cfg = config::load_config();
+                        let hub_addr = if app_cfg.hub_address.is_empty() {
+                            "34.29.70.113:8555".to_string()
+                        } else {
+                            app_cfg.hub_address.clone()
+                        };
+                        let token = std::env::var("ESFERA_HUB_TOKEN")
+                            .or_else(|_| std::env::var("HUB_MASTER_TOKEN"))
+                            .unwrap_or_else(|_| "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string());
+                        let role = if session.role == "master" { "master" } else { "empresa" };
+                        let cid = session.company_id.unwrap_or(0);
+                        if let Ok(client) = HubClient::connect(&hub_addr, &token, role, cid, "Empresa").await {
+                            *guard = Some(client);
+                        }
+                    }
                     if let Some(client) = guard.as_ref() {
-                        match client.send_command(0, "get_live_devices", serde_json::json!({"companyId": 0})).await {
+                        match client.send_command(0, "get_live_devices", serde_json::json!({"companyId": target_company_id})).await {
                             Ok(val) => val.as_array().cloned().unwrap_or_default(),
-                            Err(_) => Vec::new(),
+                            Err(_) => {
+                                *guard = None; // Força reconexão na próxima chamada
+                                Vec::new()
+                            }
                         }
                     } else {
                         Vec::new()
@@ -367,12 +383,12 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 Vec::new()
             }
         };
-        // Deduplica conexões ativas na nuvem pertencentes ao mesmo IP físico (ex: reinstalações de APK no mesmo celular)
+        // Deduplica conexões ativas na nuvem pertencentes ao mesmo ID único (esfera_device_id)
         let mut deduped_vps: Vec<serde_json::Value> = Vec::new();
         for v in live_vps {
-            let ip = v.get("ip").and_then(|s| s.as_str()).unwrap_or("");
-            if !ip.is_empty() {
-                if let Some(pos) = deduped_vps.iter().position(|existing| existing.get("ip").and_then(|s| s.as_str()) == Some(ip)) {
+            let id = v.get("esfera_device_id").and_then(|s| s.as_str()).unwrap_or("");
+            if !id.is_empty() {
+                if let Some(pos) = deduped_vps.iter().position(|existing| existing.get("esfera_device_id").and_then(|s| s.as_str()) == Some(id)) {
                     let old_seen = deduped_vps[pos].get("last_seen_utc").and_then(|s| s.as_str()).unwrap_or("");
                     let new_seen = v.get("last_seen_utc").and_then(|s| s.as_str()).unwrap_or("");
                     if new_seen > old_seen {
@@ -396,18 +412,30 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             if esfera_id.is_empty() { continue; }
             let vps_status = live.get("status").and_then(|v| v.as_str()).unwrap_or("Offline");
             let mapped_status = match vps_status {
-                "Online" => "online",
-                "Degraded" => "connecting",
+                "Online" | "Degraded" => "online",
                 _ => "offline",
             }.to_string();
             let battery = live.get("battery_level").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let vps_adb_addr = live.get("current_adb_address").and_then(|v| v.as_str()).unwrap_or("");
+            let vps_ip = live.get("ip").and_then(|v| v.as_str()).unwrap_or("");
 
-            // Já existe localmente por esfera_device_id? O NOME é preservado
-            // (nunca sobrescrito por fonte externa — o VPS não envia nome).
-            if let Some(pos) = refreshed_db.iter().position(|d| d.esfera_device_id.as_deref() == Some(esfera_id.as_str())) {
+            // Unifica local ADB + VPS remoto se pertencerem ao mesmo celular físico
+            // (combinando por EsferaDeviceId, serial ADB, current_adb_address ou IP)
+            let existing_pos = refreshed_db.iter().position(|d| {
+                d.esfera_device_id.as_deref() == Some(esfera_id.as_str())
+                    || d.serial == esfera_id
+                    || (!vps_adb_addr.is_empty() && (d.serial == vps_adb_addr || d.current_adb_address.as_deref() == Some(vps_adb_addr)))
+                    || (!vps_ip.is_empty() && !d.ip.is_empty() && d.ip == vps_ip)
+            });
+
+            if let Some(pos) = existing_pos {
                 refreshed_db[pos].via_tunnel = true;
                 refreshed_db[pos].status = mapped_status.clone();
+                if refreshed_db[pos].esfera_device_id.is_none() {
+                    refreshed_db[pos].esfera_device_id = Some(esfera_id.clone());
+                }
                 if battery > 0 { refreshed_db[pos].battery = battery; }
+                let _ = state_db.upsert_device(&refreshed_db[pos]);
                 continue;
             }
             // Device remoto AINDA NÃO está no banco local. O nome é PROTEGIDO:
@@ -475,6 +503,46 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 }
             }
         }
+
+        // FILTRO DE FANTASMAS: remove devices do DB local que NÃO estão nem no ADB
+        // local ativo nem no VPS (via_tunnel). Sem isso, celulares "usb" antigos de
+        // testes aparecem como conectados mesmo sem nada plugado. Só mostra o vivo.
+        let active_adb_set: std::collections::HashSet<String> =
+            active_adb_list.iter().map(|a| a.serial.clone()).collect();
+        refreshed_db.retain(|d| {
+            if d.via_tunnel || d.esfera_device_id.is_some() {
+                true // dispositivo remoto ou provisionado (EsferaDeviceId) é mantido na lista
+            } else {
+                active_adb_set.contains(&d.serial)
+                    || d.current_adb_address.as_deref().map_or(false, |a| active_adb_set.contains(a))
+            }
+        });
+
+        // Unifica a lista final: funde cartões que compartilhem o mesmo EsferaDeviceId, IP ou Endereço ADB
+        let mut final_deduped: Vec<Device> = Vec::new();
+        for dev in refreshed_db {
+            if let Some(pos) = final_deduped.iter().position(|existing| {
+                (existing.esfera_device_id.is_some() && dev.esfera_device_id.is_some() && existing.esfera_device_id == dev.esfera_device_id)
+                    || (!existing.ip.is_empty() && !dev.ip.is_empty() && existing.ip == dev.ip)
+                    || existing.serial == dev.serial
+                    || (existing.current_adb_address.is_some() && dev.current_adb_address.is_some() && existing.current_adb_address == dev.current_adb_address)
+            }) {
+                // Mescla os dados priorizando o card online/túnel ativo
+                if dev.status == "online" || dev.via_tunnel {
+                    if final_deduped[pos].name.starts_with("Celular ESF-") && !dev.name.starts_with("Celular ESF-") {
+                        // Preserva nomes customizados mais amigáveis (ex: Celular 192.168.1.151)
+                    }
+                    let mut merged = dev;
+                    if merged.esfera_device_id.is_none() {
+                        merged.esfera_device_id = final_deduped[pos].esfera_device_id.clone();
+                    }
+                    final_deduped[pos] = merged;
+                }
+            } else {
+                final_deduped.push(dev);
+            }
+        }
+        let refreshed_db = final_deduped;
 
         Ok(refreshed_db)
     }).await.map_err(|e| e.to_string())?
@@ -2031,13 +2099,16 @@ pub fn get_hub_credentials(
     let company_id = session.company_id.unwrap_or(0);
     let role = session.role.clone();
 
-    // Token do hub: master usa HUB_MASTER_TOKEN; empresa usa ESFERA_COMPANY_TOKEN.
-    // Se nenhum env definido, USA O TOKEN MASTER PADRÃO (igual ao seedado no VPS em
-    // db.rs:774) para que o app conecte ao VPS mesmo sem configuração manual — regra
-    // do usuário (Opção A: UM .exe + LOGIN -> company_id). O isolamento por empresa
-    // é feito pelo company_id da sessão em get_devices, não pelo role do hub.
+    // Token do hub: prioriza o configurado em Settings (config.hub_token), que o
+    // usuário alinha com HUB_MASTER_TOKEN da VPS. Se vazio, usa env/role (master:
+    // HUB_MASTER_TOKEN; empresa: ESFERA_COMPANY_TOKEN) e, na falta, o default
+    // embutido (igual ao seed do VPS em db.rs). Garante que o app conecte ao VPS
+    // e os celulares remotos (via_tunnel) apareçam no get_devices.
+    let cfg = config::load_config();
     let fallback_master = "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string();
-    let hub_token = if role == "master" {
+    let hub_token = if !cfg.hub_token.trim().is_empty() {
+        cfg.hub_token.trim().to_string()
+    } else if role == "master" {
         std::env::var("HUB_MASTER_TOKEN")
             .or_else(|_| std::env::var("ESFERA_HUB_TOKEN"))
             .unwrap_or_else(|_| fallback_master.clone())
