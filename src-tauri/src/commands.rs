@@ -156,6 +156,25 @@ fn get_cached_battery(serial: &str) -> i32 {
     AdbManager::get_battery_level(serial).unwrap_or(85)
 }
 
+/// Extrai o host/IP de um endereço, ignorando a porta (ex.: "192.168.1.151:5555" -> "192.168.1.151").
+/// Usado para cruzar dispositivos locais (ADB Wi-Fi "ip:porta") com remotos da VPS (IP sem porta).
+fn strip_port(addr: &str) -> String {
+    if addr.is_empty() {
+        return String::new();
+    }
+    // Remove porta após ':' (IPv4) ou ']' (IPv6)
+    let host = if let Some(idx) = addr.rfind(':') {
+        if addr.contains('.') {
+            &addr[..idx]
+        } else {
+            addr
+        }
+    } else {
+        addr
+    };
+    host.trim().to_lowercase().to_string()
+}
+
 #[tauri::command]
 pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<Device>, String> {
     let state_db = state.db.clone();
@@ -419,13 +438,26 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             let vps_adb_addr = live.get("current_adb_address").and_then(|v| v.as_str()).unwrap_or("");
             let vps_ip = live.get("ip").and_then(|v| v.as_str()).unwrap_or("");
 
-            // Unifica local ADB + VPS remoto se pertencerem ao mesmo celular físico
-            // (combinando por EsferaDeviceId, serial ADB, current_adb_address ou IP)
+            // Unifica local ADB + VPS remoto se pertencerem ao mesmo celular físico.
+            // Normaliza os endereços (tira a porta) antes de comparar, porque o
+            // serial ADB Wi-Fi vem como "192.168.1.151:5555" mas o VPS pode reportar
+            // "192.168.1.151" (sem porta) em current_adb_address/ip. Sem normalizar,
+            // o app criava 2 cartões para o mesmo celular (ex.: Samsung no ADB Wi-Fi
+            // + agente VPS).
+            let vps_ip_base = strip_port(vps_adb_addr);
+            let vps_ip2_base = strip_port(vps_ip);
             let existing_pos = refreshed_db.iter().position(|d| {
                 d.esfera_device_id.as_deref() == Some(esfera_id.as_str())
                     || d.serial == esfera_id
-                    || (!vps_adb_addr.is_empty() && (d.serial == vps_adb_addr || d.current_adb_address.as_deref() == Some(vps_adb_addr)))
-                    || (!vps_ip.is_empty() && !d.ip.is_empty() && d.ip == vps_ip)
+                    || (!vps_adb_addr.is_empty()
+                        && (d.serial == vps_adb_addr
+                            || d.current_adb_address.as_deref() == Some(vps_adb_addr)
+                            || strip_port(&d.serial) == vps_ip_base
+                            || strip_port(d.current_adb_address.as_deref().unwrap_or("")) == vps_ip_base))
+                    || (!vps_ip_base.is_empty()
+                        && (strip_port(&d.ip) == vps_ip_base || strip_port(&d.serial) == vps_ip_base))
+                    || (!vps_ip2_base.is_empty()
+                        && (strip_port(&d.ip) == vps_ip2_base || strip_port(&d.serial) == vps_ip2_base))
             });
 
             if let Some(pos) = existing_pos {
