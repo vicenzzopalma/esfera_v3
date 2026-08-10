@@ -57,7 +57,7 @@ export default function SettingsTab() {
   // Hub config
   const [hubEnabled, setHubEnabled] = useState(true);
   const [hubAddress, setHubAddress] = useState("34.29.70.113:8555");
-  const [hubToken, setHubToken] = useState("REMOVED_SECRET");
+  const [hubToken, setHubToken] = useState("");
   const [customIpOverride, setCustomIpOverride] = useState(false);
   const [empresaServerEnabled, setEmpresaServerEnabled] = useState(false);
   const [empresaServerPort, setEmpresaServerPort] = useState(7777);
@@ -87,7 +87,7 @@ export default function SettingsTab() {
         if (!mounted || !cfg) return;
         setHubEnabled(cfg.hub_enabled);
         setHubAddress(cfg.hub_address || "34.29.70.113:8555");
-        setHubToken(cfg.hub_token || "REMOVED_SECRET");
+        setHubToken(cfg.hub_token || "");
         setEmpresaServerEnabled(cfg.empresa_server_enabled);
         setEmpresaServerPort(cfg.empresa_server_port);
         setTunnelServerEnabled(cfg.tunnel_server_enabled ?? false);

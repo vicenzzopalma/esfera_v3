@@ -160,6 +160,22 @@ async fn handle_vps_command(
                 Err(e) => Some(Err(format!("Falha ao gerar token da empresa: {}", e))),
             }
         }
+        // Renomeia um device remoto na nuvem (VPS). O app desktop chama isto
+        // quando o usuário renomeia um dispositivo, para que o nome suba ao Hub.
+        "rename_device" => {
+            if company_id <= 0 {
+                return Some(Err("companyId obrigatório".to_string()));
+            }
+            let device_id = match args.get("esferaDeviceId").and_then(|v| v.as_str()) {
+                Some(d) if !d.is_empty() => d,
+                _ => return Some(Err("esferaDeviceId obrigatório".to_string())),
+            };
+            let name = match args.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return Some(Err("name obrigatório".to_string())),
+            };
+            Some(db.rename_device(device_id, name).map(|_| serde_json::json!({ "renamed": true })))
+        }
         _ => None,
     }
 }

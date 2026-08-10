@@ -466,6 +466,15 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 if refreshed_db[pos].esfera_device_id.is_none() {
                     refreshed_db[pos].esfera_device_id = Some(esfera_id.clone());
                 }
+                // Propaga o endereço ADB / IP do VPS para o cartão local, para que o
+                // dedup final (que cruza por current_adb_address/ip) reconheça como o
+                // mesmo celular físico e NÃO crie um segundo cartão.
+                if refreshed_db[pos].current_adb_address.is_none() && !vps_adb_addr.is_empty() {
+                    refreshed_db[pos].current_adb_address = Some(vps_adb_addr.to_string());
+                }
+                if refreshed_db[pos].ip.is_empty() && !vps_ip.is_empty() {
+                    refreshed_db[pos].ip = vps_ip.to_string();
+                }
                 if battery > 0 { refreshed_db[pos].battery = battery; }
                 let _ = state_db.upsert_device(&refreshed_db[pos]);
                 continue;
@@ -486,7 +495,6 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     name: protected_name.clone(),
                     brand: String::new(),
                     model: String::new(),
-                    ip: String::new(),
                     port: 0,
                     status: mapped_status.clone(),
                     battery,
@@ -494,9 +502,10 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     device_number: (refreshed_db.len() as i32) + 1,
                     sector: "junior".to_string(),
                     esfera_device_id: Some(esfera_id.clone()),
-                    current_adb_address: None,
+                    current_adb_address: if vps_adb_addr.is_empty() { None } else { Some(vps_adb_addr.to_string()) },
                     last_seen_utc: live.get("last_seen_utc").and_then(|v| v.as_str()).map(|s| s.to_string()),
                     via_tunnel: true,
+                    ip: vps_ip.to_string(),
                 };
                 let _ = state_db.upsert_device(&to_persist);
             }
@@ -507,7 +516,6 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 name: protected_name,
                 brand: String::new(),
                 model: String::new(),
-                ip: String::new(),
                 port: 0,
                 status: mapped_status,
                 battery,
@@ -515,9 +523,10 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 device_number: (refreshed_db.len() as i32) + 1,
                 sector: "junior".to_string(),
                 esfera_device_id: Some(esfera_id.clone()),
-                current_adb_address: None,
+                current_adb_address: if vps_adb_addr.is_empty() { None } else { Some(vps_adb_addr.to_string()) },
                 last_seen_utc: live.get("last_seen_utc").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 via_tunnel: true,
+                ip: vps_ip.to_string(),
             };
             refreshed_db.push(new_dev);
 
@@ -558,6 +567,12 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     || (!existing.ip.is_empty() && !dev.ip.is_empty() && existing.ip == dev.ip)
                     || existing.serial == dev.serial
                     || (existing.current_adb_address.is_some() && dev.current_adb_address.is_some() && existing.current_adb_address == dev.current_adb_address)
+                    // Cruzamento normalizado por IP (tira porta): "192.168.1.151:5555" == "192.168.1.151"
+                    || (!strip_port(&existing.current_adb_address.clone().unwrap_or_default()).is_empty()
+                        && strip_port(&existing.current_adb_address.clone().unwrap_or_default()) == strip_port(&dev.current_adb_address.clone().unwrap_or_default()))
+                    || (!strip_port(&existing.ip).is_empty() && strip_port(&existing.ip) == strip_port(&dev.current_adb_address.clone().unwrap_or_default()))
+                    || (!strip_port(&dev.ip).is_empty() && strip_port(&dev.ip) == strip_port(&existing.current_adb_address.clone().unwrap_or_default()))
+                    || (!strip_port(&existing.serial).is_empty() && (strip_port(&existing.serial) == strip_port(&dev.current_adb_address.clone().unwrap_or_default()) || strip_port(&existing.serial) == strip_port(&dev.ip)))
             }) {
                 // Mescla os dados priorizando o card online/túnel ativo
                 if dev.status == "online" || dev.via_tunnel {
@@ -575,6 +590,11 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             }
         }
         let refreshed_db = final_deduped;
+
+        // DEBUG TEMP: despeja o resultado de get_devices para inspeção da fusão
+        // ARQUITETURA: o servidor (VPS) é a ÚNICA fonte de verdade. NÃO escrevemos
+        // dump de devices no PC local do operador (seria "verdade local"). O app é
+        // apenas cliente do hub. (Removido get_devices_dump.json — era debug.)
 
         Ok(refreshed_db)
     }).await.map_err(|e| e.to_string())?
@@ -815,7 +835,7 @@ pub async fn connect_adb_device(
             company_id,
             device_number,
             sector,
-            esfera_device_id: Some(persistent_id.clone()),
+            esfera_device_id: None,
             current_adb_address: Some(serial.clone()),
             last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
             via_tunnel: false,
@@ -883,7 +903,7 @@ pub async fn pair_and_connect_adb_device(
             company_id,
             device_number,
             sector,
-            esfera_device_id: Some(persistent_id),
+            esfera_device_id: None,
             current_adb_address: Some(wireless_serial),
             last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
             via_tunnel: false,
@@ -923,7 +943,66 @@ pub fn update_device(state: State<'_, AppState>, token: String, device: Device) 
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, device.company_id)?;
     let db = &state.db;
-    db.upsert_device(&device)
+    db.upsert_device(&device);
+    // Propaga o nome para a VPS (Hub) para que apareça consistente em todos os
+    // clientes. Se o hub não estiver conectado, ignora (o nome fica salvo localmente).
+    if let Some(esfera_id) = &device.esfera_device_id {
+        if !esfera_id.is_empty() {
+            let hub = state.hub_client.clone();
+            let token2 = token.clone();
+            let id2 = esfera_id.clone();
+            let name2 = device.name.clone();
+            let cid = device.company_id;
+            tauri::async_runtime::spawn(async move {
+                let connected = hub.lock().await.is_some();
+                if connected {
+                    let _ = HubClient::send_command(
+                        &hub.lock().await.as_ref().unwrap(),
+                        cid,
+                        "rename_device",
+                        serde_json::json!({ "esferaDeviceId": id2, "name": name2 }),
+                    ).await;
+                }
+                let _ = token2;
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Atualiza remotamente o APK do agente num celular, SEM SSH: envia o comando
+/// `self_update <url>` através do VPS (túnel), e o agente baixa e instala o APK.
+/// `apk_url` deve ser servida por um backend/VPS acessível pelo celular.
+#[tauri::command]
+pub async fn remote_update_agent(
+    state: State<'_, AppState>,
+    token: String,
+    esfera_device_id: String,
+    apk_url: String,
+    company_id: i32,
+) -> Result<String, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    if apk_url.is_empty() || !(apk_url.starts_with("http://") || apk_url.starts_with("https://")) {
+        return Err("URL do APK inválida (use http(s)://...).".to_string());
+    }
+    let hub = state.hub_client.lock().await;
+    if hub.is_none() {
+        return Err("Hub não conectado. Verifique o Token do Hub em Configurações.".to_string());
+    }
+    match HubClient::send_command(
+        &hub.as_ref().unwrap(),
+        company_id,
+        "send_device_command",
+        serde_json::json!({
+            "companyId": company_id,
+            "esferaDeviceId": esfera_device_id,
+            "command": format!("self_update {}", apk_url)
+        }),
+    ).await {
+        Ok(v) => Ok(v.get("output").and_then(|o| o.as_str()).unwrap_or("comando enviado").to_string()),
+        Err(e) => Err(format!("Falha ao enviar atualização: {}", e)),
+    }
 }
 
 #[tauri::command]
@@ -1508,7 +1587,7 @@ pub async fn link_usb_to_wireless(
             company_id,
             device_number,
             sector,
-            esfera_device_id: Some(persistent_id.clone()),
+            esfera_device_id: None,
             current_adb_address: Some(wireless_serial.clone()),
             last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
             via_tunnel: false,
@@ -1683,7 +1762,7 @@ pub async fn force_enable_wireless_adb(
             company_id,
             device_number,
             sector,
-            esfera_device_id: Some(persistent_id),
+            esfera_device_id: None,
             current_adb_address: Some(wireless_serial),
             last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
             via_tunnel: false,
