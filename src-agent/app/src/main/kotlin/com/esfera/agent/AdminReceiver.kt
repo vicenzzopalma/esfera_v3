@@ -22,6 +22,7 @@ class AdminReceiver : DeviceAdminReceiver() {
     override fun onEnabled(context: Context, intent: Intent) {
         super.onEnabled(context, intent)
         Log.i("EsferaAgent", "AdminReceiver: device admin HABILITADO")
+        startAgent(context)
     }
 
     override fun onDisabled(context: Context, intent: Intent) {
@@ -31,6 +32,23 @@ class AdminReceiver : DeviceAdminReceiver() {
 
     override fun onProfileProvisioningComplete(context: Context, intent: Intent) {
         super.onProfileProvisioningComplete(context, intent)
-        Log.i("EsferaAgent", "AdminReceiver: profile provisioning completo")
+        Log.i("EsferaAgent", "AdminReceiver: profile provisioning completo (Device Owner)")
+        startAgent(context)
+    }
+
+    /** Ao virar Device Owner/Admin, inicia o agente em foreground sozinho.
+     *  Garante auto-start nativo sem depender de abrir o app (resolve o
+     *  bloqueio de background-start do Android 8 em apps recém-instalados). */
+    private fun startAgent(context: Context) {
+        try {
+            val i = Intent(context, EsferaAgentService::class.java)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                context.startForegroundService(i)
+            } else {
+                context.startService(i)
+            }
+        } catch (e: Exception) {
+            Log.w("EsferaAgent", "AdminReceiver: falha ao iniciar agente: ${e.message}")
+        }
     }
 }
