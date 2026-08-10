@@ -355,7 +355,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 tauri::async_runtime::block_on(async {
                     let guard = hub_client.lock().await;
                     if let Some(client) = guard.as_ref() {
-                        match client.send_command(target_company_id, "get_live_devices", serde_json::json!({"companyId": target_company_id})).await {
+                        match client.send_command(0, "get_live_devices", serde_json::json!({"companyId": 0})).await {
                             Ok(val) => val.as_array().cloned().unwrap_or_default(),
                             Err(_) => Vec::new(),
                         }
@@ -367,6 +367,24 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 Vec::new()
             }
         };
+        // Deduplica conexões ativas na nuvem pertencentes ao mesmo IP físico (ex: reinstalações de APK no mesmo celular)
+        let mut deduped_vps: Vec<serde_json::Value> = Vec::new();
+        for v in live_vps {
+            let ip = v.get("ip").and_then(|s| s.as_str()).unwrap_or("");
+            if !ip.is_empty() {
+                if let Some(pos) = deduped_vps.iter().position(|existing| existing.get("ip").and_then(|s| s.as_str()) == Some(ip)) {
+                    let old_seen = deduped_vps[pos].get("last_seen_utc").and_then(|s| s.as_str()).unwrap_or("");
+                    let new_seen = v.get("last_seen_utc").and_then(|s| s.as_str()).unwrap_or("");
+                    if new_seen > old_seen {
+                        deduped_vps[pos] = v;
+                    }
+                    continue;
+                }
+            }
+            deduped_vps.push(v);
+        }
+        let live_vps = deduped_vps;
+
         // IDs que o VPS considera vivos (para marcar offline os que saíram).
         let live_ids: std::collections::HashSet<String> = live_vps
             .iter()
@@ -414,7 +432,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     battery,
                     company_id: target_company_id,
                     device_number: (refreshed_db.len() as i32) + 1,
-                    sector: "remote".to_string(),
+                    sector: "junior".to_string(),
                     esfera_device_id: Some(esfera_id.clone()),
                     current_adb_address: None,
                     last_seen_utc: live.get("last_seen_utc").and_then(|v| v.as_str()).map(|s| s.to_string()),
@@ -435,13 +453,14 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 battery,
                 company_id: target_company_id,
                 device_number: (refreshed_db.len() as i32) + 1,
-                sector: "remote".to_string(),
+                sector: "junior".to_string(),
                 esfera_device_id: Some(esfera_id.clone()),
                 current_adb_address: None,
                 last_seen_utc: live.get("last_seen_utc").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 via_tunnel: true,
             };
             refreshed_db.push(new_dev);
+
         }
 
         // Remove/marca offline devices remotos (via_tunnel E serial==esfera_device_id)

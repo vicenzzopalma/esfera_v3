@@ -906,7 +906,7 @@ impl Database {
         let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN CustomMessage TEXT DEFAULT '';", []);
         let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
         // Limpeza de dispositivos, campanhas e logs falsos legados de desenvolvimento
-        let _ = self.conn().execute("DELETE FROM ESF_Device WHERE AdbDeviceId LIKE 'adb-dev-%';", []);
+        let _ = self.conn().execute("DELETE FROM ESF_Device WHERE AdbDeviceId LIKE 'adb-dev-%' OR EsferaDeviceId LIKE 'ESF-LEGACY-%' OR DeviceIp LIKE '192.168.1.%';", []);
         let _ = self.conn().execute("DELETE FROM ESF_Campaign WHERE CampaignName LIKE '%Black Friday%' OR CampaignName LIKE '%Julho%';", []);
         let _ = self.conn().execute("DELETE FROM ESF_AutomationRule WHERE RuleName LIKE '%Preço%' OR RuleName LIKE '%Humano%';", []);
         let _ = self.conn().execute("DELETE FROM ESF_AuditLog WHERE Message LIKE '%adb-dev-%';", []);
@@ -966,32 +966,11 @@ impl Database {
                 (2, 'pa_fixa_2', 1, 0);",
                 [],
             )?;
-
-            // Pré-cadastra os 8 celulares Wi-Fi ativados da REALESS para garantia de exibição instantânea a 0ms
-            let default_devices = vec![
-                ("192.168.1.185:5555", "1", "Xiaomi", "Redmi Note", "192.168.1.185", 1, "junior"),
-                ("192.168.1.35:5555", "2", "Multilaser", "F Pro 2", "192.168.1.35", 2, "junior"),
-                ("192.168.1.54:5555", "3", "Samsung", "Galaxy A01", "192.168.1.54", 3, "junior"),
-                ("192.168.1.57:5555", "4", "Xiaomi", "Redmi 9", "192.168.1.57", 4, "junior"),
-                ("192.168.1.92:5555", "5", "Samsung", "Galaxy J7", "192.168.1.92", 5, "junior"),
-                ("192.168.1.93:5555", "6", "Motorola", "Moto G22", "192.168.1.93", 6, "junior"),
-                ("192.168.1.94:5555", "7", "Motorola", "Moto G", "192.168.1.94", 7, "junior"),
-                ("192.168.1.95:5555", "8", "Multilaser", "F Pro 2", "192.168.1.95", 8, "junior"),
-            ];
-
-            for (serial, name, brand, model, ip, num, sector) in default_devices {
-                let esfera_id = format!("ESF-LEGACY-1-{}", num);
-                let _ = conn.execute(
-                    "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId)
-                    VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7, ?8)
-                    ON CONFLICT(AdbDeviceId) DO NOTHING;",
-                    params![serial, name, brand, model, ip, num, sector, esfera_id],
-                );
-            }
         }
 
         Ok(())
     }
+
 
     // ============================================================
     // AUTENTICAÇÃO (com hash)
