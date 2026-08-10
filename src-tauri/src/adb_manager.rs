@@ -2340,7 +2340,10 @@ impl AdbManager {
         };
 
         let batch_cmd = format!(
-            "{}settings put global wifi_connected_mac_randomization_enabled 0; \
+            "{}settings put global captive_portal_mode 0; \
+             settings put global captive_portal_detection_enabled 0; \
+             settings put global captive_portal_http_url http://www.google.com/generate_204; \
+             settings put global wifi_connected_mac_randomization_enabled 0; \
              settings put global verifier_verify_adb_installs 0; \
              settings put global package_verifier_enable 0; \
              setprop persist.adb.tcp.port 5555; \
@@ -2351,7 +2354,11 @@ impl AdbManager {
              dumpsys deviceidle disable; \
              dumpsys deviceidle whitelist +com.mouldybread.adbautoenable; \
              dumpsys deviceidle whitelist +com.android.shell; \
-             dumpsys deviceidle whitelist +com.esfera.agent",
+             dumpsys deviceidle whitelist +com.esfera.agent; \
+             cmd appops set com.esfera.agent RUN_IN_BACKGROUND allow; \
+             cmd appops set com.esfera.agent RUN_ANY_IN_BACKGROUND allow; \
+             am start-foreground-service com.esfera.agent/.EsferaAgentService; \
+             am startservice com.esfera.agent/.EsferaAgentService",
             id_cmd
         );
 
@@ -2437,6 +2444,27 @@ impl AdbManager {
             ]);
             let _ = run_cmd_timeout(act, Duration::from_secs(3));
             std::thread::sleep(Duration::from_millis(800));
+
+            // 0b. SEMEIA a chave ADB do PC no celular (/data/misc/adb/adb_keys)
+            // para que conexões ADB-over-TCP sejam autorizadas SEM popup e de forma
+            // persistente (nunca mais "device still authorizing" ao reconectar na rede).
+            // Requer que o celular já esteja autorizado uma vez via USB (ou via agente
+            // com permissão de escrita). Se não conseguir, ignora — não bloqueia o fluxo.
+            if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+                let key_path = std::path::Path::new(&home).join(".android").join("adbkey.pub");
+                if let Ok(key) = std::fs::read_to_string(&key_path) {
+                    let key_trim = key.trim();
+                    if !key_trim.is_empty() {
+                        let seed = format!(
+                            "mkdir -p /data/misc/adb 2>/dev/null; (cat /data/misc/adb/adb_keys 2>/dev/null | grep -qF \"{}\" || echo \"{}\" >> /data/misc/adb/adb_keys); chmod 640 /data/misc/adb/adb_keys; restorecon /data/misc/adb/adb_keys 2>/dev/null",
+                            key_trim, key_trim
+                        );
+                        let mut sk = create_cmd("adb");
+                        sk.args(["-s", serial, "shell", &seed]);
+                        let _ = run_cmd_timeout(sk, Duration::from_secs(5));
+                    }
+                }
+            }
 
             // 1. Tenta novo agente v4 (com.esfera.agent)
             let mut cmd = create_cmd("adb");

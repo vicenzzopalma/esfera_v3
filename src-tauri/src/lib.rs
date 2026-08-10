@@ -168,6 +168,7 @@ pub fn run() {
             disconnect_adb_device,
             delete_device,
             update_device,
+            remote_update_agent,
             optimize_device,
             get_device_ip,
             // Campanhas

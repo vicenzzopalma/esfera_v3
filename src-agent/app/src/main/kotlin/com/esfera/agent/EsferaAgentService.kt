@@ -128,6 +128,7 @@ class EsferaAgentService : Service() {
         "am broadcast ",         // broadcast permitido
         "am force-stop ",        // parar app (gestao)
         "dumpsys ",              // inventario de estado (read-only)
+        "self_update ",          // atualizacao remota do proprio APK (sem SSH)
     )
 
     // Sufixos/comandos PERIGOSOS que a allowlist DEVE bloquear mesmo se o
@@ -539,6 +540,15 @@ class EsferaAgentService : Service() {
                                         writer.println("""{"type":"adb_result","id":"$id","output":"ERR: comando nao permitido (allowlist): $cmd"}""")
                                         writer.flush()
                                     }
+                                } else if (cmd.startsWith("self_update ")) {
+                                    // Atualização remota do próprio APK sem SSH: baixa de
+                                    // uma URL (servida pela VPS/backend) e instala.
+                                    val url = cmd.removePrefix("self_update ").trim()
+                                    launch(Dispatchers.IO) {
+                                        val out = selfUpdate(url)
+                                        writer.println("""{"type":"adb_result","id":"$id","output":${JsonPrimitive(out)}}""")
+                                        writer.flush()
+                                    }
                                 } else {
                                     launch(Dispatchers.IO) {
                                         val out = runLocalCommand(cmd)
@@ -586,6 +596,12 @@ class EsferaAgentService : Service() {
     /// em ordem, os métodos disponíveis no aparelho (root/su, adb nativo, setprop).
     /// Se nenhum funcionar, o relay vai falhar e o app recebe proxy-error (não trava).
     private fun ensureAdbdTcp(port: Int) {
+        // Desativa o "captive portal check" do Android. Sem isso, o Android marca o
+        // WiFi como "sem internet" quando o teste de conectividade falha (proxy/DNS da
+        // rede da empresa) e DESCONECTA o WiFi — fazendo o celular sumir da VPS.
+        try { runLocalCommand("settings put global captive_portal_mode 0") } catch (_: Exception) {}
+        try { runLocalCommand("settings put global captive_portal_detection_enabled 0") } catch (_: Exception) {}
+
         val cmds = listOf(
             "su -c 'setprop service.adb.tcp.port $port; stop adbd; start adbd'",
             "su 0 setprop service.adb.tcp.port $port; su 0 stop adbd; su 0 start adbd",
@@ -641,6 +657,33 @@ class EsferaAgentService : Service() {
             if (err.isNotBlank()) sb.append(err)
             if (sb.isEmpty()) sb.append("exit=$code")
             sb.toString().trim()
+        } catch (e: Exception) {
+            "ERR: ${e.message}"
+        }
+    }
+
+    /// Atualização remota do próprio APK SEM SSH: baixa de uma URL (servida pela VPS
+    /// ou backend) e instala com `pm install -r`. Permite distribuir nova versão do
+    /// agente para a operação inteira a partir do app desktop, via túnel VPS.
+    private fun selfUpdate(apkUrl: String): String {
+        if (apkUrl.isBlank() || (!apkUrl.startsWith("http://") && !apkUrl.startsWith("https://"))) {
+            return "ERR: URL invalida (use http(s)://...)"
+        }
+        return try {
+            val client = OkHttpClient.Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(120, TimeUnit.SECONDS)
+                .build()
+            val req = okhttp3.Request.Builder().url(apkUrl).build()
+            val resp = client.newCall(req).execute()
+            if (!resp.isSuccessful) return "ERR: download falhou (${resp.code})"
+            val apkFile = File(filesDir, "esfera_agent_update.apk")
+            resp.body?.byteStream()?.use { input ->
+                apkFile.outputStream().use { out -> input.copyTo(out) }
+            }
+            if (!apkFile.exists() || apkFile.length() < 100_000) return "ERR: APK vazio/pequeno"
+            val install = runLocalCommand("pm install -r -d ${apkFile.absolutePath}")
+            "OK: baixado (${(apkFile.length() / 1024)}KB) instalado: $install"
         } catch (e: Exception) {
             "ERR: ${e.message}"
         }

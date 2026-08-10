@@ -1259,6 +1259,19 @@ impl Database {
     ///
     /// Regra: o estado em RAM (túnel/presença) tem precedência. Devices sem
     /// nenhum canal vivo só caem para offline pelo timeout de check-in.
+    /// Renomeia um device remoto na nuvem (VPS). Chamado quando o app desktop
+    /// renomeia um dispositivo — garante que o nome sobe para o Hub e aparece
+    /// consistente em todos os clientes (app desktop, agente, etc.).
+    pub fn rename_device(&self, esfera_device_id: &str, name: &str) -> Result<(), String> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE ESF_Device SET Name = ?1 WHERE EsferaDeviceId = ?2",
+            params![name, esfera_device_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// A identidade usada é (CompanyId, EsferaDeviceId) — NUNCA IP.
     pub fn sync_live_state(
         &self,

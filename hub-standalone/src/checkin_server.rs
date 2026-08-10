@@ -1,4 +1,5 @@
-use axum::{Router, routing::post, Json, extract::State, body::Bytes};
+use axum::{Router, routing::{post, get}, Json, extract::State, body::Bytes};
+use axum::response::IntoResponse;
 use chrono::Utc;
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -67,6 +68,9 @@ pub async fn start(db: Arc<Database>, port: u16) {
     let app = Router::new()
         .route("/api/devices/check-in", post(handle_checkin))
         .route("/admin/update", post(handle_update))
+        // Canal de atualização remota: o agente (self_update) baixa o APK daqui,
+        // sem SSH. Serve o arquivo em AGENT_APK_PATH (default ~/esfera_v3/agent_release/esfera_agent.apk).
+        .route("/download/agent.apk", get(handle_download_agent))
         .with_state((db, port));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -130,4 +134,38 @@ pub async fn handle_checkin(
     }
 
     (StatusCode::OK, "ok")
+}
+
+/// Serve o APK do agente para atualização remota (self_update), sem SSH.
+/// Caminho configurável via env AGENT_APK_PATH; default:
+///   ~/esfera_v3/agent_release/esfera_agent.apk
+/// O agente no celular baixa de http://<VPS>:8080/download/agent.apk e instala.
+pub async fn handle_download_agent() -> axum::response::Response {
+    use axum::http::{header, StatusCode};
+    let default_path = dirs_home().join("esfera_v3/agent_release/esfera_agent.apk");
+    let path = std::env::var("AGENT_APK_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(default_path);
+    match std::fs::read(&path) {
+        Ok(bytes) => (
+            [(
+                header::CONTENT_TYPE,
+                "application/vnd.android.package-archive",
+            )],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Retorna o home do usuário (fallback para std::env::var HOME/USERPROFILE).
+fn dirs_home() -> std::path::PathBuf {
+    if let Ok(h) = std::env::var("HOME") {
+        return std::path::PathBuf::from(h);
+    }
+    if let Ok(h) = std::env::var("USERPROFILE") {
+        return std::path::PathBuf::from(h);
+    }
+    std::path::PathBuf::from(".")
 }
