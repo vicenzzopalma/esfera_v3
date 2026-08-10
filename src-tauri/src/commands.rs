@@ -189,11 +189,18 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         let connected = hub_client.lock().await.is_some();
         if !connected {
             if let Ok(creds) = get_hub_credentials(state.clone(), token.clone()) {
-                if let Ok(client) = HubClient::connect(
-                    &creds.hub_address, &creds.hub_token, &creds.role,
-                    creds.company_id, &creds.company_name,
+                // TIMEOUT: nunca trava o get_devices se o hub não responder
+                // (token vazio/default rejeitado, VPS down, firewall). Sem isso,
+                // o await do connect pendura e a UI fica em "processando ADB" infinito.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    HubClient::connect(
+                        &creds.hub_address, &creds.hub_token, &creds.role,
+                        creds.company_id, &creds.company_name,
+                    ),
                 ).await {
-                    *hub_client.lock().await = Some(client);
+                    Ok(Ok(client)) => { *hub_client.lock().await = Some(client); }
+                    _ => { /* hub indisponível: segue com ADB local apenas */ }
                 }
             }
         }
