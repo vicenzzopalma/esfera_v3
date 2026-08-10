@@ -388,14 +388,20 @@ class EsferaAgentService : Service() {
     private fun startCheckInLoop(config: EsferaConfig) {
         android.util.Log.d("EsferaAgent", "startCheckInLoop: iniciado")
         checkInJob?.cancel()
+        val host = config.serverUrl
+            .replace("https://", "").replace("http://", "")
+            .substringBefore(':').substringBefore('/').ifEmpty { "34.29.70.113" }
+        val httpFallback = "http://$host:8080"
         checkInJob = scope.launch {
+            var useHttps = config.serverUrl.startsWith("https://")
             while (isActive) {
                 val ip = resolveCurrentIp()
                 android.util.Log.d("EsferaAgent", "startCheckInLoop: ip=$ip")
                 if (ip != null) {
                     lastKnownIp = ip
                     try {
-                        val response: HttpResponse = httpClient.post("${config.serverUrl}/api/devices/check-in") {
+                        val base = if (useHttps) config.serverUrl else httpFallback
+                        val response: HttpResponse = httpClient.post("$base/api/devices/check-in") {
                             contentType(ContentType.Application.Json)
                             setBody(CheckInRequest(
                                 esferaDeviceId = config.deviceId,
@@ -409,7 +415,17 @@ class EsferaAgentService : Service() {
                             android.util.Log.w("EsferaAgent", "Check-in status ${response.status.value}: $ip")
                         }
                     } catch (e: Exception) {
-                        android.util.Log.w("EsferaAgent", "Check-in falhou: ${e.message}")
+                        // Fallback autônomo: se HTTPS falhar (ex: handshake TLS em Android antigo),
+                        // tenta HTTP (porta 8080). Garante que o celular reporta ao VPS mesmo
+                        // em devices mais velhos ou com incompatibilidade de cipher.
+                        if (useHttps && (e.message?.contains("Handshake", true) == true
+                                    || e.message?.contains("SSL", true) == true
+                                    || e.message?.contains("trust", true) == true)) {
+                            android.util.Log.w("EsferaAgent", "HTTPS falhou ($e), usando fallback HTTP 8080")
+                            useHttps = false
+                        } else {
+                            android.util.Log.w("EsferaAgent", "Check-in falhou: ${e.message}")
+                        }
                     }
                 }
                 delay(CHECK_IN_INTERVAL_MS)
