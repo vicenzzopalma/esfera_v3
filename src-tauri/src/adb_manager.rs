@@ -723,6 +723,35 @@ impl AdbManager {
         }
     }
 
+    /// Tenta tornar o agente Device Owner (DPC) do celular de forma autônoma.
+    /// Device Owner faz o app ser a política mestra do device (fonte de verdade):
+    /// ignora a restrição de background-start (app recém-instalado sobe sozinho),
+    /// impede desinstalação e trava políticas. Roda após o `adb install` do APK.
+    /// Erros são ignorados (se já for DO, ou o device já tiver outro owner).
+    pub fn set_device_owner(serial: &str) -> Result<String, String> {
+        let mut adb = create_cmd("adb");
+        adb.args([
+            "-s",
+            serial,
+            "shell",
+            "dpm set-device-owner com.esfera.agent/.AdminReceiver",
+        ]);
+        match run_cmd_timeout(adb, Duration::from_secs(10)) {
+            Ok(out) => {
+                let o = String::from_utf8_lossy(&out.stdout).to_string();
+                if o.contains("already") || o.to_lowercase().contains("device owner") {
+                    Ok("Device Owner já ativo (ou aplicado).".to_string())
+                } else {
+                    Ok(format!("Device Owner aplicado: {}", o.trim()))
+                }
+            }
+            Err(e) => Err(format!(
+                "Device Owner não aplicado (ignorado): {}. O agente segue via keep-alive.",
+                e
+            )),
+        }
+    }
+
     /// Executa o diagnóstico avançado de hardware/processos USB & ADB
     pub fn run_diagnostic() -> EsferaAdbDiagnosticResult {
         let mut diag = EsferaAdbDiagnostic {
@@ -2873,6 +2902,7 @@ impl AdbManager {
         if output.status.success() || combined.to_lowercase().contains("success") {
             let _ = Self::start_agent_service(serial);
             let _ = Self::deploy_keepalive(serial);
+            let _ = Self::set_device_owner(serial);
             let _ = Self::inject_device_immunity(serial, None);
 
             Ok(format!(
@@ -2887,6 +2917,7 @@ impl AdbManager {
                 if retry_out.status.success() {
                     let _ = Self::start_agent_service(serial);
                     let _ = Self::deploy_keepalive(serial);
+                    let _ = Self::set_device_owner(serial);
                     let _ = Self::inject_device_immunity(serial, None);
                     return Ok(format!(
                         "📱 App Agente Esfera v3 instalado e ativado no celular {} com sucesso!",
