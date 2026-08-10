@@ -367,6 +367,24 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 Vec::new()
             }
         };
+        // Deduplica conexões ativas na nuvem pertencentes ao mesmo IP físico (ex: reinstalações de APK no mesmo celular)
+        let mut deduped_vps: Vec<serde_json::Value> = Vec::new();
+        for v in live_vps {
+            let ip = v.get("ip").and_then(|s| s.as_str()).unwrap_or("");
+            if !ip.is_empty() {
+                if let Some(pos) = deduped_vps.iter().position(|existing| existing.get("ip").and_then(|s| s.as_str()) == Some(ip)) {
+                    let old_seen = deduped_vps[pos].get("last_seen_utc").and_then(|s| s.as_str()).unwrap_or("");
+                    let new_seen = v.get("last_seen_utc").and_then(|s| s.as_str()).unwrap_or("");
+                    if new_seen > old_seen {
+                        deduped_vps[pos] = v;
+                    }
+                    continue;
+                }
+            }
+            deduped_vps.push(v);
+        }
+        let live_vps = deduped_vps;
+
         // IDs que o VPS considera vivos (para marcar offline os que saíram).
         let live_ids: std::collections::HashSet<String> = live_vps
             .iter()
