@@ -892,91 +892,9 @@ impl Database {
                 [],
             )?;
 
-            // Pré-cadastra os 8 celulares Wi-Fi ativados da REALESS para garantia de exibição instantânea a 0ms
-            let default_devices = vec![
-                (
-                    "192.168.1.185:5555",
-                    "Aparelho 1",
-                    "Xiaomi",
-                    "Redmi Note",
-                    "192.168.1.185",
-                    1,
-                    "junior",
-                ),
-                (
-                    "192.168.1.35:5555",
-                    "Aparelho 2",
-                    "Multilaser",
-                    "F Pro 2",
-                    "192.168.1.35",
-                    2,
-                    "junior",
-                ),
-                (
-                    "192.168.1.54:5555",
-                    "Aparelho 3",
-                    "Samsung",
-                    "Galaxy A01",
-                    "192.168.1.54",
-                    3,
-                    "junior",
-                ),
-                (
-                    "192.168.1.57:5555",
-                    "Aparelho 4",
-                    "Xiaomi",
-                    "Redmi 9",
-                    "192.168.1.57",
-                    4,
-                    "junior",
-                ),
-                (
-                    "192.168.1.92:5555",
-                    "Aparelho 5",
-                    "Samsung",
-                    "Galaxy J7",
-                    "192.168.1.92",
-                    5,
-                    "junior",
-                ),
-                (
-                    "192.168.1.93:5555",
-                    "Aparelho 6",
-                    "Motorola",
-                    "Moto G22",
-                    "192.168.1.93",
-                    6,
-                    "junior",
-                ),
-                (
-                    "192.168.1.94:5555",
-                    "Aparelho 7",
-                    "Motorola",
-                    "Moto G",
-                    "192.168.1.94",
-                    7,
-                    "junior",
-                ),
-                (
-                    "192.168.1.95:5555",
-                    "Aparelho 8",
-                    "Multilaser",
-                    "F Pro 2",
-                    "192.168.1.95",
-                    8,
-                    "junior",
-                ),
-            ];
-
-            for (serial, name, brand, model, ip, num, sector) in default_devices {
-                let esfera_id = format!("ESF-LEGACY-{}", num);
-                let _ = self.conn().execute(
-                    "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId)
-                    VALUES (?1, ?2, ?3, ?4, ?5, 5555, 'offline', 100, 1, ?6, ?7, ?8)
-                    ON CONFLICT(AdbDeviceId) DO NOTHING;",
-                    params![serial, name, brand, model, ip, num, sector, esfera_id],
-                );
-            }
+            // DISPOSITIVOS FANTASMAS REMOVIDOS: nao pre-cadastramos mais exemplos
+// (Aparelho 1..8). Os celulares reais aparecem via check-in/presenca do
+// agente Kotlin na VPS (via_tunnel). Seed de exemplo so poluia a lista.
         }
 
         Ok(())
