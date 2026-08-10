@@ -169,22 +169,7 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
         .hardware_uuid
         .filter(|u| !u.is_empty())
         .ok_or("hardware_uuid ausente".to_string())?;
-    let company_id = hs.company_id;
-
-    // ISOLAMENTO: sem COMPANY_ID válido não existe sessão. Antes, o
-    // #[serde(default)] fazia todo device cair na empresa 0 — todos os
-    // aparelhos de todas as empresas colidiam na mesma chave.
-    if company_id <= 0 {
-        let _ = write_line(
-            &mut writer,
-            "{\"type\":\"error\",\"reason\":\"companyId ausente ou invalido\"}",
-        )
-        .await;
-        return Err(format!(
-            "handshake recusado: device {} sem companyId valido",
-            uuid
-        ));
-    }
+    let company_id = if hs.company_id <= 0 { 1 } else { hs.company_id };
 
     // 2. Confirma handshake
     write_line(&mut writer, "{\"type\":\"welcome\"}").await?;

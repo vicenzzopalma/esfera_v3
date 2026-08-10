@@ -482,11 +482,12 @@ pub fn create_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW (0x08000000) é exclusivo para ferramentas CLI sem janela (adb.exe).
-        // O scrcpy é uma aplicação gráfica (SDL2) e DEVE ser iniciado sem essa flag!
-        if name != "scrcpy" {
-            cmd.creation_flags(0x08000000);
-        }
+        // CREATE_NO_WINDOW (0x08000000) evita que processos console-subsystem
+        // (adb.exe, scrcpy.exe) abram uma janela de terminal visível. Para o
+        // scrcpy (SDL2), isso só esconde a "caixa preta" do console — a janela
+        // gráfica de vídeo continua aparecendo normalmente. Sem isso, clicar em
+        // "Câmera Frontal" abre um terminal visível (bug reportado).
+        cmd.creation_flags(0x08000000);
     }
     if name == "adb" || name == "scrcpy" {
         if let Some(dir) = bundled_tools_dir() {
@@ -1339,6 +1340,8 @@ impl AdbManager {
             ""
         };
         let title = format!("Esfera v3 — Stream H.264 ({}){}", target_serial, mode_label);
+        let is_wireless = target_serial.contains(':') || target_serial.contains('.');
+        let bitrate = if is_wireless { "2M" } else { "4M" };
         let mut cmd = create_cmd("scrcpy");
         cmd.args([
             "-s",
@@ -1348,7 +1351,8 @@ impl AdbManager {
             "--max-fps",
             "60",
             "--video-bit-rate",
-            "4M",
+            bitrate,
+            "--no-audio",
             "--window-title",
             &title,
         ]);

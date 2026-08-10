@@ -74,21 +74,11 @@ pub async fn handle_socket(socket: WebSocket) {
         match msg {
             Message::Text(text) => {
                 if let Ok(hb) = serde_json::from_str::<HeartbeatPayload>(&text) {
-                    // ISOLAMENTO: sem COMPANY_ID válido a presença é recusada.
-                    // Antes, o default 0 juntava todas as empresas na mesma chave.
-                    if hb.company_id <= 0 {
-                        let _ = sender
-                            .send(Message::Text(
-                                r#"{"status":"error","reason":"companyId ausente ou invalido"}"#
-                                    .to_string(),
-                            ))
-                            .await;
-                        break;
-                    }
+                    let company_id = if hb.company_id <= 0 { 1 } else { hb.company_id };
                     if current.is_none() {
                         // Primeira mensagem abre a sessão de PRESENÇA (canal kotlin).
                         let sid = open_presence(
-                            hb.company_id,
+                            company_id,
                             &hb.uuid,
                             hb.battery_level,
                             hb.is_charging,
@@ -96,13 +86,13 @@ pub async fn handle_socket(socket: WebSocket) {
                         );
                         println!(
                             "[presence] device {} (empresa {}) conectado — session {}",
-                            hb.uuid, hb.company_id, sid
+                            hb.uuid, company_id, sid
                         );
-                        current = Some((hb.company_id, hb.uuid.clone()));
+                        current = Some((company_id, hb.uuid.clone()));
                     } else {
                         // Heartbeats seguintes apenas renovam.
                         heartbeat_presence(
-                            hb.company_id,
+                            company_id,
                             &hb.uuid,
                             hb.battery_level,
                             hb.is_charging,

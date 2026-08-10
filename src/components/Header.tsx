@@ -41,9 +41,6 @@ export default function Header() {
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [companies, setCompanies] = useState<Company[]>([]);
   const [onlineDevicesCount, setOnlineDevicesCount] = useState(0);
-  const [updatingVps, setUpdatingVps] = useState(false);
-  const [updateVpsMsg, setUpdateVpsMsg] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const companyDropdownRef = useRef<HTMLDivElement>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
@@ -101,28 +98,6 @@ export default function Header() {
     leaveCompany();
     setCompanyDropdownOpen(false);
     navigate("/companies");
-  };
-
-  const handleUpdateVpsClick = () => {
-    fileInputRef.current?.click();
-  };
-
-  const handleVpsFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setUpdatingVps(true);
-    setUpdateVpsMsg(null);
-    try {
-      const buf = await file.arrayBuffer();
-      const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-      const res = await api<string>("update_vps_hub", { base64_bin: b64 });
-      setUpdateVpsMsg(res || "VPS atualizado.");
-    } catch (err: any) {
-      setUpdateVpsMsg("Erro: " + (err?.message || err));
-    } finally {
-      setUpdatingVps(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
-    }
   };
 
   return (
@@ -187,31 +162,6 @@ export default function Header() {
 
       {/* Right: Engine Badge & User Profile */}
       <div className="flex items-center gap-3">
-        {/* Atualizar VPS (self-update remoto, sem SSH) */}
-        <div className="hidden md:flex flex-col items-end">
-          <button
-            onClick={handleUpdateVpsClick}
-            disabled={updatingVps}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#5E6AD2]/15 border border-[#5E6AD2]/30 text-[11px] text-[#828DF7] hover:bg-[#5E6AD2]/25 transition-colors cursor-pointer disabled:opacity-50"
-            title="Selecione o esfera-hub-standalone.exe para atualizar o VPS remotamente"
-          >
-            <Cpu size={12} className="shrink-0" />
-            {updatingVps ? "Atualizando..." : "Atualizar VPS"}
-          </button>
-          {updateVpsMsg && (
-            <span className="text-[9px] text-zinc-500 max-w-[160px] text-right truncate" title={updateVpsMsg}>
-              {updateVpsMsg}
-            </span>
-          )}
-        </div>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".exe"
-          className="hidden"
-          onChange={handleVpsFile}
-        />
-
         {/* ADB Engine Status Badge */}
         <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white/[0.03] border border-white/[0.07] text-[11px]">
           <Cpu size={12} className="text-[#828DF7] shrink-0" />
