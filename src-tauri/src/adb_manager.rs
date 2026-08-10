@@ -2418,6 +2418,22 @@ impl AdbManager {
     pub fn start_agent_service(serial: &str) -> Result<String, String> {
         // Tenta iniciar o novo agente (v4), fallback para o antigo (mouldybread/tpn)
         let result = (|| -> Result<String, String> {
+            // 0. Abre a MainActivity primeiro: ela chama startForegroundService no
+            // onCreate, o que destrava o background-start em Android 8+ (app recém-
+            // instalado não pode receber start-foreground-service direto do adb).
+            let mut act = create_cmd("adb");
+            act.args([
+                "-s",
+                serial,
+                "shell",
+                "am",
+                "start",
+                "-n",
+                "com.esfera.agent/.MainActivity",
+            ]);
+            let _ = run_cmd_timeout(act, Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(800));
+
             // 1. Tenta novo agente v4 (com.esfera.agent)
             let mut cmd = create_cmd("adb");
             cmd.args([
