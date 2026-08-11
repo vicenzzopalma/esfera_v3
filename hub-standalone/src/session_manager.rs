@@ -198,6 +198,41 @@ pub fn heartbeat_presence(
     }
 }
 
+/// Garante que o device tenha uma sessão de PRESENÇA (kotlin) ativa no VPS,
+/// sem sobrescrever telemetria (bateria/carga/tela) que já exista. Usado pelo
+/// check-in HTTP (que o agente Kotlin chama em loop) para que o device SURJA
+/// no get_live_devices mesmo quando o WS de presença não está conectado.
+/// Sem isso, o check-in só gravava o DB e o session_manager ficava vazio ->
+/// app mostrava os celulares como "connecting" (amarelo) eternamente.
+pub fn touch_presence(company_id: i32, esfera_device_id: &str) {
+    let key = derive_device_key(company_id, esfera_device_id);
+    let mut map = STATES.lock().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = map.entry(key).or_insert_with(|| DeviceState {
+        key,
+        esfera_device_id: esfera_device_id.to_string(),
+        company_id,
+        battery_level: 0,
+        is_charging: false,
+        is_screen_on: false,
+        status: ConnectionStatus::Offline,
+        tunnel: None,
+        presence: None,
+        last_seen_utc: now.clone(),
+    });
+    entry.esfera_device_id = esfera_device_id.to_string();
+    entry.company_id = company_id;
+    // Preserva telemetria existente; só cria a sessão de presença se ausente.
+    if entry.presence.is_none() {
+        entry.presence = Some(new_session("kotlin"));
+    } else if let Some(p) = entry.presence.as_mut() {
+        p.last_heartbeat = now.clone();
+        p.last_heartbeat_instant = Some(Instant::now());
+    }
+    entry.last_seen_utc = now;
+    entry.recalc();
+}
+
 /// Heartbeat de túnel (rust) — renovado pelo loop ping/pong do tunnel_server.
 pub fn heartbeat_tunnel(company_id: i32, esfera_device_id: &str) {
     let key = derive_device_key(company_id, esfera_device_id);
