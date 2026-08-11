@@ -133,6 +133,12 @@ pub async fn handle_checkin(
         }
     }
 
+    // REGISTRA a presença (kotlin) no session_manager para que o device SURJA
+    // no get_live_devices (o app só marca verde os devices com sessão ativa).
+    // Antes, o check-in só gravava o DB e o session_manager ficava vazio ->
+    // celulares eternamente "connecting" (amarelo) no app.
+    crate::session_manager::touch_presence(company_id, &payload.esfera_device_id);
+
     (StatusCode::OK, "ok")
 }
 
