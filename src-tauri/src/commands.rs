@@ -384,10 +384,17 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                         } else {
                             app_cfg.hub_address.clone()
                         };
-                        let token = std::env::var("ESFERA_HUB_TOKEN")
-                            .or_else(|_| std::env::var("HUB_MASTER_TOKEN"))
-                            .unwrap_or_else(|_| "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string());
-                        let role = if session.role == "master" { "master" } else { "empresa" };
+                        let token = if !app_cfg.hub_token.trim().is_empty() {
+                            app_cfg.hub_token.trim().to_string()
+                        } else {
+                            std::env::var("ESFERA_HUB_TOKEN")
+                                .or_else(|_| std::env::var("HUB_MASTER_TOKEN"))
+                                .unwrap_or_else(|_| "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string())
+                        };
+                        let is_master_tok = token == "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b"
+                            || token == std::env::var("HUB_MASTER_TOKEN").unwrap_or_default()
+                            || token.starts_with("EsferaHubMaster_");
+                        let role = if is_master_tok || session.role == "master" { "master" } else { "empresa" };
                         let cid = session.company_id.unwrap_or(0);
                         if let Ok(client) = HubClient::connect(&hub_addr, &token, role, cid, "Empresa").await {
                             *guard = Some(client);
@@ -2234,9 +2241,15 @@ pub fn get_hub_credentials(
         std::env::var("ESFERA_COMPANY_TOKEN")
             .unwrap_or_else(|_| fallback_master.clone())
     };
-    // Para empresas sem token manual, conectamos como master no VPS (o VPS isola
-    // por company_id nos comandos). O app continua agindo como a empresa localmente.
-    let effective_role = if role == "master" { "master" } else { "master" };
+    // O role usado na conexão ao VPS é o da sessão do usuário logado:
+    // "master" (dono da infra) ou "empresa" (operador/colaborador). NUNCA
+    // forçamos master para todos — um colaborador deve conectar como
+    // empresa, e o VPS isola por company_id. O token em config.hub_token é
+    // o do papel correspondente (master para dono, da empresa para operador).
+    let is_master_tok = hub_token == fallback_master
+        || hub_token == std::env::var("HUB_MASTER_TOKEN").unwrap_or_default()
+        || hub_token.starts_with("EsferaHubMaster_");
+    let effective_role = if is_master_tok || role == "master" { "master" } else { "empresa" };
 
     let company_name = if company_id > 0 {
         state

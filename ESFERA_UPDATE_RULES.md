@@ -62,8 +62,10 @@ O agente baixa de `http://<VPS>:8080/download/agent.apk` e instala com
   devices ADB-locais — eles usam `esfera_device_id: None`).
 - **Build desktop = `npm run tauri build`** sempre. `cargo build` solto gera
   exe que falha com `ERR_CONNECTION_REFUSED` (sem frontend).
-- **Token do hub:** o app desktop usa `config.hub_token` (Configurações → Hub).
-  Se vazio, cai no default que a VPS REJEITA. Sempre preencher o token real.
+- **Token do hub & Papéis (Master vs Empresa):**
+  - **Master (`role: "master"`, CompanyId = 0):** Reservado para o dono da infraestrutura. Acesso global a todas as empresas/aparelhos.
+  - **Empresa (`role: "empresa"`, CompanyId > 0):** Papel dos operadores e colaboradores. O app desktop autentica com o token da empresa e `role = "empresa"`. O VPS isola 100% das listagens e comandos pelo `company_id`.
+  - O app desktop usa `config.hub_token` em Configurações → Hub (ou env). O role é derivado da sessão do usuário logado no app (`master` para o dono, `empresa` para colaboradores).
 - **Device IDs fixos:** moto g22 = `ESF-00829256`; Samsung = `ESF-4200DA85`.
   Nunca dois celulares no mesmo `esferaDeviceId`.
 - **Imunidade de background** já está em `adb_manager.rs start_agent_service`
