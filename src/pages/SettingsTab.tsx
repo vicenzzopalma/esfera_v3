@@ -295,7 +295,7 @@ export default function SettingsTab() {
                     </select>
                   </div>
 
-                  {appMode !== "local" && (
+                  {(appMode === "empresa" || appMode === "master" || isMasterUser) && (
                     <div className="space-y-6 pt-4 border-t border-border">
                       <div>
                         <label className="block font-semibold text-secondary mb-2 text-sm">Servidor Hub Nuvem</label>
@@ -342,18 +342,22 @@ export default function SettingsTab() {
                       </div>
                       <ToggleRow label="Habilitar Conexão Contínua" desc="Manter heartbeat em tempo real com o servidor central" checked={hubEnabled} onChange={setHubEnabled} />
 
-                      {isMasterUser && (
+                      {(appMode === "master" || appMode === "empresa") && (
                         <div className="space-y-2 pt-4 border-t border-border">
-                          <label className="block font-semibold text-secondary mb-2 text-sm">Token do Hub (Master)</label>
+                          <label className="block font-semibold text-secondary mb-2 text-sm">
+                            {appMode === "master" || isMasterUser ? "Token do Hub (Master)" : "Token da Empresa (REALESS)"}
+                          </label>
                           <input
                             type="password"
                             value={hubToken}
                             onChange={(e) => setHubToken(e.target.value)}
-                            placeholder="EsferaHubMaster_..."
+                            placeholder={appMode === "master" || isMasterUser ? "root123" : "Ope@2025"}
                             className="w-full input-setting font-mono text-sm"
                           />
                           <p className="text-[11px] text-amber-400 font-medium">
-                            Alinhe com HUB_MASTER_TOKEN da VPS. Se vazio, usa o default embutido. Sem ele, os celulares remotos não aparecem.
+                            {appMode === "master" || isMasterUser
+                              ? "Alinhe com HUB_MASTER_TOKEN da VPS (root123)."
+                              : "Token da empresa REALESS (Ope@2025). Sem ele, os celulares remotos não aparecem."}
                           </p>
                           <div className="flex items-center gap-3 pt-2">
                             <button
