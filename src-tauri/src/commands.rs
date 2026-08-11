@@ -464,9 +464,24 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             // + agente VPS).
             let vps_ip_base = strip_port(vps_adb_addr);
             let vps_ip2_base = strip_port(vps_ip);
+            // Correlação determinística serial <-> esfera_device_id: o agente Kotlin
+            // usa deviceId = "ESF-" + 8 primeiros do serial ADB em maiúsculo
+            // (ex: serial 4200da8501667545 -> ESF-4200DA85). Sem isso, o cartão
+            // local (serial) não cruzava com o live_vps (ESF-xxxx) e o celular
+            // remoto/SOLTO ficava amarelo eternamente mesmo com presença na VPS.
             let existing_pos = refreshed_db.iter().position(|d| {
+                // deviceId do agente = "ESF-" + 8 primeiros do serial em maiúsculo
+                let serial_prefix = d.serial.to_uppercase();
+                let esfera_from_serial = if serial_prefix.len() >= 8 {
+                    format!("ESF-{}", &serial_prefix[0..8])
+                } else if !serial_prefix.is_empty() {
+                    format!("ESF-{}", serial_prefix)
+                } else {
+                    String::new()
+                };
                 d.esfera_device_id.as_deref() == Some(esfera_id.as_str())
                     || d.serial == esfera_id
+                    || esfera_from_serial == esfera_id.to_uppercase()
                     || (!vps_adb_addr.is_empty()
                         && (d.serial == vps_adb_addr
                             || d.current_adb_address.as_deref() == Some(vps_adb_addr)
