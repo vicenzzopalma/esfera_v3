@@ -1,44 +1,77 @@
 @echo off
 REM ============================================================
-REM  setup_esfera_device.bat  —  Rotina CRONICA de setup de celular
-REM  Aplica TUDO de uma vez num celular plugado (USB ou TCP):
-REM   1. Imunidade de segundo plano (Doze/bateria nao mata o agente)
-REM   2. Semeia a chave ADB do PC (/data/misc/adb/adb_keys) -> sem popup
-REM   3. captive_portal_mode 0 (WiFi nao cai "sem internet")
-REM   4. Sobe o agente Esfera em foreground-service
-REM  Uso: setup_esfera_device.bat <serial_ou_ip:porta>
-REM  Ex:  setup_esfera_device.bat 4200da8501667545
-REM        setup_esfera_device.bat 192.168.1.83:5555
+REM Esfera v3 - setup_esfera_device.bat
+REM Torna o agente "indestrutivel" no celular conectado via USB.
+REM
+REM Nivel 1 (sem root): Device Owner via dpm set-device-owner.
+REM   - App nao desinstalavel, imune a otimizacao de bateria, sobrevive a reboot.
+REM Nivel 2 (root): se o aparelho estiver rootado (su/Magisk), move o app para
+REM   /system/priv-app -> vira app de sistema (sobrevive a factory reset do user space).
+REM
+REM PREREQUISITOS:
+REM   - Celular com USB debug ativo e autorizado neste PC.
+REM   - APP ja instalado (adb install -r app-release-signed.apk).
+REM   - Para Device Owner: o app NAO pode ter conta Google sincronizada que
+REM     bloqueie; se falhar, faca um factory reset rapido ou remova contas primeiro.
 REM ============================================================
-setlocal
-if "%1"=="" (
-  echo Uso: %~nx0 ^<serial^|ip:porta^>
+
+setlocal enabledelayedexpansion
+set PKG=com.esfera.agent
+set RECEIVER=.AdminReceiver
+set APK=C:\Users\vicenzzo.palma\Desktop\EsferaAgent\app-release-signed.apk
+
+echo ============================================================
+echo  Esfera Agent - Setup de persistencia (Device Owner / System)
+echo ============================================================
+echo.
+
+REM Verifica device
+adb devices | findstr /r "device$" >nul
+if errorlevel 1 (
+  echo [ERRO] Nenhum celular autorizado encontrado. Plugue via USB e aceite a depuracao.
+  pause
   exit /b 1
 )
-set SERIAL=%1
-set ADB=D:\Programs\android-sdk\platform-tools\adb.exe
-set PKG=com.esfera.agent
 
-echo [1/4] Imunidade de segundo plano...
-%ADB% -s %SERIAL% shell "dumpsys deviceidle whitelist +%PKG%; cmd appops set %PKG% RUN_IN_BACKGROUND allow; cmd appops set %PKG% RUN_ANY_IN_BACKGROUND allow 2>/dev/null; settings put global wifi_sleep_policy 2; settings put global stay_on_while_plugged_in 7; device_config put activity_manager max_phantom_processes 2147483647"
-
-echo [2/4] Semeia chave ADB (sem popup futuro)...
-set KEY=%USERPROFILE%\.android\adbkey.pub
-if exist "%KEY%" (
-  for /f "usebackq delims=" %%K in ("%KEY%") do set PUB=%%K
-  %ADB% -s %SERIAL% shell "mkdir -p /data/misc/adb 2>/dev/null; (cat /data/misc/adb/adb_keys 2>/dev/null | grep -qF '%PUB%' || echo %PUB% >> /data/misc/adb/adb_keys); chmod 640 /data/misc/adb/adb_keys; restorecon /data/misc/adb/adb_keys 2>/dev/null"
+echo [1/4] Garantindo que o app esta instalado...
+if exist "%APK%" (
+  adb install -r "%APK%"
 ) else (
-  echo   AVISO: %KEY% nao encontrado (rode 'adb keygen' antes)
+  echo [AVISO] APK nao encontrado em %APK%. Se ja esta instalado, ignore.
 )
 
-echo [3/4] captive_portal_mode 0 (WiFi nao cai)...
-%ADB% -s %SERIAL% shell "settings put global captive_portal_mode 0; settings put global captive_portal_detection_enabled 0"
+echo [2/4] Aplicando Device Owner (trava o app como dono do aparelho)...
+adb shell dpm set-device-owner %PKG%/%RECEIVER%
+if errorlevel 1 (
+  echo [AVISO] Device Owner falhou. Possiveis causas: conta Google ativa ou ja e profile owner.
+  echo         Faca um factory reset e rode este script ANTES de adicionar conta, ou use o caminho root abaixo.
+) else (
+  echo [OK] Device Owner aplicado. O agente agora e indestrutivel (sem root).
+)
 
-echo [4/4] Sobe o agente...
-%ADB% -s %SERIAL% shell "am start -n %PKG%/.MainActivity"
-%ADB% -s %SERIAL% shell "am start-foreground-service %PKG%/.EsferaAgentService"
+echo [3/4] Tentando nivel root (system-app) se o aparelho estiver rootado...
+adb shell "su -c 'echo root_ok'" >nul 2>&1
+if errorlevel 1 (
+  echo [INFO] Aparelho NAO rootado (ou su indisponivel). Device Owner ja basta para o objetivo.
+  goto :fim
+)
 
+echo [INFO] Root detectado. Instalando como app de sistema (/system/priv-app)...
+adb shell su -c "mount -o remount,rw /system"
+adb shell su -c "mkdir -p /system/priv-app/EsferaAgent"
+adb push "%APK%" /sdcard/esfera_agent_tmp.apk
+adb shell su -c "cp /sdcard/esfera_agent_tmp.apk /system/priv-app/EsferaAgent/EsferaAgent.apk"
+adb shell su -c "chmod 644 /system/priv-app/EsferaAgent/EsferaAgent.apk"
+adb shell su -c "chown root:root /system/priv-app/EsferaAgent/EsferaAgent.apk"
+adb shell su -c "rm -f /sdcard/esfera_agent_tmp.apk"
+adb shell su -c "mount -o remount,ro /system"
+echo [OK] App de sistema instalado. Reinicie o celular para ativar.
+adb reboot
+
+:fim
 echo.
-echo PRONTO. Celular %SERIAL% imune + agente ativo + chave semeada.
-echo (Se pediu autorizacao na tela do celular, toque PERMITIR uma vez.)
-endlocal
+echo ============================================================
+echo  Pronto. Abra o app "Esfera Agent" uma vez para concluir o assistente
+echo  (bateria sem restricao + Device Admin) e ele nunca mais para.
+echo ============================================================
+pause
