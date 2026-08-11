@@ -209,7 +209,10 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
     tauri::async_runtime::spawn_blocking(move || {
         let session = validate_session(&state_sessions, &token)?;
         let target_company_id = if session.role == "master" {
-            0
+            // O "master" é papel de permissão, mas os DADOS pertencem à empresa
+            // real (ex: REALESS = CompanyId 1). Não filtramos por company 0 (que
+            // não tem celulares) — usamos a company do usuário, ou 1 por padrão.
+            session.company_id.filter(|c| *c > 0).unwrap_or(1)
         } else if company_id <= 0 {
             session.company_id.unwrap_or(0)
         } else {
@@ -392,6 +395,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                                 .unwrap_or_else(|_| "REMOVED_SECRET".to_string())
                         };
                         let is_master_tok = token == "REMOVED_SECRET"
+                            || token == "REMOVED_SECRET"
                             || token == std::env::var("HUB_MASTER_TOKEN").unwrap_or_default()
                             || token.starts_with("EsferaHubMaster_");
                         let role = if is_master_tok || session.role == "master" { "master" } else { "empresa" };
@@ -2239,14 +2243,10 @@ pub fn get_hub_credentials(
             .unwrap_or_else(|_| fallback_master.clone())
     } else {
         std::env::var("ESFERA_COMPANY_TOKEN")
-            .unwrap_or_else(|_| fallback_master.clone())
+            .unwrap_or_else(|_| "REMOVED_SECRET".to_string())
     };
-    // O role usado na conexão ao VPS é o da sessão do usuário logado:
-    // "master" (dono da infra) ou "empresa" (operador/colaborador). NUNCA
-    // forçamos master para todos — um colaborador deve conectar como
-    // empresa, e o VPS isola por company_id. O token em config.hub_token é
-    // o do papel correspondente (master para dono, da empresa para operador).
     let is_master_tok = hub_token == fallback_master
+        || hub_token == "REMOVED_SECRET"
         || hub_token == std::env::var("HUB_MASTER_TOKEN").unwrap_or_default()
         || hub_token.starts_with("EsferaHubMaster_");
     let effective_role = if is_master_tok || role == "master" { "master" } else { "empresa" };
