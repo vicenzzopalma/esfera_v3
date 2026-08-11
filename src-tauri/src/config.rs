@@ -26,7 +26,7 @@ impl Default for AppConfig {
             // Porta 8555 = hub TCP master (Auth/Command/Register). NÃO é a :8888
             // (tunnel server do device-agent) nem localhost.
             hub_address: "34.29.70.113:8555".to_string(),
-            hub_token: "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string(),
+            hub_token: "root123".to_string(),
             empresa_server_enabled: false,
             empresa_server_port: 7777,
             checkin_server_enabled: true,

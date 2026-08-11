@@ -15,7 +15,7 @@ pub async fn handle_update(
     body: Bytes,
 ) -> (axum::http::StatusCode, String) {
     let master_token = std::env::var("HUB_MASTER_TOKEN")
-        .unwrap_or_else(|_| "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string());
+        .unwrap_or_else(|_| "root123".to_string());
     let provided = headers
         .get("X-Hub-Token")
         .and_then(|v| v.to_str().ok())

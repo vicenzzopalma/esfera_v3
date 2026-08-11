@@ -845,12 +845,15 @@ impl Database {
                 [],
             )?;
 
-            // Token MASTER do Hub (CompanyId = 0). Sem credencial global em código.
-            // Lê de HUB_MASTER_TOKEN (env); se ausente, usa um token forte padrão
-            // que DEVE ser trocado em produção. NUNCA usar senha trivial.
+            // Token MASTER do Hub (CompanyId = 0).
             let master_token = std::env::var("HUB_MASTER_TOKEN")
-                .unwrap_or_else(|_| "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string());
+                .unwrap_or_else(|_| "root123".to_string());
             self.upsert_company_token(0, &master_token, "master")?;
+
+            // Token da Empresa REALESS (CompanyId = 1).
+            let company_token = std::env::var("ESFERA_COMPANY_TOKEN")
+                .unwrap_or_else(|_| "Ope@2025".to_string());
+            self.upsert_company_token(1, &company_token, "empresa")?;
 
             // Usuários seedados: SOMENTE contas do dono, com senhas não-triviais.
             // Contas de demonstração com senhas fracas (admin/admin, gestor/gestor, colab/colab)
