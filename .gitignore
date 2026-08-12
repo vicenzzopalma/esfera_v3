@@ -34,3 +34,8 @@ dist-ssr
 __pycache__/
 *.pyc
 
+# Relatorio de arquitetura e resiliência (SEMPRE versionado)
+# target/ como um todo continua versionavel; este arquivo em particular
+# eh obrigatorio no git independente de qualquer regra acima.
+!target/relatorio.md
+
