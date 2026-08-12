@@ -19,6 +19,7 @@ import io.ktor.websocket.readText
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -29,6 +30,8 @@ import kotlinx.serialization.json.Json
 @Serializable
 data class HeartbeatPayload(
     val uuid: String,
+    val esferaDeviceId: String = "",
+    val currentAdbAddress: String = "",
     val batteryLevel: Int,
     val isCharging: Boolean,
     val isScreenOn: Boolean,
@@ -42,9 +45,12 @@ class PresenceClient(
     private val serverHost: String,
     private val wsPort: Int = 7779,
     private val companyId: Int = 0,
-    private val useTls: Boolean = false
+    private val useTls: Boolean = false,
+    private val adbAddressProvider: () -> String = { "" }
 ) {
-    private val scope = CoroutineScope(Dispatchers.IO + Job())
+    // SupervisorJob: uma falha temporária do WebSocket (oscilação de rede) NUNCA
+    // cancela coroutines irmãs do scope (regra de indelestrutibilidade do agente).
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -72,16 +78,18 @@ class PresenceClient(
     fun start() {
         job?.cancel()
         job = scope.launch {
-            var backoffMs = 5_000L
+            // BACKOFF EXPONENCIAL INDESTRUTÍVEL: 2s -> 4s -> 8s -> ... -> máx 30s.
+            // Reset para 2s assim que a conexão WebSocket voltar a subir.
+            var backoffMs = 2_000L
             while (isActive) {
                 try {
                     val scheme = if (useTls) "wss" else "ws"
                     val url = "$scheme://$serverHost:$wsPort/ws/presence"
                     Log.d("PresenceClient", "Conectando ao Presence WS: $url")
-                    
+
                     client.webSocket(urlString = url) {
                         Log.i("PresenceClient", "WebSocket de Presença CONECTADO!")
-                        backoffMs = 5_000L
+                        backoffMs = 2_000L
 
                         while (isActive) {
                             val batteryInfo = getBatteryInfo(context)
@@ -89,6 +97,8 @@ class PresenceClient(
 
                             val payload = HeartbeatPayload(
                                 uuid = deviceId,
+                                esferaDeviceId = deviceId,
+                                currentAdbAddress = adbAddressProvider(),
                                 batteryLevel = batteryInfo.first,
                                 isCharging = batteryInfo.second,
                                 isScreenOn = screenOn,
@@ -106,8 +116,9 @@ class PresenceClient(
                     Log.w("PresenceClient", "Erro/Queda no WebSocket de Presença: ${e.message}")
                 }
 
-                delay(backoffMs + (0..2000).random().toLong())
-                backoffMs = (backoffMs * 2).coerceIn(5_000L, 10_000L)
+                Log.w("PresenceClient", "Reconectando em ${backoffMs}ms")
+                delay(backoffMs + (0..1000).random().toLong())
+                backoffMs = (backoffMs * 2).coerceIn(2_000L, 30_000L)
             }
         }
     }

@@ -168,6 +168,8 @@ async fn reconciliacao_ram_db_protege_device_com_canal_vivo() {
         status: "online".to_string(),
         battery_level: 77,
         last_seen_utc: chrono::Utc::now().to_rfc3339(),
+        ip: String::new(),
+        current_adb_address: String::new(),
     }];
     db.sync_live_state(&live, 120).unwrap();
 

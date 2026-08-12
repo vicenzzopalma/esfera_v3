@@ -8,18 +8,25 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, Result, Transaction};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 
 /// Projeção do estado VIVO (em RAM, session_manager) para persistência.
 /// Identidade = (company_id, esfera_device_id). NUNCA IP/porta/ordem de lista.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LiveDeviceState {
     pub company_id: i32,
     pub esfera_device_id: String,
     pub status: String, // "online" | "degraded" | "offline"
     pub battery_level: u8,
     pub last_seen_utc: String,
+    /// Endereço ADB corrente (ip:porta) — projetado do session_manager para que
+    /// o `get_live_devices` devolva o IP e o app desktop cruze o cartão local
+    /// (fix do status amarelo "connecting").
+    pub ip: String,
+    pub current_adb_address: String,
 }
 
 // ============================================================
@@ -1334,6 +1341,29 @@ impl Database {
             .map_err(|e| e.to_string())?;
 
         Ok(touched)
+    }
+
+    /// Worker de fundo assíncrono que periodicamente salva o estado vivo do
+    /// session_manager (RAM) no SQLite, sem bloquear a thread de I/O de rede.
+    /// Roda em loop com intervalo `interval_secs`; o snapshot é capturado no
+    /// início de cada iteração para garantir consistência.
+    pub fn spawn_sync_live_state_worker(
+        self: Arc<Self>,
+        interval_secs: u64,
+        stale_timeout_seconds: i32,
+    ) -> tokio::task::JoinHandle<()> {
+        let db = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let live = crate::session_manager::live_snapshot();
+                if !live.is_empty() {
+                    let _ = db.sync_live_state(&live, stale_timeout_seconds);
+                }
+            }
+        })
     }
 
     pub fn get_device_by_esfera_id(&self, esfera_device_id: &str) -> Option<Device> {

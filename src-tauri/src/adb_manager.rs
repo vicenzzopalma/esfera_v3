@@ -2410,6 +2410,60 @@ impl AdbManager {
         }
     }
 
+    /// Grava no celular `/sdcard/esfera_config.json` com a identidade EXATA do
+    /// Android = serial ADB enxergado pelo PC (ex.: serial `4200da8501667545`
+    /// -> `deviceId: "ESF-4200DA85"`).
+    ///
+    /// Isso é o que garante que o cruzamento local (serial ADB) x remoto (VPS,
+    /// `esfera_device_id = ESF-xxxx`) NUNCA falhe: ambos compartilham o mesmo
+    /// prefixo determinístico. Chamado em CADA detecção de dispositivo (USB ou
+    /// Wi-Fi) pelo `get_devices`, independentemente de o agente já estar rodando.
+    ///
+    /// Escreve o JSON via `echo '...' > /sdcard/esfera_config.json` (shell)
+    /// porque `/sdcard` é gravável sem root e o `EsferaAgentService` Kotlin lê
+    /// esse arquivo no check-in. Em caso de falha (device não autorizado),
+    /// retorna `Err` mas NÃO bloqueia o fluxo de listagem.
+    pub fn write_identity_config(
+        serial: &str,
+        company_id: i32,
+        server_url: &str,
+    ) -> Result<String, String> {
+        let serial_upper = serial.to_uppercase();
+        let prefix8: &str = if serial_upper.len() >= 8 {
+            &serial_upper[0..8]
+        } else if !serial_upper.is_empty() {
+            &serial_upper
+        } else {
+            return Err("Serial ADB vazio: não foi possível derivar ESF-xxxx".to_string());
+        };
+        let device_id = format!("ESF-{}", prefix8);
+
+        // JSON com aspas simples no shell (evita escape de aspas duplas).
+        let json = format!(
+            "{{\"deviceId\":\"{}\",\"companyId\":{},\"serverUrl\":\"{}\"}}",
+            device_id, company_id, server_url
+        );
+
+        let mut cmd = create_cmd("adb");
+        cmd.args([
+            "-s",
+            serial,
+            "shell",
+            &format!("echo '{}' > /sdcard/esfera_config.json", json),
+        ]);
+
+        match run_cmd_timeout(cmd, Duration::from_secs(5)) {
+            Ok(_) => Ok(format!(
+                "Identidade {} (empresa {}) gravada em /sdcard/esfera_config.json",
+                device_id, company_id
+            )),
+            Err(e) => Err(format!(
+                "Falha ao gravar esfera_config.json no {}: {}",
+                serial, e
+            )),
+        }
+    }
+
     /// Extrai só o host de uma URL (o device-agent Rust espera host puro em
     /// `persist.esfera.hub`, não uma URL completa).
     fn host_of(server_url: &str) -> String {

@@ -24,6 +24,7 @@ import { DeviceConfigModal } from "../components/devices/DeviceConfigModal";
 import { MirrorModal } from "../components/devices/MirrorModal";
 import { DiagnosticModal } from "../components/devices/DiagnosticModal";
 import { ScreenRegionModal } from "../components/devices/ScreenRegionModal";
+import { DeviceIdentityModal } from "../components/devices/DeviceIdentityModal";
 
 import {
   Smartphone,
@@ -62,6 +63,12 @@ export default function DevicesTab() {
 
   const [configModalOpen, setConfigModalOpen] = useState(false);
   const [selectedDeviceForConfig, setSelectedDeviceForConfig] = useState<Device | null>(null);
+
+  const [identityModalOpen, setIdentityModalOpen] = useState(false);
+  const [selectedDeviceForDiagnostic, setSelectedDeviceForDiagnostic] = useState<Device | null>(null);
+
+  // Connecting timeout tracking (15s)
+  const [connectingTimestamps, setConnectingTimestamps] = useState<Record<string, number>>({});
 
   // USB Device Scanning & Linking Status
   const [usbDevices, setUsbDevices] = useState<{ serial: string; state: string; model: string }[]>([]);
@@ -111,24 +118,70 @@ export default function DevicesTab() {
     const unlisten = listen<{ esferaDeviceId: string; currentAdbAddress: string; status: string; lastSeenUtc: string }>(
       "device-updated",
       (event) => {
+        const newStatus = event.payload.status as DeviceStatus;
+        const devId = event.payload.esferaDeviceId;
+
         setDevicesList((prev) =>
           prev.map((d) =>
-            d.esferaDeviceId === event.payload.esferaDeviceId
+            d.esferaDeviceId === devId
               ? {
                   ...d,
                   currentAdbAddress: event.payload.currentAdbAddress,
-                  status: event.payload.status as DeviceStatus,
+                  status: newStatus,
                   lastSeenUtc: event.payload.lastSeenUtc,
                 }
               : d
           )
         );
+
+        // Track connecting timestamps for 15s timeout
+        if (newStatus === "connecting") {
+          setConnectingTimestamps((prev) => {
+            if (!prev[devId]) {
+              return { ...prev, [devId]: Date.now() };
+            }
+            return prev;
+          });
+        } else {
+          // Clear timestamp when status changes away from connecting
+          setConnectingTimestamps((prev) => {
+            const next = { ...prev };
+            delete next[devId];
+            return next;
+          });
+        }
       }
     );
     return () => {
       unlisten.then((fn) => fn());
     };
   }, []);
+
+  // 15s connecting timeout: force visual to offline if device stays in "connecting"
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = Date.now();
+      const expiredIds = Object.entries(connectingTimestamps)
+        .filter(([_id, ts]) => now - ts > 15000)
+        .map(([id]) => id);
+
+      if (expiredIds.length > 0) {
+        setDevicesList((prev) =>
+          prev.map((d) =>
+            d.esferaDeviceId && expiredIds.includes(d.esferaDeviceId) && d.status === "connecting"
+              ? { ...d, status: "offline" as DeviceStatus }
+              : d
+          )
+        );
+        setConnectingTimestamps((prev) => {
+          const next = { ...prev };
+          for (const id of expiredIds) delete next[id];
+          return next;
+        });
+      }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [connectingTimestamps]);
 
   const fetchUsbDevices = async () => {
     setLoadingUsb(true);
@@ -422,6 +475,10 @@ export default function DevicesTab() {
                     device.name || `Aparelho ${device.deviceNumber}`
                   );
                 }}
+                onOpenDiagnostic={() => {
+                  setSelectedDeviceForDiagnostic(device);
+                  setIdentityModalOpen(true);
+                }}
               />
             ))}
           </div>
@@ -582,6 +639,15 @@ export default function DevicesTab() {
         isOpen={regionModalOpen}
         onClose={() => setRegionModalOpen(false)}
         serial={selectedSerialForRegion}
+      />
+
+      <DeviceIdentityModal
+        isOpen={identityModalOpen}
+        onClose={() => {
+          setIdentityModalOpen(false);
+          setSelectedDeviceForDiagnostic(null);
+        }}
+        device={selectedDeviceForDiagnostic}
       />
     </div>
   );

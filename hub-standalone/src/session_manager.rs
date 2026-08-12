@@ -20,6 +20,14 @@
 //   Eles NUNCA disputam a mesma sessão/porta/identidade.
 //   Reconectar gera novo SESSION_ID, mantém DEVICE_ID+COMPANY_ID.
 //   Desconectar B só mexe em B.
+//
+// CRUZAMENTO POR IP (fix do status AMARELO no app desktop):
+//   O `current_adb_address` (ip:porta) e `ip` são reportados pelo agente Kotlin
+//   no check-in HTTP (:8080). Eles são projetados em `live_snapshot()` para que o
+//   `get_live_devices` da VPS devolva o endereço do celular. O app desktop então
+//   consegue cruzar o cartão ADB local (serial 192.168.1.83:5555) com o gêmeo VPS
+//   por IP e marcar o dispositivo como "online" (verde) em vez de "connecting"
+//   (amarelo) eternamente. Sem esses campos, o cartão local ficava órfão.
 // ============================================================
 
 use std::collections::HashMap;
@@ -44,6 +52,7 @@ pub struct DeviceIdentity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ConnectionStatus {
     Online,   // túnel + presença OK
     Degraded, // apenas um dos canais OK
@@ -65,6 +74,11 @@ pub struct DeviceState {
     pub key: DeviceKey,
     pub esfera_device_id: String,
     pub company_id: i32,
+    // Identidade de rede do aparelho (precisa bater com o cartão local do ADB
+    // no desktop, que usa ip:porta ou serial). Sem isso, o cruzamento por IP
+    // no app desktop falha e o celular fica "connecting" (amarelo) eternamente.
+    pub ip: String,
+    pub current_adb_address: String,
     pub battery_level: u8,
     pub is_charging: bool,
     pub is_screen_on: bool,
@@ -102,6 +116,11 @@ fn derive_device_key(company_id: i32, esfera_device_id: &str) -> DeviceKey {
     DeviceKey { company_id, device_id: (h >> 32) as i32 }
 }
 
+/// Remove a porta de um endereço (ex: "192.168.1.5:5555" -> "192.168.1.5").
+fn strip_port(s: &str) -> String {
+    s.rsplit_once(':').map(|(ip, _)| ip.to_string()).unwrap_or_else(|| s.to_string())
+}
+
 fn new_session(agent_id: &str) -> ChannelSession {
     let now = chrono::Utc::now();
     ChannelSession {
@@ -116,14 +135,21 @@ fn new_session(agent_id: &str) -> ChannelSession {
 // ---- API PÚBLICA ----
 
 /// Canal TÚNEL (agente rust). Substitui a sessão de túnel do device; não toca presença.
-pub fn open_tunnel(company_id: i32, esfera_device_id: &str) -> String {
+pub fn open_tunnel(company_id: i32, esfera_device_id: &str, current_local_ip: &str) -> String {
     let key = derive_device_key(company_id, esfera_device_id);
+    let adb_addr = if current_local_ip.is_empty() {
+        String::new()
+    } else {
+        format!("{}:5555", current_local_ip)
+    };
     let mut map = STATES.lock().unwrap();
     let now = chrono::Utc::now().to_rfc3339();
     let entry = map.entry(key).or_insert_with(|| DeviceState {
         key,
         esfera_device_id: esfera_device_id.to_string(),
         company_id,
+        ip: current_local_ip.to_string(),
+        current_adb_address: adb_addr.clone(),
         battery_level: 0,
         is_charging: false,
         is_screen_on: false,
@@ -134,6 +160,10 @@ pub fn open_tunnel(company_id: i32, esfera_device_id: &str) -> String {
     });
     entry.esfera_device_id = esfera_device_id.to_string();
     entry.company_id = company_id;
+    if !current_local_ip.is_empty() {
+        entry.ip = current_local_ip.to_string();
+        entry.current_adb_address = adb_addr;
+    }
     entry.tunnel = Some(new_session("rust"));
     entry.last_seen_utc = now;
     entry.recalc();
@@ -141,6 +171,8 @@ pub fn open_tunnel(company_id: i32, esfera_device_id: &str) -> String {
 }
 
 /// Canal PRESENÇA (agente kotlin). Substitui a sessão de presença; não toca túnel.
+/// O WS de presença não carrega o endereço ADB, então `ip`/`current_adb_address`
+/// só são preenchidos se já existirem (vindos do check-in HTTP).
 pub fn open_presence(
     company_id: i32,
     esfera_device_id: &str,
@@ -155,6 +187,8 @@ pub fn open_presence(
         key,
         esfera_device_id: esfera_device_id.to_string(),
         company_id,
+        ip: String::new(),
+        current_adb_address: String::new(),
         battery_level: battery,
         is_charging: charging,
         is_screen_on: screen_on,
@@ -202,16 +236,21 @@ pub fn heartbeat_presence(
 /// sem sobrescrever telemetria (bateria/carga/tela) que já exista. Usado pelo
 /// check-in HTTP (que o agente Kotlin chama em loop) para que o device SURJA
 /// no get_live_devices mesmo quando o WS de presença não está conectado.
+/// O `current_adb_address` (ip:porta) reportado pelo check-in é preservado no
+/// estado para que o app desktop cruze o cartão local por IP (fix do amarelo).
 /// Sem isso, o check-in só gravava o DB e o session_manager ficava vazio ->
 /// app mostrava os celulares como "connecting" (amarelo) eternamente.
-pub fn touch_presence(company_id: i32, esfera_device_id: &str) {
+pub fn touch_presence(company_id: i32, esfera_device_id: &str, current_adb_address: &str) {
     let key = derive_device_key(company_id, esfera_device_id);
+    let ip = strip_port(current_adb_address);
     let mut map = STATES.lock().unwrap();
     let now = chrono::Utc::now().to_rfc3339();
     let entry = map.entry(key).or_insert_with(|| DeviceState {
         key,
         esfera_device_id: esfera_device_id.to_string(),
         company_id,
+        ip: ip.clone(),
+        current_adb_address: current_adb_address.to_string(),
         battery_level: 0,
         is_charging: false,
         is_screen_on: false,
@@ -222,7 +261,11 @@ pub fn touch_presence(company_id: i32, esfera_device_id: &str) {
     });
     entry.esfera_device_id = esfera_device_id.to_string();
     entry.company_id = company_id;
-    // Preserva telemetria existente; só cria a sessão de presença se ausente.
+    if !current_adb_address.is_empty() {
+        entry.current_adb_address = current_adb_address.to_string();
+        entry.ip = ip;
+    }
+    // Preserva telemetria existente; renova a sessão de presença se ausente.
     if entry.presence.is_none() {
         entry.presence = Some(new_session("kotlin"));
     } else if let Some(p) = entry.presence.as_mut() {
@@ -314,6 +357,28 @@ pub fn list_all() -> Vec<DeviceState> {
     STATES.lock().unwrap().values().cloned().collect()
 }
 
+/// Device considerado "atividade recente" se tiver atualizado last_seen_utc
+/// ou tiver heartbeat de túnel/presença nos últimos `timeout_secs` segundos.
+/// Usado pelo `live_snapshot` para filtrar dispositivos mortos.
+pub fn recently_active_90s() -> Vec<DeviceState> {
+    let cutoff = Instant::now() - Duration::from_secs(90);
+    STATES
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|s| {
+            // Dispositivo com presença ou túnel com heartbeat recente
+            let has_recent_channel = s.tunnel.as_ref().and_then(|t| t.last_heartbeat_instant)
+                .map_or(false, |instant| instant > cutoff)
+                || s.presence.as_ref().and_then(|p| p.last_heartbeat_instant)
+                    .map_or(false, |instant| instant > cutoff);
+            // Ou last_seen_utc recente (usado pelo touch_presence/check-in HTTP)
+            has_recent_channel
+        })
+        .cloned()
+        .collect()
+}
+
 /// Remove completamente um device do estado em RAM (usado em testes de isolamento).
 pub fn forget(company_id: i32, esfera_device_id: &str) {
     let key = derive_device_key(company_id, esfera_device_id);
@@ -332,17 +397,23 @@ impl ConnectionStatus {
 
 /// Projeta o estado vivo (RAM) para o formato persistível do DB.
 /// É o ÚNICO ponto de tradução RAM -> banco; evita duas fontes de verdade.
+/// Só include dispositivos com atividade nos últimos 90 segundos (check-in HTTP,
+/// presença WS ou túnel Rust) para que o `get_live_devices` da VPS devolva a
+/// lista completa e correta.
+/// Inclui `ip` e `current_adb_address` para que o `get_live_devices` da VPS
+/// devolva o endereço do aparelho e o app desktop cruze o cartão local (fix
+/// do status amarelo "connecting").
 pub fn live_snapshot() -> Vec<crate::db::LiveDeviceState> {
-    STATES
-        .lock()
-        .unwrap()
-        .values()
+    recently_active_90s()
+        .into_iter()
         .map(|s| crate::db::LiveDeviceState {
             company_id: s.company_id,
             esfera_device_id: s.esfera_device_id.clone(),
             status: s.status.as_str().to_string(),
             battery_level: s.battery_level,
             last_seen_utc: s.last_seen_utc.clone(),
+            ip: s.ip.clone(),
+            current_adb_address: s.current_adb_address.clone(),
         })
         .collect()
 }

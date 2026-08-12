@@ -81,11 +81,17 @@ async fn handle_vps_command(
 
     match cmd {
         // Estado VIVO (túnel + presença) por empresa — independe do hub local.
+        // Usa live_snapshot() (filtra atividade 90s) como base, depois aplica
+        // isolamento por empresa se não for master.
         "get_live_devices" => {
+            // live_snapshot() já filtra por atividade recente (últimos 90s)
+            let all_live = crate::session_manager::live_snapshot();
             let states = if company_id <= 0 {
-                crate::session_manager::list_all()
+                // Master (ou companyId=0): retorna TODOS os dispositivos de TODAS as empresas
+                all_live
             } else {
-                crate::session_manager::list_by_company(company_id)
+                // Empresa: filtra estritamente por company_id
+                all_live.into_iter().filter(|s| s.company_id == company_id).collect()
             };
             Some(serde_json::to_value(states).map_err(|e| e.to_string()))
         }
