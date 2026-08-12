@@ -9,6 +9,8 @@ import android.content.ComponentName
 import android.app.job.JobInfo
 import android.app.job.JobScheduler
 import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -70,7 +72,10 @@ data class EsferaConfig(
 data class CheckInRequest(
     val esferaDeviceId: String,
     val currentAdbAddress: String,
-    val companyId: Int = 0
+    val companyId: Int = 0,
+    val batteryLevel: Int = 0,
+    val isCharging: Boolean = false,
+    val isScreenOn: Boolean = false
 )
 
 @Serializable
@@ -158,6 +163,11 @@ class EsferaAgentService : Service() {
     private var agentConfig: EsferaConfig? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    // URLs do check-in (base + fallback HTTP 8080) compartilhadas entre o loop
+    // periódico e o disparo imediato do NetworkCallback (troca de rede/reboot).
+    @Volatile private var checkInUrls: Pair<String, String>? = null
+    @Volatile private var useHttpFallback = false
+
     private val json = Json { ignoreUnknownKeys = true }
 
     // Trust-all OkHttpClient (apenas para TESTE com cert self-signed do VPS).
@@ -231,7 +241,12 @@ class EsferaAgentService : Service() {
         acquireWakeLock()
         android.util.Log.d("EsferaAgent", "onStartCommand: iniciando loadConfigAndStart")
         if (started.compareAndSet(false, true)) {
-            loadConfigAndStart()
+            // loadConfig() executa getProp()/Runtime.exec (bloqueante) e I/O de
+            // arquivos: roda no Dispatchers.IO do scope SupervisorJob, NUNCA na
+            // main thread. O START_STICKY + respawn cobrem kill posterior.
+            scope.launch {
+                loadConfigAndStart()
+            }
         } else {
             android.util.Log.d("EsferaAgent", "onStartCommand: ja iniciado, ignorando duplicata")
         }
@@ -272,16 +287,17 @@ class EsferaAgentService : Service() {
 
     /**
      * Lista TODOS os caminhos candidatos de configuração, na ordem de precedência:
-     * (1) external-files do app (sem permissão especial), (2) /sdcard/esfera_config.json
-     * (legado, escrito pelo desktop via adb), (3) filesDir interno. O loadConfig()
-     * varre TODOS e usa o primeiro com configuração VÁLIDA (não apenas o primeiro
-     * que existe — um arquivo vazio não deve vencer um válido em outra ordem).
+     * (1) /sdcard/esfera_config.json (injetado pelo app Desktop via adb shell echo —
+     * sobrevive a clear de dados e é a FONTE DE VERDADE), (2) external-files do app
+     * (sem permissão especial), (3) filesDir interno. O loadConfig() varre TODOS e
+     * usa o primeiro com configuração VÁLIDA (não apenas o primeiro que existe — um
+     * arquivo vazio não deve vencer um válido em outra ordem).
      */
     private fun resolveConfigCandidates(): List<File> {
         val list = mutableListOf<File>()
+        list.add(File("/sdcard/esfera_config.json"))
         val ext = getExternalFilesDir(null)
         if (ext != null) list.add(File(ext, "esfera_config.json"))
-        list.add(File("/sdcard/esfera_config.json"))
         list.add(File(filesDir, "esfera_config.json"))
         return list
     }
@@ -291,12 +307,6 @@ class EsferaAgentService : Service() {
     }
 
     private fun loadConfig(): EsferaConfig {
-        val defaultAndroidId = try {
-            Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "UNKNOWN_DEVICE"
-        } catch (e: Exception) {
-            "UNKNOWN_DEVICE"
-        }
-
         // FONTE DE VERDADE: varre TODOS os caminhos candidatos e usa o primeiro
         // com configuração VÁLIDA (serverUrl + deviceId). Um arquivo existente mas
         // vazio NÃO deve vencer um válido em outra posição da lista.
@@ -330,20 +340,68 @@ class EsferaAgentService : Service() {
         val resolvedCompany = if (fileConfig.companyId > 0) fileConfig.companyId else propCompany
         val resolvedServer = fileConfig.serverUrl.ifBlank { propServer }
 
-        val finalDeviceId = if (resolvedDeviceId.isBlank() || resolvedDeviceId == "UNIQUE_DEVICE_ID") {
-            defaultAndroidId
-        } else {
-            resolvedDeviceId
+        // BLOQUEIO DE IDENTIDADE FACTUAL: um deviceId ESF- vindo do arquivo/prop é
+        // IMUTÁVEL — nunca é substituído por ANDROID_ID (que muda em reinstall/clear
+        // de dados, gerando IDs incompatíveis e sumindo o celular da VPS). Apenas se
+        // NÃO houver nenhum ID persistido derivamos o fallback estável ESF-<serial>.
+        val finalDeviceId = when {
+            resolvedDeviceId.startsWith("ESF-") -> resolvedDeviceId
+            resolvedDeviceId.isBlank() || resolvedDeviceId == "UNIQUE_DEVICE_ID" -> deriveFallbackDeviceId()
+            else -> resolvedDeviceId
         }
 
-        // Espelha a identidade resolvida de volta no arquivo para resiliência cruzada.
+        // Espelha a identidade resolvida de volta para o armazenamento DO APP
+        // (writable sem permissão especial; o /sdcard é escrito pelo Desktop).
         try {
             val out = EsferaConfig(serverUrl = resolvedServer, deviceId = finalDeviceId, companyId = resolvedCompany)
-            val writeTarget = resolveConfigCandidates().firstOrNull { it.exists() } ?: resolveConfigCandidates().first()
+            val ext = getExternalFilesDir(null)
+            val writeTarget = if (ext != null && (ext.exists() || ext.mkdirs())) File(ext, "esfera_config.json") else File(filesDir, "esfera_config.json")
             writeTarget.writeText(json.encodeToString(EsferaConfig.serializer(), out))
         } catch (_: Exception) {}
 
+        // 2ª camada de espelho: SharedPreferences. Hoje o prefs é apenas FONTE de
+        // fallback (leitura); gravar aqui garante que a identidade factual ESF-
+        // sobrevive mesmo se os 3 arquivos de config forem limpos/inacessíveis.
+        try {
+            getSharedPreferences("esfera_agent", MODE_PRIVATE).edit()
+                .putString("serverUrl", resolvedServer)
+                .putString("deviceId", finalDeviceId)
+                .putInt("companyId", resolvedCompany)
+                .apply()
+        } catch (_: Exception) {}
+
         return EsferaConfig(serverUrl = resolvedServer, deviceId = finalDeviceId, companyId = resolvedCompany)
+    }
+
+    /**
+     * Serial físico via Build.getSerial() (API 26+ exige READ_PHONE_STATE; sem a
+     * permissão lança SecurityException e caímos no ANDROID_ID — ainda com ESF-).
+     * Seriais "unknown"/vazios também são tratados como inacessíveis.
+     */
+    private fun getSerialNumber(): String {
+        return try {
+            val s = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Build.getSerial() else Build.SERIAL
+            if (s.isNullOrBlank() || s.equals("unknown", ignoreCase = true)) "" else s
+        } catch (_: Exception) { "" }
+    }
+
+    /**
+     * Deriva o ID estável quando NÃO existe config injetada: "ESF-" + 8 primeiros
+     * caracteres do serial em MAIÚSCULAS (mesmo formato que o app Desktop cruza no
+     * commands.rs — serial ADB -> ESF-XXXX). Se o serial for inacessível (sem
+     * permissão), usa o ANDROID_ID ainda com o prefixo ESF- (nunca pelado).
+     */
+    private fun deriveFallbackDeviceId(): String {
+        val serial = getSerialNumber().uppercase()
+        if (serial.isNotBlank()) {
+            return "ESF-" + (if (serial.length >= 8) serial.substring(0, 8) else serial)
+        }
+        val androidId = try {
+            Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "UNKNOWN_DEVICE"
+        } catch (e: Exception) {
+            "UNKNOWN_DEVICE"
+        }
+        return "ESF-$androidId"
     }
 
     private fun startPresenceLoop(config: EsferaConfig) {
@@ -365,7 +423,8 @@ class EsferaAgentService : Service() {
             serverHost = host,
             wsPort = wsPort,
             companyId = config.companyId,
-            useTls = useTls
+            useTls = useTls,
+            adbAddressProvider = { resolveCurrentIp()?.let { "$it:5555" } ?: "" }
         ).apply { start() }
     }
 
@@ -392,46 +451,99 @@ class EsferaAgentService : Service() {
         val host = config.serverUrl
             .replace("https://", "").replace("http://", "")
             .substringBefore(':').substringBefore('/').ifEmpty { "34.29.70.113" }
-        val httpFallback = "http://$host:8080"
+        // Compartilhado com o disparo imediato do NetworkCallback (troca de rede).
+        checkInUrls = config.serverUrl to "http://$host:8080"
         checkInJob = scope.launch {
-            var useHttps = config.serverUrl.startsWith("https://")
+            // BACKOFF EXPONENCIAL INDESTRUTÍVEL: 2s -> 4s -> 8s -> ... -> máx 30s.
+            // Reset para 2s após sucesso. Uma falha temporária de rede NUNCA derruba
+            // a coroutine (SupervisorJob + scope próprio do check-in).
+            var backoffMs = 2_000L
             while (isActive) {
-                val ip = resolveCurrentIp()
-                android.util.Log.d("EsferaAgent", "startCheckInLoop: ip=$ip")
-                if (ip != null) {
-                    lastKnownIp = ip
-                    try {
-                        val base = if (useHttps) config.serverUrl else httpFallback
-                        val response: HttpResponse = httpClient.post("$base/api/devices/check-in") {
-                            contentType(ContentType.Application.Json)
-                            setBody(CheckInRequest(
-                                esferaDeviceId = config.deviceId,
-                                currentAdbAddress = ip,
-                                companyId = config.companyId
-                            ))
-                        }
-                        if (response.status.value == 200) {
-                            android.util.Log.d("EsferaAgent", "Check-in OK: $ip")
-                        } else {
-                            android.util.Log.w("EsferaAgent", "Check-in status ${response.status.value}: $ip")
-                        }
-                    } catch (e: Exception) {
-                        // Fallback autônomo: se HTTPS falhar (ex: handshake TLS em Android antigo),
-                        // tenta HTTP (porta 8080). Garante que o celular reporta ao VPS mesmo
-                        // em devices mais velhos ou com incompatibilidade de cipher.
-                        if (useHttps && (e.message?.contains("Handshake", true) == true
-                                    || e.message?.contains("SSL", true) == true
-                                    || e.message?.contains("trust", true) == true)) {
-                            android.util.Log.w("EsferaAgent", "HTTPS falhou ($e), usando fallback HTTP 8080")
-                            useHttps = false
-                        } else {
-                            android.util.Log.w("EsferaAgent", "Check-in falhou: ${e.message}")
-                        }
-                    }
+                if (doCheckIn(config)) {
+                    backoffMs = 2_000L
+                    delay(CHECK_IN_INTERVAL_MS)
+                } else {
+                    android.util.Log.w("EsferaAgent", "Check-in falhou; retentando em ${backoffMs}ms")
+                    delay(backoffMs + (0..1000).random().toLong())
+                    backoffMs = (backoffMs * 2).coerceIn(2_000L, 30_000L)
                 }
-                delay(CHECK_IN_INTERVAL_MS)
             }
         }
+    }
+
+    /**
+     * Check-in HTTP único (loop periódico OU disparo imediato de troca de rede).
+     * Retorna true em sucesso. O payload SEMPRE inclui o ID factual (esferaDeviceId),
+     * o endereço ADB (<IP_LOCAL:PORTA>), companyId e o estado de bateria/tela.
+     */
+    private suspend fun doCheckIn(config: EsferaConfig): Boolean {
+        val urls = checkInUrls ?: return false
+        val ip = resolveCurrentIp()
+        if (ip == null) {
+            android.util.Log.w("EsferaAgent", "doCheckIn: sem IP ativo (rede indisponível)")
+            return false
+        }
+        lastKnownIp = ip
+        val battery = batteryInfo()
+        return try {
+            val base = if (useHttpFallback) urls.second else urls.first
+            val response: HttpResponse = httpClient.post("$base/api/devices/check-in") {
+                contentType(ContentType.Application.Json)
+                setBody(CheckInRequest(
+                    esferaDeviceId = config.deviceId,
+                    currentAdbAddress = "$ip:5555",
+                    companyId = config.companyId,
+                    batteryLevel = battery.first,
+                    isCharging = battery.second,
+                    isScreenOn = isScreenInteractive()
+                ))
+            }
+            val ok = response.status.value == 200
+            if (ok) {
+                android.util.Log.d("EsferaAgent", "Check-in OK: $ip")
+            } else {
+                android.util.Log.w("EsferaAgent", "Check-in status ${response.status.value}: $ip")
+            }
+            ok
+        } catch (e: Exception) {
+            // Fallback autônomo: se HTTPS falhar (ex: handshake TLS em Android antigo),
+            // tenta HTTP (porta 8080). Garante que o celular reporta ao VPS mesmo
+            // em devices mais velhos ou com incompatibilidade de cipher.
+            if (!useHttpFallback && (e.message?.contains("Handshake", true) == true
+                        || e.message?.contains("SSL", true) == true
+                        || e.message?.contains("trust", true) == true)) {
+                android.util.Log.w("EsferaAgent", "HTTPS falhou ($e), usando fallback HTTP 8080")
+                useHttpFallback = true
+            } else {
+                android.util.Log.w("EsferaAgent", "Check-in falhou: ${e.message}")
+            }
+            false
+        }
+    }
+
+    /** Dispara um check-in HTTP imediato (usado quando a rede ACABA de ganhar IP). */
+    private fun fireImmediateCheckIn() {
+        val cfg = agentConfig ?: return
+        scope.launch { doCheckIn(cfg) }
+    }
+
+    private fun batteryInfo(): Pair<Int, Boolean> {
+        return try {
+            val bs = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = bs?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = bs?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+            val pct = if (level >= 0 && scale > 0) (level * 100 / scale.toFloat()).toInt() else 100
+            val status = bs?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+            val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                    status == BatteryManager.BATTERY_STATUS_FULL
+            Pair(pct, charging)
+        } catch (e: Exception) {
+            Pair(100, false)
+        }
+    }
+
+    private fun isScreenInteractive(): Boolean {
+        return try { powerManager.isInteractive } catch (_: Exception) { false }
     }
 
     // ----------------------------------------------------------------
@@ -690,17 +802,29 @@ class EsferaAgentService : Service() {
     }
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        // DISPARO IMEDIATO: no exato momento em que uma interface (Wi-Fi/Dados
+        // Móveis) ganha conectividade, faz check-in HTTP na hora — sem esperar o
+        // intervalo de 30s. Sem isso o celular ficava amarelo/offline na VPS após
+        // trocar de rede, ser desplugado do USB ou reiniciar.
+        override fun onAvailable(network: Network) {
+            android.util.Log.d("EsferaAgent", "onAvailable: rede ganhou conectividade — check-in imediato")
+            fireImmediateCheckIn()
+        }
+
         override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
             val ip = linkProperties.linkAddresses
                 .firstOrNull { it.address is java.net.Inet4Address }
                 ?.address?.hostAddress
             if (ip != null && ip != lastKnownIp) {
                 lastKnownIp = ip
-                android.util.Log.d("EsferaAgent", "IP mudou: $ip — reconectando túnel reverso")
+                android.util.Log.d("EsferaAgent", "IP mudou: $ip — check-in imediato + reconexão do túnel")
                 // Reconexão imediata do túnel (entrega "reconexão em ms" do design).
                 // Cancela o túnel anterior para não vazar/duplicar sockets.
                 tunnelJob?.cancel()
-                agentConfig?.let { startTunnelLoop(it) }
+                agentConfig?.let {
+                    startTunnelLoop(it)
+                    fireImmediateCheckIn()
+                }
             }
         }
     }

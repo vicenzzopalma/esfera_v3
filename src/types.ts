@@ -310,6 +310,24 @@ export const CHIP_STATUS_CONFIG: Record<ChipStatus, { label: string; color: stri
   restrito_custom: { label: "Restrito", color: "text-pink-400", bgColor: "bg-pink-500/15", borderColor: "border-pink-500/30" },
 };
 
+// --- Helper para badges de origem de conexão ---
+export type ConnectionOrigin = "vps" | "usb" | "wifi";
+
+export const CONNECTION_BADGE_CONFIG: Record<
+  ConnectionOrigin,
+  { label: string; icon: string; badgeVariant: "purple" | "info" | "success" }
+> = {
+  vps: { label: "VPS Núvem", icon: "☁️", badgeVariant: "purple" },
+  usb: { label: "ADB USB", icon: "🔌", badgeVariant: "info" },
+  wifi: { label: "Wi-Fi Direct", icon: "📡", badgeVariant: "success" },
+};
+
+export function getConnectionOrigin(device: Device): ConnectionOrigin {
+  if (device.viaTunnel) return "vps";
+  if (device.serial.includes(":")) return "wifi";
+  return "usb";
+}
+
 // --- Helper para setores ---
 export const SECTOR_CONFIG: Record<string, { label: string; color: string; headerColor: string; bgLight: string; borderLight: string }> = {
   junior: { label: "Júnior", color: "text-green-400", headerColor: "from-green-600 to-green-500", bgLight: "bg-green-50", borderLight: "border-green-200" },

@@ -110,7 +110,7 @@ struct AgentHandshake {
     #[serde(default)]
     _agent_version: String,
     #[serde(default)]
-    _current_local_ip: String,
+    current_local_ip: String,
     // NOVO: identidade de isolamento (vindo do device-agent Rust).
     #[serde(default)]
     company_id: i32,
@@ -169,13 +169,24 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
         .hardware_uuid
         .filter(|u| !u.is_empty())
         .ok_or("hardware_uuid ausente".to_string())?;
-    let company_id = if hs.company_id <= 0 { 1 } else { hs.company_id };
+    let company_id = hs.company_id;
+    if company_id <= 0 {
+        let _ = write_line(
+            &mut writer,
+            "{\"type\":\"error\",\"reason\":\"companyId ausente ou invalido\"}",
+        )
+        .await;
+        return Err(format!(
+            "handshake recusado: device {} sem companyId valido",
+            uuid
+        ));
+    }
 
     // 2. Confirma handshake
     write_line(&mut writer, "{\"type\":\"welcome\"}").await?;
 
     // 3. Abre a sessão de TÚNEL (canal EXCLUSIVO do rust). Gera novo SESSION_ID.
-    let session_id = open_tunnel(company_id, &uuid);
+    let session_id = open_tunnel(company_id, &uuid, &hs.current_local_ip);
     println!(
         "[tunnel] device {} (empresa {}) conectado — session {}",
         uuid, company_id, session_id

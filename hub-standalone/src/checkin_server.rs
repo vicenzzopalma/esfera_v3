@@ -92,7 +92,10 @@ pub async fn handle_checkin(
 ) -> (axum::http::StatusCode, &'static str) {
     use axum::http::StatusCode;
 
-    let company_id = if payload.company_id <= 0 { 1 } else { payload.company_id };
+    let company_id = payload.company_id;
+    if company_id <= 0 {
+        return (StatusCode::BAD_REQUEST, "companyId ausente ou invalido");
+    }
 
     let now = Utc::now().to_rfc3339();
     let adb_address = &payload.current_adb_address;
@@ -137,7 +140,7 @@ pub async fn handle_checkin(
     // no get_live_devices (o app só marca verde os devices com sessão ativa).
     // Antes, o check-in só gravava o DB e o session_manager ficava vazio ->
     // celulares eternamente "connecting" (amarelo) no app.
-    crate::session_manager::touch_presence(company_id, &payload.esfera_device_id);
+    crate::session_manager::touch_presence(company_id, &payload.esfera_device_id, &payload.current_adb_address);
 
     (StatusCode::OK, "ok")
 }

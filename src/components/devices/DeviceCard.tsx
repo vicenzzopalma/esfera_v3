@@ -5,7 +5,9 @@
 
 import { memo, useState, useRef, useEffect } from "react";
 import type { Device } from "../../types";
+import { getConnectionOrigin, CONNECTION_BADGE_CONFIG } from "../../types";
 import Button from "../ui/Button";
+import Badge from "../ui/Badge";
 import { api } from "../../tauri";
 import {
   Trash2,
@@ -15,6 +17,7 @@ import {
   Sliders,
   Shield,
   BatteryCharging,
+  Info,
 } from "lucide-react";
 
 interface DeviceCardProps {
@@ -27,6 +30,7 @@ interface DeviceCardProps {
   onOpenConfig: () => void;
   onOpenRegion: () => void;
   onForceWireless: () => void;
+  onOpenDiagnostic: () => void;
 }
 
 export const DeviceCard = memo(function DeviceCard({
@@ -39,12 +43,15 @@ export const DeviceCard = memo(function DeviceCard({
   onOpenConfig,
   onOpenRegion,
   onForceWireless,
+  onOpenDiagnostic,
 }: DeviceCardProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   const displayName = device.name || device.serial;
   const isUsbOnly = device.status === "online" && !device.serial.includes(":") && !device.viaTunnel;
+  const origin = getConnectionOrigin(device);
+  const originBadge = CONNECTION_BADGE_CONFIG[origin];
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -64,7 +71,6 @@ export const DeviceCard = memo(function DeviceCard({
           : "border-white/[0.07] hover:border-white/[0.15]"
       }`}
     >
-      {/* Header Line: Checkbox + Status Dot + Name + Sector + Dropdown */}
       <div className="flex items-center justify-between gap-2 border-b border-white/[0.06] pb-2.5">
         <div className="flex items-center gap-2 min-w-0">
           <input
@@ -74,10 +80,12 @@ export const DeviceCard = memo(function DeviceCard({
             className="w-3.5 h-3.5 rounded border-white/20 bg-zinc-900 text-[#5E6AD2] focus:ring-0 cursor-pointer shrink-0"
           />
 
-          {/* Status Dot */}
           <span className="relative flex h-2 w-2 shrink-0">
             {device.status === "online" && (
               <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75 animate-ping" />
+            )}
+            {device.status === "connecting" && (
+              <span className="absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75 animate-pulse" />
             )}
             <span
               className={`relative inline-flex rounded-full h-2 w-2 ${
@@ -85,6 +93,8 @@ export const DeviceCard = memo(function DeviceCard({
                   ? "bg-emerald-400"
                   : device.status === "connecting"
                   ? "bg-amber-400"
+                  : device.status === "error"
+                  ? "bg-red-400"
                   : "bg-zinc-600"
               }`}
             />
@@ -99,68 +109,81 @@ export const DeviceCard = memo(function DeviceCard({
                 {device.sector.replace("_", " ")}
               </span>
             </div>
-            <p className="text-[10px] text-zinc-500 font-mono truncate mt-0.5">
-              {device.model} {isUsbOnly && "(USB)"}
-            </p>
+            <div className="flex items-center gap-1.5 mt-0.5">
+              <p className="text-[10px] text-zinc-500 font-mono truncate">
+                {device.model}
+              </p>
+              <Badge variant={originBadge.badgeVariant} className="text-[8px] px-1 py-0">
+                {originBadge.icon} {originBadge.label}
+              </Badge>
+            </div>
           </div>
         </div>
 
-        {/* Options Dropdown */}
-        <div className="relative shrink-0" ref={menuRef}>
+        <div className="flex items-center gap-0.5 shrink-0">
           <button
-            onClick={() => setMenuOpen(!menuOpen)}
-            className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.08] transition-colors cursor-pointer"
-            title="Ações do celular"
+            onClick={onOpenDiagnostic}
+            className="p-1 rounded text-zinc-500 hover:text-[#828DF7] hover:bg-[#5E6AD2]/10 transition-colors cursor-pointer"
+            title="Diagnóstico do dispositivo"
           >
-            <MoreVertical size={14} />
+            <Info size={14} />
           </button>
 
-          {menuOpen && (
-            <div className="absolute right-0 mt-1 w-44 rounded-md bg-[#19191e] border border-white/[0.1] shadow-xl p-1 z-50 animate-scale-in text-xs">
-              <button
-                onClick={() => {
-                  setMenuOpen(false);
-                  onOpenConfig();
-                }}
-                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-zinc-300 hover:text-white hover:bg-white/[0.06] transition-colors"
-              >
-                <Sliders size={13} />
-                <span>Configurar</span>
-              </button>
+          <div className="relative shrink-0" ref={menuRef}>
+            <button
+              onClick={() => setMenuOpen(!menuOpen)}
+              className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.08] transition-colors cursor-pointer"
+              title="Ações do celular"
+            >
+              <MoreVertical size={14} />
+            </button>
 
-              <button
-                onClick={async () => {
-                  setMenuOpen(false);
-                  try {
-                    const targetSerial = (device.status === "online" && device.currentAdbAddress) ? device.currentAdbAddress : device.serial;
-                    const msg = await api<string>("provision_device", { serial: targetSerial, server_url: null });
-                    alert(`Provisionado: ${msg}`);
-                  } catch (err: any) {
-                    alert(typeof err === "string" ? err : err?.message || "Erro ao provisionar.");
-                  }
-                }}
-                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-zinc-300 hover:text-white hover:bg-white/[0.06] transition-colors"
-              >
-                <Shield size={13} className="text-emerald-400" />
-                <span>{device.esferaDeviceId ? "Reprovisionar" : "Provisionar"}</span>
-              </button>
+            {menuOpen && (
+              <div className="absolute right-0 mt-1 w-44 rounded-md bg-[#19191e] border border-white/[0.1] shadow-xl p-1 z-50 animate-scale-in text-xs">
+                <button
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onOpenConfig();
+                  }}
+                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-zinc-300 hover:text-white hover:bg-white/[0.06] transition-colors"
+                >
+                  <Sliders size={13} />
+                  <span>Configurar</span>
+                </button>
 
-              <button
-                onClick={() => {
-                  setMenuOpen(false);
-                  if (confirm(`Deseja remover ${displayName}?`)) onRemove();
-                }}
-                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-red-400 hover:bg-red-500/10 transition-colors border-t border-white/[0.06] mt-1 pt-1.5"
-              >
-                <Trash2 size={13} />
-                <span>Remover</span>
-              </button>
-            </div>
-          )}
+                <button
+                  onClick={async () => {
+                    setMenuOpen(false);
+                    try {
+                      const targetSerial = (device.status === "online" && device.currentAdbAddress) ? device.currentAdbAddress : device.serial;
+                      const msg = await api<string>("provision_device", { serial: targetSerial, server_url: null });
+                      alert(`Provisionado: ${msg}`);
+                    } catch (err: any) {
+                      alert(typeof err === "string" ? err : err?.message || "Erro ao provisionar.");
+                    }
+                  }}
+                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-zinc-300 hover:text-white hover:bg-white/[0.06] transition-colors"
+                >
+                  <Shield size={13} className="text-emerald-400" />
+                  <span>{device.esferaDeviceId ? "Reprovisionar" : "Provisionar"}</span>
+                </button>
+
+                <button
+                  onClick={() => {
+                    setMenuOpen(false);
+                    if (confirm(`Deseja remover ${displayName}?`)) onRemove();
+                  }}
+                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-red-400 hover:bg-red-500/10 transition-colors border-t border-white/[0.06] mt-1 pt-1.5"
+                >
+                  <Trash2 size={13} />
+                  <span>Remover</span>
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
-      {/* Active User Banner (if any) */}
       {activeUserDisplayName && (
         <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 text-[10px] text-emerald-300">
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
@@ -168,7 +191,6 @@ export const DeviceCard = memo(function DeviceCard({
         </div>
       )}
 
-      {/* IP/Serial & Battery */}
       <div className="flex items-center justify-between text-[10px] font-mono text-zinc-400 bg-white/[0.02] p-1.5 rounded border border-white/[0.04]">
         <span className="text-zinc-500 truncate max-w-[140px]" title={device.currentAdbAddress || device.serial}>
           {device.currentAdbAddress || device.serial}
@@ -179,7 +201,6 @@ export const DeviceCard = memo(function DeviceCard({
         </div>
       </div>
 
-      {/* Primary Actions (USB vs Wireless) */}
       {isUsbOnly ? (
         <Button
           variant="secondary"

@@ -136,6 +136,61 @@ use std::time::{Duration, Instant};
 static ADB_LIST_CACHE: std::sync::LazyLock<RwLock<(Vec<AdbDeviceInfo>, Instant)>> =
     std::sync::LazyLock::new(|| RwLock::new((Vec::new(), Instant::now() - Duration::from_secs(10))));
 
+/// Cache de QUAL serial já teve o `/sdcard/esfera_config.json` (identidade
+/// ESF-xxxx) gravado nesta sessão, para NÃO reescrever o arquivo a cada
+/// tick de 5s do get_devices (evita I/O ADB desnecessário e desgaste do flash).
+/// Chave = serial ADB; Valor = (Instant do último write, company_id usado).
+static PROVISIONED_IDENTITY_CACHE: std::sync::LazyLock<
+    RwLock<std::collections::HashMap<String, (Instant, i32)>>,
+> = std::sync::LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
+
+/// Janela máxima permitida em estado "connecting" (subtarefa 3). Um cartão só
+/// pode ficar amarelo por no máximo 15s durante uma tentativa ativa de reconexão
+/// de IP via ADB. Após isso, se não entrou em "online" nem na VPS, vira "offline".
+const CONNECTING_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Marca temporal em que cada cartão (identificado por serial) entrou em
+/// "connecting". Usada para expirar o estado amarelo eterno. Chave = serial ADB
+/// (ou esfera_device_id quando não há serial local).
+static CONNECTING_SINCE: std::sync::LazyLock<RwLock<std::collections::HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
+
+/// Retorna a chave estável de um cartão para o rastreamento de "connecting":
+/// prefere o serial ADB (mesmo com porta) e cai para esfera_device_id.
+fn connecting_key(dev: &Device) -> String {
+    if !dev.serial.is_empty() {
+        dev.serial.clone()
+    } else {
+        dev.esfera_device_id.clone().unwrap_or_default()
+    }
+}
+
+/// Garante que o celular possua `/sdcard/esfera_config.json` com deviceId
+/// = "ESF-<SERIAL_ADB_MAIUSCULO>", para que o cruzamento local x VPS seja
+/// determinístico. Reescreve no máximo 1x a cada 60s por serial (ou se a
+/// empresa mudou). Falhas (device não autorizado) são ignoradas — não bloqueiam.
+fn ensure_identity_provisioned(serial: &str, company_id: i32, server_url: &str) {
+    let now = Instant::now();
+    let needs_write = {
+        let cache = PROVISIONED_IDENTITY_CACHE.read().unwrap();
+        match cache.get(serial) {
+            Some((t, cid)) => now.duration_since(*t).as_secs() >= 60 || *cid != company_id,
+            None => true,
+        }
+    };
+    if !needs_write {
+        return;
+    }
+    if let Ok(_) = AdbManager::write_identity_config(serial, company_id, server_url) {
+        if let Ok(mut cache) = PROVISIONED_IDENTITY_CACHE.write() {
+            cache.insert(serial.to_string(), (now, company_id));
+        }
+    } else if let Ok(mut cache) = PROVISIONED_IDENTITY_CACHE.write() {
+        // Mesmo falhando, marca para não tentar de novo antes de 60s.
+        cache.insert(serial.to_string(), (now, company_id));
+    }
+}
+
 fn get_cached_adb_devices() -> Vec<AdbDeviceInfo> {
     let now = Instant::now();
     if let Ok(cache) = ADB_LIST_CACHE.read() {
@@ -173,6 +228,116 @@ fn strip_port(addr: &str) -> String {
         addr
     };
     host.trim().to_lowercase().to_string()
+}
+
+/// Normaliza um serial ADB removendo a porta (Wi-Fi "ip:porta" -> "ip") e
+/// passando a minúsculas, para comparar com identidades sem porta.
+fn normalize_serial(serial: &str) -> String {
+    strip_port(serial)
+}
+
+/// Deriva o deviceId determinístico a partir do serial ADB, idêntico ao que o
+/// agente Kotlin grava no /sdcard/esfera_config.json:
+///   serial `4200da8501667545` -> `ESF-4200DA85`
+///   (8 primeiros caracteres do serial em MAIÚSCULO, prefixados de "ESF-")
+fn device_id_from_serial(serial: &str) -> String {
+    let s = serial.to_uppercase();
+    if s.len() >= 8 {
+        format!("ESF-{}", &s[0..8])
+    } else if !s.is_empty() {
+        format!("ESF-{}", s)
+    } else {
+        String::new()
+    }
+}
+
+/// Cruzamento determinístico entre um cartão local (`d`) e um registro VPS (`live`).
+/// Retorna `true` se pertencerem ao MESMO celular físico, testando em ordem de
+/// precedência (subtarefa 2):
+///   a) d.esfera_device_id == live.esfera_device_id
+///   b) d.serial (ou limpa de porta) == live.esfera_device_id  (ou vice-versa)
+///   c) "ESF-" + 8 primeiros do d.serial == live.esfera_device_id
+///   d) Correspondência de IP local ou ADB address (normalizado, sem porta).
+fn device_matches_live(d: &Device, live: &serde_json::Value) -> bool {
+    let esfera_id = live
+        .get("esfera_device_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if esfera_id.is_empty() {
+        return false;
+    }
+    let esfera_id_up = esfera_id.to_uppercase();
+
+    // (a) esfera_device_id exato
+    if let Some(ref local_id) = d.esfera_device_id {
+        if local_id.eq_ignore_ascii_case(&esfera_id) {
+            return true;
+        }
+    }
+
+    // (b) serial local == esfera_device_id (ou vice-versa), com e sem porta
+    let serial_norm = normalize_serial(&d.serial);
+    let addr_norm = d
+        .current_adb_address
+        .as_deref()
+        .map(normalize_serial)
+        .unwrap_or_default();
+    if d.serial.eq_ignore_ascii_case(&esfera_id)
+        || serial_norm.eq_ignore_ascii_case(&esfera_id)
+        || esfera_id.eq_ignore_ascii_case(&d.serial)
+        || (!addr_norm.is_empty() && addr_norm.eq_ignore_ascii_case(&esfera_id))
+    {
+        return true;
+    }
+
+    // (c) ESF- + 8 primeiros do serial == esfera_device_id
+    let derived = device_id_from_serial(&d.serial);
+    if !derived.is_empty() && derived.eq_ignore_ascii_case(&esfera_id_up) {
+        return true;
+    }
+
+    // (d) IP local ou ADB address (normalizado sem porta): SÓ conta se um
+    // candidato LOCAL (serial/addr/ip do cartão) for igual a um candidato VPS
+    // (current_adb_address/ip do live). A comparação é cruzada (local x vps),
+    // NUNCA candidato contra si mesmo, para não gerar falso-positivo.
+    let vps_adb = live
+        .get("current_adb_address")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let vps_ip = live
+        .get("ip")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let vps_candidates: Vec<String> = vec![
+        normalize_serial(&vps_adb),
+        normalize_serial(&vps_ip),
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect();
+
+    let local_ip_norm = normalize_serial(&d.ip);
+    let local_candidates: Vec<String> = vec![
+        serial_norm,
+        addr_norm,
+        local_ip_norm,
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect();
+
+    for lc in &local_candidates {
+        for vc in &vps_candidates {
+            if lc == vc {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 #[tauri::command]
@@ -237,6 +402,18 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             } else {
                 "".to_string()
             };
+
+            // AUTO-PROVISIONAMENTO DE IDENTIDADE: qualquer device ADB autorizado
+            // ("device") recebe /sdcard/esfera_config.json com deviceId =
+            // "ESF-<SERIAL_ADB_MAIUSCULO>". Garante que o serial que o PC enxerga
+            // seja EXATAMENTE a identidade reportada pelo agente Kotlin à VPS,
+            // fechando o ciclo do cruzamento determinístico (subtarefa 1). Só faz
+            // sentido quando já está autorizado (shell funciona); para "unauthorized"
+            // o ADB bloqueia escrita, então pulamos (será provido após autorizar).
+            if adb_dev.state == "device" {
+                let esfera_cfg_server = "http://34.29.70.113:31000".to_string();
+                ensure_identity_provisioned(&adb_dev.serial, target_company_id, &esfera_cfg_server);
+            }
 
             let status = if adb_dev.state == "device" {
                 "online".to_string()
@@ -327,49 +504,57 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         }
 
         for dev in &mut refreshed_db {
-            // Devices só-túnel (identidade estável via EsferaDeviceId) com sessão ativa
-            // NÃO devem ser forçados a offline: o túnel reverso é a fonte de verdade da
-            // conexão. O loop anterior já marcou via_tunnel/online quando is_tunnel_active.
             if dev.via_tunnel {
-                if let Some(ref uuid) = dev.esfera_device_id {
-                    if crate::tunnel_server::is_tunnel_active(uuid) {
-                        dev.status = "online".to_string();
-                    } else {
-                        // Sessão de túnel caiu (hub fechado/reabriu): mantém o device visível
-                        // como "connecting" em vez de sumir, e o agente reconecta sozinho.
-                        if dev.status == "online" {
-                            dev.status = "connecting".to_string();
-                        }
-                    }
-                }
+                // Celular remoto (via VPS) ou túnel direto desktop<->celular.
+                // O status de verdade JÁ foi definido acima:
+                //   - túnel direto: o bloco is_tunnel_active setou via_tunnel=true e status="online".
+                //   - remoto VPS: o loop get_live_devices (abaixo) setou status conforme a VPS.
+                // Não sobrescrever: confia no que veio da VPS.
                 continue;
             }
 
             let is_active = active_adb_list.iter().any(|adb_d| adb_d.serial == dev.serial);
             if is_active {
+                // Presente no ADB local ativo: online e limpa qualquer timer de connecting.
                 dev.status = "online".to_string();
+                let _ = CONNECTING_SINCE.write().map(|mut m| m.remove(&connecting_key(dev)));
             } else if dev.esfera_device_id.is_some() || dev.current_adb_address.is_some() || !dev.ip.is_empty() {
-                // Se o dispositivo possui EsferaDeviceId, IP ou ADB address cadastrado,
-                // mantém como "connecting" em vez de marcar offline abruptamente.
-                if dev.status != "connecting" {
-                    dev.status = "connecting".to_string();
-                }
-                let ip_target = if !dev.ip.is_empty() {
-                    dev.ip.clone()
-                } else if dev.serial.contains(':') {
-                    dev.serial.split(':').next().unwrap_or("").to_string()
-                } else {
-                    "".to_string()
+                // Possui identidade/endereço mas NÃO está no ADB local agora:
+                // permite "connecting" SÓ durante a janela de reconexão de IP (15s).
+                // Após o timeout, vira "offline" (subtarefa 3) — nunca amarelo eterno.
+                let key = connecting_key(dev);
+                let entered_at = {
+                    let mut map = CONNECTING_SINCE.write().unwrap();
+                    *map.entry(key.clone()).or_insert_with(Instant::now)
                 };
-
-                if !ip_target.is_empty() && ip_target.contains('.') {
-                    let port = if dev.port > 0 { dev.port } else { 5555 };
-                    std::thread::spawn(move || {
-                        let _ = AdbManager::connect_device(&ip_target, port);
-                    });
+                let elapsed = Instant::now().duration_since(entered_at);
+                if elapsed <= CONNECTING_TIMEOUT {
+                    // Ainda dentro da janela: mantém "connecting" e dispara 1 tentativa de reconexão.
+                    if dev.status != "connecting" {
+                        dev.status = "connecting".to_string();
+                    }
+                    let ip_target = if !dev.ip.is_empty() {
+                        dev.ip.clone()
+                    } else if dev.serial.contains(':') {
+                        dev.serial.split(':').next().unwrap_or("").to_string()
+                    } else {
+                        "".to_string()
+                    };
+                    // Só Wi-Fi (IP) tenta reconexão ADB; USB sem presença vira offline no timeout.
+                    if !ip_target.is_empty() && ip_target.contains('.') {
+                        let port = if dev.port > 0 { dev.port } else { 5555 };
+                        std::thread::spawn(move || {
+                            let _ = AdbManager::connect_device(&ip_target, port);
+                        });
+                    }
+                } else {
+                    // Janela estourou: sem ADB local e sem VPS -> offline definitivo.
+                    dev.status = "offline".to_string();
+                    let _ = CONNECTING_SINCE.write().map(|mut m| m.remove(&key));
                 }
             } else {
                 dev.status = "offline".to_string();
+                let _ = CONNECTING_SINCE.write().map(|mut m| m.remove(&connecting_key(dev)));
             }
         }
 
@@ -447,51 +632,28 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         for live in &live_vps {
             let esfera_id = live.get("esfera_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if esfera_id.is_empty() { continue; }
-            let vps_status = live.get("status").and_then(|v| v.as_str()).unwrap_or("Offline");
-            let mapped_status = match vps_status {
-                "Online" | "Degraded" => "online",
+            let vps_status = live.get("status").and_then(|v| v.as_str()).unwrap_or("offline");
+            // A VPS reporta status em lowercase ("online"/"degraded"/"offline").
+            // Comparar case-insensitive para nao cair sempre no branch "offline"
+            // (o que deixava os celulares remotos vermelhos/ausentes no app).
+            let mapped_status = match vps_status.to_lowercase().as_str() {
+                "online" | "degraded" => "online",
                 _ => "offline",
             }.to_string();
             let battery = live.get("battery_level").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             let vps_adb_addr = live.get("current_adb_address").and_then(|v| v.as_str()).unwrap_or("");
             let vps_ip = live.get("ip").and_then(|v| v.as_str()).unwrap_or("");
 
-            // Unifica local ADB + VPS remoto se pertencerem ao mesmo celular físico.
-            // Normaliza os endereços (tira a porta) antes de comparar, porque o
-            // serial ADB Wi-Fi vem como "192.168.1.151:5555" mas o VPS pode reportar
-            // "192.168.1.151" (sem porta) em current_adb_address/ip. Sem normalizar,
-            // o app criava 2 cartões para o mesmo celular (ex.: Samsung no ADB Wi-Fi
-            // + agente VPS).
-            let vps_ip_base = strip_port(vps_adb_addr);
-            let vps_ip2_base = strip_port(vps_ip);
-            // Correlação determinística serial <-> esfera_device_id: o agente Kotlin
-            // usa deviceId = "ESF-" + 8 primeiros do serial ADB em maiúsculo
-            // (ex: serial 4200da8501667545 -> ESF-4200DA85). Sem isso, o cartão
-            // local (serial) não cruzava com o live_vps (ESF-xxxx) e o celular
-            // remoto/SOLTO ficava amarelo eternamente mesmo com presença na VPS.
-            let existing_pos = refreshed_db.iter().position(|d| {
-                // deviceId do agente = "ESF-" + 8 primeiros do serial em maiúsculo
-                let serial_prefix = d.serial.to_uppercase();
-                let esfera_from_serial = if serial_prefix.len() >= 8 {
-                    format!("ESF-{}", &serial_prefix[0..8])
-                } else if !serial_prefix.is_empty() {
-                    format!("ESF-{}", serial_prefix)
-                } else {
-                    String::new()
-                };
-                d.esfera_device_id.as_deref() == Some(esfera_id.as_str())
-                    || d.serial == esfera_id
-                    || esfera_from_serial == esfera_id.to_uppercase()
-                    || (!vps_adb_addr.is_empty()
-                        && (d.serial == vps_adb_addr
-                            || d.current_adb_address.as_deref() == Some(vps_adb_addr)
-                            || strip_port(&d.serial) == vps_ip_base
-                            || strip_port(d.current_adb_address.as_deref().unwrap_or("")) == vps_ip_base))
-                    || (!vps_ip_base.is_empty()
-                        && (strip_port(&d.ip) == vps_ip_base || strip_port(&d.serial) == vps_ip_base))
-                    || (!vps_ip2_base.is_empty()
-                        && (strip_port(&d.ip) == vps_ip2_base || strip_port(&d.serial) == vps_ip2_base))
-            });
+            // Cruzamento determinístico local ADB + VPS remoto (subtarefa 2):
+            // usa device_matches_live() que testa em ordem de precedência
+            // (a) esfera_device_id == live.esfera_device_id;
+            // (b) serial (ou limpa de porta) == live.esfera_device_id (ou vice-versa);
+            // (c) "ESF-" + 8 primeiros do serial == live.esfera_device_id;
+            // (d) IP local / ADB address normalizado (sem porta).
+            // NUNCA cria um segundo cartão quando há match em qualquer critério.
+            let existing_pos = refreshed_db
+                .iter()
+                .position(|d| device_matches_live(d, live));
 
             if let Some(pos) = existing_pos {
                 refreshed_db[pos].via_tunnel = true;
@@ -2651,6 +2813,85 @@ pub fn rotate_master_token(
         .db
         .upsert_company_token(0, &new_token, "master")
         .map_err(|e| format!("Falha ao gravar token master: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn dev_with(serial: &str, esfera_id: Option<&str>, ip: &str, addr: Option<&str>) -> Device {
+        Device {
+            id: 0,
+            serial: serial.to_string(),
+            name: String::new(),
+            brand: String::new(),
+            model: String::new(),
+            ip: ip.to_string(),
+            port: 5555,
+            status: "offline".to_string(),
+            battery: 0,
+            company_id: 1,
+            device_number: 1,
+            sector: "junior".to_string(),
+            esfera_device_id: esfera_id.map(|s| s.to_string()),
+            current_adb_address: addr.map(|s| s.to_string()),
+            last_seen_utc: None,
+            via_tunnel: false,
+        }
+    }
+
+    #[test]
+    fn crossing_by_esfera_id_exact() {
+        let d = dev_with("R58M1234567", Some("ESF-4200DA85"), "", None);
+        let live = json!({"esfera_device_id":"ESF-4200DA85","status":"online"});
+        assert!(device_matches_live(&d, &live));
+    }
+
+    #[test]
+    fn crossing_by_serial_equals_esfera_id() {
+        // USB serial sem porta == live.esfera_device_id
+        let d = dev_with("4200da8501667545", None, "", None);
+        let live = json!({"esfera_device_id":"4200da8501667545","status":"online"});
+        assert!(device_matches_live(&d, &live));
+    }
+
+    #[test]
+    fn crossing_by_serial_prefix() {
+        // (c) ESF- + 8 primeiros do serial == live.esfera_device_id
+        let d = dev_with("4200da8501667545", None, "", None);
+        let live = json!({"esfera_device_id":"ESF-4200DA85","status":"online"});
+        assert!(device_matches_live(&d, &live));
+    }
+
+    #[test]
+    fn crossing_by_ip_normalized() {
+        // WiFi serial "192.168.1.151:5555" cruza com live.ip "192.168.1.151"
+        let d = dev_with("192.168.1.151:5555", None, "192.168.1.151", Some("192.168.1.151:5555"));
+        let live = json!({"esfera_device_id":"ESF-ABCDEF12","status":"online","current_adb_address":"192.168.1.151","ip":"192.168.1.151"});
+        assert!(device_matches_live(&d, &live));
+    }
+
+    #[test]
+    fn no_crossing_for_different_device() {
+        let d = dev_with("R58M9999999", Some("ESF-11111111"), "", None);
+        let live = json!({"esfera_device_id":"ESF-22222222","status":"online"});
+        assert!(!device_matches_live(&d, &live));
+    }
+
+    #[test]
+    fn empty_esfera_id_never_matches() {
+        let d = dev_with("R58M1234567", None, "", None);
+        let live = json!({"esfera_device_id":"","status":"online"});
+        assert!(!device_matches_live(&d, &live));
+    }
+
+    #[test]
+    fn device_id_from_serial_derivation() {
+        assert_eq!(device_id_from_serial("4200da8501667545"), "ESF-4200DA85");
+        assert_eq!(device_id_from_serial("R58M1234567"), "ESF-R58M1234");
+        assert_eq!(device_id_from_serial("abc"), "ESF-ABC");
+    }
 }
 
 
