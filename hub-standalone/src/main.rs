@@ -1,5 +1,5 @@
 use esfera_hub_standalone::{
-    checkin_server, db, hub, presence_server, protocol, session_manager, tls_server, tunnel_server,
+    checkin_server, db, hub, mqtt_fallback_server, presence_server, protocol, session_manager, tls_server, tunnel_server,
 };
 use std::env;
 use std::io::Write;
@@ -74,8 +74,17 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8888);
+    let tp = tunnel_port;
     tokio::spawn(async move {
-        tunnel_server::start(tunnel_port).await;
+        match tunnel_server::start(tp).await {
+            Ok(()) => {}
+            Err(e) => {
+                // Erro CRÍTICO: o handler de túnel não subiu (ex: porta 8888 já
+                // ocupada por zumbi/segunda instância). Sem isso, o agente conecta
+                // num processo que não responde handshake e o celular nunca aparece.
+                eprintln!("❌ TUNNEL SERVER FALHOU AO SUBIR: {}", e);
+            }
+        }
     });
 
     // 6. Presence WebSocket (agente KOTLIN) :7779 — telemetria
@@ -100,9 +109,18 @@ async fn main() {
         tls_server::start(db_tls, tls_port).await;
     });
 
+    // 8. MQTT Fallback Server :1883 — Canal Secundário Redundante
+    let mqtt_port: u16 = env::var("MQTT_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(1883);
+    tokio::spawn(async move {
+        mqtt_fallback_server::start(mqtt_port).await;
+    });
+
     println!(
-        "Hub Standalone ATIVO: master={} checkin={} tunnel={} presence={} tls={}",
-        port, http_port, tunnel_port, presence_port, tls_port
+        "Hub Standalone ATIVO: master={} checkin={} tunnel={} presence={} tls={} mqtt={}",
+        port, http_port, tunnel_port, presence_port, tls_port, mqtt_port
     );
     let _ = std::io::stdout().flush();
 

@@ -79,6 +79,7 @@ export function DeviceIdentityModal({ isOpen, onClose, device }: DeviceIdentityM
     offline: { label: "Offline", dot: "bg-zinc-600", text: "text-zinc-400" },
     error: { label: "Erro", dot: "bg-red-400", text: "text-red-400" },
     online_agent: { label: "Online (Agente)", dot: "bg-emerald-400", text: "text-emerald-400" },
+    degraded: { label: "Degradado (sem ADB)", dot: "bg-amber-500", text: "text-amber-400" },
   };
 
   const status = statusConfig[device.status] || statusConfig.offline;

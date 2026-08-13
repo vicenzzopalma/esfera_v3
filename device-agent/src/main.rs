@@ -8,7 +8,8 @@
 use rand::Rng;
 use serde_json::{json, Value};
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::io::ErrorKind;
 use std::net::{Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::process::Command;
 use std::time::Duration;
@@ -188,29 +189,106 @@ fn handle_proxy(
     // 2. Confirma para o hub
     write_line(stream, &json!({"type": "proxy-ack"}).to_string())?;
 
-    // 3. Relay bruto: limpa timeouts (a sessão vira binária) e faz copy 2 vias.
-    //    Usa clones do socket — o shutdown de qualquer lado derruba o par.
-    let _ = stream.set_read_timeout(None);
-    let _ = local.set_read_timeout(None);
+    // 3. Relay binário com timeout de atividade: NUNCA removemos o read_timeout
+    //    (bug anterior deixava o std::io::copy travado para sempre quando o adbd
+    //    fechava sem EOF limpo, matando o loop de reconexão). Agora cada lado tem
+    //    read_timeout e um watchdog de inatividade encerra o relay se nada fluir,
+    //    garantindo que run_session retorne Err e o main() reconecte.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = local.set_read_timeout(Some(Duration::from_secs(5)));
+
     let mut raw_read = std::mem::replace(reader, BufReader::new(stream.try_clone().map_err(|e| e.to_string())?))
         .into_inner();
     let mut raw_write = stream.try_clone().map_err(|e| e.to_string())?;
     let mut local_read = local.try_clone().map_err(|e| e.to_string())?;
-    let local_shutdown = local.try_clone().map_err(|e| e.to_string())?;
-    let hub_shutdown = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut local_write = local.try_clone().map_err(|e| e.to_string())?;
 
-    let t1 = std::thread::spawn(move || {
-        // Hub -> adbd
-        let _ = std::io::copy(&mut raw_read, &mut local);
-        let _ = local_shutdown.shutdown(Shutdown::Both);
-        let _ = hub_shutdown.shutdown(Shutdown::Both);
+    // Watchdog: se nenhum byte fluir em 120s, derruba os sockets (copy termina).
+    let watchdog_raw = raw_read.try_clone().ok();
+    let watchdog_local = local_read.try_clone().ok();
+    let last_activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    ));
+    let wd_last = last_activity.clone();
+    let _wd = std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(10));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let last = wd_last.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(last) > 120 {
+                let _ = watchdog_raw.as_ref().map(|s| s.shutdown(Shutdown::Both));
+                let _ = watchdog_local.as_ref().map(|s| s.shutdown(Shutdown::Both));
+                break;
+            }
+        }
     });
-    let t2 = std::thread::spawn(move || {
-        // adbd -> Hub
-        let _ = std::io::copy(&mut local_read, &mut raw_write);
-        let _ = raw_write.shutdown(Shutdown::Both);
-        let _ = local_read.shutdown(Shutdown::Both);
-    });
+
+    let mark_now = |la: &std::sync::Arc<std::sync::atomic::AtomicU64>| {
+        la.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    };
+
+    // Hub -> adbd
+    let t1 = {
+        let mut src = raw_read.try_clone().map_err(|e| e.to_string())?;
+        let mut dst = local_write.try_clone().map_err(|e| e.to_string())?;
+        let la = last_activity.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match src.read(&mut buf) {
+                    Ok(0) => break,                       // EOF: adbd fechou
+                    Ok(n) => {
+                        if dst.write_all(&buf[..n]).is_err() { break; }
+                        let _ = dst.flush();
+                        mark_now(&la);
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock
+                        || e.kind() == ErrorKind::TimedOut => continue, // keepalive, segue
+                    Err(_) => break,
+                }
+            }
+            let _ = src.shutdown(Shutdown::Both);
+            let _ = dst.shutdown(Shutdown::Both);
+        })
+    };
+
+    // adbd -> Hub
+    let t2 = {
+        let mut src = local_read.try_clone().map_err(|e| e.to_string())?;
+        let mut dst = raw_write.try_clone().map_err(|e| e.to_string())?;
+        let la = last_activity.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match src.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if dst.write_all(&buf[..n]).is_err() { break; }
+                        let _ = dst.flush();
+                        mark_now(&la);
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock
+                        || e.kind() == ErrorKind::TimedOut => continue,
+                    Err(_) => break,
+                }
+            }
+            let _ = src.shutdown(Shutdown::Both);
+            let _ = dst.shutdown(Shutdown::Both);
+        })
+    };
+
     let _ = t1.join();
     let _ = t2.join();
 
@@ -319,5 +397,63 @@ fn main() {
             total_ms, attempt
         );
         std::thread::sleep(Duration::from_millis(total_ms));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Validação FUNCIONAL da CORREÇÃO A: o relay em handle_proxy NÃO pode
+    /// travar quando o adbd (lado local) fecha a conexão. Antes da correção,
+    /// std::io::copy com read_timeout(None) travava o loop de reconexão.
+    /// Aqui simulamos: fake adbd na 5555, fake hub na 9999. O hub manda
+    /// "proxy" e depois fecha; o adbd aceita e fecha após um instante.
+    /// O teste PASSED significa que handle_proxy RETORNOU (não travou).
+    #[test]
+    fn relay_termina_quando_adbd_fecha() {
+        // Fake adbd: aceita 1 conexão, some após 150ms (simula adbd morto).
+        let adbd = TcpListener::bind("127.0.0.1:5555").unwrap();
+        let adbd_h = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = adbd.accept() {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let _ = s.shutdown(Shutdown::Both);
+            }
+        });
+
+        // Fake hub: aceita 1 conexão, manda "proxy 5555" e fecha após 400ms.
+        let hub = TcpListener::bind("127.0.0.1:9999").unwrap();
+        let hub_h = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = hub.accept() {
+                let _ = s.write_all(b"{\"type\":\"proxy\",\"port\":5555}\n");
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let _ = s.shutdown(Shutdown::Both);
+            }
+        });
+
+        // Conecta ao fake hub como se fosse o agente.
+        let _stream = TcpStream::connect("127.0.0.1:9999").unwrap();
+
+        // Se handle_proxy travasse (bug antigo), este teste excederia o tempo
+        // e falharia. Com a correção, ele RETORNA Ok(true) quando o adbd fecha.
+        let result = handle_proxy(&mut stream_clone_for_test(), &mut reader_for_test(), 5555);
+        let _ = adbd_h.join();
+        let _ = hub_h.join();
+
+        match result {
+            Ok(true) => {} // relay encerrou corretamente -> correção OK
+            Ok(false) => panic!("relay retornou false (adbd local inalcançável, mas não deveria travar)"),
+            Err(e) => panic!("handle_proxy retornou erro inesperado: {}", e),
+        }
+    }
+
+    // Helpers: reconectam ao fake hub para isolar o teste do borrow do stream acima.
+    fn stream_clone_for_test() -> TcpStream {
+        TcpStream::connect("127.0.0.1:9999").unwrap()
+    }
+    fn reader_for_test() -> BufReader<TcpStream> {
+        BufReader::new(TcpStream::connect("127.0.0.1:9999").unwrap())
     }
 }

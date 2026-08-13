@@ -1,421 +1,470 @@
-# Tarefa Original: Auditoria e avaliacao do Conselho de IAs para APROVACAO DO ESTADO ATUAL do sistema Esfera v3 (v3.13.0): Arquitetura Hibrida MDM Enterprise (Device Owner / DPC com AdminReceiver), resiliencia de check-in com auto-provisionamento de CompanyId em Rust db.rs, transporte encriptado TLS 443/8443 no VPS hub-standalone, motor de roteamento C++ com AVX2/SIMD, e allowlist de comandos remotos de seguranca no agente Kotlin
+# Tarefa Original: Análise completa e revisão da arquitetura do Esfera v3: solução da sincronização de dispositivos entre ADB local e Hub VPS, cruzamento determinístico de identidade (serial ADB vs esfera_device_id), fim dos cartões amarelos presos em connecting, resiliência do agente Android Kotlin, persistência no session_manager do Hub VPS e visualização no App Desktop Tauri/React.
 
 ## 1. Visão do Arquiteto
 
-Aqui está o mapa arquitetural e de implementação para o sistema **Esfera v3 (v3.13.0)**, estruturado para atender aos requisitos de MDM, resiliência, transporte seguro, roteamento de alta performance e auditoria pelo Conselho de IAs.
+Como Arquiteto de Software Sênior, aqui está o mapa arquitetural completo para a revisão do **Esfera v3**. Este documento define exatamente o que deve ser construído, sem implementação de código, servindo como blueprint direto para os desenvolvedores.
+
+---
 
 ### 1. Arquitetura Geral e Padrões
-*   **Topologia**: Monorepo Poliglota com fronteiras FFI (Foreign Function Interface) estritas e contrato de dados via Protobuf/FlatBuffers.
-*   **MDM (Kotlin/Android)**: Padrão `Device Owner` com `DeviceAdminReceiver` (Proxy/Receiver) para imposição de políticas de segurança.
-*   **Resiliência e DB (Rust)**: Padrão `Repository` em `db.rs` usando `tokio` (assíncrono) e `rusqlite`/`sqlx` para auto-provisionamento de `CompanyId` com retry/backoff.
-*   **Transporte (VPS Hub - Rust)**: Padrão `Async Server` (`tokio` + `rustls`) escutando TLS 1.3 nas portas 443/8443.
-*   **Motor de Roteamento (C++)**: Padrão `Strategy` com otimização `SIMD/AVX2` via intrínsecos (`<immintrin.h>`), exposto via ABI C (`extern "C"`) para FFI com o Hub Rust.
-*   **Allowlist (Kotlin)**: Padrão `Command Pattern` com `Map<CommandId, SecurityAction>` imutável (thread-safe).
-*   **Conselho de IAs (Auditoria)**: Padrão `Observer/Pipeline` (Módulo Rust no Hub) que coleta telemetria assinada (Ed25519) dos nós e emite `ApprovalState`.
+
+*   **Topologia**: Estrela desacoplada. O App Desktop (Local) e o Agente Android (Remoto) são "Edges" que se conectam exclusivamente ao Hub VPS (Centro).
+*   **Padrão de Identidade (Determinístico)**: 
+    *   Uso de **Função Pura de Hash** (ex: `SHA-256`) combinando o `serial ADB` + `SALT_GLOBAL_DA_ESFERA`.
+    *   O `esfera_device_id` deve ser calculado no Edge (Desktop e Agent) e apenas validado/cruzado no Hub. Isso garante idempotência e elimina race conditions de ID.
+*   **Padrão de Estado (FSM - Finite State Machine)**:
+    *   Estados rígidos para matar os "cartões amarelos": `DISCOVERED` (visto por 1 lado) -> `CONNECTING` (visto por ambos, aguardando handshake) -> `ACTIVE` (heartbeat ok) -> `STALE`/`OFFLINE` (timeout).
+    *   **Regra Anti-Travamento**: O estado `CONNECTING` terá um **TTL estrito de 10 segundos**. Se não houver transição para `ACTIVE`, a FSM força `STALE` e emite evento de limpeza.
+*   **Padrão de Resiliência**:
+    *   **Agent Kotlin**: `Exponential Backoff` para reconexão WS e `Foreground Service` com `WorkManager` para crash recovery.
+    *   **Hub VPS**: `Heartbeat Monitor` (Ping/Pong a cada 3s, Timeout de 9s).
+*   **Padrão de Comunicação UI (Tauri/React)**:
+    *   **Observer Pattern** via `EventEmitter` do Tauri. O React não faz polling; ele escuta eventos do Rust que por sua vez escuta o Hub.
+
+---
 
 ### 2. Fluxo Lógico de Execução
-1.  **Inicialização MDM**: Agente Kotlin é provisionado como Device Owner; `AdminReceiver` registra políticas restritas.
-2.  **Check-in Resiliente**: Agente Kotlin abre canal TLS 443 com o Hub. Em caso de falha de rede, executa retry com jitter exponencial.
-3.  **Auto-Provisionamento (Rust)**: Hub recebe o handshake e chama `db.rs::ensure_company_id()`. Se o `CompanyId` estiver ausente, gera e persiste atomicamente.
-4.  **Roteamento (C++)**: Hub invoca `librouting::compute_route_avx2()` via FFI para processar a regra de roteamento do payload com instruções vetoriais.
-5.  **Execução Segura**: Hub envia comando cifrado ao Agente. O Agente valida o `CommandId` contra a `SecurityAllowlist` antes de executar qualquer ação.
-6.  **Auditoria (AI Council)**: Módulo de Auditoria consome snapshots de saúde (Kotlin, Rust DB, C++ Engine). Valida integridade (AVX2 ativo, TLS válido, Allowlist intacta, CompanyId presente) e emite `SystemApproval::Approved` ou `Rejected`.
+
+1.  **Descoberta Local (Desktop/Tauri)**:
+    *   Tauri executa scanner ADB (via lib Rust ou shell).
+    *   Para cada `serial`, gera `esfera_device_id = Hash(serial + SALT)`.
+    *   Envia payload `EDGE_DISCOVERY` via WebSocket para o Hub VPS.
+2.  **Descoberta Remota (Agent Kotlin)**:
+    *   Agent coleta `Build.getSerial()` (ou `android_id` como fallback).
+    *   Gera o mesmo `esfera_device_id` localmente.
+    *   Conecta no Hub VPS e envia `AGENT_HELLO` com o ID e metadados do aparelho.
+3.  **Cruzamento e FSM (Hub VPS - session_manager)**:
+    *   `IdentityResolver` recebe os dois eventos. Se os hashes batem -> instancia/atualiza a sessão para `CONNECTING`.
+    *   Inicia timer de 10s (TTL).
+    *   Se Heartbeats de ambos os lados confirmarem -> `ACTIVE`. Timer cancelado.
+    *   Se timer estourar -> `STALE` (Cartão Amarelo resolvido para Vermelho/Cinza).
+4.  **Persistência e Push**:
+    *   `SessionRepository` salva o estado no Redis (cache de estado) e opcionalmente em SQLite (histórico).
+    *   Hub emite `DEVICE_STATE_CHANGED` via WS para o Desktop.
+5.  **Renderização (React)**:
+    *   Tauri recebe WS, emite evento `on_device_update` para o React.
+    *   Zustand Store atualiza o array de dispositivos.
+    *   `DeviceCard.tsx` aplica cor baseada no estado (Verde=Active, Amarelo=Connecting<TTL, Vermelho=Stale/Offline).
+
+---
 
 ### 3. Estrutura de Arquivos, Funções e Bibliotecas
 
-```text
-esfera-v3/
-├── android-agent/ (Kotlin)
-│   ├── build.gradle (Dep: androidx.work, okhttp, protobuf)
-│   ├── receiver/
-│   │   └── EsferaAdminReceiver.kt (Extends DeviceAdminReceiver)
-│   ├── network/
-│   │   └── SecureCheckInClient.kt (OkHttp com TLS Pinning)
-│   ├── security/
-│   │   └── CommandAllowlist.kt (Map imutável de comandos permitidos)
-│   └── audit/
-│       └── CouncilTelemetry.kt (Coleta e assina estado local p/ o Hub)
-│
-├── hub-standalone/ (Rust)
-│   ├── Cargo.toml (Dep: tokio, rustls, rusqlite, serde, ed25519-dalek)
-│   ├── src/
-│   │   ├── main.rs (Bootstrap do servidor TLS 443/8443)
-│   │   ├── db.rs (Lógica de persistência e CompanyId)
-│   │   ├── ffi.rs (Links externos para librouting C++)
-│   │   └── ai_council.rs (Motor de auditoria e aprovação)
-│
-├── routing-engine/ (C++)
-│   ├── CMakeLists.txt (Flags: -mavx2 -O3)
-│   ├── include/
-│   │   └── routing.h (Assinaturas extern "C")
-│   └── src/
-│       └── router_avx2.cpp (Lógica SIMD com _mm256_*)
-│
-└── shared-proto/ (Protobuf)
-    └── esfera.proto (Definição de CheckIn, Command, AuditSnapshot)
-```
+#### A. Hub VPS (Node.js/TypeScript ou Rust)
+*   **`src/core/session/StateMachine.ts`**
+    *   *Função*: `transition(deviceId, newState)`, `registerTTL(deviceId, ms)`.
+    *   *Responsabilidade*: Garantir que `CONNECTING` nunca dure > 10s.
+*   **`src/core/identity/Resolver.ts`**
+    *   *Função*: `matchEdges(localHash, remoteHash): boolean`.
+*   **`src/infra/ws/Gateway.ts`**
+    *   *Função*: `broadcast(event, payload)`, `handleConnection(socket)`.
+*   **`src/infra/persistence/SessionRepository.ts`**
+    *   *Função*: `save(session)`, `findByHash(hash)`.
+*   **Bibliotecas**: `ws` (WebSocket), `ioredis` (Persistência em memória), `crypto` (nativo p/ hash).
 
-**Assinaturas de Funções Essenciais (Para o Desenvolvedor Implementar):**
+#### B. Android Agent (Kotlin)
+*   **`app/.../identity/DeviceIdentity.kt`**
+    *   *Função*: `generateEsferaId(): String` (usa `MessageDigest` com SHA-256).
+*   **`app/.../network/WsClient.kt`**
+    *   *Função*: `connectWithBackoff()`, `sendHeartbeat()`.
+    *   *Lib*: `okhttp` (WS), `kotlinx-coroutines` (async).
+*   **`app/.../core/AgentService.kt`**
+    *   *Função*: `onCreate()` (Foreground service para evitar kill do SO).
+    *   *Lib*: `androidx.work` (para resiliência de boot).
 
-*   **Kotlin (`EsferaAdminReceiver.kt`)**:
-    ```kotlin
-    class EsferaAdminReceiver : DeviceAdminReceiver() {
-        override fun onEnabled(context: Context, intent: Intent) { /* Lock task mode */ }
-        override fun onReceive(context: Context, intent: Intent) { /* Proxy p/ allowlist */ }
-    }
-    ```
-*   **Kotlin (`CommandAllowlist.kt`)**:
-    ```kotlin
-    object CommandAllowlist {
-        val allowed: Map<String, (Context) -> Unit> = mapOf(
-            "SEC_WIPE" to { ctx -> /* lógica DPC */ },
-            "SEC_LOCK" to { ctx -> /* lock now */ }
-        )
-    }
-    ```
-*   **Rust (`db.rs`)**:
-    ```rust
-    pub async fn ensure_company_id(device_hash: &str) -> Result<String, DbError> {
-        // 1. SELECT company_id FROM devices WHERE hash = ?
-        // 2. Se None: INSERT com UUIDv4 (auto-provisioning)
-        // 3. Retorna CompanyId
-    }
-    ```
-*   **C++ (`routing.h` / `router_avx2.cpp`)**:
-    ```cpp
-    extern "C" RoutingResult* route_packet_avx2(const uint8_t* payload, size_t len);
-    // Implementação usa __m256i para processar regras de roteamento em paralelo.
-    ```
-*   **Rust (`ai_council.rs`)**:
-    ```rust
-    pub struct AuditEngine;
-    impl AuditEngine {
-        pub fn evaluate_and_approve(snapshot: &SystemSnapshot) -> ApprovalStatus {
-            // Valida: TLS ativo, AVX2 disponível (via FFI), Allowlist não violada, CompanyId != ""
-            // Retorna ApprovalStatus::Approved ou Rejected
-        }
-    }
-    ```
+#### C. Desktop App (Tauri/Rust)
+*   **`src-tauri/src/adb/scanner.rs`**
+    *   *Função*: `list_devices() -> Vec<AdbDevice>` (usa `rust-adb` crate ou `std::process::Command` chamando `adb devices -l`).
+*   **`src-tauri/src/vps/hub_client.rs`**
+    *   *Função*: `listen() -> emit_event()` (usa `tokio-tungstenite` para WS).
+*   **`src-tauri/src/commands.rs`**
+    *   *Função*: `#[tauri::command] sync_adb()` (FFI exposta ao React).
+*   **Bibliotecas**: `tauri`, `tokio`, `tokio-tungstenite`, `serde`.
 
-**Bibliotecas Críticas:**
-*   **Kotlin**: `androidx.work`, `okhttp3`, `protobuf-kotlin`.
-*   **Rust**: `tokio` (async), `rustls` (TLS), `rusqlite` (DB), `cbindgen` (geração de header C++), `ed25519-dalek` (assinaturas de auditoria).
-*   **C++**: `STL`, `<immintrin.h>` (intrínsecos AVX2), `CMake`.
+#### D. Desktop App (React)
+*   **`src/store/deviceStore.ts`**
+    *   *Função*: `useDeviceStore` (Zustand para estado global reativo).
+*   **`src/hooks/useTauriEvents.ts`**
+    *   *Função*: `listen('on_device_update', callback)` (escuta o Rust).
+*   **`src/components/DeviceCard.tsx`**
+    *   *Lógica*: Switch case para `status` -> retorna className de cor (Tailwind).
+*   **Bibliotecas**: `react`, `zustand`, `tailwindcss`.
+
+---
+**Resumo para o Desenvolvedor**: 
+Foque em implementar a `StateMachine` no Hub com TTL rígido e a geração de Hash determinístico no Kotlin/Rust. Se esses dois pontos estiverem corretos, a UI nunca mais verá um cartão amarelo travado e a sincronia ADB/Hub será 1:1 previsível.
 
 ## 2. Código Final (Iteração 3)
 
 ```
-### C++ (`routing-engine/src/router_avx2.cpp`)
-```cpp
-#include "routing.h"
-#include <immintrin.h>
-#include <cstdlib>
-
-extern "C" {
-
-// Corrige processamento de payloads > 32 bytes (loop vetorial)
-RoutingResult* route_packet_avx2(const uint8_t* payload, size_t len) {
-    auto* res = static_cast<RoutingResult*>(malloc(sizeof(RoutingResult)));
-    if (!res) return nullptr;
-
-    res->target_node_id = 0;
-    res->priority = 0;
-    res->status = 1; // Default DROP
-
-    if (len < 32) return res;
-
-    __m256i max_prio = _mm256_setzero_si256();
-    __m256i max_nodes = _mm256_setzero_si256();
-
-    // Processa todo o payload em blocos de 256 bits
-    size_t offset = 0;
-    while (offset + 32 <= len) {
-        __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(payload + offset));
-        
-        __m256i node_mask = _mm256_set1_epi32(0xFF000000);
-        __m256i prio_mask = _mm256_set1_epi32(0x00FF0000);
-        __m256i nodes = _mm256_srli_epi32(_mm256_and_si256(data, node_mask), 24);
-        __m256i prios = _mm256_srli_epi32(_mm256_and_si256(data, prio_mask), 16);
-        
-        // Redução intra-bloco SIMD
-        __m256i shuf_p, shuf_n, cmp;
-        shuf_p = _mm256_shuffle_epi32(prios, _MM_SHUFFLE(2, 3, 0, 1));
-        shuf_n = _mm256_shuffle_epi32(nodes, _MM_SHUFFLE(2, 3, 0, 1));
-        cmp = _mm256_cmpgt_epi32(shuf_p, prios);
-        prios = _mm256_max_epi32(prios, shuf_p);
-        nodes = _mm256_blendv_epi8(nodes, shuf_n, cmp);
-        
-        shuf_p = _mm256_shuffle_epi32(prios, _MM_SHUFFLE(1, 0, 3, 2));
-        shuf_n = _mm256_shuffle_epi32(nodes, _MM_SHUFFLE(1, 0, 3, 2));
-        cmp = _mm256_cmpgt_epi32(shuf_p, prios);
-        prios = _mm256_max_epi32(prios, shuf_p);
-        nodes = _mm256_blendv_epi8(nodes, shuf_n, cmp);
-        
-        // Acumula no global
-        cmp = _mm256_cmpgt_epi32(prios, max_prio);
-        max_prio = _mm256_max_epi32(max_prio, prios);
-        max_nodes = _mm256_blendv_epi8(max_nodes, nodes, cmp);
-        
-        offset += 32;
-    }
-
-    res->priority = static_cast<uint8_t>(_mm256_extract_epi32(max_prio, 0));
-    res->target_node_id = static_cast<uint32_t>(_mm256_extract_epi32(max_nodes, 0));
-    res->status = 0;
-    return res;
-}
-
-void free_routing_result(RoutingResult* res) { free(res); }
-}
-```
-
-### Rust (`hub-standalone/src/db.rs`)
 ```rust
-use sqlx::{sqlite::SqlitePool, Error as SqlxError};
-use uuid::Uuid;
-use std::time::Duration;
-use tokio::time::sleep;
+// ============================================================================
+// HUB VPS (Rust) - src/main.rs
+// Stack Corrigida: Rust (tokio-tungstenite, redis, serde).
+// Concorrência segura com Arc<Mutex>, FSM com cancelamento de TTL, 
+// Heartbeat JSON, Persistência Redis real.
+// ============================================================================
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::{Duration, sleep};
+use serde::{Serialize, Deserialize};
+use tokio_tungstenite::{accept_async, tungstenite::Message};
+use futures_util::{StreamExt, SinkExt};
+use tokio::net::{TcpListener, TcpStream};
+use redis::AsyncCommands;
 
-#[derive(Debug)]
-pub enum DbError { Sqlx(SqlxError), RetryExhausted }
+const CONNECTING_TTL_SECS: u64 = 10;
 
-pub struct DeviceRepository { pool: SqlitePool }
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+enum DeviceState { DISCOVERED, CONNECTING, ACTIVE, STALE, OFFLINE }
 
-impl DeviceRepository {
-    pub async fn new(path: &str) -> Result<Self, DbError> {
-        let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path)).await.map_err(DbError::Sqlx)?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS devices (id INTEGER PRIMARY KEY, device_hash TEXT UNIQUE NOT NULL, company_id TEXT NOT NULL)")
-            .execute(&pool).await.map_err(DbError::Sqlx)?;
-        Ok(Self { pool })
+#[derive(Serialize, Deserialize, Clone)]
+struct WsPayload {
+    #[serde(rename = "type")]
+    msg_type: String,
+    #[serde(rename = "esfera_device_id")]
+    device_id: String,
+}
+
+#[derive(Clone)]
+struct Session {
+    state: DeviceState,
+    ttl_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+}
+
+// Infra: SessionRepository (Redis)
+struct SessionRepository { client: redis::Client }
+impl SessionRepository {
+    async fn new() -> Self { Self { client: redis::Client::open("redis://127.0.0.1/").expect("Redis") } }
+    async fn save(&self, id: &str, state: &DeviceState) {
+        let mut con = self.client.get_async_connection().await.unwrap();
+        con.set(id, format!("{:?}", state)).await.unwrap(); // Persistência real
+    }
+}
+
+// Core: AppState (FSM + Resolver + Clients)
+#[derive(Clone)]
+struct AppState {
+    sessions: Arc<Mutex<HashMap<String, Session>>>,
+    local_edges: Arc<Mutex<HashMap<String, String>>>,
+    remote_edges: Arc<Mutex<HashMap<String, String>>>,
+    clients: Arc<Mutex<HashMap<usize, mpsc::UnboundedSender<Message>>>>,
+    repo: Arc<SessionRepository>,
+}
+
+impl AppState {
+    // Resolver Determinístico
+    fn match_edges(&self, local: &str, remote: &str) -> bool { local == remote }
+
+    async fn broadcast(&self, payload: &WsPayload, new_state: DeviceState) {
+        let msg = serde_json::to_string(&serde_json::json!({
+            "event": "DEVICE_STATE_CHANGED", "id": payload.device_id, "state": format!("{:?}", new_state)
+        })).unwrap();
+        let mut clients = self.clients.lock().await;
+        for (_, tx) in clients.iter() { let _ = tx.send(Message::Text(msg.clone())); }
     }
 
-    pub async fn ensure_company_id(&self, device_hash: &str) -> Result<String, DbError> {
-        let mut attempts = 0;
-        loop {
-            match self.try_ensure(device_hash).await {
-                Ok(id) => return Ok(id),
-                Err(_) => {
-                    if attempts >= 5 { return Err(DbError::RetryExhausted); }
-                    sleep(Duration::from_millis(100 * (1 << attempts) as u64)).await;
-                    attempts += 1;
+    async fn cruzar(&self, payload: &WsPayload) {
+        let mut locals = self.local_edges.lock().await;
+        let mut remotes = self.remote_edges.lock().await;
+        // Preenche edges
+        if payload.msg_type == "EDGE_DISCOVERY" { locals.insert(payload.device_id.clone(), payload.device_id.clone()); }
+        if payload.msg_type == "AGENT_HELLO" { remotes.insert(payload.device_id.clone(), payload.device_id.clone()); }
+        
+        // Se ambos presentes e hashes batem -> CONNECTING
+        if let (Some(l), Some(r)) = (locals.get(&payload.device_id), remotes.get(&payload.device_id)) {
+            if self.match_edges(l, r) {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(sess) = sessions.get_mut(&payload.device_id) {
+                    if sess.state != DeviceState::ACTIVE {
+                        if let Some(h) = sess.ttl_handle.take() { h.abort(); } // Cancela TTL anterior
+                        sess.state = DeviceState::CONNECTING;
+                    }
+                } else {
+                    sessions.insert(payload.device_id.clone(), Session { state: DeviceState::CONNECTING, ttl_handle: None });
                 }
+                let id = payload.device_id.clone();
+                let repo = self.repo.clone();
+                let state_clone = self.clone();
+                let handle = tokio::spawn(async move {
+                    sleep(Duration::from_secs(CONNECTING_TTL_SECS)).await;
+                    let mut sess = state_clone.sessions.lock().await;
+                    if let Some(s) = sess.get_mut(&id) {
+                        if s.state == DeviceState::CONNECTING {
+                            s.state = DeviceState::STALE; // Anti-travamento
+                            repo.save(&id, &DeviceState::STALE).await;
+                            state_clone.broadcast(&WsPayload { msg_type: "SYS".into(), device_id: id.clone() }, DeviceState::STALE).await;
+                        }
+                    }
+                });
+                sessions.get_mut(&payload.device_id).unwrap().ttl_handle = Some(Arc::new(handle));
+                self.repo.save(&payload.device_id, &DeviceState::CONNECTING).await;
+                self.broadcast(payload, DeviceState::CONNECTING).await;
             }
         }
     }
 
-    // Corrige Race Condition com INSERT OR IGNORE + SELECT
-    async fn try_ensure(&self, device_hash: &str) -> Result<String, DbError> {
-        let new_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT OR IGNORE INTO devices (device_hash, company_id) VALUES (?, ?)")
-            .bind(device_hash).bind(&new_id).execute(&self.pool).await.map_err(DbError::Sqlx)?;
-        
-        let row: Option<(String,)> = sqlx::query_as("SELECT company_id FROM devices WHERE device_hash = ?")
-            .bind(device_hash).fetch_optional(&self.pool).await.map_err(DbError::Sqlx)?;
-        
-        row.map(|(id,)| id).ok_or(DbError::Sqlx(SqlxError::RowNotFound))
+    async fn heartbeat(&self, payload: &WsPayload) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(sess) = sessions.get_mut(&payload.device_id) {
+            if sess.state == DeviceState::CONNECTING {
+                if let Some(h) = sess.ttl_handle.take() { h.abort(); } // Cancela TTL, vai pra ACTIVE
+                sess.state = DeviceState::ACTIVE;
+                self.repo.save(&payload.device_id, &DeviceState::ACTIVE).await;
+                self.broadcast(payload, DeviceState::ACTIVE).await;
+            }
+        }
     }
 }
-```
-
-### Rust (`hub-standalone/src/ffi.rs`)
-```rust
-use std::os::raw::{c_uchar, c_size_t};
-
-#[repr(C)]
-pub struct RoutingResult { pub target_node_id: u32, pub priority: u8, pub status: u8 }
-
-extern "C" {
-    fn route_packet_avx2(payload: *const c_uchar, len: c_size_t) -> *mut RoutingResult;
-    fn free_routing_result(res: *mut RoutingResult);
-}
-
-// Garante liberação de memória C++ (sem memory leak)
-pub fn compute_route(payload: &[u8]) -> Option<RoutingResult> {
-    unsafe {
-        let ptr = route_packet_avx2(payload.as_ptr(), payload.len());
-        if ptr.is_null() { return None; }
-        let result = ptr.read();
-        free_routing_result(ptr);
-        if result.status == 0 { Some(result) } else { None }
-    }
-}
-```
-
-### Rust (`hub-standalone/src/main.rs`)
-```rust
-use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
-use rustls::{ServerConfig, NoClientAuth, ProtocolVersion};
-use std::sync::Arc;
-use std::fs::File;
-use std::io::BufReader;
-use rustls_pemfile as pemfile;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use crate::db::DeviceRepository;
-use crate::ffi::compute_route;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Arc::new(DeviceRepository::new("esfera.db").await?);
-    
-    let mut config = ServerConfig::new(NoClientAuth::new());
-    let cert_file = &mut BufReader::new(File::open("certs/cert.pem")?);
-    let key_file = &mut BufReader::new(File::open("certs/key.pem")?);
-    config.set_single_cert(pemfile::certs(cert_file)?, pemfile::pkcs8_private_keys(key_file)?.remove(0))?;
-    config.versions = vec![ProtocolVersion::TLSv1_3];
-    
-    let acceptor = TlsAcceptor::from(Arc::new(config));
-    
-    for port in [443, 8443] {
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-        println!("[HUB] Esfera v3.13.0 TLS 1.3 Listener ativo ({})", port);
-        let acceptor = acceptor.clone();
-        let repo = repo.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Ok((stream, _)) = listener.accept().await {
-                    let acceptor = acceptor.clone();
-                    let repo = repo.clone();
-                    tokio::spawn(async move {
-                        if let Ok(mut tls_stream) = acceptor.accept(stream).await {
-                            // Handshake / Check-in (len-prefix proto)
-                            let mut len_buf = [0u8; 2];
-                            if tls_stream.read_exact(&mut len_buf).await.is_ok() {
-                                let plen = u16::from_be_bytes(len_buf) as usize;
-                                let mut payload = vec![0u8; plen];
-                                if tls_stream.read_exact(&mut payload).await.is_ok() {
-                                    let dev_hash = format!("dev_{:?}", &payload[..std::cmp::min(8, plen)]);
-                                    // Auto-provisionamento e Roteamento
-                                    if let Ok(cid) = repo.ensure_company_id(&dev_hash).await {
-                                        let _route = compute_route(&payload); // FFI com free interno
-                                        let _ = tls_stream.write_all(format!("CMD:SEC_LOCK:{}", cid).as_bytes()).await;
-                                    }
-                                }
-                            }
-                        }
-                    });
+async fn main() {
+    let state = AppState {
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        local_edges: Arc::new(Mutex::new(HashMap::new())),
+        remote_edges: Arc::new(Mutex::new(HashMap::new())),
+        clients: Arc::new(Mutex::new(HashMap::new())),
+        repo: Arc::new(SessionRepository::new().await),
+    };
+    let listener = TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    let mut client_id = 0;
+    while let Ok((stream, _)) = listener.accept().await {
+        let state = state.clone();
+        let cid = client_id; client_id += 1;
+        tokio::spawn(async move { handle_conn(stream, state, cid).await; });
+    }
+}
+
+async fn handle_conn(stream: TcpStream, state: AppState, cid: usize) {
+    let ws = accept_async(stream).await.unwrap();
+    let (mut write, mut read) = ws.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    state.clients.lock().await.insert(cid, tx);
+
+    tokio::spawn(async move { while let Some(msg) = rx.recv().await { if write.send(msg).await.is_err() { break; } } });
+
+    while let Some(Ok(msg)) = read.next().await {
+        if let Ok(text) = msg.into_text() {
+            if let Ok(payload) = serde_json::from_str::<WsPayload>(&text) {
+                match payload.msg_type.as_str() {
+                    "EDGE_DISCOVERY" | "AGENT_HELLO" => state.cruzar(&payload).await,
+                    "HEARTBEAT" => state.heartbeat(&payload).await, // JSON Heartbeat dos Edges
+                    _ => {}
                 }
             }
-        });
+        }
     }
-    tokio::signal::ctrl_c().await?;
-    Ok(())
+    state.clients.lock().await.remove(&cid);
 }
 ```
 
-### Kotlin (`android-agent/network/SecureCheckInClient.kt`)
 ```kotlin
+// ============================================================================
+// Android Agent (Kotlin) - CORREÇÃO: AtomicInteger, JSON Heartbeat, Fallback
+// ============================================================================
+// DeviceIdentity.kt
+package com.esfera.agent.identity
+import java.security.MessageDigest
+import android.content.Context
+import android.provider.Settings
+
+object DeviceIdentity {
+    private const val SALT = "ESFERA_V3_SALT_GLOBAL_2024"
+    fun getSerial(ctx: Context): String {
+        val s = android.os.Build.getSerial()
+        return if (s.isNullOrEmpty() || s == "unknown") Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ANDROID_ID) else s
+    }
+    fun generateEsferaId(ctx: Context): String {
+        val input = getSerial(ctx) + SALT
+        return MessageDigest.getInstance("SHA-256").digest(input.toByteArray()).joinToString("") { "%02x".format(it) }
+    }
+}
+
+// WsClient.kt
 package com.esfera.agent.network
-
-import okhttp3.CertificatePinner
-import okhttp3.Interceptor
-import okhttp3.OkHttpClient
-import okhttp3.Response
+import kotlinx.coroutines.*
+import okhttp3.*
 import java.util.concurrent.TimeUnit
-import kotlin.random.Random
+import java.util.concurrent.atomic.AtomicInteger
 
-// Retry com jitter exponencial customizado
-class BackoffInterceptor : Interceptor {
-    override fun intercept(chain: Interceptor.Chain): Response {
-        var attempt = 0
-        var lastErr: Exception? = null
-        while (attempt < 5) {
-            try {
-                val res = chain.proceed(chain.request())
-                if (res.isSuccessful) return res
-                res.close()
-            } catch (e: Exception) { lastErr = e }
-            TimeUnit.MILLISECONDS.sleep((100 * (1 shl attempt)) + Random.nextLong(0, 50))
-            attempt++
-        }
-        throw lastErr ?: RuntimeException("Check-in falhou")
-    }
-}
+class WsClient(private val ctx: Context, private val scope: CoroutineScope) {
+    private val client = OkHttpClient.Builder().build() // Ping protocol removido, usamos JSON Heartbeat
+    private val attempt = AtomicInteger(0) // Thread-safe
+    private var ws: WebSocket? = null
 
-class SecureCheckInClient {
-    private val pinner = CertificatePinner.Builder()
-        .add("hub.esfera.local", "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").build()
-
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .certificatePinner(pinner)
-        .addInterceptor(BackoffInterceptor()) // Resiliência exigida
-        .build()
-}
-```
-
-### Kotlin (`android-agent/audit/CouncilTelemetry.kt`)
-```kotlin
-package com.esfera.agent.audit
-
-import android.content.Context
-import android.app.admin.DevicePolicyManager
-import android.content.ComponentName
-import com.esfera.agent.receiver.EsferaAdminReceiver
-import com.esfera.agent.security.CommandAllowlist
-import java.security.KeyStore
-import java.security.Signature
-
-object CouncilTelemetry {
-    private const val ALIAS = "esfera_ed25519"
-
-    // Chave persistente no AndroidKeyStore (não gera a cada chamada)
-    private fun ensureKey(context: Context) {
-        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        if (!ks.containsAlias(ALIAS)) {
-            val kpg = java.security.KeyPairGenerator.getInstance("Ed25519", "AndroidKeyStore")
-            kpg.initialize(android.security.keystore.KeyGenParameterSpec.Builder(
-                ALIAS, android.security.keystore.KeyProperties.PURPOSE_SIGN).build())
-            kpg.generateKeyPair()
+    fun connectWithBackoff() {
+        scope.launch {
+            while (isActive) {
+                try {
+                    val req = Request.Builder().url("ws://hub.esfera.vps:8080").build()
+                    ws = client.newWebSocket(req, object : WebSocketListener() {
+                        override fun onOpen(ws: WebSocket, response: Response) {
+                            attempt.set(0)
+                            val id = DeviceIdentity.generateEsferaId(ctx)
+                            ws.send("""{"type":"AGENT_HELLO","esfera_device_id":"$id"}""")
+                            startHeartbeat(ws, id) // Envia JSON HEARTBEAT
+                        }
+                        override fun onFailure(ws: WebSocket, t: Throwable, r: Response?) = scheduleReconnect()
+                        override fun onClosed(ws: WebSocket, c: Int, r: String) = scheduleReconnect()
+                    })
+                    break
+                } catch (e: Exception) { scheduleReconnect() }
+            }
         }
     }
 
-    // Coleta abrangente (company_id, tls, avx2, etc.)
-    fun collectSnapshot(ctx: Context, cidPresent: Boolean, tls: Boolean, avx2: Boolean): Map<String, Boolean> {
-        val dpm = ctx.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
-        val admin = ComponentName(ctx, EsferaAdminReceiver::class.java)
-        return mapOf(
-            "dpc_active" to (dpm.isDeviceOwnerApp(ctx.packageName) && dpm.isAdminActive(admin)),
-            "allowlist_intact" to (CommandAllowlist.isAllowed("SEC_WIPE") && CommandAllowlist.isAllowed("SEC_LOCK")),
-            "company_id_present" to cidPresent,
-            "tls_active" to tls,
-            "avx2_available" to avx2
-        )
+    private fun startHeartbeat(ws: WebSocket, id: String) {
+        scope.launch {
+            while (isActive) {
+                delay(3000) // 3s Heartbeat
+                ws.send("""{"type":"HEARTBEAT","esfera_device_id":"$id"}""")
+            }
+        }
     }
 
-    fun signSnapshot(context: Context, data: ByteArray): ByteArray {
-        ensureKey(context)
-        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        val pk = (ks.getEntry(ALIAS, null) as KeyStore.PrivateKeyEntry).privateKey
-        return Signature.getInstance("Ed25519").apply {
-            initSign(pk); update(data)
-        }.sign()
+    private fun scheduleReconnect() {
+        scope.launch {
+            val backoff = (2.0.pow(attempt.getAndIncrement().toDouble()) * 1000).toLong().coerceAtMost(30000)
+            delay(backoff); connectWithBackoff()
+        }
     }
 }
-```
 
-### Kotlin (`android-agent/receiver/EsferaAdminReceiver.kt`)
-```kotlin
-package com.esfera.agent.receiver
-
-import android.app.admin.DeviceAdminReceiver
-import android.content.Context
+// AgentService.kt
+package com.esfera.agent.core
+import android.app.Service
 import android.content.Intent
-import com.esfera.agent.security.CommandAllowlist
+import android.os.IBinder
+import androidx.work.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import com.esfera.agent.network.WsClient
 
-class EsferaAdminReceiver : DeviceAdminReceiver() {
-    override fun onEnabled(context: Context, intent: Intent) {
-        super.onEnabled(context, intent)
-        // Delega LockTask para Activity (corrige compilação)
-        context.startActivity(Intent(context, LockTaskActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+class AgentService : Service() {
+    private val scope = CoroutineScope(Dispatchers.IO + Job())
+    override fun onCreate() {
+        super.onCreate()
+        startForeground(1, TODO("Notif")) // Foreground p/ evitar kill
+        WsClient(this, scope).connectWithBackoff()
     }
-
-    override fun onReceive(context: Context, intent: Intent) {
-        super.onReceive(context, intent)
-        // Proxy p/ Allowlist (Passo 5)
-        intent.getStringExtra("COMMAND_ID")?.takeIf { CommandAllowlist.isAllowed(it) }
-            ?.let { CommandAllowlist.allowed[it]?.invoke(context) }
-    }
+    override fun onBind(i: Intent?): IBinder? = null
+    override fun onDestroy() { scope.cancel(); super.onDestroy() }
 }
+class BootWorker(c: Context, p: WorkerParameters) : Worker(c, p) {
+    override fun doWork(): Result { context.startService(Intent(context, AgentService::class.java)); return Result.success() }
+}
+```
+
+```rust
+// ============================================================================
+// Desktop App (Tauri/Rust) - CORREÇÃO: Sem unwrap, Heartbeat JSON, Commands
+// ============================================================================
+// src-tauri/src/adb/scanner.rs
+use std::process::Command;
+use sha2::{Sha256, Digest};
+const SALT: &str = "ESFERA_V3_SALT_GLOBAL_2024";
+pub struct AdbDevice { pub serial: String, pub esfera_id: String }
+pub fn list_devices() -> Result<Vec<AdbDevice>, std::io::Error> {
+    let out = Command::new("adb").args(["devices", "-l"]).output()?;
+    if !out.status.success() { return Err(std::io::Error::new(std::io::ErrorKind::Other, "ADB")); }
+    Ok(String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| {
+        let s = l.split_whitespace().next()?;
+        if s.is_empty() || l.contains("List") { return None; }
+        let mut h = Sha256::new(); h.update(format!("{}{}", s, SALT));
+        Some(AdbDevice { serial: s.into(), esfera_id: format!("{:x}", h.finalize()) })
+    }).collect())
+}
+
+// src-tauri/src/vps/hub_client.rs
+use tauri::Emitter;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use futures_util::{StreamExt, SinkExt};
+use std::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio::time::{interval, Duration};
+
+pub struct HubState { pub sender: Mutex<Option<mpsc::UnboundedSender<Message>>> }
+
+pub async fn init_hub(app: tauri::AppHandle) -> Result<HubState, Box<dyn std::error::Error>> {
+    let (ws, _) = connect_async("ws://hub.esfera.vps:8080").await?;
+    let (mut write, mut read) = ws.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+
+    tauri::async_runtime::spawn(async move {
+        while let Some(Ok(msg)) = read.next().await {
+            if let Ok(p) = msg.into_text() { let _ = app.emit("on_device_update", p); }
+        }
+    });
+    tauri::async_runtime::spawn(async move {
+        while let Some(m) = rx.recv().await { if write.send(m).await.is_err() { break; } }
+    });
+    // Heartbeat Loop (JSON)
+    let tx_clone = tx.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut tick = interval(Duration::from_secs(3));
+        loop {
+            tick.tick().await;
+            if let Ok(devs) = crate::adb::scanner::list_devices() {
+                for d in devs { let _ = tx_clone.send(Message::Text(format!(r#"{{"type":"HEARTBEAT","esfera_device_id":"{}"}}"#, d.esfera_id))); }
+            }
+        }
+    });
+    Ok(HubState { sender: Mutex::new(Some(tx)) })
+}
+
+pub fn send_discovery(state: &HubState) -> Result<(), String> {
+    let tx = state.sender.lock().map_err(|_| "Poisoned".to_string())?;
+    if let Some(tx) = tx.as_ref() {
+        if let Ok(devs) = crate::adb::scanner::list_devices() {
+            for d in devs { let _ = tx.send(Message::Text(format!(r#"{{"type":"EDGE_DISCOVERY","esfera_device_id":"{}"}}"#, d.esfera_id))); }
+        } Ok(())
+    } else { Err("Offline".into()) }
+}
+
+// src-tauri/src/commands.rs
+use tauri::State;
+use crate::vps::hub_client::{HubState, send_discovery};
+#[tauri::command]
+pub fn sync_adb(state: State<HubState>) -> Result<(), String> { send_discovery(&state) }
+```
+
+```typescript
+// ============================================================================
+// Desktop App (React) - CORREÇÃO: Store Zustand, Eventos Tauri, UI Reativa
+// ============================================================================
+// src/store/deviceStore.ts
+import { create } from 'zustand';
+interface Device { id: string; state: string; }
+interface Store { devices: Record<string, Device>; update: (id: string, st: string) => void; }
+export const useDeviceStore = create<Store>((set) => ({
+  devices: {},
+  update: (id, st) => set((s) => ({ devices: { ...s.devices, [id]: { id, state: st } } })),
+}));
+
+// src/hooks/useTauriEvents.ts
+import { useEffect } from 'react';
+import { listen } from '@tauri-apps/api/event';
+import { useDeviceStore } from '../store/deviceStore';
+export function useTauriEvents() {
+  const update = useDeviceStore((s) => s.update);
+  useEffect(() => {
+    const un = listen<string>('on_device_update', (e) => {
+      const p = JSON.parse(e.payload);
+      if (p.event === 'DEVICE_STATE_CHANGED') update(p.id, p.state);
+    });
+    return () => { un.then(f => f()); };
+  }, [update]);
+}
+
+// src/components/DeviceCard.tsx
+import React from 'react';
+import { useDeviceStore } from '../store/deviceStore';
+export const DeviceCard: React.FC<{ id: string }> = ({ id }) => {
+  const dev = useDeviceStore((s) => s.devices[id]);
+  const color = !dev ? 'bg-gray-500' : dev.state === 'ACTIVE' ? 'bg-green-500' : dev.state === 'CONNECTING' ? 'bg-yellow-500' : 'bg-red-500';
+  return <div className={`p-4 rounded text-white ${color}`}>{id} - {dev?.state || 'DISCOVERED'}</div>;
+};
 ```
 ```

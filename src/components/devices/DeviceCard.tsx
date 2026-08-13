@@ -84,7 +84,7 @@ export const DeviceCard = memo(function DeviceCard({
             {device.status === "online" && (
               <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75 animate-ping" />
             )}
-            {device.status === "connecting" && (
+            {(device.status === "connecting" || device.status === "degraded") && (
               <span className="absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75 animate-pulse" />
             )}
             <span
@@ -93,6 +93,8 @@ export const DeviceCard = memo(function DeviceCard({
                   ? "bg-emerald-400"
                   : device.status === "connecting"
                   ? "bg-amber-400"
+                  : device.status === "degraded"
+                  ? "bg-amber-500"
                   : device.status === "error"
                   ? "bg-red-400"
                   : "bg-zinc-600"

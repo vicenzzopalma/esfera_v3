@@ -86,6 +86,11 @@ pub struct DeviceState {
     pub tunnel: Option<ChannelSession>,   // EXCLUSIVO do agente rust
     pub presence: Option<ChannelSession>, // EXCLUSIVO do agente kotlin
     pub last_seen_utc: String,
+    // Rastreia o último check-in HTTP (touch_presence) como Instant para que
+    // recently_active_90s() considere dispositivos que fazem check-in via HTTP
+    // mesmo quando não há sessão WS/túnel ativa.
+    #[serde(skip)]
+    pub last_touch_instant: Option<Instant>,
 }
 
 impl DeviceState {
@@ -157,6 +162,7 @@ pub fn open_tunnel(company_id: i32, esfera_device_id: &str, current_local_ip: &s
         tunnel: None,
         presence: None,
         last_seen_utc: now.clone(),
+        last_touch_instant: None,
     });
     entry.esfera_device_id = esfera_device_id.to_string();
     entry.company_id = company_id;
@@ -196,6 +202,7 @@ pub fn open_presence(
         tunnel: None,
         presence: None,
         last_seen_utc: now.clone(),
+        last_touch_instant: None,
     });
     entry.esfera_device_id = esfera_device_id.to_string();
     entry.company_id = company_id;
@@ -258,6 +265,7 @@ pub fn touch_presence(company_id: i32, esfera_device_id: &str, current_adb_addre
         tunnel: None,
         presence: None,
         last_seen_utc: now.clone(),
+        last_touch_instant: Some(Instant::now()),
     });
     entry.esfera_device_id = esfera_device_id.to_string();
     entry.company_id = company_id;
@@ -273,6 +281,9 @@ pub fn touch_presence(company_id: i32, esfera_device_id: &str, current_adb_addre
         p.last_heartbeat_instant = Some(Instant::now());
     }
     entry.last_seen_utc = now;
+    // Sempre renova o instant do check-in HTTP para que recently_active_90s()
+    // inclua este device mesmo sem sessão WS/túnel ativa.
+    entry.last_touch_instant = Some(Instant::now());
     entry.recalc();
 }
 
@@ -291,13 +302,17 @@ pub fn heartbeat_tunnel(company_id: i32, esfera_device_id: &str) {
     }
 }
 
-/// Fecha apenas o canal TÚNEL (agente rust desconectou). Presença intocada.
-pub fn close_tunnel(company_id: i32, esfera_device_id: &str) {
+/// Fecha apenas o canal TÚNEL (agente rust desconectou) se a session_id bater com a ativa.
+pub fn close_tunnel(company_id: i32, esfera_device_id: &str, session_id: &str) {
     let key = derive_device_key(company_id, esfera_device_id);
     let mut map = STATES.lock().unwrap();
     if let Some(entry) = map.get_mut(&key) {
-        entry.tunnel = None;
-        entry.recalc();
+        if let Some(ref t) = entry.tunnel {
+            if t.session_id == session_id {
+                entry.tunnel = None;
+                entry.recalc();
+            }
+        }
     }
 }
 
@@ -357,9 +372,11 @@ pub fn list_all() -> Vec<DeviceState> {
     STATES.lock().unwrap().values().cloned().collect()
 }
 
-/// Device considerado "atividade recente" se tiver atualizado last_seen_utc
-/// ou tiver heartbeat de túnel/presença nos últimos `timeout_secs` segundos.
-/// Usado pelo `live_snapshot` para filtrar dispositivos mortos.
+/// Device considerado "atividade recente" se tiver:
+///   1. Heartbeat de túnel ou presença WS nos últimos 90s, OU
+///   2. Check-in HTTP recente (last_touch_instant) nos últimos 90s.
+/// Sem o critério 2, dispositivos que só fazem check-in HTTP (sem WS/túnel)
+/// ficam invisíveis no get_live_devices e aparecem amarelos no app desktop.
 pub fn recently_active_90s() -> Vec<DeviceState> {
     let cutoff = Instant::now() - Duration::from_secs(90);
     STATES
@@ -367,13 +384,15 @@ pub fn recently_active_90s() -> Vec<DeviceState> {
         .unwrap()
         .values()
         .filter(|s| {
-            // Dispositivo com presença ou túnel com heartbeat recente
+            // Critério 1: canal WS ou túnel com heartbeat recente
             let has_recent_channel = s.tunnel.as_ref().and_then(|t| t.last_heartbeat_instant)
                 .map_or(false, |instant| instant > cutoff)
                 || s.presence.as_ref().and_then(|p| p.last_heartbeat_instant)
                     .map_or(false, |instant| instant > cutoff);
-            // Ou last_seen_utc recente (usado pelo touch_presence/check-in HTTP)
-            has_recent_channel
+            // Critério 2: check-in HTTP recente (touch_presence foi chamado < 90s)
+            let has_recent_checkin = s.last_touch_instant
+                .map_or(false, |instant| instant > cutoff);
+            has_recent_channel || has_recent_checkin
         })
         .cloned()
         .collect()

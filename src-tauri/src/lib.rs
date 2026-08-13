@@ -63,8 +63,10 @@ fn diag(s: &str) {
 }
 
 pub fn run() {
+    commands::init_connect_log();
     std::panic::set_hook(Box::new(|info| {
         diag(&format!("PANIC DETECTADO: {:?}", info));
+        commands::log_connect(&format!("[CONNECT] PANIC DETECTADO NO PROCESSO: {:?}", info));
     }));
     diag("ETAPA [1] main/run iniciado");
     let db_path = get_db_path();

@@ -7,6 +7,7 @@ pub mod tunnel_server;
 pub mod presence_server;
 pub mod session_manager;
 pub mod tls_server;
+pub mod mqtt_fallback_server;
 
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpSocket};

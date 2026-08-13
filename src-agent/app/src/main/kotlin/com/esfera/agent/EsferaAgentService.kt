@@ -432,6 +432,8 @@ class EsferaAgentService : Service() {
         android.util.Log.d("EsferaAgent", "loadConfigAndStart: lendo config")
         val config = loadConfig()
         android.util.Log.d("EsferaAgent", "loadConfigAndStart: serverUrl='${config.serverUrl}' deviceId='${config.deviceId}' companyId=${config.companyId}")
+        android.util.Log.i("EsferaAgent", "[TUNNEL] service_started")
+        android.util.Log.i("EsferaAgent", "[TUNNEL] tunnel_enabled=${config.tunnelEnabled}")
         if (config.serverUrl.isBlank() || config.deviceId.isBlank()) {
             android.util.Log.w("EsferaAgent", "loadConfigAndStart: config vazia, stopSelf")
             stopSelf()
@@ -546,6 +548,8 @@ class EsferaAgentService : Service() {
         return try { powerManager.isInteractive } catch (_: Exception) { false }
     }
 
+    @Volatile private var currentTunnelSocket: Socket? = null
+
     // ----------------------------------------------------------------
     // Tunnel reverso (celular -> servidor, handshake por Hardware UUID)
     // Mantém socket TCP persistente; reconecta em ms quando a rede muda.
@@ -553,9 +557,14 @@ class EsferaAgentService : Service() {
     // ----------------------------------------------------------------
 
     private fun startTunnelLoop(config: EsferaConfig) {
-        tunnelJob?.cancel() // evita duplo túnel se rechamado
+        val existing = tunnelJob != null
+        android.util.Log.i("EsferaAgent", "[TUNNEL] startTunnelLoop_called existing_job=$existing")
+        try { currentTunnelSocket?.close() } catch (_: Exception) {}
+        tunnelJob?.cancel()
         var first = true
         tunnelJob = scope.launch {
+            val instanceUuid = java.util.UUID.randomUUID().toString().substring(0, 8)
+            android.util.Log.i("EsferaAgent", "[TUNNEL] loop_instance_created=$instanceUuid")
             var backoffMs = 5_000L
             while (isActive) {
                 val host = config.serverUrl
@@ -563,28 +572,33 @@ class EsferaAgentService : Service() {
                     .replace("https://", "")
                     .substringBefore(':')
                     .substringBefore('/')
-                    .ifEmpty { "127.0.0.1" }
+                    .ifEmpty { "34.29.70.113" }
+                android.util.Log.i("EsferaAgent", "[TUNNEL] server_url=$host instance=$instanceUuid")
+                android.util.Log.i("EsferaAgent", "[TUNNEL] tunnel_port=${config.tunnelPort}")
                 try {
-                    openTunnel(host, config.tunnelPort, config.deviceId, config.companyId)
-                    backoffMs = 5_000L // reset em caso de fechamento limpo
+                    android.util.Log.i("EsferaAgent", "[TUNNEL] connect_attempt instance=$instanceUuid")
+                    openTunnel(host, config.tunnelPort, config.deviceId, if (config.companyId <= 0) 1 else config.companyId, instanceUuid)
+                    backoffMs = 5_000L
                 } catch (e: Exception) {
-                    android.util.Log.w("EsferaAgent", "Túnel caiu: ${e.message}")
+                    android.util.Log.e("EsferaAgent", "[TUNNEL] connect_error instance=$instanceUuid: ${e.javaClass.simpleName}: ${e.message}")
                 }
-                if (first) { first = false; backoffMs = 1_000L } // A primeira tentativa após ligar o app é rápida
+                if (first) { first = false; backoffMs = 1_000L }
                 
-                // Adiciona um Jitter de 0 a 2 segundos para evitar "thundering herd" (todos conectando no mesmo ms)
-                delay(backoffMs + (0..2000).random().toLong())
-                
-                // Backoff respeitando o limite pedido: entre 5 e 10 segundos de máximo.
+                val waitMs = backoffMs + (0..2000).random().toLong()
+                android.util.Log.i("EsferaAgent", "[TUNNEL] reconnect_scheduled instance=$instanceUuid")
+                delay(waitMs)
+                android.util.Log.i("EsferaAgent", "[TUNNEL] reconnect_attempt instance=$instanceUuid")
                 backoffMs = (backoffMs * 2).coerceIn(5_000L, 10_000L)
             }
         }
     }
 
-    private suspend fun openTunnel(host: String, port: Int, deviceId: String, companyId: Int) {
+    private suspend fun openTunnel(host: String, port: Int, deviceId: String, companyId: Int, instanceUuid: String) {
         val ip = resolveCurrentIp() ?: "0.0.0.0"
         val socket = Socket()
+        currentTunnelSocket = socket
         socket.connect(InetSocketAddress(host, port), 10_000)
+        android.util.Log.i("EsferaAgent", "[TUNNEL] tcp_connected instance=$instanceUuid")
         socket.soTimeout = 0
         val writer = PrintWriter(socket.getOutputStream(), true)
         val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
@@ -597,92 +611,90 @@ class EsferaAgentService : Service() {
         )
         writer.println(json.encodeToString(TunnelHandshake.serializer(), hs))
         writer.flush()
+        android.util.Log.i("EsferaAgent", "[TUNNEL] handshake_sent instance=$instanceUuid")
 
         // 2. Loop de heartbeat L7 + leitura da resposta do servidor.
-        //    Se o servidor fechar o socket (readLine() == null), encerramos o
-        //    coroutineScope filho -> openTunnel retorna -> startTunnelLoop reconecta.
-        coroutineScope {
-            val readerJob = launch {
-                while (isActive) {
-                    val line = try { reader.readLine() } catch (_: Exception) { null }
-                    if (line == null) {
-                        // EOF ou erro de leitura: o servidor caiu. Sai do escopo.
-                        return@launch
-                    }
-                    // Trata mensagens de controle enviadas pelo servidor (túnel reverso).
-                    when {
-                        line.contains("\"type\":\"ping\"") -> {
-                            writer.println("""{"type":"pong"}""")
-                            writer.flush()
+        try {
+            coroutineScope {
+                val readerJob = launch {
+                    while (isActive) {
+                        val line = try { reader.readLine() } catch (_: Exception) { null }
+                        if (line == null) {
+                            android.util.Log.i("EsferaAgent", "[TUNNEL] connection_closed instance=$instanceUuid")
+                            return@launch
                         }
-                        line.contains("\"type\":\"proxy\"") -> {
-                            val port = Regex("\"port\"\\s*:\\s*(\\d+)").find(line)
-                                ?.groupValues?.get(1)?.toInt() ?: 5555
-                            // Garante que o adbd local escute em TCP antes de abrir o relay.
-                            // Sem isso o app trava em "processando ADB" (relay falha silenciosamente).
-                            ensureAdbdTcp(port)
-                            try {
-                                val local = Socket("127.0.0.1", port)
-                                // Só confirma o proxy APÓS a conexão local existir de verdade.
-                                writer.println("""{"type":"proxy-ack"}""")
-                                writer.flush()
-                                launch(Dispatchers.IO) { relayToLocal(local, socket) }
-                            } catch (e: Exception) {
-                                android.util.Log.e("EsferaAgent", "proxy falhou: adbd nao escuta em 127.0.0.1:$port (${e.message})")
-                                writer.println("""{"type":"proxy-error","message":"adbd nao escuta em 127.0.0.1:$port"}""")
+                        when {
+                            line.contains("\"type\":\"ping\"") -> {
+                                writer.println("""{"type":"pong"}""")
                                 writer.flush()
                             }
-                        }
-                        line.contains("\"type\":\"adb_cmd\"") -> {
-                            // Comando remoto solicitado pelo app desktop via VPS.
-                            // Executa LOCALMENTE no aparelho (input/screencap/etc.) e
-                            // devolve a saída. Fecha a bifurcação A: celular remoto
-                            // (via_tunnel) passa a ser controlável sem root.
-                            // SEGURANÇA: só executa se na LISTA BRANCA (allowlist
-                            // autenticada) — nunca shell arbitrário.
-                            val id = Regex("\"id\"\\s*:\\s*\"?([^\",}]+)\"?").find(line)
-                                ?.groupValues?.get(1)?.trim()
-                            val cmd = Regex("\"command\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(line)
-                                ?.groupValues?.get(1)
-                                ?.replace("\\\"", "\"")?.replace("\\\\", "\\")
-                            if (id != null && cmd != null) {
-                                if (!isCommandAllowed(cmd)) {
-                                    android.util.Log.w("EsferaAgent", "adb_cmd BLOQUEADO (fora da allowlist): $cmd")
-                                    launch(Dispatchers.IO) {
-                                        writer.println("""{"type":"adb_result","id":"$id","output":"ERR: comando nao permitido (allowlist): $cmd"}""")
-                                        writer.flush()
-                                    }
-                                } else if (cmd.startsWith("self_update ")) {
-                                    // Atualização remota do próprio APK sem SSH: baixa de
-                                    // uma URL (servida pela VPS/backend) e instala.
-                                    val url = cmd.removePrefix("self_update ").trim()
-                                    launch(Dispatchers.IO) {
-                                        val out = selfUpdate(url)
-                                        writer.println("""{"type":"adb_result","id":"$id","output":${JsonPrimitive(out)}}""")
-                                        writer.flush()
-                                    }
-                                } else {
-                                    launch(Dispatchers.IO) {
-                                        val out = runLocalCommand(cmd)
-                                        writer.println("""{"type":"adb_result","id":"$id","output":${JsonPrimitive(out)}}""")
-                                        writer.flush()
+                            line.contains("\"type\":\"welcome\"") -> {
+                                android.util.Log.i("EsferaAgent", "[TUNNEL] welcome_received instance=$instanceUuid")
+                                android.util.Log.i("EsferaAgent", "[TUNNEL] heartbeat_started instance=$instanceUuid")
+                            }
+                            line.contains("\"type\":\"proxy\"") -> {
+                                val pPort = Regex("\"port\"\\s*:\\s*(\\d+)").find(line)
+                                    ?.groupValues?.get(1)?.toInt() ?: 5555
+                                ensureAdbdTcp(pPort)
+                                try {
+                                    val local = Socket("127.0.0.1", pPort)
+                                    writer.println("""{"type":"proxy-ack"}""")
+                                    writer.flush()
+                                    launch(Dispatchers.IO) { relayToLocal(local, socket) }
+                                } catch (e: Exception) {
+                                    android.util.Log.e("EsferaAgent", "proxy falhou: adbd nao escuta em 127.0.0.1:$pPort (${e.message})")
+                                    writer.println("""{"type":"proxy-error","message":"adbd nao escuta em 127.0.0.1:$pPort"}""")
+                                    writer.flush()
+                                }
+                            }
+                            line.contains("\"type\":\"adb_cmd\"") -> {
+                                val id = Regex("\"id\"\\s*:\\s*\"?([^\",}]+)\"?").find(line)
+                                    ?.groupValues?.get(1)?.trim()
+                                val cmd = Regex("\"command\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(line)
+                                    ?.groupValues?.get(1)
+                                    ?.replace("\\\"", "\"")?.replace("\\\\", "\\")
+                                if (id != null && cmd != null) {
+                                    if (!isCommandAllowed(cmd)) {
+                                        android.util.Log.w("EsferaAgent", "adb_cmd BLOQUEADO (fora da allowlist): $cmd")
+                                        launch(Dispatchers.IO) {
+                                            writer.println("""{"type":"adb_result","id":"$id","output":"ERR: comando nao permitido (allowlist): $cmd"}""")
+                                            writer.flush()
+                                        }
+                                    } else if (cmd.startsWith("self_update ")) {
+                                        val url = cmd.removePrefix("self_update ").trim()
+                                        launch(Dispatchers.IO) {
+                                            val out = selfUpdate(url)
+                                            writer.println("""{"type":"adb_result","id":"$id","output":${JsonPrimitive(out)}}""")
+                                            writer.flush()
+                                        }
+                                    } else {
+                                        launch(Dispatchers.IO) {
+                                            val out = runLocalCommand(cmd)
+                                            writer.println("""{"type":"adb_result","id":"$id","output":${JsonPrimitive(out)}}""")
+                                            writer.flush()
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            try {
-                while (isActive && !socket.isClosed) {
-                    delay(10_000L) // envia ping a cada 10s (backend tolera 45s de silêncio)
-                    if (socket.isClosed) break
-                    writer.println("""{"type":"ping"}""")
-                    writer.flush()
+                try {
+                    while (isActive && !socket.isClosed) {
+                        delay(10_000L)
+                        if (socket.isClosed) break
+                        writer.println("""{"type":"ping"}""")
+                        writer.flush()
+                    }
+                } finally {
+                    readerJob.cancel()
                 }
-            } finally {
-                readerJob.cancel()
+            }
+        } finally {
+            try { socket.close() } catch (_: Exception) {}
+            if (currentTunnelSocket == socket) {
+                currentTunnelSocket = null
             }
         }
     }

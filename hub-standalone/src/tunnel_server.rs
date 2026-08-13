@@ -20,32 +20,37 @@
 //             e manda handshake novo — socket velho é descartado no break).
 // ============================================================
 
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::TcpListener;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use crate::session_manager::{self, open_tunnel, close_tunnel, heartbeat_tunnel};
+use crate::session_manager::{close_tunnel, heartbeat_tunnel, open_tunnel};
 
+/// Struct do Handshake enviado na 1ª linha pelo agente Kotlin/C++
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TunnelHandshake {
+    hardware_uuid: String,
+    #[serde(default)]
+    company_id: i32,
+    #[serde(default)]
+    current_local_ip: String,
+}
+
+/// Timeout de inatividade L7 sem heartbeat (45 segundos)
 const HEARTBEAT_GRACE_SECS: u64 = 45;
 
-/// Registry de CONTROLE: (company_id, device_id) -> canal de escrita da sessão
-/// de túnel. É o que permite ao Master EMITIR comandos ao aparelho
-/// (antes o hub só respondia `proxy-ack`, nunca pedia proxy — não existia
-/// caminho Master -> VPS -> adbd).
-/// Identidade é sempre (company_id, uuid); nunca IP/socket.
-static CONTROL: LazyLock<Mutex<HashMap<(i32, String), mpsc::UnboundedSender<String>>>> =
+/// Registry de CONTROLE: (company_id, device_id) -> (session_id, canal de escrita)
+static CONTROL: LazyLock<Mutex<HashMap<(i32, String), (String, mpsc::UnboundedSender<String>)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Pede ao device-agent que abra o proxy do adbd local na porta indicada.
-/// Retorna erro se a empresa/dispositivo não tiver sessão de túnel ativa
-/// (isolamento: empresa A nunca alcança device da empresa B).
 pub fn request_proxy(company_id: i32, esfera_device_id: &str, adb_port: u16) -> Result<(), String> {
     let map = CONTROL.lock().unwrap();
-    let tx = map
+    let (_, tx) = map
         .get(&(company_id, esfera_device_id.to_string()))
         .ok_or_else(|| "device sem túnel ativo para esta empresa".to_string())?;
     tx.send(format!("{{\"type\":\"proxy\",\"port\":{}}}", adb_port))
@@ -55,7 +60,7 @@ pub fn request_proxy(company_id: i32, esfera_device_id: &str, adb_port: u16) -> 
 /// Envia uma linha JSON arbitrária pelo túnel de controle do device.
 pub fn send_control(company_id: i32, esfera_device_id: &str, json_line: &str) -> Result<(), String> {
     let map = CONTROL.lock().unwrap();
-    let tx = map
+    let (_, tx) = map
         .get(&(company_id, esfera_device_id.to_string()))
         .ok_or_else(|| "device sem túnel ativo para esta empresa".to_string())?;
     tx.send(json_line.to_string())
@@ -63,14 +68,11 @@ pub fn send_control(company_id: i32, esfera_device_id: &str, json_line: &str) ->
 }
 
 /// Registry de RESULTADOS de comandos remotos: (company_id, device_id, cmd_id) -> sender.
-/// O hub.rs (send_device_command) aguarda neste canal até o device responder `adb_result`.
 static RESULTS: LazyLock<
     Mutex<HashMap<(i32, String, String), tokio::sync::oneshot::Sender<String>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Solicita execução de um comando no device (canal de controle remoto, sem root).
-/// O device (agente Kotlin) executa localmente e devolve `adb_result` com o mesmo id.
-/// Retorna o Receiver que o hub.rs deve aguardar (com timeout).
 pub fn request_adb_command(
     company_id: i32,
     esfera_device_id: &str,
@@ -80,63 +82,39 @@ pub fn request_adb_command(
     let line = format!(
         "{{\"type\":\"adb_cmd\",\"id\":\"{}\",\"command\":{}}}",
         cmd_id,
-        serde_json::to_string(command).map_err(|e| e.to_string())?
+        serde_json::to_string(command).unwrap_or_else(|_| format!("\"{}\"", command))
     );
-    {
-        let map = CONTROL.lock().unwrap();
-        let tx = map
-            .get(&(company_id, esfera_device_id.to_string()))
-            .ok_or_else(|| "device sem túnel ativo para esta empresa".to_string())?;
-        tx.send(line).map_err(|_| "sessão de túnel encerrada".to_string())?;
-    }
-    let (os_tx, os_rx) = tokio::sync::oneshot::channel::<String>();
+    let (tx, rx) = tokio::sync::oneshot::channel();
     RESULTS
         .lock()
         .unwrap()
-        .insert((company_id, esfera_device_id.to_string(), cmd_id.to_string()), os_tx);
-    Ok(os_rx)
+        .insert((company_id, esfera_device_id.to_string(), cmd_id.to_string()), tx);
+
+    if let Err(e) = send_control(company_id, esfera_device_id, &line) {
+        RESULTS
+            .lock()
+            .unwrap()
+            .remove(&(company_id, esfera_device_id.to_string(), cmd_id.to_string()));
+        return Err(e);
+    }
+    Ok(rx)
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentHandshake {
-    #[serde(rename = "type")]
-    _msg_type: Option<String>,
-    hardware_uuid: Option<String>,
-    #[serde(default)]
-    _mac_address: String,
-    #[serde(default)]
-    _serial_number: String,
-    #[serde(default)]
-    _agent_version: String,
-    #[serde(default)]
-    current_local_ip: String,
-    // NOVO: identidade de isolamento (vindo do device-agent Rust).
-    #[serde(default)]
-    company_id: i32,
-}
-
-pub async fn start(port: u16) {
+pub async fn start(port: u16) -> Result<(), String> {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = match crate::bind_reuse(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("AVISO: Tunnel server na porta {} ja em uso: {}", port, e);
-            return;
-        }
-    };
+    let listener = crate::bind_reuse(addr).await
+        .map_err(|e| format!("Tunnel server na porta {} ja em uso: {}", port, e))?;
     println!("🔌 Tunnel server (canal RUST) ativo na porta {}", port);
 
-    // Heartbeat sweeper: mantém o estado de túnel fiel à realidade da conexão.
     tokio::spawn(async {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
-            session_manager::sweep_stale(HEARTBEAT_GRACE_SECS, 30);
+            crate::session_manager::sweep_stale(HEARTBEAT_GRACE_SECS, 30);
         }
     });
 
     loop {
-        let (stream, _addr) = match listener.accept().await {
+        let (stream, remote_addr) = match listener.accept().await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Aviso: erro ao aceitar túnel: {}", e);
@@ -144,6 +122,7 @@ pub async fn start(port: u16) {
             }
         };
         tokio::spawn(async move {
+            println!("[tunnel] accepted remote={}", remote_addr);
             if let Err(e) = handle_agent(stream).await {
                 eprintln!("[tunnel] sessão encerrada: {}", e);
             }
@@ -151,55 +130,85 @@ pub async fn start(port: u16) {
     }
 }
 
-async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
-    let (read_half, write_half) = tokio::io::split(stream);
-    let mut reader = BufReader::new(read_half);
-    let mut writer = BufWriter::new(write_half);
-
-    // 1. Handshake na primeira linha (timeout 10s)
-    let first = tokio::time::timeout(Duration::from_secs(10), read_line(&mut reader))
-        .await
-        .map_err(|_| "timeout no handshake".to_string())?
-        .ok_or("sem handshake".to_string())?;
-
-    let hs: AgentHandshake = serde_json::from_str(&first)
-        .map_err(|e| format!("handshake inválido: {}", e))?;
-
-    let uuid = hs
-        .hardware_uuid
-        .filter(|u| !u.is_empty())
-        .ok_or("hardware_uuid ausente".to_string())?;
-    let company_id = hs.company_id;
-    if company_id <= 0 {
-        let _ = write_line(
-            &mut writer,
-            "{\"type\":\"error\",\"reason\":\"companyId ausente ou invalido\"}",
-        )
-        .await;
-        return Err(format!(
-            "handshake recusado: device {} sem companyId valido",
-            uuid
-        ));
-    }
-
-    // 2. Confirma handshake
-    write_line(&mut writer, "{\"type\":\"welcome\"}").await?;
-
-    // 3. Abre a sessão de TÚNEL (canal EXCLUSIVO do rust). Gera novo SESSION_ID.
-    let session_id = open_tunnel(company_id, &uuid, &hs.current_local_ip);
-    println!(
-        "[tunnel] device {} (empresa {}) conectado — session {}",
-        uuid, company_id, session_id
-    );
-
-    // 4. Registra o canal de CONTROLE desta sessão (Master -> device).
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+/// Verifica se o dispositivo possui túnel TCP ativo no backend.
+pub fn is_tunnel_active(company_id: i32, esfera_device_id: &str) -> bool {
     CONTROL
         .lock()
         .unwrap()
-        .insert((company_id, uuid.clone()), tx);
+        .contains_key(&(company_id, esfera_device_id.to_string()))
+}
 
-    // 5. Loop: heartbeat L7 (ping/pong) + comandos de controle + proxy
+async fn read_line(reader: &mut BufReader<tokio::net::tcp::ReadHalf<'_>>) -> Option<String> {
+    let mut line = String::new();
+    match reader.read_line(&mut line).await {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line),
+    }
+}
+
+async fn write_line(
+    writer: &mut tokio::net::tcp::WriteHalf<'_>,
+    msg: &str,
+) -> Result<(), std::io::Error> {
+    writer.write_all(msg.as_bytes()).await?;
+    if !msg.ends_with('\n') {
+        writer.write_all(b"\n").await?;
+    }
+    writer.flush().await
+}
+
+/// Processa uma conexão de agente no Server VPS (porta 8888)
+pub async fn handle_agent(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (reader, mut writer) = stream.split();
+    let mut reader = BufReader::new(reader);
+
+    // 1. Handshake na primeira linha
+    let first_line = match read_line(&mut reader).await {
+        Some(l) => l,
+        None => return Ok(()),
+    };
+
+    let hs: TunnelHandshake = match serde_json::from_str(first_line.trim()) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[tunnel] handshake invalido: {} — payload: {}", e, first_line.trim());
+            return Ok(());
+        }
+    };
+
+    let uuid = hs.hardware_uuid.trim().to_string();
+    if uuid.is_empty() {
+        eprintln!("[tunnel] handshake rejeitado: hardware_uuid vazio");
+        return Ok(());
+    }
+
+    if hs.company_id <= 0 {
+        write_line(&mut writer, "{\"error\":\"companyId obrigatorio\"}").await?;
+        return Ok(());
+    }
+    let company_id = hs.company_id;
+
+    // 2. Responde welcome ao agente
+    write_line(&mut writer, "{\"type\":\"welcome\"}").await?;
+
+    // 3. Abre a sessão de TÚNEL. Gera novo SESSION_ID.
+    let session_id = open_tunnel(company_id, &uuid, &hs.current_local_ip);
+
+    // 4. Registra no mapa de CONTROLE (deduplica substituindo a sessão anterior se houver)
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    {
+        let mut ctrl = CONTROL.lock().unwrap();
+        if let Some((old_sess, _)) = ctrl.get(&(company_id, uuid.clone())) {
+            println!(
+                "[tunnel] previous_session={} replaced by new_session={} device={}",
+                old_sess, session_id, uuid
+            );
+        }
+        ctrl.insert((company_id, uuid.clone()), (session_id.clone(), tx));
+    }
+    println!("[tunnel] device {} (empresa {}) conectado (session {})", uuid, company_id, session_id);
+
+    // 5. Loop: heartbeat L7 + comandos de controle
     let mut last_heartbeat = Instant::now();
     loop {
         tokio::select! {
@@ -212,49 +221,23 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
             line = read_line(&mut reader) => {
                 let line = match line {
                     Some(l) => l,
-                    None => break, // EOF ou erro -> encerra (device reconecta)
+                    None => break,
                 };
                 last_heartbeat = Instant::now();
                 heartbeat_tunnel(company_id, &uuid);
                 let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or(serde_json::Value::Null);
                 match v.get("type").and_then(|t| t.as_str()) {
                     Some("ping") => {
-                        write_line(&mut writer, "{\"type\":\"pong\"}").await?;
+                        let _ = write_line(&mut writer, "{\"type\":\"pong\"}").await;
                     }
                     Some("proxy") => {
-                        // Sinaliza ao device-agent que o hub aceita o proxy.
-                        // O relay bruto é feito PELO device-agent (handle_proxy).
-                        write_line(&mut writer, "{\"type\":\"proxy-ack\"}").await?;
+                        let _ = write_line(&mut writer, "{\"type\":\"proxy-ack\"}").await;
                     }
-                    // Respostas ao proxy PEDIDO pelo hub (Master -> VPS -> adbd).
-                    Some("proxy-ack") => {
-                        println!("[tunnel] proxy aceito pelo device {} (empresa {})", uuid, company_id);
-                    }
-                    Some("proxy-error") => {
-                        let reason = v.get("error").and_then(|e| e.as_str()).unwrap_or("desconhecido");
-                        eprintln!(
-                            "[tunnel] proxy recusado pelo device {} (empresa {}): {}",
-                            uuid, company_id, reason
-                        );
-                    }
-                    // Resultado de comando remoto (agente Kotlin executou localmente).
                     Some("adb_result") => {
-                        let cmd_id = v
-                            .get("id")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let output = v
-                            .get("output")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if let Some(tx) = RESULTS
-                            .lock()
-                            .unwrap()
-                            .remove(&(company_id, uuid.clone(), cmd_id.clone()))
-                        {
-                            let _ = tx.send(output);
+                        let cmd_id = v.get("id").and_then(|s| s.as_str()).unwrap_or("");
+                        let output = v.get("output").and_then(|s| s.as_str()).unwrap_or("");
+                        if let Some(tx) = RESULTS.lock().unwrap().remove(&(company_id, uuid.clone(), cmd_id.to_string())) {
+                            let _ = tx.send(output.to_string());
                         }
                     }
                     _ => {}
@@ -268,27 +251,32 @@ async fn handle_agent(stream: tokio::net::TcpStream) -> Result<(), String> {
         }
     }
 
-    // 6. Cleanup: remove canal de controle e marca túnel offline (presença intocada).
-    CONTROL.lock().unwrap().remove(&(company_id, uuid.clone()));
-    close_tunnel(company_id, &uuid);
-    println!(
-        "[tunnel] device {} (empresa {}) desconectado — túnel fechado",
-        uuid, company_id
-    );
+    // 6. Cleanup SEGURO por geração: só remove de CONTROL se a sessão gravada for ESTA.
+    {
+        let mut ctrl = CONTROL.lock().unwrap();
+        if let Some((stored_sess, _)) = ctrl.get(&(company_id, uuid.clone())) {
+            if stored_sess == &session_id {
+                ctrl.remove(&(company_id, uuid.clone()));
+                close_tunnel(company_id, &uuid, &session_id);
+                println!(
+                    "[tunnel] connection_closed session={} device={}",
+                    session_id, uuid
+                );
+            } else {
+                println!(
+                    "[tunnel] cleanup session={} device={} IGNORADO — sessão mais nova existe (não apaga CONTROL)",
+                    session_id, uuid
+                );
+            }
+        } else {
+            close_tunnel(company_id, &uuid, &session_id);
+            println!(
+                "[tunnel] connection_closed session={} device={}",
+                session_id, uuid
+            );
+        }
+    }
     Ok(())
 }
 
-async fn read_line(reader: &mut BufReader<tokio::io::ReadHalf<tokio::net::TcpStream>>) -> Option<String> {
-    let mut line = String::new();
-    match reader.read_line(&mut line).await {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(line),
-    }
-}
 
-async fn write_line(writer: &mut BufWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>, s: &str) -> Result<(), String> {
-    let mut buf = s.as_bytes().to_vec();
-    buf.push(b'\n');
-    writer.write_all(&buf).await.map_err(|e| e.to_string())?;
-    writer.flush().await.map_err(|e| e.to_string())
-}
