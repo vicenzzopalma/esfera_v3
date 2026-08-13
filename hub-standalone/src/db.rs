@@ -1085,7 +1085,7 @@ impl Database {
                 "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                 ON CONFLICT(AdbDeviceId) DO UPDATE SET
-                DeviceName=CASE WHEN ESF_Device.DeviceName IS NOT NULL AND ESF_Device.DeviceName != '' AND ESF_Device.DeviceName != excluded.Model THEN ESF_Device.DeviceName ELSE excluded.DeviceName END,
+                DeviceName=CASE WHEN ESF_Device.DeviceName IS NOT NULL AND ESF_Device.DeviceName != '' THEN ESF_Device.DeviceName ELSE excluded.DeviceName END,
                 Brand=excluded.Brand, Model=excluded.Model,
                 DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
                 BatteryLevel=excluded.BatteryLevel,
@@ -1274,8 +1274,11 @@ impl Database {
     /// consistente em todos os clientes (app desktop, agente, etc.).
     pub fn rename_device(&self, esfera_device_id: &str, name: &str) -> Result<(), String> {
         let conn = self.conn();
+        // Coluna correta é `DeviceName` (schema: CREATE TABLE ESF_Device ... DeviceName TEXT NOT NULL).
+        // Antes apontava para `Name` (inexistente) e o rename falhava silenciosamente no VPS,
+        // fazendo o nome customizado sumir após o próximo get_devices.
         conn.execute(
-            "UPDATE ESF_Device SET Name = ?1 WHERE EsferaDeviceId = ?2",
+            "UPDATE ESF_Device SET DeviceName = ?1 WHERE EsferaDeviceId = ?2",
             params![name, esfera_device_id],
         )
         .map_err(|e| e.to_string())?;

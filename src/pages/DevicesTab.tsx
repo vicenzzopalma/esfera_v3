@@ -551,8 +551,8 @@ export default function DevicesTab() {
                     <td className="px-4 py-3 font-mono text-zinc-300 text-[11px]">{device.currentAdbAddress || device.serial}</td>
                     <td className="px-4 py-3 uppercase font-medium text-[10px] text-zinc-400">{device.sector}</td>
                     <td className="px-4 py-3">
-                      <Badge variant={device.status === "online" ? "success" : device.status === "connecting" ? "warning" : "danger"} dot>
-                        {device.status}
+                      <Badge variant={device.status === "online" ? "success" : (device.status === "connecting" || device.status === "degraded") ? "warning" : "danger"} dot>
+                        {device.status === "degraded" ? "degradado (sem ADB)" : device.status}
                       </Badge>
                     </td>
                     <td className="px-4 py-3 font-mono text-zinc-300">{device.battery}%</td>

@@ -61,7 +61,7 @@ export interface Company {
   createdAt: string;
 }
 
-export type DeviceStatus = "online" | "offline" | "connecting" | "error" | "online_agent";
+export type DeviceStatus = "online" | "offline" | "connecting" | "error" | "online_agent" | "degraded";
 
 export interface Device {
   id: number;

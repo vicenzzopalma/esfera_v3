@@ -25,6 +25,52 @@ pub struct AppState {
     pub hub_client: Arc<TokioMutex<Option<HubClient>>>,
 }
 
+static CONNECT_LOG_MUTEX: Mutex<()> = Mutex::new(());
+
+pub fn log_connect(msg: &str) {
+    let _guard = CONNECT_LOG_MUTEX.lock().ok();
+
+    let base_dir = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("LOCALAPPDATA"))
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+
+    let dir = base_dir.join("esfera_v3");
+    let _ = std::fs::create_dir_all(&dir);
+    let log_file = dir.join("connect-debug.log");
+
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+    let line = format!("{} {}\n", timestamp, msg);
+
+    println!("{}", line.trim());
+
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_file) {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
+    }
+}
+
+pub fn init_connect_log() {
+    let _guard = CONNECT_LOG_MUTEX.lock().ok();
+
+    let base_dir = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("LOCALAPPDATA"))
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+
+    let dir = base_dir.join("esfera_v3");
+    let _ = std::fs::create_dir_all(&dir);
+    let log_file = dir.join("connect-debug.log");
+
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+    let header = format!("=== SESSÃO INICIADA EM {} ===\n", timestamp);
+
+    let _ = std::fs::write(log_file, header.as_bytes());
+}
+
 fn validate_session(
     sessions: &Arc<Mutex<SessionManager>>,
     token: &str,
@@ -590,9 +636,9 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                         }
                     }
                     if let Some(client) = guard.as_ref() {
-                        match client.send_command(0, "get_live_devices", serde_json::json!({"companyId": target_company_id})).await {
-                            Ok(val) => val.as_array().cloned().unwrap_or_default(),
-                            Err(_) => {
+                        match tokio::time::timeout(std::time::Duration::from_secs(2), client.send_command(0, "get_live_devices", serde_json::json!({"companyId": target_company_id}))).await {
+                            Ok(Ok(val)) => val.as_array().cloned().unwrap_or_default(),
+                            _ => {
                                 *guard = None; // Força reconexão na próxima chamada
                                 Vec::new()
                             }
@@ -637,7 +683,11 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             // Comparar case-insensitive para nao cair sempre no branch "offline"
             // (o que deixava os celulares remotos vermelhos/ausentes no app).
             let mapped_status = match vps_status.to_lowercase().as_str() {
-                "online" | "degraded" => "online",
+                "online" => "online",
+                // DEGRADED = presença WS viva, mas túnel ADB indisponível.
+                // NÃO forjar "online": o app precisa mostrar estado real para que o
+                // usuário saiba que o espelhamento/ADB não funciona até o túnel voltar.
+                "degraded" => "degraded",
                 _ => "offline",
             }.to_string();
             let battery = live.get("battery_level").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
@@ -960,90 +1010,230 @@ pub async fn connect_adb_device(
     sector: String,
     device_name: Option<String>,
 ) -> Result<String, String> {
+    log_connect(&format!("[CONNECT] ipc_entered fn=connect_adb_device ip={} port={} company_id={}", ip, port, company_id));
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
     let state_db = state.db.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let (target_ip, target_port) = if ip.contains(':') {
-            let parts: Vec<&str> = ip.split(':').collect();
-            let parsed_port = parts.get(1).and_then(|p| p.trim().parse::<i32>().ok()).unwrap_or(if port <= 0 { 5555 } else { port });
-            (parts[0].trim().to_string(), parsed_port)
-        } else {
-            (ip.trim().to_string(), if port <= 0 { 5555 } else { port })
-        };
+        log_connect("[CONNECT] worker_entered fn=connect_adb_device");
+        let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let start_time = std::time::Instant::now();
+            let (target_ip, target_port) = if ip.contains(':') {
+                let parts: Vec<&str> = ip.split(':').collect();
+                let parsed_port = parts.get(1).and_then(|p| p.trim().parse::<i32>().ok()).unwrap_or(if port <= 0 { 5555 } else { port });
+                (parts[0].trim().to_string(), parsed_port)
+            } else {
+                (ip.trim().to_string(), if port <= 0 { 5555 } else { port })
+            };
 
-        // ── Bifurcação VPS ──────────────────────────────────────────────
-        // Se o IP pertence a um device que já está conectado via VPS (via_tunnel),
-        // o PC não precisa tentar adb connect local (evita timeout de rede).
-        {
+            log_connect(&format!("[CONNECT] entered ip={}:{} company_id={}", target_ip, target_port, company_id));
+
+            // ── 1. CHECAGEM DE DISPOSITIVO REMOTO / VPS ─────────────────────────────
+            log_connect("[CONNECT] get_devices_start");
             let all_devs = state_db.get_devices(company_id);
-            for dev in &all_devs {
-                let ip_match = dev.ip == target_ip
-                    || dev.serial == target_ip
-                    || dev.current_adb_address.as_deref()
-                        .map(|a| a.starts_with(&format!("{}:", target_ip)))
-                        .unwrap_or(false);
-                if ip_match {
-                    let is_tunnel = dev.via_tunnel
-                        || dev.status == "online"
-                        || dev.esfera_device_id.as_deref()
-                            .map(|eid| crate::tunnel_server::is_tunnel_active(eid))
-                            .unwrap_or(false);
-                    if is_tunnel {
-                        let label = if !dev.name.is_empty() { dev.name.clone() } else { target_ip.clone() };
-                        return Ok(format!(
-                            "✅ {} já está conectado e online via VPS Hub! O controle remoto já está ativo.",
-                            label
-                        ));
-                    }
-                }
+            log_connect(&format!("[CONNECT] get_devices_end count={}", all_devs.len()));
+
+            let existing_dev = all_devs.into_iter().find(|d| {
+                d.ip == target_ip
+                    || d.serial == target_ip
+                    || d.current_adb_address.as_deref() == Some(&target_ip)
+                    || d.esfera_device_id.as_deref() == Some(&target_ip)
+            });
+            log_connect(&format!("[CONNECT] existing_lookup_end found={}", existing_dev.is_some()));
+
+            log_connect("[CONNECT] tunnel_check_start");
+            let active_by_target = crate::tunnel_server::is_tunnel_active(&target_ip);
+            let active_by_eid = existing_dev
+                .as_ref()
+                .and_then(|d| d.esfera_device_id.as_deref())
+                .map(|eid| crate::tunnel_server::is_tunnel_active(eid))
+                .unwrap_or(false);
+            log_connect(&format!("[CONNECT] tunnel_check_end active_by_target={} active_by_eid={}", active_by_target, active_by_eid));
+
+            let is_remote_device = target_ip.starts_with("ESF-")
+                || existing_dev.as_ref().map(|d| d.via_tunnel).unwrap_or(false)
+                || active_by_target
+                || active_by_eid;
+
+            log_connect(&format!("[CONNECT] remote_decision={}", is_remote_device));
+
+            if is_remote_device {
+                log_connect(&format!("[CONNECT] remote_detected target={}", target_ip));
+                let esfera_id = existing_dev
+                    .as_ref()
+                    .and_then(|d| d.esfera_device_id.clone())
+                    .unwrap_or_else(|| if target_ip.starts_with("ESF-") { target_ip.clone() } else { format!("ESF-{}", target_ip) });
+
+                let final_name = device_name
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| existing_dev.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| format!("Aparelho {}", device_number)));
+
+                let is_active = active_by_target || active_by_eid;
+                let status_str = if is_active { "online".to_string() } else { "degraded".to_string() };
+
+                log_connect("[CONNECT] db_upsert_start");
+                let dev = Device {
+                    id: existing_dev.as_ref().map(|d| d.id).unwrap_or(0),
+                    serial: format!("{}:{}", target_ip, target_port),
+                    name: final_name.clone(),
+                    brand: existing_dev.as_ref().map(|d| d.brand.clone()).unwrap_or_else(|| "Android".to_string()),
+                    model: existing_dev.as_ref().map(|d| d.model.clone()).unwrap_or_else(|| "Smartphone".to_string()),
+                    ip: target_ip.clone(),
+                    port: target_port,
+                    status: status_str,
+                    battery: existing_dev.as_ref().map(|d| d.battery).unwrap_or(90),
+                    company_id,
+                    device_number,
+                    sector,
+                    esfera_device_id: Some(esfera_id),
+                    current_adb_address: Some(format!("{}:{}", target_ip, target_port)),
+                    last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
+                    via_tunnel: true,
+                };
+                let _ = state_db.upsert_device(&dev);
+                log_connect("[CONNECT] db_upsert_end");
+
+                let elapsed = start_time.elapsed().as_millis();
+                log_connect(&format!("[CONNECT] returning elapsed_ms={}", elapsed));
+                return Ok(format!("✅ Dispositivo remoto {} cadastrado via VPS Hub em {}ms!", final_name, elapsed));
             }
-            // Também verifica se o próprio IP é um esfera_device_id com túnel ativo.
-            if crate::tunnel_server::is_tunnel_active(&target_ip) {
-                return Ok(format!(
-                    "✅ Dispositivo {} já conectado via túnel VPS.",
-                    target_ip
-                ));
+
+            // ── 2. PROBAÇÃO DE ADB LOCAL ──────────────────────────────────────────
+            log_connect("[CONNECT] probe_start");
+            let is_local_tcp_open = {
+                let addr_str = format!("{}:{}", target_ip, target_port);
+                if let Ok(sa) = addr_str.parse() {
+                    std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(1500)).is_ok()
+                } else {
+                    false
+                }
+            };
+            log_connect(&format!("[CONNECT] probe_end is_local_tcp={}", is_local_tcp_open));
+
+            let serial = format!("{}:{}", target_ip, target_port);
+
+            // Se o TCP local NÃO responder em 1.5s: NENHUM COMANDO ADB É EXECUTADO!
+            if !is_local_tcp_open {
+                log_connect("[CONNECT] local_adb_unreachable — bypassing all adb commands");
+                let esfera_id = existing_dev
+                    .as_ref()
+                    .and_then(|d| d.esfera_device_id.clone())
+                    .unwrap_or_else(|| format!("ESF-{}", target_ip.replace('.', "_")));
+
+                let final_name = device_name
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { target_ip.clone() });
+
+                let is_active = crate::tunnel_server::is_tunnel_active(&esfera_id);
+                let status_str = if is_active { "online".to_string() } else { "degraded".to_string() };
+
+                log_connect("[CONNECT] db_upsert_start");
+                let dev = Device {
+                    id: existing_dev.as_ref().map(|d| d.id).unwrap_or(0),
+                    serial: serial.clone(),
+                    name: final_name.clone(),
+                    brand: "Android".to_string(),
+                    model: "Smartphone".to_string(),
+                    ip: target_ip.clone(),
+                    port: target_port,
+                    status: status_str,
+                    battery: 90,
+                    company_id,
+                    device_number,
+                    sector,
+                    esfera_device_id: Some(esfera_id),
+                    current_adb_address: Some(serial.clone()),
+                    last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
+                    via_tunnel: true,
+                };
+                let _ = state_db.upsert_device(&dev);
+                log_connect("[CONNECT] db_upsert_end");
+
+                let elapsed = start_time.elapsed().as_millis();
+                log_connect(&format!("[CONNECT] returning elapsed_ms={}", elapsed));
+                return Ok(format!("✅ Dispositivo {} vinculado com sucesso em {}ms!", final_name, elapsed));
+            }
+
+            // ── 3. APENAS SE FOR WI-FI LOCAL ACESSÍVEL: ───────────────────────────
+            log_connect("[CONNECT] adb_connect_start");
+            let adb_conn_res = AdbManager::connect_device(&target_ip, target_port);
+            log_connect(&format!("[CONNECT] adb_connect_end ok={}", adb_conn_res.is_ok()));
+
+            let (brand, model) = if adb_conn_res.is_ok() {
+                AdbManager::get_device_info(&serial)
+            } else {
+                ("Android".to_string(), "Smartphone".to_string())
+            };
+
+            let final_name = device_name
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { target_ip.clone() });
+
+            log_connect("[CONNECT] persistent_id_start");
+            let persistent_id = if adb_conn_res.is_ok() {
+                AdbManager::get_persistent_device_id(&serial)
+                    .unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()))
+            } else {
+                format!("ESF-{}", target_ip.replace('.', "_"))
+            };
+            log_connect(&format!("[CONNECT] persistent_id_end pid={}", persistent_id));
+
+            if adb_conn_res.is_ok() {
+                let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
+                let _ = AdbManager::deploy_keepalive(&serial);
+            }
+
+            let is_tunnel_active = crate::tunnel_server::is_tunnel_active(&persistent_id)
+                || crate::tunnel_server::is_tunnel_active(&target_ip);
+
+            let status_str = if adb_conn_res.is_ok() || is_tunnel_active {
+                "online".to_string()
+            } else {
+                "degraded".to_string()
+            };
+
+            log_connect("[CONNECT] db_upsert_start");
+            let dev = Device {
+                id: 0,
+                serial: serial.clone(),
+                name: final_name.clone(),
+                brand,
+                model,
+                ip: target_ip.clone(),
+                port: target_port,
+                status: status_str,
+                battery: 90,
+                company_id,
+                device_number,
+                sector,
+                esfera_device_id: Some(persistent_id),
+                current_adb_address: Some(serial.clone()),
+                last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
+                via_tunnel: adb_conn_res.is_err(),
+            };
+            state_db.upsert_device(&dev)?;
+            log_connect("[CONNECT] db_upsert_end");
+
+            let elapsed = start_time.elapsed().as_millis();
+            log_connect(&format!("[CONNECT] returning elapsed_ms={}", elapsed));
+            Ok(format!("✅ Dispositivo {} conectado com sucesso em {}ms!", final_name, elapsed))
+        }));
+
+        match panic_res {
+            Ok(res) => res,
+            Err(e) => {
+                let panic_msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Erro interno / panic no worker".to_string()
+                };
+                log_connect(&format!("[CONNECT] PANIC_DETECTED msg={}", panic_msg));
+                Err(format!("Erro no processo: {}", panic_msg))
             }
         }
-
-        let result = AdbManager::connect_device(&target_ip, target_port)?;
-        let serial = format!("{}:{}", target_ip, target_port);
-        let (brand, model) = AdbManager::get_device_info(&serial);
-        let final_name = device_name
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { target_ip.clone() });
-        let persistent_id = AdbManager::get_persistent_device_id(&serial)
-            .unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()));
-        let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
-        let dev = Device {
-            id: 0,
-            serial: serial.clone(),
-            name: final_name,
-            brand,
-            model,
-            ip: target_ip,
-            port: target_port,
-            status: "online".to_string(),
-            battery: 90,
-            company_id,
-            device_number,
-            sector,
-            esfera_device_id: None,
-            current_adb_address: Some(serial.clone()),
-            last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
-            via_tunnel: false,
-        };
-        state_db.upsert_device(&dev)?;
-        let _ = AdbManager::deploy_keepalive(&serial);
-        state_db.queue_add_log(
-            company_id,
-            "info",
-            "ADB Engine",
-            &format!("Dispositivo {} conectado via wireless na porta {}.", serial, target_port),
-        );
-        Ok(result)
     }).await.map_err(|e| e.to_string())?
 }
 
@@ -1388,7 +1578,18 @@ pub fn clear_logs(state: State<'_, AppState>, token: String, company_id: i32) ->
 // ============================================================
 
 #[tauri::command]
-pub async fn capture_device_screen(_token: String, serial: String) -> Result<String, String> {
+pub async fn capture_device_screen(state: State<'_, AppState>, _token: String, serial: String) -> Result<String, String> {
+    // Device remoto (via_tunnel): roteia a captura pelo túnel VPS, que empurra até
+    // o agente Kotlin executar o screencap localmente. Sem isso, o capture tentava
+    // ADB local (inexistente para remoto) e falhava com "não foi possível capturar".
+    if let Some(company_id) = resolve_remote_target(&state, &serial) {
+        match send_remote_adb_command(&state, company_id, &serial, "screencap -p | base64 -w 0").await {
+            Ok(b64) if !b64.trim().is_empty() => return Ok(b64.trim().to_string()),
+            // Túnel existe (via_tunnel) mas o comando não voltou: presença viva, ADB morto.
+            Ok(_) => return Err("Túnel ADB do celular está indisponível (presença ativa). Aguardando reconexão do túnel...".to_string()),
+            Err(e) => return Err(format!("Falha ao capturar via túnel: {}. Verifique se o celular está online.", e)),
+        }
+    }
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::capture_screen(&serial)
     }).await.map_err(|e| e.to_string())?
@@ -1902,72 +2103,211 @@ pub async fn force_enable_wireless_adb(
     sector: String,
     device_name: Option<String>,
 ) -> Result<String, String> {
+    log_connect(&format!("[CONNECT] ipc_entered fn=force_enable_wireless_adb serial={} company_id={}", serial, company_id));
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
     let state_db = state.db.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        // ── Bifurcação VPS ──────────────────────────────────────────────
-        // Se o serial é um esfera_device_id com túnel ativo, não tenta ADB local.
-        if crate::tunnel_server::is_tunnel_active(&serial) {
-            return Ok(format!(
-                "✅ Dispositivo {} já conectado via túnel VPS — vinculação USB dispensada.",
-                serial
-            ));
-        }
+        log_connect("[CONNECT] worker_entered fn=force_enable_wireless_adb");
+        let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let start_time = std::time::Instant::now();
+            log_connect(&format!("[CONNECT] entered serial={} company_id={}", serial, company_id));
 
-        let ip = AdbManager::get_device_wifi_ip(&serial).map_err(|e| {
-            format!("{} Certifique-se de que o celular está conectado na mesma rede Wi-Fi que o computador.", e)
-        })?;
+            // ── 1. CHECAGEM SE É REMOTO / DISPOSITIVO VPS / ESFERA_DEVICE_ID
+            log_connect("[CONNECT] get_devices_start");
+            let all_devs = state_db.get_devices(company_id);
+            log_connect(&format!("[CONNECT] get_devices_end count={}", all_devs.len()));
 
-        // 1. Reutiliza a identidade existente ou cria UUID, nunca usa o slot como identidade.
-        let persistent_id = AdbManager::get_persistent_device_id(&serial)
-            .unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()));
-        let _ = AdbManager::inject_persistent_device_id(&serial, &persistent_id);
+            let existing_dev = all_devs.into_iter().find(|d| {
+                d.serial == serial
+                    || d.esfera_device_id.as_deref() == Some(&serial)
+                    || d.ip == serial
+                    || d.current_adb_address.as_deref() == Some(&serial)
+            });
+            log_connect(&format!("[CONNECT] existing_lookup_end found={}", existing_dev.is_some()));
 
-        let _ = crate::adb_manager::create_cmd("adb")
-            .args(["-s", &serial, "shell", "setprop", "persist.adb.tcp.port", "5555"])
-            .output();
-        AdbManager::enable_tcpip(&serial, 5555)?;
-        std::thread::sleep(std::time::Duration::from_millis(300));
+            log_connect("[CONNECT] tunnel_check_start");
+            let active_by_serial = crate::tunnel_server::is_tunnel_active(&serial);
+            let active_by_eid = existing_dev
+                .as_ref()
+                .and_then(|d| d.esfera_device_id.as_deref())
+                .map(|eid| crate::tunnel_server::is_tunnel_active(eid))
+                .unwrap_or(false);
+            log_connect(&format!("[CONNECT] tunnel_check_end active_by_serial={} active_by_eid={}", active_by_serial, active_by_eid));
 
-        let connect_res = AdbManager::connect_device(&ip, 5555)?;
-        let (brand, model) = AdbManager::get_device_info(&serial);
-        let wireless_serial = format!("{}:5555", ip);
+            let is_remote_device = serial.starts_with("ESF-")
+                || existing_dev.as_ref().map(|d| d.via_tunnel).unwrap_or(false)
+                || active_by_serial
+                || active_by_eid;
 
-        // 2. Injeta Imunidade + MAC Físico + Kernel ID na conexão Wi-Fi
-        let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
-        let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
-        let _ = AdbManager::deploy_keepalive(&wireless_serial);
+            log_connect(&format!("[CONNECT] remote_decision={}", is_remote_device));
 
-        let final_name = device_name
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { ip.clone() });
+            if is_remote_device {
+                log_connect(&format!("[CONNECT] remote_detected serial={}", serial));
+                let esfera_id = existing_dev
+                    .as_ref()
+                    .and_then(|d| d.esfera_device_id.clone())
+                    .unwrap_or_else(|| if serial.starts_with("ESF-") { serial.clone() } else { format!("ESF-{}", serial) });
 
-        let device = Device {
-            id: 0,
-            serial: wireless_serial.clone(),
-            name: final_name,
-            brand,
-            model,
-            ip: ip.clone(),
-            port: 5555,
-            status: "online".to_string(),
-            battery: 100,
-            company_id,
-            device_number,
-            sector,
-            esfera_device_id: None,
-            current_adb_address: Some(wireless_serial),
-            last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
-            via_tunnel: false,
-        };
-        state_db.upsert_device(&device)?;
+                let final_name = device_name
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| existing_dev.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| format!("Aparelho {}", device_number)));
 
-        Ok(format!(
-            "Sucesso! Depuração Wi-Fi forçada e ativada no celular com IP {}! ({})",
-            ip, connect_res
-        ))
+                let is_active = active_by_serial || active_by_eid;
+                let status_str = if is_active { "online".to_string() } else { "degraded".to_string() };
+
+                log_connect("[CONNECT] db_upsert_start");
+                let dev = Device {
+                    id: existing_dev.as_ref().map(|d| d.id).unwrap_or(0),
+                    serial: serial.clone(),
+                    name: final_name.clone(),
+                    brand: existing_dev.as_ref().map(|d| d.brand.clone()).unwrap_or_else(|| "Android".to_string()),
+                    model: existing_dev.as_ref().map(|d| d.model.clone()).unwrap_or_else(|| "Smartphone".to_string()),
+                    ip: existing_dev.as_ref().map(|d| d.ip.clone()).unwrap_or_else(|| "0.0.0.0".to_string()),
+                    port: 5555,
+                    status: status_str,
+                    battery: existing_dev.as_ref().map(|d| d.battery).unwrap_or(100),
+                    company_id,
+                    device_number,
+                    sector,
+                    esfera_device_id: Some(esfera_id),
+                    current_adb_address: Some(serial.clone()),
+                    last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
+                    via_tunnel: true,
+                };
+                let _ = state_db.upsert_device(&dev);
+                log_connect("[CONNECT] db_upsert_end");
+
+                let elapsed = start_time.elapsed().as_millis();
+                log_connect(&format!("[CONNECT] returning elapsed_ms={}", elapsed));
+                return Ok(format!("✅ Dispositivo remoto {} vinculado via VPS Hub em {}ms!", final_name, elapsed));
+            }
+
+            // ── 2. PROBAÇÃO DE ADB LOCAL ──────────────────────────────────────────
+            log_connect("[CONNECT] probe_start");
+            let is_usb_attached = AdbManager::list_devices().unwrap_or_default().iter().any(|d| d.serial == serial);
+            let is_local_tcp_open = if !is_usb_attached {
+                let addr_str = if serial.contains(':') { serial.clone() } else { format!("{}:5555", serial) };
+                if let Ok(sa) = addr_str.parse() {
+                    std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(1500)).is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            log_connect(&format!("[CONNECT] probe_end is_usb={} is_tcp={}", is_usb_attached, is_local_tcp_open));
+
+            // Se NÃO for USB físico E o TCP local NÃO responder em 1.5s: NENHUM COMANDO ADB É EXECUTADO!
+            if !is_usb_attached && !is_local_tcp_open {
+                log_connect("[CONNECT] local_adb_unreachable — bypassing all adb commands");
+                let esfera_id = existing_dev
+                    .as_ref()
+                    .and_then(|d| d.esfera_device_id.clone())
+                    .unwrap_or_else(|| format!("ESF-{}", serial.replace(':', "_")));
+
+                let final_name = device_name
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { serial.clone() });
+
+                let is_active = crate::tunnel_server::is_tunnel_active(&esfera_id);
+                let status_str = if is_active { "online".to_string() } else { "degraded".to_string() };
+
+                log_connect("[CONNECT] db_upsert_start");
+                let dev = Device {
+                    id: existing_dev.as_ref().map(|d| d.id).unwrap_or(0),
+                    serial: serial.clone(),
+                    name: final_name.clone(),
+                    brand: "Android".to_string(),
+                    model: "Smartphone".to_string(),
+                    ip: serial.split(':').next().unwrap_or(&serial).to_string(),
+                    port: 5555,
+                    status: status_str,
+                    battery: 100,
+                    company_id,
+                    device_number,
+                    sector,
+                    esfera_device_id: Some(esfera_id),
+                    current_adb_address: Some(serial.clone()),
+                    last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
+                    via_tunnel: true,
+                };
+                let _ = state_db.upsert_device(&dev);
+                log_connect("[CONNECT] db_upsert_end");
+
+                let elapsed = start_time.elapsed().as_millis();
+                log_connect(&format!("[CONNECT] returning elapsed_ms={}", elapsed));
+                return Ok(format!("✅ Dispositivo {} cadastrado em {}ms!", final_name, elapsed));
+            }
+
+            // ── 3. APENAS SE FOR DISPOSITIVO FISICAMENTE CONECTADO VIA USB OU WI-FI LOCAL ACESSÍVEL:
+            log_connect("[CONNECT] adb_connect_start");
+            let ip = if is_usb_attached {
+                AdbManager::get_device_wifi_ip(&serial).unwrap_or_else(|_| "127.0.0.1".to_string())
+            } else {
+                serial.split(':').next().unwrap_or(&serial).to_string()
+            };
+            log_connect(&format!("[CONNECT] adb_connect_end ip={}", ip));
+
+            log_connect("[CONNECT] persistent_id_start");
+            let persistent_id = AdbManager::get_persistent_device_id(&serial)
+                .unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()));
+            let _ = AdbManager::inject_persistent_device_id(&serial, &persistent_id);
+            log_connect(&format!("[CONNECT] persistent_id_end pid={}", persistent_id));
+
+            if is_usb_attached {
+                let _ = crate::adb_manager::create_cmd("adb")
+                    .args(["-s", &serial, "shell", "setprop", "persist.adb.tcp.port", "5555"])
+                    .output();
+                let _ = AdbManager::enable_tcpip(&serial, 5555);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+
+            let connect_res = if ip != "127.0.0.1" && ip != "0.0.0.0" {
+                AdbManager::connect_device(&ip, 5555).ok()
+            } else {
+                None
+            };
+
+            let (brand, model) = AdbManager::get_device_info(&serial);
+            let wireless_serial = if ip != "127.0.0.1" && ip != "0.0.0.0" { format!("{}:5555", ip) } else { serial.clone() };
+
+            if connect_res.is_some() || is_usb_attached {
+                let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
+                let _ = AdbManager::deploy_keepalive(&wireless_serial);
+            }
+
+            let final_name = device_name
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { serial.clone() });
+
+            let is_tunnel_active = crate::tunnel_server::is_tunnel_active(&persistent_id);
+            let status_str = if connect_res.is_some() || is_usb_attached || is_tunnel_active {
+                "online".to_string()
+            } else {
+                "degraded".to_string()
+            };
+
+            log_connect("[CONNECT] db_upsert_start");
+            let device = Device {
+                id: 0,
+                serial: wireless_serial.clone(),
+                name: final_name.clone(),
+                brand,
+                model,
+                ip: ip.clone(),
+                port: 5555,
+                status: status_str,
+                battery: 100,
+                company_id,
+                device_number,
+                sector,
+        println!("[CONNECT] db_upsert_end");
+
+        let elapsed = start_time.elapsed().as_millis();
+        println!("[CONNECT] returning elapsed_ms={}", elapsed);
+        Ok(format!("✅ Dispositivo {} configurado com sucesso em {}ms!", final_name, elapsed))
     }).await.map_err(|e| e.to_string())?
 }
 

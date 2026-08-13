@@ -1129,11 +1129,13 @@ impl Database {
         if let Some(ref esfera_id) = device.esfera_device_id {
             if !esfera_id.trim().is_empty() {
                 let affected = self.exec_retry(
-                    "UPDATE ESF_Device SET Brand=?1, Model=?2, DeviceIp=?3,
-                        DevicePort=?4, Status=?5, BatteryLevel=?6,
-                        CurrentAdbAddress=?7, LastSeenUTC=?8
-                     WHERE CompanyId=?9 AND EsferaDeviceId=?10",
-                    params![device.brand, device.model, device.ip, device.port,
+                    "UPDATE ESF_Device SET
+                        DeviceName = CASE WHEN ?2 IS NOT NULL AND ?2 != '' THEN ?2 ELSE ESF_Device.DeviceName END,
+                        Brand=?1, Model=?3, DeviceIp=?4,
+                        DevicePort=?5, Status=?6, BatteryLevel=?7,
+                        CurrentAdbAddress=?8, LastSeenUTC=?9
+                     WHERE CompanyId=?10 AND EsferaDeviceId=?11",
+                    params![device.brand, device.name, device.model, device.ip, device.port,
                         device.status, device.battery, device.current_adb_address,
                         device.last_seen_utc, target_comp, esfera_id],
                 ).map_err(|e| e.to_string())?;

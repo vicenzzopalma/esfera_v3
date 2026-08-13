@@ -203,6 +203,26 @@ async fn handle_connection(
     let mut auth_company_id: Option<i32> = None;
     let mut auth_role: Option<String> = None;
 
+    // RAII Cleanup Guard: garante remoção de connections SEMPRE que a função encerrar
+    // (seja por break, error, timeout ou panic). Elimina vamentos de socket em CLOSE-WAIT.
+    struct ConnectionGuard {
+        connections: Arc<Mutex<HashMap<String, HubConnection>>>,
+        session_id: String,
+        addr: std::net::SocketAddr,
+    }
+    impl Drop for ConnectionGuard {
+        fn drop(&mut self) {
+            let connections = self.connections.clone();
+            let session_id = self.session_id.clone();
+            let addr = self.addr;
+            tokio::spawn(async move {
+                connections.lock().await.remove(&session_id);
+                println!("Conexão {} ({}) limpa do Hub com sucesso", addr, session_id);
+            });
+        }
+    }
+    let _guard = ConnectionGuard { connections: connections.clone(), session_id: session_id.clone(), addr };
+
     loop {
         line.clear();
         let n = match timeout(Duration::from_secs(300), reader.read_line(&mut line)).await {
@@ -213,7 +233,20 @@ async fn handle_connection(
         if n == 0 {
             break;
         }
-        let msg: HubMessage = deserialize_msg(line.trim().as_bytes())?;
+        let msg: HubMessage = match deserialize_msg(line.trim().as_bytes()) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[Hub :8555] Erro ao deserializar mensagem de {}: {} | Recebido 74B: '{}'", addr, e, line.trim());
+                let resp = HubMessage::AuthResponse {
+                    success: false,
+                    session_id: None,
+                    company_id: None,
+                    error: Some(format!("Payload inválido: {}", e)),
+                };
+                let _ = send_raw(&writer_lock, &resp).await;
+                continue;
+            }
+        };
 
         match msg {
             HubMessage::Auth { token, role } => {

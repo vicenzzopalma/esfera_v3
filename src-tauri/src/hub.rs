@@ -122,6 +122,27 @@ async fn handle_connection(
         company_name: None,
     };
     connections.lock().await.insert(session_id.clone(), conn);
+
+    // RAII Cleanup Guard: garante remoção de connections SEMPRE que a função encerrar
+    // (seja por break, error, timeout ou panic). Elimina vazamentos em CLOSE-WAIT.
+    struct ConnectionGuard {
+        connections: Arc<Mutex<HashMap<String, HubConnection>>>,
+        session_id: String,
+        addr: std::net::SocketAddr,
+    }
+    impl Drop for ConnectionGuard {
+        fn drop(&mut self) {
+            let connections = self.connections.clone();
+            let session_id = self.session_id.clone();
+            let addr = self.addr;
+            tokio::spawn(async move {
+                connections.lock().await.remove(&session_id);
+                println!("Conexão {} ({}) limpa do Hub com sucesso", addr, session_id);
+            });
+        }
+    }
+    let _guard = ConnectionGuard { connections: connections.clone(), session_id: session_id.clone(), addr };
+
     let mut line = String::new();
 
     loop {
