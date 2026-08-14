@@ -482,7 +482,7 @@ export default function DevicesTab() {
                     device.serial,
                     device.deviceNumber,
                     device.sector,
-                    device.name || `Aparelho ${device.deviceNumber}`
+                    device.name || device.model || device.serial
                   );
                 }}
                 onOpenDiagnostic={() => {
