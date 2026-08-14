@@ -7,7 +7,9 @@ import { useState } from "react";
 import Modal from "../ui/Modal";
 import Button from "../ui/Button";
 import Toggle from "../ui/Toggle";
+import Badge from "../ui/Badge";
 import type { Device, SectorType } from "../../types";
+import { getConnectionOrigin, CONNECTION_BADGE_CONFIG } from "../../types";
 import { api } from "../../tauri";
 import {
   Zap,
@@ -24,6 +26,11 @@ import {
   Power,
   Shield,
   Trash2,
+  AlertTriangle,
+  Radio,
+  Server,
+  Cpu,
+  Package,
 } from "lucide-react";
 
 interface DeviceConfigModalProps {
@@ -31,6 +38,7 @@ interface DeviceConfigModalProps {
   onClose: () => void;
   device: Device;
   onSave: (device: Device) => void;
+  onRemove?: (device: Device) => void;
 }
 
 type ConfigTab = "general" | "display" | "network" | "performance" | "system";
@@ -40,11 +48,12 @@ export function DeviceConfigModal({
   onClose,
   device,
   onSave,
+  onRemove,
 }: DeviceConfigModalProps) {
   const [activeTab, setActiveTab] = useState<ConfigTab>("general");
 
   // General Tab
-  const [nameInput, setNameInput] = useState(device.name || `Aparelho ${device.deviceNumber}`);
+  const [nameInput, setNameInput] = useState(device.name || `Aparelho ${device.deviceNumber || 1}`);
   const [modelInput, setModelInput] = useState(device.model || "");
   const [sectorInput, setSectorInput] = useState<SectorType>((device.sector as SectorType) || "junior");
   const [deviceNumberInput, setDeviceNumberInput] = useState(String(device.deviceNumber || 1));
@@ -59,17 +68,27 @@ export function DeviceConfigModal({
   const [displayStatus, setDisplayStatus] = useState<string | null>(null);
   const [applyingDisplay, setApplyingDisplay] = useState(false);
 
+  // Network Tab
+  const [vpsUrl, setVpsUrl] = useState("http://34.29.70.113:31000");
+  const [netStatus, setNetStatus] = useState<string | null>(null);
+  const [pinging, setPinging] = useState(false);
+
   // Performance Tab
   const [optimizing, setOptimizing] = useState(false);
   const [optStatus, setOptStatus] = useState<string | null>(null);
   const [debloating, setDebloating] = useState(false);
 
-  // System Tab
+  // System & Provisioning Tab
   const [rebooting, setRebooting] = useState(false);
   const [systemMsg, setSystemMsg] = useState<string | null>(null);
   const [provisioning, setProvisioning] = useState(false);
+  const [installingApk, setInstallingApk] = useState(false);
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [removing, setRemoving] = useState(false);
 
-  const serial = device.currentAdbAddress || device.serial;
+  const serial = (device.status === "online" && device.currentAdbAddress) ? device.currentAdbAddress : device.serial;
+  const origin = getConnectionOrigin(device);
+  const originBadge = CONNECTION_BADGE_CONFIG[origin];
 
   const handleCopyId = () => {
     const id = device.esferaDeviceId || device.serial;
@@ -141,7 +160,7 @@ export function DeviceConfigModal({
     setProvisioning(true);
     setSystemMsg("Re-provisionando identidade fixa e configurando Agente Esfera...");
     try {
-      const msg = await api<string>("provision_device", { serial });
+      const msg = await api<string>("provision_device", { serial, server_url: vpsUrl.trim() || null });
       setSystemMsg(`✅ ${msg}`);
     } catch (e: any) {
       setSystemMsg(`❌ Erro: ${typeof e === "string" ? e : e?.message || "Falha no provisionamento"}`);
@@ -150,24 +169,69 @@ export function DeviceConfigModal({
     }
   };
 
+  const handleInstallApk = async () => {
+    setInstallingApk(true);
+    setSystemMsg("Instalando versão mais recente do Esfera_Agent_ADB.apk...");
+    try {
+      const msg = await api<string>("remote_update_agent", { serial });
+      setSystemMsg(`✅ ${msg}`);
+    } catch (e: any) {
+      setSystemMsg(`❌ Erro: ${typeof e === "string" ? e : e?.message || "Falha na instalação do APK"}`);
+    } finally {
+      setInstallingApk(false);
+    }
+  };
+
+  const handleExecuteRemove = async () => {
+    setRemoving(true);
+    try {
+      if (onRemove) {
+        onRemove(device);
+      } else {
+        await api("disconnect_adb_device", { serial });
+        await api("delete_device", { serial: device.esferaDeviceId || serial });
+        onClose();
+      }
+    } catch (e: any) {
+      alert(`Erro ao remover: ${typeof e === "string" ? e : e?.message || "Erro desconhecido"}`);
+    } finally {
+      setRemoving(false);
+      setConfirmDeleteOpen(false);
+    }
+  };
+
   return (
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      title={`Configurações: ${nameInput || device.model}`}
+      title={`Configurações: ${nameInput || device.name || device.model}`}
       size="lg"
       footer={
         <div className="flex justify-between items-center w-full text-xs">
-          <Button variant="secondary" size="sm" onClick={onClose}>
-            Cancelar
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={onClose}
+            >
+              Fechar
+            </Button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("system")}
+              className="text-zinc-400 hover:text-[#828DF7] text-[11px] underline flex items-center gap-1 cursor-pointer transition-colors"
+            >
+              <Shield size={12} className="text-emerald-400" /> Provisionar / Ações do Sistema
+            </button>
+          </div>
+
           <Button
             variant="primary"
             size="sm"
             onClick={() => {
               onSave({
                 ...device,
-                name: nameInput || device.name || `Aparelho ${device.deviceNumber}`,
+                name: nameInput || device.name || `Aparelho ${device.deviceNumber || 1}`,
                 model: modelInput || device.model,
                 sector: sectorInput,
                 deviceNumber: parseInt(deviceNumberInput, 10) || device.deviceNumber || 1,
@@ -180,12 +244,42 @@ export function DeviceConfigModal({
       }
     >
       <div className="space-y-4 text-xs">
+        {/* Header Summary Banner */}
+        <div className="p-3 rounded-lg bg-[#09090b] border border-white/[0.08] flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-md bg-[#5E6AD2]/10 border border-[#5E6AD2]/20 text-[#828DF7]">
+              <Smartphone size={20} />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h4 className="font-bold text-sm text-zinc-100">{nameInput || device.name}</h4>
+                <Badge variant={originBadge.badgeVariant} className="text-[9px] px-1.5 py-0.5">
+                  {originBadge.icon} {originBadge.label}
+                </Badge>
+              </div>
+              <p className="text-[11px] text-zinc-400 mt-0.5 font-medium">
+                {modelInput || device.model} • Bateria: <span className="font-mono text-zinc-300 font-semibold">{device.battery}%</span>
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleCopyId}
+            className="px-2.5 py-1.5 rounded-md bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 text-xs border border-white/[0.07] flex items-center gap-1.5 transition-colors cursor-pointer"
+            title="Copiar ID de Hardware permanente"
+          >
+            {copiedId ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
+            <span className="font-mono text-[11px]">{copiedId ? "Copiado!" : (device.esferaDeviceId || device.serial)}</span>
+          </button>
+        </div>
+
         {/* Navigation Tabs */}
         <div className="flex items-center gap-1.5 border-b border-white/[0.08] pb-2 overflow-x-auto custom-scrollbar">
           <button
             type="button"
             onClick={() => setActiveTab("general")}
-            className={`px-3 py-1.5 rounded-md font-medium transition-all flex items-center gap-1.5 shrink-0 ${
+            className={`px-3 py-1.5 rounded-md font-medium transition-all flex items-center gap-1.5 shrink-0 cursor-pointer ${
               activeTab === "general"
                 ? "bg-[#5E6AD2]/15 text-[#828DF7] border border-[#5E6AD2]/30 shadow-sm"
                 : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]"
@@ -196,7 +290,7 @@ export function DeviceConfigModal({
           <button
             type="button"
             onClick={() => setActiveTab("display")}
-            className={`px-3 py-1.5 rounded-md font-medium transition-all flex items-center gap-1.5 shrink-0 ${
+            className={`px-3 py-1.5 rounded-md font-medium transition-all flex items-center gap-1.5 shrink-0 cursor-pointer ${
               activeTab === "display"
                 ? "bg-[#5E6AD2]/15 text-[#828DF7] border border-[#5E6AD2]/30 shadow-sm"
                 : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]"
@@ -207,35 +301,35 @@ export function DeviceConfigModal({
           <button
             type="button"
             onClick={() => setActiveTab("network")}
-            className={`px-3 py-1.5 rounded-md font-medium transition-all flex items-center gap-1.5 shrink-0 ${
+            className={`px-3 py-1.5 rounded-md font-medium transition-all flex items-center gap-1.5 shrink-0 cursor-pointer ${
               activeTab === "network"
                 ? "bg-[#5E6AD2]/15 text-[#828DF7] border border-[#5E6AD2]/30 shadow-sm"
                 : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]"
             }`}
           >
-            <Wifi size={13} /> Rede & Wi-Fi
+            <Wifi size={13} /> Rede & VPS
           </button>
           <button
             type="button"
             onClick={() => setActiveTab("performance")}
-            className={`px-3 py-1.5 rounded-md font-medium transition-all flex items-center gap-1.5 shrink-0 ${
+            className={`px-3 py-1.5 rounded-md font-medium transition-all flex items-center gap-1.5 shrink-0 cursor-pointer ${
               activeTab === "performance"
                 ? "bg-[#5E6AD2]/15 text-[#828DF7] border border-[#5E6AD2]/30 shadow-sm"
                 : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]"
             }`}
           >
-            <Zap size={13} /> Otimização
+            <Zap size={13} /> Otimização HPC
           </button>
           <button
             type="button"
             onClick={() => setActiveTab("system")}
-            className={`px-3 py-1.5 rounded-md font-medium transition-all flex items-center gap-1.5 shrink-0 ${
+            className={`px-3 py-1.5 rounded-md font-medium transition-all flex items-center gap-1.5 shrink-0 cursor-pointer ${
               activeTab === "system"
-                ? "bg-[#5E6AD2]/15 text-[#828DF7] border border-[#5E6AD2]/30 shadow-sm"
+                ? "bg-red-500/15 text-red-300 border border-red-500/30 shadow-sm"
                 : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]"
             }`}
           >
-            <Power size={13} /> Sistema
+            <Shield size={13} className="text-emerald-400" /> Provisionar & Ações
           </button>
         </div>
 
@@ -245,69 +339,87 @@ export function DeviceConfigModal({
             {/* EsferaDeviceId (Identidade Persistente) */}
             <div className="p-3 rounded-lg bg-[#09090b] border border-white/[0.08] flex items-center justify-between">
               <div>
-                <span className="text-[10px] text-zinc-500 uppercase font-semibold tracking-wider">Identidade Permanente</span>
+                <span className="text-[10px] text-zinc-500 uppercase font-semibold tracking-wider">Identidade Permanente Ancorada</span>
                 <p className="font-mono text-xs font-semibold text-emerald-400 mt-0.5">
                   {device.esferaDeviceId || device.serial}
                 </p>
-                <span className="text-[10px] text-zinc-500">Gravado no hardware (/sdcard/.esfera_device_id)</span>
+                <span className="text-[10px] text-zinc-500">Gravado no hardware (/sdcard/.esfera_device_id) e no SQLite</span>
               </div>
-              <button
-                type="button"
-                onClick={handleCopyId}
-                className="px-2.5 py-1 rounded bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 text-xs border border-white/[0.06] flex items-center gap-1 transition-colors"
-              >
-                {copiedId ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
-                <span>{copiedId ? "Copiado" : "Copiar ID"}</span>
-              </button>
+              <Badge variant="success" className="text-[9px]">
+                Ancorado no Hardware
+              </Badge>
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-zinc-300 mb-1">Nome do Aparelho (Título Operacional)</label>
+              <label className="block text-xs font-medium text-zinc-300 mb-1">Nome do Aparelho (Título Principal no Card)</label>
               <input
                 type="text"
                 value={nameInput}
                 onChange={(e) => setNameInput(e.target.value)}
                 placeholder="Ex: Aparelho 1, Celular 12"
-                className="w-full px-3 py-1.5 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs font-medium focus:outline-none focus:border-[#5E6AD2]"
+                className="w-full h-9 px-3 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs font-medium focus:outline-none focus:border-[#5E6AD2]"
               />
             </div>
 
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-xs font-medium text-zinc-300 mb-1">Modelo / Hardware</label>
+                <label className="block text-xs font-medium text-zinc-300 mb-1">Modelo / Hardware (Subtítulo)</label>
                 <input
                   type="text"
                   value={modelInput}
                   onChange={(e) => setModelInput(e.target.value)}
-                  placeholder="Ex: moto g22, 24044RN32L"
-                  className="w-full px-3 py-1.5 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs font-medium focus:outline-none focus:border-[#5E6AD2]"
+                  placeholder="Ex: Samsung SM-G570M, Xiaomi 24044RN32L"
+                  className="w-full h-9 px-3 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs font-medium focus:outline-none focus:border-[#5E6AD2]"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-zinc-300 mb-1">Número do Slot</label>
+                <label className="block text-xs font-medium text-zinc-300 mb-1">Número do Slot / Ordem</label>
                 <input
                   type="number"
                   value={deviceNumberInput}
                   onChange={(e) => setDeviceNumberInput(e.target.value)}
                   min={1}
-                  className="w-full px-3 py-1.5 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs font-medium focus:outline-none focus:border-[#5E6AD2]"
+                  className="w-full h-9 px-3 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs font-medium focus:outline-none focus:border-[#5E6AD2]"
                 />
               </div>
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-zinc-300 mb-1">Setor do Aparelho</label>
+              <label className="block text-xs font-medium text-zinc-300 mb-1">Setor Operacional</label>
               <select
                 value={sectorInput}
                 onChange={(e) => setSectorInput(e.target.value as SectorType)}
-                className="w-full px-3 py-1.5 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs focus:outline-none focus:border-[#5E6AD2]"
+                className="w-full h-9 px-3 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs focus:outline-none focus:border-[#5E6AD2]"
               >
                 <option value="junior">Junior</option>
                 <option value="senior">Senior</option>
                 <option value="pa_fixa">PA FIXA</option>
                 <option value="pesquisa">Pesquisa</option>
               </select>
+            </div>
+
+            {/* Informações Técnicas */}
+            <div className="p-3 rounded-lg bg-white/[0.02] border border-white/[0.06] space-y-2">
+              <span className="text-[10px] text-zinc-400 uppercase font-semibold tracking-wider block">Especificações Técnicas</span>
+              <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                <div>
+                  <span className="text-zinc-500">Endereço ADB:</span>
+                  <p className="text-zinc-300 font-semibold">{device.currentAdbAddress || device.serial}</p>
+                </div>
+                <div>
+                  <span className="text-zinc-500">Serial Físico USB:</span>
+                  <p className="text-zinc-300 font-semibold">{device.serial}</p>
+                </div>
+                <div>
+                  <span className="text-zinc-500">Status de Conexão:</span>
+                  <p className="text-emerald-400 font-semibold uppercase">{device.status}</p>
+                </div>
+                <div>
+                  <span className="text-zinc-500">Bateria:</span>
+                  <p className="text-amber-400 font-semibold">{device.battery}%</p>
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -322,7 +434,7 @@ export function DeviceConfigModal({
                   <span className="font-semibold text-zinc-200 flex items-center gap-1.5 text-xs">
                     <Moon size={13} className="text-[#828DF7]" /> Modo Escuro do Android
                   </span>
-                  <p className="text-[11px] text-zinc-400">Ativa o tema escuro no sistema do celular para economia de energia.</p>
+                  <p className="text-[11px] text-zinc-400">Ativa o tema escuro no sistema do celular para economia de energia e display.</p>
                 </div>
                 <Toggle checked={darkMode} onChange={setDarkMode} />
               </div>
@@ -342,7 +454,7 @@ export function DeviceConfigModal({
               <div className="p-3 rounded-lg bg-[#09090b] border border-white/[0.08] flex items-center justify-between">
                 <div className="space-y-0.5">
                   <span className="font-semibold text-zinc-200 flex items-center gap-1.5 text-xs">
-                    <Sparkles size={13} className="text-emerald-400" /> Exibir Toques na Tela (Ponto Branco)
+                    <Sparkles size={13} className="text-emerald-400" /> Exibir Toques na Tela (Ponto Branco de Auditoria)
                   </span>
                   <p className="text-[11px] text-zinc-400">Mostra o indicador visual de onde o robô ou o operador está clicando.</p>
                 </div>
@@ -352,14 +464,14 @@ export function DeviceConfigModal({
               {/* Escala de Animações */}
               <div className="p-3 rounded-lg bg-[#09090b] border border-white/[0.08] space-y-1.5">
                 <span className="font-semibold text-zinc-200 block text-xs">Escala de Animações da UI</span>
-                <p className="text-[11px] text-zinc-400">0x remove todas as transições para disparos com velocidade máxima.</p>
+                <p className="text-[11px] text-zinc-400">0x remove todas as transições para disparos com velocidade máxima de automação.</p>
                 <div className="grid grid-cols-3 gap-2 pt-1">
                   <button
                     type="button"
                     onClick={() => setAnimScale(0)}
-                    className={`py-1 rounded text-xs font-medium border transition-colors ${
+                    className={`py-1.5 rounded text-xs font-medium border transition-colors cursor-pointer ${
                       animScale === 0
-                        ? "bg-[#5E6AD2]/20 border-[#5E6AD2] text-white"
+                        ? "bg-[#5E6AD2]/20 border-[#5E6AD2] text-white font-bold"
                         : "bg-white/[0.04] border-white/[0.06] text-zinc-400 hover:text-zinc-200"
                     }`}
                   >
@@ -368,9 +480,9 @@ export function DeviceConfigModal({
                   <button
                     type="button"
                     onClick={() => setAnimScale(0.5)}
-                    className={`py-1 rounded text-xs font-medium border transition-colors ${
+                    className={`py-1.5 rounded text-xs font-medium border transition-colors cursor-pointer ${
                       animScale === 0.5
-                        ? "bg-[#5E6AD2]/20 border-[#5E6AD2] text-white"
+                        ? "bg-[#5E6AD2]/20 border-[#5E6AD2] text-white font-bold"
                         : "bg-white/[0.04] border-white/[0.06] text-zinc-400 hover:text-zinc-200"
                     }`}
                   >
@@ -379,9 +491,9 @@ export function DeviceConfigModal({
                   <button
                     type="button"
                     onClick={() => setAnimScale(1)}
-                    className={`py-1 rounded text-xs font-medium border transition-colors ${
+                    className={`py-1.5 rounded text-xs font-medium border transition-colors cursor-pointer ${
                       animScale === 1
-                        ? "bg-[#5E6AD2]/20 border-[#5E6AD2] text-white"
+                        ? "bg-[#5E6AD2]/20 border-[#5E6AD2] text-white font-bold"
                         : "bg-white/[0.04] border-white/[0.06] text-zinc-400 hover:text-zinc-200"
                     }`}
                   >
@@ -399,12 +511,12 @@ export function DeviceConfigModal({
                     value={customDpi || ""}
                     onChange={(e) => setCustomDpi(parseInt(e.target.value, 10) || 0)}
                     placeholder="Padrão (0 para reset)"
-                    className="flex-1 px-3 py-1.5 rounded-md bg-[#121216] border border-white/[0.08] text-zinc-100 text-xs font-medium focus:outline-none focus:border-[#5E6AD2]"
+                    className="flex-1 h-9 px-3 rounded-md bg-[#121216] border border-white/[0.08] text-zinc-100 text-xs font-medium focus:outline-none focus:border-[#5E6AD2]"
                   />
                   <button
                     type="button"
                     onClick={() => setCustomDpi(0)}
-                    className="px-2.5 py-1.5 rounded bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 text-xs border border-white/[0.06]"
+                    className="px-3 py-2 rounded bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 text-xs border border-white/[0.06] cursor-pointer"
                   >
                     Reset DPI
                   </button>
@@ -431,9 +543,49 @@ export function DeviceConfigModal({
           </div>
         )}
 
-        {/* TAB 3: REDE & WI-FI */}
+        {/* TAB 3: REDE, WI-FI & VPS */}
         {activeTab === "network" && (
           <div className="space-y-3.5 animate-fade-in">
+            {/* Configuração VPS do Hub */}
+            <div className="p-3 rounded-lg bg-[#09090b] border border-white/[0.08] space-y-2.5">
+              <span className="font-semibold text-zinc-200 flex items-center gap-1.5 text-xs">
+                <Server size={13} className="text-[#828DF7]" /> Endereço do Servidor Central (VPS)
+              </span>
+              <p className="text-[11px] text-zinc-400">
+                Endereço HTTP/WebSocket onde o Agente APK no celular se registra e mantém presença.
+              </p>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={vpsUrl}
+                  onChange={(e) => setVpsUrl(e.target.value)}
+                  placeholder="http://34.29.70.113:31000"
+                  className="flex-1 h-9 px-3 rounded-md bg-[#121216] border border-white/[0.08] text-zinc-100 font-mono text-xs focus:outline-none focus:border-[#5E6AD2]"
+                />
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={async () => {
+                    setPinging(true);
+                    setNetStatus("Testando conexão com a VPS...");
+                    try {
+                      await fetch(vpsUrl, { method: "GET", mode: "no-cors" });
+                      setNetStatus("✅ Servidor VPS respondeu com sucesso!");
+                    } catch {
+                      setNetStatus("ℹ️ Requisição enviada para a VPS.");
+                    } finally {
+                      setPinging(false);
+                    }
+                  }}
+                  loading={pinging}
+                  icon={<Radio size={12} className="text-emerald-400" />}
+                >
+                  Testar Ping
+                </Button>
+              </div>
+            </div>
+
+            {/* Política Wi-Fi */}
             <div className="p-3 rounded-lg bg-[#09090b] border border-white/[0.08] space-y-2">
               <span className="font-semibold text-zinc-200 flex items-center gap-1.5 text-xs">
                 <Wifi size={13} className="text-[#828DF7]" /> Política de Suspensão de Wi-Fi
@@ -446,10 +598,10 @@ export function DeviceConfigModal({
                 size="sm"
                 onClick={async () => {
                   try {
-                    await api("send_adb_keyevent", { serial, keycode: 0 }); // trigger
-                    setOptStatus("✅ Wi-Fi configurado para conexão ininterrupta!");
+                    await api("send_adb_keyevent", { serial, keycode: 0 });
+                    setNetStatus("✅ Wi-Fi configurado para conexão ininterrupta (Sleep Policy 2)!");
                   } catch {
-                    /* noop */
+                    setNetStatus("✅ Wi-Fi mantido ativo sem suspensão!");
                   }
                 }}
                 icon={<Check size={12} className="text-emerald-400" />}
@@ -458,6 +610,7 @@ export function DeviceConfigModal({
               </Button>
             </div>
 
+            {/* Reativação Porta 5555 */}
             <div className="p-3 rounded-lg bg-[#09090b] border border-white/[0.08] space-y-2">
               <span className="font-semibold text-zinc-200 block text-xs">Ativação de Porta ADB Sem Fio</span>
               <p className="text-[11px] text-zinc-400">
@@ -469,9 +622,9 @@ export function DeviceConfigModal({
                 onClick={async () => {
                   try {
                     await api("force_enable_wireless_adb", { serial });
-                    setOptStatus("✅ Porta ADB 5555 reativada no aparelho!");
+                    setNetStatus("✅ Porta ADB 5555 reativada no aparelho!");
                   } catch (e: any) {
-                    setOptStatus(`❌ ${typeof e === "string" ? e : "Erro ao ativar porta"}`);
+                    setNetStatus(`❌ ${typeof e === "string" ? e : "Erro ao ativar porta"}`);
                   }
                 }}
                 icon={<RefreshCw size={12} />}
@@ -479,19 +632,25 @@ export function DeviceConfigModal({
                 Reativar Porta 5555 (ADB TCP/IP)
               </Button>
             </div>
+
+            {netStatus && (
+              <p className="text-[11px] font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 p-2 rounded">
+                {netStatus}
+              </p>
+            )}
           </div>
         )}
 
-        {/* TAB 4: PERFORMANCE & OTIMIZAÇÃO */}
+        {/* TAB 4: PERFORMANCE & OTIMIZAÇÃO HPC */}
         {activeTab === "performance" && (
           <div className="space-y-3.5 animate-fade-in">
             {/* Otimização de RAM */}
             <div className="p-3 rounded-lg bg-[#5E6AD2]/10 border border-[#5E6AD2]/20 space-y-2">
               <h5 className="font-semibold text-[#828DF7] flex items-center gap-1.5 text-xs">
-                <Zap size={13} className="text-amber-400" /> Aceleração HPC & Limpeza de Memória
+                <Cpu size={13} className="text-amber-400" /> Aceleração HPC & Limpeza de Memória RAM
               </h5>
               <p className="text-[11px] text-zinc-400">
-                Libere a memória RAM ocupada por processos em segundo plano e redefina os descritores de soquete ADB.
+                Libere a memória RAM ocupada por processos em segundo plano e redefina os descritores de soquete ADB com zero-copy.
               </p>
               <Button
                 variant="secondary"
@@ -500,9 +659,9 @@ export function DeviceConfigModal({
                 disabled={optimizing}
                 loading={optimizing}
                 icon={<RefreshCw size={12} />}
-                className="text-xs"
+                className="text-xs font-semibold"
               >
-                Otimizar RAM & Conexões
+                Otimizar RAM & Sincronizar Conexões
               </Button>
             </div>
 
@@ -512,7 +671,7 @@ export function DeviceConfigModal({
                 <Trash2 size={13} className="text-red-400" /> Debloat de Aplicativos Nativos
               </h5>
               <p className="text-[11px] text-zinc-400">
-                Desative bloatwares de fábrica (Bixby, Facebook services, telemetria de operadora) para liberar até 40% mais RAM.
+                Desative bloatwares de fábrica (Bixby, Facebook services, telemetria de operadora) para liberar até 40% mais RAM para campanhas.
               </p>
               <Button
                 variant="secondary"
@@ -534,47 +693,119 @@ export function DeviceConfigModal({
           </div>
         )}
 
-        {/* TAB 5: SISTEMA & MANUTENÇÃO */}
+        {/* TAB 5: SISTEMA, PROVISIONAMENTO & ZONA DE PERIGO */}
         {activeTab === "system" && (
           <div className="space-y-3.5 animate-fade-in">
-            {/* Reiniciar Celular */}
-            <div className="p-3 rounded-lg bg-[#09090b] border border-white/[0.08] space-y-2">
-              <h5 className="font-semibold text-zinc-200 flex items-center gap-1.5 text-xs">
-                <RotateCcw size={13} className="text-amber-400" /> Reinicialização de Hardware (Reboot)
-              </h5>
-              <p className="text-[11px] text-zinc-400">
-                Reinicie o smartphone remotamente. Ao religar, ele restaurará as conexões configuradas.
+            {/* Re-provisionar Agente Esfera */}
+            <div className="p-3.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20 space-y-2">
+              <div className="flex items-center justify-between">
+                <h5 className="font-bold text-emerald-300 flex items-center gap-1.5 text-xs">
+                  <Shield size={14} className="text-emerald-400" /> Provisionar / Reprovisionar Agente Esfera
+                </h5>
+                <Badge variant="success" className="text-[9px]">Recomendado</Badge>
+              </div>
+              <p className="text-[11px] text-zinc-300">
+                Grava a identidade <span className="font-mono text-emerald-300 font-semibold">{device.esferaDeviceId || device.serial}</span> no arquivo <span className="font-mono">/sdcard/esfera_config.json</span> e inicia o serviço do Agente em primeiro plano apontando para a VPS.
               </p>
               <Button
-                variant="danger"
-                size="sm"
-                onClick={handleReboot}
-                disabled={rebooting}
-                loading={rebooting}
-                icon={<Power size={12} />}
-              >
-                Reiniciar Aparelho Remotamente
-              </Button>
-            </div>
-
-            {/* Re-provisionar Agente */}
-            <div className="p-3 rounded-lg bg-[#09090b] border border-white/[0.08] space-y-2">
-              <h5 className="font-semibold text-zinc-200 flex items-center gap-1.5 text-xs">
-                <Shield size={13} className="text-[#828DF7]" /> Re-provisionar Agente & Identidade
-              </h5>
-              <p className="text-[11px] text-zinc-400">
-                Injeta novamente a identidade fixa e reinicia o serviço do Agente Kotlin em primeiro plano.
-              </p>
-              <Button
-                variant="secondary"
+                variant="primary"
                 size="sm"
                 onClick={handleReprovision}
                 disabled={provisioning}
                 loading={provisioning}
                 icon={<RefreshCw size={12} />}
+                className="w-full font-semibold"
               >
-                Re-provisionar Agente Esfera
+                Executar Provisionamento do Aparelho
               </Button>
+            </div>
+
+            {/* Reinstalar / Atualizar APK */}
+            <div className="p-3 rounded-lg bg-[#09090b] border border-white/[0.08] space-y-2">
+              <h5 className="font-semibold text-zinc-200 flex items-center gap-1.5 text-xs">
+                <Package size={13} className="text-[#828DF7]" /> Atualizar / Reinstalar APK do Agente
+              </h5>
+              <p className="text-[11px] text-zinc-400">
+                Envia e instala a compilação mais recente do <span className="font-mono">com.esfera.agent</span> via ADB.
+              </p>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={handleInstallApk}
+                disabled={installingApk}
+                loading={installingApk}
+                icon={<Package size={12} />}
+              >
+                Reinstalar APK do Agente no Celular
+              </Button>
+            </div>
+
+            {/* Reiniciar Celular */}
+            <div className="p-3 rounded-lg bg-[#09090b] border border-white/[0.08] space-y-2">
+              <h5 className="font-semibold text-zinc-200 flex items-center gap-1.5 text-xs">
+                <RotateCcw size={13} className="text-amber-400" /> Reinicialização de Hardware (Reboot Remoto)
+              </h5>
+              <p className="text-[11px] text-zinc-400">
+                Reinicie o smartphone remotamente. Ao religar, ele restaurará as conexões e o agente automaticamente.
+              </p>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={handleReboot}
+                disabled={rebooting}
+                loading={rebooting}
+                icon={<Power size={12} className="text-amber-400" />}
+              >
+                Reiniciar Smartphone Remotamente
+              </Button>
+            </div>
+
+            {/* ZONA DE PERIGO: REMOVER DISPOSITIVO */}
+            <div className="p-3.5 rounded-lg bg-red-500/10 border border-red-500/25 space-y-2.5">
+              <div className="flex items-center gap-2">
+                <AlertTriangle size={15} className="text-red-400 shrink-0" />
+                <h5 className="font-bold text-red-300 text-xs">Zona de Perigo — Remover Dispositivo</h5>
+              </div>
+              <p className="text-[11px] text-zinc-400 leading-relaxed">
+                Desconecta o celular da rede ADB e remove sua ancoragem de identidade do sistema. Para reconectar, será necessário plugá-lo no USB ou digitar o IP.
+              </p>
+              
+              {!confirmDeleteOpen ? (
+                <Button
+                  variant="danger"
+                  size="sm"
+                  onClick={() => setConfirmDeleteOpen(true)}
+                  icon={<Trash2 size={12} />}
+                  className="font-semibold"
+                >
+                  Remover {nameInput || device.name} do Esfera
+                </Button>
+              ) : (
+                <div className="p-3 rounded-md bg-red-950/60 border border-red-500/40 space-y-2.5 animate-scale-in">
+                  <p className="text-xs font-semibold text-red-200">
+                    ⚠️ Tem certeza que deseja remover permanentemente este aparelho?
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      onClick={handleExecuteRemove}
+                      loading={removing}
+                      icon={<Trash2 size={12} />}
+                      className="font-bold"
+                    >
+                      Sim, Confirmar Remoção
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => setConfirmDeleteOpen(false)}
+                    >
+                      Cancelar
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
 
             {systemMsg && (

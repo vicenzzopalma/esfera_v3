@@ -1367,18 +1367,25 @@ pub fn update_device(state: State<'_, AppState>, token: String, device: Device) 
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, device.company_id)?;
     let db = &state.db;
+
+    if let Some(ref esfera_id) = device.esfera_device_id {
+        if !esfera_id.trim().is_empty() {
+            let _ = db.save_device_identity(esfera_id, &device.name, &device.sector, device.device_number, &device.model);
+        }
+    }
+
     let _ = db.update_device_config(&device);
     let _ = db.upsert_device(&device);
-    // Propaga o nome para a VPS (Hub) para que apareça consistente em todos os
-    // clientes. Se o hub não estiver conectado, ignora (o nome fica salvo localmente).
+
+    // Propaga o novo nome para o Banco de Dados da VPS (Hub) imediatamente
     if let Some(esfera_id) = &device.esfera_device_id {
         if !esfera_id.is_empty() {
             let hub = state.hub_client.clone();
-            let token2 = token.clone();
             let id2 = esfera_id.clone();
             let name2 = device.name.clone();
             let cid = device.company_id;
             tauri::async_runtime::spawn(async move {
+                // 1. Envia via Hub WebSocket se conectado
                 let connected = hub.lock().await.is_some();
                 if connected {
                     let _ = HubClient::send_command(
@@ -1388,7 +1395,21 @@ pub fn update_device(state: State<'_, AppState>, token: String, device: Device) 
                         serde_json::json!({ "esferaDeviceId": id2, "name": name2 }),
                     ).await;
                 }
-                let _ = token2;
+
+                // 2. Envia via HTTP Checkin Server da VPS (porta 31000)
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(4))
+                    .build();
+                if let Ok(c) = client {
+                    let _ = c.post("http://34.29.70.113:31000/api/devices/rename")
+                        .json(&serde_json::json!({
+                            "esfera_device_id": id2,
+                            "name": name2,
+                            "company_id": cid
+                        }))
+                        .send()
+                        .await;
+                }
             });
         }
     }

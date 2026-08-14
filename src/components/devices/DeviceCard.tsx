@@ -3,19 +3,15 @@
 // Card compacto e elegante para exibição do celular no Hub
 // ============================================================
 
-import { memo, useState, useRef, useEffect } from "react";
+import { memo, useState } from "react";
 import type { Device } from "../../types";
 import { getConnectionOrigin, CONNECTION_BADGE_CONFIG } from "../../types";
 import Button from "../ui/Button";
 import Badge from "../ui/Badge";
-import { api } from "../../tauri";
 import {
-  Trash2,
   Zap,
   Camera,
   MoreVertical,
-  Sliders,
-  Shield,
   BatteryCharging,
   Info,
 } from "lucide-react";
@@ -25,7 +21,6 @@ interface DeviceCardProps {
   activeUserDisplayName?: string;
   isSelected: boolean;
   onToggleSelect: () => void;
-  onRemove: () => void;
   onOpenMirror: () => void;
   onOpenConfig: () => void;
   onOpenRegion: () => void;
@@ -38,15 +33,12 @@ export const DeviceCard = memo(function DeviceCard({
   activeUserDisplayName,
   isSelected,
   onToggleSelect,
-  onRemove,
   onOpenMirror,
   onOpenConfig,
   onOpenRegion,
   onForceWireless,
   onOpenDiagnostic,
 }: DeviceCardProps) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const menuRef = useRef<HTMLDivElement>(null);
 
   const displayName = device.name || (device.deviceNumber ? `Aparelho ${device.deviceNumber}` : device.serial);
   const displayModel = device.model && device.model !== "Smartphone" && device.model !== "Android"
@@ -65,16 +57,6 @@ export const DeviceCard = memo(function DeviceCard({
     setCopiedId(true);
     setTimeout(() => setCopiedId(false), 1500);
   };
-
-  useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        setMenuOpen(false);
-      }
-    };
-    if (menuOpen) document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [menuOpen]);
 
   return (
     <div
@@ -144,58 +126,13 @@ export const DeviceCard = memo(function DeviceCard({
             <Info size={14} />
           </button>
 
-          <div className="relative shrink-0" ref={menuRef}>
-            <button
-              onClick={() => setMenuOpen(!menuOpen)}
-              className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.08] transition-colors cursor-pointer"
-              title="Ações do celular"
-            >
-              <MoreVertical size={14} />
-            </button>
-
-            {menuOpen && (
-              <div className="absolute right-0 mt-1 w-44 rounded-md bg-[#19191e] border border-white/[0.1] shadow-xl p-1 z-50 animate-scale-in text-xs">
-                <button
-                  onClick={() => {
-                    setMenuOpen(false);
-                    onOpenConfig();
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-zinc-300 hover:text-white hover:bg-white/[0.06] transition-colors"
-                >
-                  <Sliders size={13} />
-                  <span>Configurar</span>
-                </button>
-
-                <button
-                  onClick={async () => {
-                    setMenuOpen(false);
-                    try {
-                      const targetSerial = (device.status === "online" && device.currentAdbAddress) ? device.currentAdbAddress : device.serial;
-                      const msg = await api<string>("provision_device", { serial: targetSerial, server_url: null });
-                      alert(`Provisionado: ${msg}`);
-                    } catch (err: any) {
-                      alert(typeof err === "string" ? err : err?.message || "Erro ao provisionar.");
-                    }
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-zinc-300 hover:text-white hover:bg-white/[0.06] transition-colors"
-                >
-                  <Shield size={13} className="text-emerald-400" />
-                  <span>{device.esferaDeviceId ? "Reprovisionar" : "Provisionar"}</span>
-                </button>
-
-                <button
-                  onClick={() => {
-                    setMenuOpen(false);
-                    if (confirm(`Deseja remover ${displayName}?`)) onRemove();
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-red-400 hover:bg-red-500/10 transition-colors border-t border-white/[0.06] mt-1 pt-1.5"
-                >
-                  <Trash2 size={13} />
-                  <span>Remover</span>
-                </button>
-              </div>
-            )}
-          </div>
+          <button
+            onClick={onOpenConfig}
+            className="p-1 rounded text-zinc-400 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer"
+            title="Configurações, provisionamento e ações do celular"
+          >
+            <MoreVertical size={14} />
+          </button>
         </div>
       </div>
 
