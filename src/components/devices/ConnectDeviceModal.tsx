@@ -62,16 +62,19 @@ export function ConnectDeviceModal({
 
   // Filtra dispositivos que já estão vinculados no sistema
   const isDeviceAlreadyAdded = (devSerial: string) => {
-    const s = devSerial.trim();
+    const s = devSerial.trim().toLowerCase();
     const ipOnly = s.includes(":") ? s.split(":")[0] : s;
     return existingDevices.some((d) => {
-      const ds = d.serial?.trim() || "";
-      const da = d.currentAdbAddress?.trim() || "";
-      const di = d.ip?.trim() || "";
-      const de = d.esferaDeviceId?.trim() || "";
-      if (s && (ds === s || da === s)) return true;
+      const ds = (d.serial || "").trim().toLowerCase();
+      const da = (d.currentAdbAddress || "").trim().toLowerCase();
+      const di = (d.ip || "").trim().toLowerCase();
+      const de = (d.esferaDeviceId || "").trim().toLowerCase();
+      const rawDe = de.replace("esf-", "");
+
+      if (s && (ds === s || da === s || di === s)) return true;
       if (ipOnly && (di === ipOnly || da.startsWith(ipOnly) || ds.startsWith(ipOnly))) return true;
-      if (de && s.includes(de.replace("ESF-", ""))) return true;
+      if (rawDe && rawDe.length >= 4 && (s.includes(rawDe) || rawDe.includes(s))) return true;
+      if (de && (s === de || s.includes(de))) return true;
       return false;
     });
   };
