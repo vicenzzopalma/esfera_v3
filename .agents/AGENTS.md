@@ -11,4 +11,18 @@
    npm run tauri build
    ```
 
-3. **Antes de realizar qualquer build do projeto, LEIA obrigatoriamente o arquivo `REGRA.md` na raiz do repositório**.
+3. **Compilação sob Demanda**:
+   - Apenas compilar quando o usuário solicitar explicitamente ("compile", "faça o build", etc.). Ao fazer alterações sem solicitação de build, sempre concluir com `"não compilado"`.
+
+---
+
+## 🔒 REGRA CRÍTICA DE IMUTABILIDADE ABSOLUTA DE NOMES E IDENTIDADE DE DISPOSITIVOS
+
+1. **PROIBIÇÃO TOTAL DE RENOMEAÇÃO AUTOMÁTICA OU EM LOTE**:
+   - O nome dado pelo operador a um aparelho é **SOBERANO e IMUTÁVEL**.
+   - **JAMAIS** executar scripts, comandos ou rotinas automáticas de renomeação em lote ("Aparelho 1, 2, 3..."), resets de banco de dados ou reatribuição de nomes de dispositivos existentes.
+   - A tabela `ESF_DeviceIdentity` (local e na VPS) é a **âncora definitiva** de hardware: uma vez salvo, o nome pertence exclusivamente ao operador.
+
+2. **COMPORTAMENTO OBRIGATÓRIO DO SISTEMA (ESCALA DE 100+ DISPOSITIVOS)**:
+   - Rotinas de reconexão ADB, auto-recovery, descoberta de rede ou sincronização com a VPS devem **APENAS LER E PRESERVAR** o nome existente vinculado ao `EsferaDeviceId`.
+   - A alteração de nome só pode ocorrer por clique e confirmação manual do usuário no modal de configurações.

@@ -154,13 +154,13 @@ graph LR
 
 ## 🔥 Principais Módulos & Recursos
 
-### 1. 📱 Identidade Permanente de Hardware (`EsferaDeviceId`)
+### 1. 📱 Identidade Permanente de Hardware & Imutabilidade Absoluta (`EsferaDeviceId`)
 - **Ancoragem Indestrutível**: O dispositivo possui uma chave de hardware imutável baseada em número de série de fábrica e identificador de placa, gravada nas tabelas `ESF_DeviceIdentity` e `ESF_Device`.
-- **Persistência Total de Nomes**: Renomeações personalizadas nunca são perdidas em reinicializações, desconexões ou alternâncias de transporte (USB ↔ Wi-Fi TCP/IP).
+- **Imutabilidade Absoluta de Nomes**: O nome atribuído pelo operador é **sacrossanto e perpétuo**. Nenhuma IA, script ou rotina de auto-discovery tem permissão de renomear ou reatribuir identificadores em massa.
 - **Hierarquia Visual nos Cards**:
-  - **Título Principal**: Nome personalizado (*ex: Aparelho 1, WhatsApp Vendas*).
+  - **Título Principal**: Nome personalizado pelo operador (*ex: Aparelho 1, WhatsApp Vendas, Motorola Loja SP*).
   - **Subtítulo**: Fabricante & Modelo de Hardware (*ex: Samsung SM-A155M*).
-  - **Identificadores**: ID de Hardware e endereço de rede ADB.
+  - **Identificadores**: ID de Hardware (`EsferaDeviceId`) e endereço de rede ADB.
 
 ### 2. ☁️ Sincronização com VPS (Fonte Única da Verdade)
 - **Sincronização Dupla**: Ao renomear ou reconfigurar qualquer celular, o desktop propaga a alteração instantaneamente via:
