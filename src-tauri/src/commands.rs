@@ -399,12 +399,10 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
     // AUTO-CONEXÃO DO HUB: Conexão assíncrona em background para NUNCA travar o retorno do get_devices
     {
         let hub_client_clone = hub_client.clone();
-        let state_clone = state.clone();
-        let token_clone = token.clone();
-        tokio::spawn(async move {
-            let is_connected = hub_client_clone.lock().await.is_some();
-            if !is_connected {
-                if let Ok(creds) = get_hub_credentials(state_clone, token_clone) {
+        if let Ok(creds) = get_hub_credentials(state.clone(), token.clone()) {
+            tokio::spawn(async move {
+                let is_connected = hub_client_clone.lock().await.is_some();
+                if !is_connected {
                     if let Ok(Ok(client)) = tokio::time::timeout(
                         std::time::Duration::from_secs(4),
                         HubClient::connect(
@@ -415,8 +413,8 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                         *hub_client_clone.lock().await = Some(client);
                     }
                 }
-            }
-        });
+            });
+        }
     }
 
     tauri::async_runtime::spawn_blocking(move || {
