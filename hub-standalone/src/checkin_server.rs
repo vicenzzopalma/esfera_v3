@@ -64,9 +64,18 @@ pub struct CheckInPayload {
     pub company_id: i32,
 }
 
+#[derive(Deserialize)]
+pub struct RenameDevicePayload {
+    pub esfera_device_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub company_id: i32,
+}
+
 pub async fn start(db: Arc<Database>, port: u16) {
     let app = Router::new()
         .route("/api/devices/check-in", post(handle_checkin))
+        .route("/api/devices/rename", post(handle_rename_device))
         .route("/admin/update", post(handle_update))
         // Canal de atualização remota: o agente (self_update) baixa o APK daqui,
         // sem SSH. Serve o arquivo em AGENT_APK_PATH (default ~/esfera_v3/agent_release/esfera_agent.apk).
@@ -143,6 +152,23 @@ pub async fn handle_checkin(
     crate::session_manager::touch_presence(company_id, &payload.esfera_device_id, &payload.current_adb_address);
 
     (StatusCode::OK, "ok")
+}
+
+pub async fn handle_rename_device(
+    State((db, _port)): State<(Arc<Database>, u16)>,
+    Json(payload): Json<RenameDevicePayload>,
+) -> (axum::http::StatusCode, &'static str) {
+    use axum::http::StatusCode;
+    if payload.esfera_device_id.trim().is_empty() || payload.name.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "esfera_device_id ou name ausente");
+    }
+    match db.rename_device(payload.esfera_device_id.trim(), payload.name.trim()) {
+        Ok(_) => (StatusCode::OK, "ok"),
+        Err(e) => {
+            eprintln!("Erro ao renomear device no DB da VPS: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "erro no banco da vps")
+        }
+    }
 }
 
 /// Serve o APK do agente para atualização remota (self_update), sem SSH.

@@ -1224,22 +1224,19 @@ impl Database {
     pub fn upsert_device(&self, device: &Device) -> Result<(), String> {
         let target_comp = if device.company_id <= 0 { 1 } else { device.company_id };
 
-        // Se existir identidade permanente na ESF_DeviceIdentity para este Hardware ID, preserva-a
+        // Se existir identidade permanente na ESF_DeviceIdentity para este Hardware ID, sincroniza
         let (final_name, final_sector, final_num) = if let Some(ref esfera_id) = device.esfera_device_id {
-            if let Some((saved_name, saved_sec, saved_num, _)) = self.get_device_identity(esfera_id) {
-                let name = if !device.name.is_empty() && !device.name.starts_with("Aparelho ") && !device.name.starts_with("Celular ") {
-                    device.name.clone()
-                } else if !saved_name.is_empty() {
-                    saved_name
-                } else {
-                    device.name.clone()
-                };
-                (name, saved_sec, saved_num)
-            } else {
-                if !device.name.is_empty() {
-                    let _ = self.save_device_identity(esfera_id, &device.name, &device.sector, device.device_number, &device.model);
-                }
+            if !device.name.is_empty() {
+                // Nome explícito fornecido — salva como nova identidade oficial permanente
+                let _ = self.save_device_identity(esfera_id, &device.name, &device.sector, device.device_number, &device.model);
                 (device.name.clone(), device.sector.clone(), device.device_number)
+            } else if let Some((saved_name, saved_sec, saved_num, _)) = self.get_device_identity(esfera_id) {
+                (saved_name, saved_sec, saved_num)
+            } else {
+                let next_num = self.get_next_device_number();
+                let gen_name = format!("Aparelho {}", next_num);
+                let _ = self.save_device_identity(esfera_id, &gen_name, &device.sector, next_num, &device.model);
+                (gen_name, device.sector.clone(), next_num)
             }
         } else {
             (device.name.clone(), device.sector.clone(), device.device_number)

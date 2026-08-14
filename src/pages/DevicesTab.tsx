@@ -327,15 +327,22 @@ export default function DevicesTab() {
     }
   };
 
-  const handleRemoveDevice = async (serial: string) => {
+  const handleRemoveDevice = async (serialOrId: string) => {
     try {
-      await api("delete_device", { serial });
-      setDevicesList((prev) => prev.filter((d) => d.serial !== serial));
-      setSelectedSerials((prev) => prev.filter((s) => s !== serial));
-      refreshDevices();
-    } catch (e) {
+      await api("disconnect_adb_device", { serial: serialOrId });
+    } catch {
+      // noop
+    }
+    try {
+      await api("delete_device", { serial: serialOrId });
+    } catch (e: any) {
       console.warn("Falha ao apagar dispositivo:", e);
     }
+    setDevicesList((prev) => prev.filter((d) => d.serial !== serialOrId && d.esferaDeviceId !== serialOrId));
+    setSelectedSerials((prev) => prev.filter((s) => s !== serialOrId));
+    setConfigModalOpen(false);
+    setSelectedDeviceForConfig(null);
+    refreshDevices();
   };
 
   const toggleSelectDevice = (serial: string) => {
@@ -454,7 +461,6 @@ export default function DevicesTab() {
                 activeUserDisplayName={activeUserMap[device.serial]?.activeUserDisplayName}
                 isSelected={selectedSerials.includes(device.serial)}
                 onToggleSelect={() => toggleSelectDevice(device.serial)}
-                onRemove={() => handleRemoveDevice(device.serial)}
                 onOpenMirror={() => {
                   setSelectedDeviceForMirror(device);
                   setMirrorModalOpen(true);
@@ -586,6 +592,7 @@ export default function DevicesTab() {
             setSelectedDeviceForConfig(null);
           }}
           device={selectedDeviceForConfig}
+          onRemove={(dev) => handleRemoveDevice(dev.esferaDeviceId || dev.currentAdbAddress || dev.serial)}
           onSave={async (updated) => {
             try {
               await api("update_device", { device: updated });
