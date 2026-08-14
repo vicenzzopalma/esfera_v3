@@ -287,7 +287,7 @@ export default function CampaignsTab() {
       {/* Filter and Search */}
       <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
         <div className="relative w-full sm:w-80 flex items-center">
-          <Search size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-tertiary pointer-events-none z-10" />
+          <Search size={16} className="input-icon-left text-tertiary" />
           <input
             type="text"
             placeholder="Buscar campanha por nome..."

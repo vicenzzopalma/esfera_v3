@@ -48,7 +48,10 @@ export const DeviceCard = memo(function DeviceCard({
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
-  const displayName = device.name || device.serial;
+  const displayName = device.name || (device.deviceNumber ? `Aparelho ${device.deviceNumber}` : device.serial);
+  const displayModel = device.model && device.model !== "Smartphone" && device.model !== "Android"
+    ? device.model
+    : (device.brand && device.brand !== "Android" ? `${device.brand} Smartphone` : "Android Smartphone");
   const isUsbOnly = device.status === "online" && !device.serial.includes(":") && !device.viaTunnel;
   const origin = getConnectionOrigin(device);
   const originBadge = CONNECTION_BADGE_CONFIG[origin];
@@ -114,16 +117,16 @@ export const DeviceCard = memo(function DeviceCard({
 
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
-              <span className="font-semibold text-xs text-zinc-100 truncate" title={displayName}>
+              <span className="font-bold text-sm text-zinc-100 truncate" title={displayName}>
                 {displayName}
               </span>
-              <span className="px-1.5 py-0.2 rounded bg-white/[0.06] text-zinc-400 text-[9px] font-mono uppercase">
+              <span className="px-1.5 py-0.2 rounded bg-[#5E6AD2]/15 text-[#828DF7] text-[9px] font-mono uppercase font-semibold border border-[#5E6AD2]/30">
                 {device.sector.replace("_", " ")}
               </span>
             </div>
             <div className="flex items-center gap-1.5 mt-0.5">
-              <p className="text-[10px] text-zinc-500 font-mono truncate">
-                {device.model}
+              <p className="text-[11px] text-zinc-400 font-medium truncate" title={displayModel}>
+                {displayModel}
               </p>
               <Badge variant={originBadge.badgeVariant} className="text-[8px] px-1 py-0">
                 {originBadge.icon} {originBadge.label}

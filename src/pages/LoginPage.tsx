@@ -81,39 +81,39 @@ export default function LoginPage() {
 
             {/* Input Usuário */}
             <div>
-              <label htmlFor="login-username" className="text-xs text-zinc-300 font-medium mb-1 block">Usuário</label>
+              <label htmlFor="login-username" className="text-xs text-zinc-300 font-medium mb-1.5 block">Usuário</label>
               <div className="relative flex items-center">
-                <User size={15} className="absolute left-3 text-zinc-500 pointer-events-none z-10" />
+                <User size={16} className="input-icon-left text-zinc-500" />
                 <input
                   id="login-username"
                   type="text"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   placeholder="Digite seu usuário"
-                  className="w-full h-9 pl-9 pr-3 text-xs bg-white/[0.03] border border-white/[0.08] rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-[#5E6AD2]"
+                  className="w-full h-10 input-with-icon-left pr-3 text-xs bg-white/[0.03] border border-white/[0.08] rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-[#5E6AD2]"
                 />
               </div>
             </div>
 
             {/* Input Senha */}
             <div>
-              <label htmlFor="login-password font-medium" className="text-xs text-zinc-300 font-medium mb-1 block">Senha</label>
+              <label htmlFor="login-password" className="text-xs text-zinc-300 font-medium mb-1.5 block">Senha</label>
               <div className="relative flex items-center">
-                <Lock size={15} className="absolute left-3 text-zinc-500 pointer-events-none z-10" />
+                <Lock size={16} className="input-icon-left text-zinc-500" />
                 <input
                   id="login-password"
                   type={showPassword ? "text" : "password"}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="Digite sua senha"
-                  className="w-full h-9 pl-9 pr-9 text-xs bg-white/[0.03] border border-white/[0.08] rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-[#5E6AD2]"
+                  className="w-full h-10 input-with-icon-both text-xs bg-white/[0.03] border border-white/[0.08] rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-[#5E6AD2]"
                 />
                 <button
                   type="button"
                   onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3 text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer z-10"
+                  className="input-icon-right text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer"
                 >
-                  {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
+                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>
             </div>

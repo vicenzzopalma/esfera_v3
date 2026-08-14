@@ -186,74 +186,93 @@ body {
   overflow-x: hidden;
 }
 
-/* Base Form Control Reset */
-label {
-  display: block;
-  font-size: 0.8125rem;
-  font-weight: 500;
-  margin-bottom: 0.375rem;
-  color: var(--color-text-secondary);
-  line-height: 1.25;
+/* Base Form Control Reset — Encapsulado em @layer base para que classes utilitárias sempre prevaleçam */
+@layer base {
+  label {
+    display: block;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    margin-bottom: 0.375rem;
+    color: var(--color-text-secondary);
+    line-height: 1.25;
+  }
+
+  input,
+  select,
+  textarea {
+    display: block;
+    width: 100%;
+    border-radius: 0.5rem;
+    background-color: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--color-border);
+    color: var(--color-text-primary);
+    font-size: 0.8125rem;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+  }
+
+  input[type="text"],
+  input[type="password"],
+  input[type="number"],
+  input[type="email"],
+  select {
+    height: 2.5rem;
+    padding: 0.5rem 0.875rem;
+  }
+
+  .light input,
+  .light select,
+  .light textarea {
+    background-color: rgba(0, 0, 0, 0.03);
+  }
+
+  textarea {
+    padding: 0.625rem 0.875rem;
+    line-height: 1.375rem;
+  }
+
+  input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: rgba(94, 106, 210, 0.8);
+    box-shadow: 0 0 0 3px rgba(94, 106, 210, 0.25);
+    background-color: rgba(255, 255, 255, 0.06);
+  }
+
+  input::placeholder, textarea::placeholder {
+    color: var(--color-text-tertiary);
+    opacity: 0.7;
+  }
 }
 
-input[type="text"],
-input[type="password"],
-input[type="number"],
-input[type="email"],
-select {
-  display: block;
-  width: 100%;
-  height: 2.5rem;
-  padding: 0 0.875rem;
-  font-size: 0.8125rem;
-  line-height: 1.25rem;
-  border-radius: 0.5rem;
-  background-color: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--color-border);
-  color: var(--color-text-primary);
-  transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
-}
-
-.light input[type="text"],
-.light input[type="password"],
-.light input[type="number"],
-.light input[type="email"],
-.light select {
-  background-color: rgba(0, 0, 0, 0.03);
-}
-
-textarea {
-  display: block;
-  width: 100%;
-  padding: 0.625rem 0.875rem;
-  font-size: 0.8125rem;
-  line-height: 1.375rem;
-  border-radius: 0.5rem;
-  background-color: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--color-border);
-  color: var(--color-text-primary);
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-
-input:focus, select:focus, textarea:focus {
-  outline: none;
-  border-color: rgba(94, 106, 210, 0.8);
-  box-shadow: 0 0 0 3px rgba(94, 106, 210, 0.25);
-  background-color: rgba(255, 255, 255, 0.06);
-}
-
-input::placeholder, textarea::placeholder {
-  color: var(--color-text-tertiary);
-  opacity: 0.7;
-}
-
-/* Icon positioning helpers that NEVER block typing or clicking */
+/* Utilitários de Ícone e Input: Garantia absoluta de que o texto NUNCA sobrepõe ícones */
 .input-with-icon-left {
-  padding-left: 2.375rem !important;
+  padding-left: 2.75rem !important;
 }
 
 .input-with-icon-right {
-  padding-right: 2.375rem !important;
+  padding-right: 2.75rem !important;
+}
+
+.input-with-icon-both {
+  padding-left: 2.75rem !important;
+  padding-right: 2.75rem !important;
+}
+
+.input-icon-left {
+  position: absolute;
+  left: 0.875rem;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none !important;
+  user-select: none !important;
+  z-index: 10;
+}
+
+.input-icon-right {
+  position: absolute;
+  right: 0.875rem;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 10;
 }
 
 .input-icon-overlay {

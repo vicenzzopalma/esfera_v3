@@ -831,6 +831,19 @@ impl Database {
             [],
         )?;
 
+        // 17.6 ESF_DeviceIdentity (Vínculo permanente de Nome, Setor e Número ao Hardware ID EsferaDeviceId)
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_DeviceIdentity (
+                EsferaDeviceId TEXT PRIMARY KEY,
+                CustomName TEXT NOT NULL,
+                Sector TEXT NOT NULL DEFAULT 'junior',
+                DeviceNumber INTEGER NOT NULL DEFAULT 1,
+                Model TEXT DEFAULT '',
+                UpdatedAt TEXT NOT NULL
+            );",
+            [],
+        )?;
+
         // 18. Performance Indexes (Microsecond Lookups)
         self.conn().execute_batch("
             CREATE INDEX IF NOT EXISTS idx_device_company ON ESF_Device (CompanyId);
@@ -858,6 +871,19 @@ impl Database {
 
     /// Migra tabelas existentes que não tinham as colunas novas
     fn migrate_existing_tables(&self) -> Result<()> {
+        // Tabela permanente de identidade vinculada ao Hardware ID
+        let _ = self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_DeviceIdentity (
+                EsferaDeviceId TEXT PRIMARY KEY,
+                CustomName TEXT NOT NULL,
+                Sector TEXT NOT NULL DEFAULT 'junior',
+                DeviceNumber INTEGER NOT NULL DEFAULT 1,
+                Model TEXT DEFAULT '',
+                UpdatedAt TEXT NOT NULL
+            );",
+            [],
+        );
+
         // ESF_Device
         let _ = self.conn().execute("ALTER TABLE ESF_Device ADD COLUMN DeviceNumber INTEGER DEFAULT 1;", []);
         let _ = self.conn().execute("ALTER TABLE ESF_Device ADD COLUMN Sector TEXT DEFAULT 'junior';", []);
@@ -905,8 +931,8 @@ impl Database {
         let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN RetryCount INTEGER DEFAULT 0;", []);
         let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN CustomMessage TEXT DEFAULT '';", []);
         let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
-        // Limpeza de dispositivos, campanhas e logs falsos legados de desenvolvimento
-        let _ = self.conn().execute("DELETE FROM ESF_Device WHERE AdbDeviceId LIKE 'adb-dev-%' OR EsferaDeviceId LIKE 'ESF-LEGACY-%' OR DeviceIp LIKE '192.168.1.%';", []);
+        // Limpeza APENAS de dispositivos mockados de testes 'adb-dev-%' (NUNCA deletar conexões reais Wi-Fi/IP)
+        let _ = self.conn().execute("DELETE FROM ESF_Device WHERE AdbDeviceId LIKE 'adb-dev-%';", []);
         let _ = self.conn().execute("DELETE FROM ESF_Campaign WHERE CampaignName LIKE '%Black Friday%' OR CampaignName LIKE '%Julho%';", []);
         let _ = self.conn().execute("DELETE FROM ESF_AutomationRule WHERE RuleName LIKE '%Preço%' OR RuleName LIKE '%Humano%';", []);
         let _ = self.conn().execute("DELETE FROM ESF_AuditLog WHERE Message LIKE '%adb-dev-%';", []);
@@ -1122,11 +1148,53 @@ impl Database {
         }
     }
 
+    /// Salva o vínculo permanente do Nome, Setor e Número ao Hardware ID (EsferaDeviceId)
+    pub fn save_device_identity(&self, esfera_id: &str, name: &str, sector: &str, num: i32, model: &str) -> Result<(), String> {
+        if esfera_id.trim().is_empty() { return Ok(()); }
+        let now = chrono::Utc::now().to_rfc3339();
+        self.exec_retry(
+            "INSERT INTO ESF_DeviceIdentity (EsferaDeviceId, CustomName, Sector, DeviceNumber, Model, UpdatedAt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(EsferaDeviceId) DO UPDATE SET
+                CustomName = CASE WHEN ?2 != '' THEN ?2 ELSE ESF_DeviceIdentity.CustomName END,
+                Sector = CASE WHEN ?3 != '' THEN ?3 ELSE ESF_DeviceIdentity.Sector END,
+                DeviceNumber = CASE WHEN ?4 > 0 THEN ?4 ELSE ESF_DeviceIdentity.DeviceNumber END,
+                Model = CASE WHEN ?5 != '' THEN ?5 ELSE ESF_DeviceIdentity.Model END,
+                UpdatedAt = ?6;",
+            params![esfera_id, name, sector, num, model, now],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Obtém os dados de identidade permanente ancorados ao Hardware ID
+    pub fn get_device_identity(&self, esfera_id: &str) -> Option<(String, String, i32, String)> {
+        if esfera_id.trim().is_empty() { return None; }
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT CustomName, Sector, DeviceNumber, Model FROM ESF_DeviceIdentity WHERE EsferaDeviceId = ?1",
+            params![esfera_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).ok()
+    }
+
+    /// Gera o próximo número único sequencial global para um novo aparelho (evita duplicatas como 2x Aparelho 1)
+    pub fn get_next_device_number(&self) -> i32 {
+        let conn = self.conn();
+        let max_dev: i32 = conn.query_row("SELECT COALESCE(MAX(DeviceNumber), 0) FROM ESF_Device", [], |r| r.get(0)).unwrap_or(0);
+        let max_id: i32 = conn.query_row("SELECT COALESCE(MAX(DeviceNumber), 0) FROM ESF_DeviceIdentity", [], |r| r.get(0)).unwrap_or(0);
+        std::cmp::max(max_dev, max_id) + 1
+    }
+
     pub fn update_device_config(&self, device: &Device) -> Result<(), String> {
         let target_comp = if device.company_id <= 0 { 1 } else { device.company_id };
         let serial = &device.serial;
         let esfera_id = device.esfera_device_id.as_deref().unwrap_or("");
         let adb_addr = device.current_adb_address.as_deref().unwrap_or("");
+
+        // Ancora permanentemente na tabela ESF_DeviceIdentity para nunca perder o nome
+        if !esfera_id.is_empty() {
+            let _ = self.save_device_identity(esfera_id, &device.name, &device.sector, device.device_number, &device.model);
+        }
 
         self.exec_retry(
             "UPDATE ESF_Device SET
@@ -1156,23 +1224,45 @@ impl Database {
     pub fn upsert_device(&self, device: &Device) -> Result<(), String> {
         let target_comp = if device.company_id <= 0 { 1 } else { device.company_id };
 
+        // Se existir identidade permanente na ESF_DeviceIdentity para este Hardware ID, preserva-a
+        let (final_name, final_sector, final_num) = if let Some(ref esfera_id) = device.esfera_device_id {
+            if let Some((saved_name, saved_sec, saved_num, _)) = self.get_device_identity(esfera_id) {
+                let name = if !device.name.is_empty() && !device.name.starts_with("Aparelho ") && !device.name.starts_with("Celular ") {
+                    device.name.clone()
+                } else if !saved_name.is_empty() {
+                    saved_name
+                } else {
+                    device.name.clone()
+                };
+                (name, saved_sec, saved_num)
+            } else {
+                if !device.name.is_empty() {
+                    let _ = self.save_device_identity(esfera_id, &device.name, &device.sector, device.device_number, &device.model);
+                }
+                (device.name.clone(), device.sector.clone(), device.device_number)
+            }
+        } else {
+            (device.name.clone(), device.sector.clone(), device.device_number)
+        };
+
         // EsferaDeviceId identifica o aparelho; IP:porta/USB são somente transporte.
         if let Some(ref esfera_id) = device.esfera_device_id {
             if !esfera_id.trim().is_empty() {
                 let affected = self.exec_retry(
                     "UPDATE ESF_Device SET
                         DeviceName = CASE 
-                            WHEN ESF_Device.DeviceName IS NOT NULL AND ESF_Device.DeviceName != '' THEN ESF_Device.DeviceName
                             WHEN ?2 IS NOT NULL AND ?2 != '' THEN ?2 
-                            ELSE ESF_Device.DeviceName 
+                            WHEN ESF_Device.DeviceName IS NOT NULL AND ESF_Device.DeviceName != '' THEN ESF_Device.DeviceName
+                            ELSE ?2 
                         END,
                         Brand=?1, Model=?3, DeviceIp=?4,
                         DevicePort=?5, Status=?6, BatteryLevel=?7,
-                        CurrentAdbAddress=?8, LastSeenUTC=?9
+                        CurrentAdbAddress=?8, LastSeenUTC=?9,
+                        Sector=?12, DeviceNumber=?13
                      WHERE CompanyId=?10 AND EsferaDeviceId=?11",
-                    params![device.brand, device.name, device.model, device.ip, device.port,
+                    params![device.brand, final_name, device.model, device.ip, device.port,
                         device.status, device.battery, device.current_adb_address,
-                        device.last_seen_utc, target_comp, esfera_id],
+                        device.last_seen_utc, target_comp, esfera_id, final_sector, final_num],
                 ).map_err(|e| e.to_string())?;
                 if affected > 0 { return Ok(()); }
             }
@@ -1183,20 +1273,21 @@ impl Database {
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(AdbDeviceId) DO UPDATE SET
             DeviceName=CASE 
+                WHEN ?2 IS NOT NULL AND ?2 != '' AND ?2 != 'Aparelho 1' THEN ?2
                 WHEN ESF_Device.DeviceName IS NOT NULL AND ESF_Device.DeviceName != '' THEN ESF_Device.DeviceName
                 WHEN excluded.DeviceName IS NOT NULL AND excluded.DeviceName != '' THEN excluded.DeviceName 
-                ELSE ESF_Device.DeviceName 
+                ELSE ?2 
             END,
             Brand=excluded.Brand, Model=excluded.Model,
             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
             BatteryLevel=excluded.BatteryLevel,
-            DeviceNumber=CASE WHEN ESF_Device.DeviceNumber IS NOT NULL AND ESF_Device.DeviceNumber > 0 THEN ESF_Device.DeviceNumber ELSE excluded.DeviceNumber END,
-            Sector=CASE WHEN ESF_Device.Sector IS NOT NULL AND ESF_Device.Sector != '' THEN ESF_Device.Sector ELSE excluded.Sector END,
+            DeviceNumber=CASE WHEN ?10 > 0 THEN ?10 WHEN ESF_Device.DeviceNumber > 0 THEN ESF_Device.DeviceNumber ELSE excluded.DeviceNumber END,
+            Sector=CASE WHEN ?11 != '' THEN ?11 WHEN ESF_Device.Sector != '' THEN ESF_Device.Sector ELSE excluded.Sector END,
             EsferaDeviceId=COALESCE(excluded.EsferaDeviceId, ESF_Device.EsferaDeviceId),
             CurrentAdbAddress=excluded.CurrentAdbAddress, LastSeenUTC=excluded.LastSeenUTC;",
             params![
                 device.serial,
-                device.name,
+                final_name,
                 device.brand,
                 device.model,
                 device.ip,
@@ -1204,8 +1295,8 @@ impl Database {
                 device.status,
                 device.battery,
                 target_comp,
-                device.device_number,
-                device.sector,
+                final_num,
+                final_sector,
                 device.esfera_device_id,
                 device.current_adb_address,
                 device.last_seen_utc,

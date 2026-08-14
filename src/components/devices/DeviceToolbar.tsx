@@ -114,14 +114,14 @@ export function DeviceToolbar({
         {/* Right: Search, Conectar, Dropdown Menu */}
         <div className="flex items-center gap-2">
           {/* Search bar */}
-          <div className="relative min-w-[200px] sm:min-w-[260px]">
-            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500 pointer-events-none" />
+          <div className="relative min-w-[200px] sm:min-w-[260px] flex items-center">
+            <Search size={14} className="input-icon-left text-zinc-500" />
             <input
               type="text"
               placeholder="Buscar por modelo, serial ou IP..."
               value={searchQuery}
               onChange={(e) => onSearchChange(e.target.value)}
-              className="w-full bg-[#09090b] border border-white/[0.08] text-zinc-100 rounded-md pl-8 pr-3 py-1.5 text-xs placeholder:text-zinc-600 focus:outline-none focus:border-[#5E6AD2]"
+              className="w-full h-8 bg-[#09090b] border border-white/[0.08] text-zinc-100 rounded-md input-with-icon-left pr-3 text-xs placeholder:text-zinc-600 focus:outline-none focus:border-[#5E6AD2]"
             />
           </div>
 

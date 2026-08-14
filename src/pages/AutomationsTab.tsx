@@ -308,7 +308,7 @@ export default function AutomationsTab() {
 
       {/* Search */}
       <div className="relative max-w-md flex items-center">
-        <Search size={16} className="absolute left-3.5 text-tertiary pointer-events-none z-10" />
+        <Search size={16} className="input-icon-left text-tertiary" />
         <input
           type="text"
           placeholder="Buscar por regra ou palavra-chave..."

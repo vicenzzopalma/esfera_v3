@@ -172,7 +172,7 @@ export default function CompaniesTab() {
 
       {/* Search Input */}
       <div className="relative max-w-md flex items-center">
-        <Search size={17} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-tertiary pointer-events-none z-10" />
+        <Search size={16} className="input-icon-left text-tertiary" />
         <input
           type="text"
           placeholder="Buscar empresa por nome..."
