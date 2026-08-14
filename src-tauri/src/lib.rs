@@ -192,6 +192,9 @@ pub fn run() {
             capture_device_screen,
             send_adb_tap,
             send_adb_keyevent,
+            send_adb_input_text,
+            apply_device_settings,
+            reboot_adb_device,
             get_hpc_capabilities,
             // Chips
             get_device_chips,

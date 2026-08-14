@@ -6,13 +6,15 @@
 import { useState } from "react";
 import Modal from "../ui/Modal";
 import Button from "../ui/Button";
-import { RefreshCw, Smartphone } from "lucide-react";
+import type { Device } from "../../types";
+import { RefreshCw, Smartphone, CheckCircle2, Eye, EyeOff } from "lucide-react";
 
 interface ConnectDeviceModalProps {
   isOpen: boolean;
   onClose: () => void;
   usbDevices: { serial: string; state: string; model: string }[];
   loadingUsb: boolean;
+  existingDevices?: Device[];
   onFetchUsb: () => void;
   onForceWirelessAdb: (serial: string, deviceNumber: number, sector: string, deviceName: string) => void;
   onConnectDevice: (ip: string, port: number, deviceNumber: number, sector: string, deviceName: string) => void;
@@ -35,6 +37,7 @@ export function ConnectDeviceModal({
   onClose,
   usbDevices,
   loadingUsb,
+  existingDevices = [],
   onFetchUsb,
   onForceWirelessAdb,
   onConnectDevice,
@@ -50,11 +53,31 @@ export function ConnectDeviceModal({
   const [pairPort, setPairPort] = useState("");
   const [pairCode, setPairCode] = useState("");
   const [connectPortInput, setConnectPortInput] = useState("5555");
+  const [showAlreadyConnected, setShowAlreadyConnected] = useState(false);
 
   const [setupDeviceData, setSetupDeviceData] = useState<{ serial?: string; ip?: string; port?: number } | null>(null);
   const [deviceNumberInput, setDeviceNumberInput] = useState(nextDeviceNumber.toString());
   const [deviceNameInput, setDeviceNameInput] = useState(`Aparelho ${nextDeviceNumber}`);
   const [sectorInput, setSectorInput] = useState("junior");
+
+  // Filtra dispositivos que já estão vinculados no sistema
+  const isDeviceAlreadyAdded = (devSerial: string) => {
+    const s = devSerial.trim();
+    const ipOnly = s.includes(":") ? s.split(":")[0] : s;
+    return existingDevices.some((d) => {
+      const ds = d.serial?.trim() || "";
+      const da = d.currentAdbAddress?.trim() || "";
+      const di = d.ip?.trim() || "";
+      const de = d.esferaDeviceId?.trim() || "";
+      if (s && (ds === s || da === s)) return true;
+      if (ipOnly && (di === ipOnly || da.startsWith(ipOnly) || ds.startsWith(ipOnly))) return true;
+      if (de && s.includes(de.replace("ESF-", ""))) return true;
+      return false;
+    });
+  };
+
+  const newUsbDevices = usbDevices.filter((dev) => !isDeviceAlreadyAdded(dev.serial));
+  const alreadyConnectedDevices = usbDevices.filter((dev) => isDeviceAlreadyAdded(dev.serial));
 
   const handlePrepareSetup = (data: { serial?: string; ip?: string; port?: number }) => {
     setDeviceNumberInput(nextDeviceNumber.toString());
@@ -64,6 +87,7 @@ export function ConnectDeviceModal({
 
   const handleClose = () => {
     setSetupDeviceData(null);
+    setShowAlreadyConnected(false);
     onClose();
   };
 
@@ -220,10 +244,6 @@ export function ConnectDeviceModal({
 
           {connectTab === "usb" ? (
             <div className="space-y-3">
-              <p className="text-[11px] text-zinc-400">
-                Dispositivos detectados via USB/Wi-Fi no computador:
-              </p>
-
               {loadingUsb ? (
                 <div className="flex flex-col items-center justify-center py-6 text-zinc-400">
                   <RefreshCw size={20} className="animate-spin text-[#828DF7] mb-2" />
@@ -235,37 +255,88 @@ export function ConnectDeviceModal({
                   <p className="font-medium text-zinc-300">Nenhum celular detectado no ADB</p>
                   <p className="text-[11px] text-zinc-500 mt-0.5">Conecte o cabo USB e ative a "Depuração USB".</p>
                 </div>
+              ) : newUsbDevices.length === 0 && !showAlreadyConnected ? (
+                <div className="text-center py-5 border border-emerald-500/20 bg-emerald-500/[0.04] rounded-lg p-4 space-y-2 animate-fade-in">
+                  <CheckCircle2 size={30} className="mx-auto text-emerald-400 mb-1" />
+                  <p className="font-semibold text-zinc-100 text-xs">Todos os celulares detectados já estão conectados</p>
+                  <p className="text-[11px] text-zinc-400 max-w-sm mx-auto">
+                    Todos os {alreadyConnectedDevices.length} aparelho(s) ADB encontrados neste computador já estão cadastrados e ativos no sistema.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setShowAlreadyConnected(true)}
+                    className="mt-2 text-[11px] text-[#828DF7] hover:underline font-medium cursor-pointer inline-flex items-center gap-1"
+                  >
+                    <Eye size={12} /> Ver aparelhos já conectados ({alreadyConnectedDevices.length})
+                  </button>
+                </div>
               ) : (
-                <div className="space-y-1.5 max-h-48 overflow-y-auto custom-scrollbar pr-1">
-                  {usbDevices.map((dev) => {
-                    const safeSerial = String(dev.serial || "");
-                    const safeModel = String(dev.model || "Aparelho Android");
-                    const safeState = String(dev.state || "");
-                    return (
-                      <div key={safeSerial} className="flex items-center justify-between p-2.5 rounded-md bg-white/[0.02] border border-white/[0.06]">
-                        <div>
-                          <p className="font-medium text-zinc-100">{safeModel}</p>
-                          <p className="text-[10px] text-zinc-500 font-mono">
-                            {safeSerial.includes(":") ? "🟢 IP: " : "🔌 USB: "} {safeSerial} ({safeState})
-                          </p>
-                        </div>
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          onClick={() => {
-                            if (safeSerial.includes(":")) {
-                              const ipOnly = safeSerial.split(":")[0];
-                              handlePrepareSetup({ ip: ipOnly, port: 5555 });
-                            } else {
-                              handlePrepareSetup({ serial: safeSerial });
-                            }
-                          }}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <p className="text-[11px] text-zinc-400">
+                      {newUsbDevices.length > 0
+                        ? `Novos aparelhos disponíveis para conexão (${newUsbDevices.length}):`
+                        : `Aparelhos já vinculados no sistema (${alreadyConnectedDevices.length}):`}
+                    </p>
+                    {alreadyConnectedDevices.length > 0 && newUsbDevices.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setShowAlreadyConnected(!showAlreadyConnected)}
+                        className="text-[10px] text-zinc-400 hover:text-zinc-200 flex items-center gap-1 cursor-pointer"
+                      >
+                        {showAlreadyConnected ? <EyeOff size={11} /> : <Eye size={11} />}
+                        {showAlreadyConnected ? "Ocultar já conectados" : `Ver já conectados (${alreadyConnectedDevices.length})`}
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto custom-scrollbar pr-1">
+                    {(showAlreadyConnected ? usbDevices : newUsbDevices).map((dev) => {
+                      const safeSerial = String(dev.serial || "");
+                      const safeModel = String(dev.model || "Aparelho Android");
+                      const safeState = String(dev.state || "");
+                      const isConnected = isDeviceAlreadyAdded(safeSerial);
+
+                      return (
+                        <div
+                          key={safeSerial}
+                          className={`flex items-center justify-between p-2.5 rounded-md border ${
+                            isConnected
+                              ? "bg-emerald-500/[0.03] border-emerald-500/20 opacity-80"
+                              : "bg-white/[0.02] border-white/[0.06]"
+                          }`}
                         >
-                          {safeSerial.includes(":") ? "Sincronizar" : "Vincular Wi-Fi"}
-                        </Button>
-                      </div>
-                    );
-                  })}
+                          <div>
+                            <div className="flex items-center gap-1.5">
+                              <p className="font-medium text-zinc-100">{safeModel}</p>
+                              {isConnected && (
+                                <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">
+                                  Já Conectado
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-[10px] text-zinc-500 font-mono">
+                              {safeSerial.includes(":") ? "🟢 IP: " : "🔌 USB: "} {safeSerial} ({safeState})
+                            </p>
+                          </div>
+                          <Button
+                            size="sm"
+                            variant={isConnected ? "secondary" : "primary"}
+                            onClick={() => {
+                              if (safeSerial.includes(":")) {
+                                const ipOnly = safeSerial.split(":")[0];
+                                handlePrepareSetup({ ip: ipOnly, port: 5555 });
+                              } else {
+                                handlePrepareSetup({ serial: safeSerial });
+                              }
+                            }}
+                          >
+                            {isConnected ? "Re-sincronizar" : safeSerial.includes(":") ? "Conectar IP" : "Vincular Wi-Fi"}
+                          </Button>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
             </div>

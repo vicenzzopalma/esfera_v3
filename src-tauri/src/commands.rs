@@ -479,7 +479,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             let existing_idx = db_devices.iter().position(|d| {
                 d.serial == adb_dev.serial
                     || persistent_id.as_ref().is_some_and(|id| d.esfera_device_id.as_ref() == Some(id))
-                    || (!ip_only.is_empty() && d.ip == ip_only)
+                    || (!ip_only.is_empty() && (d.ip == ip_only || d.serial.starts_with(&ip_only) || d.current_adb_address.as_deref().unwrap_or("").starts_with(&ip_only)))
                     || d.current_adb_address.as_deref() == Some(&adb_dev.serial)
                     || d.esfera_device_id.as_deref() == Some(&adb_dev.serial)
             });
@@ -514,7 +514,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 let new_dev = Device {
                     id: 0,
                     serial: adb_dev.serial.clone(),
-                    name: format!("Celular {}", if !ip_only.is_empty() { &ip_only } else { &adb_dev.serial }),
+                    name: format!("Aparelho {}", (db_devices.len() + 1)),
                     brand,
                     model,
                     ip: ip_only,
@@ -563,10 +563,18 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 continue;
             }
 
-            let is_active = active_adb_list.iter().any(|adb_d| adb_d.serial == dev.serial);
-            if is_active {
+            let matching_adb = active_adb_list.iter().find(|adb_d| {
+                adb_d.serial == dev.serial
+                    || dev.current_adb_address.as_deref() == Some(&adb_d.serial)
+                    || (!dev.ip.is_empty() && (adb_d.serial == dev.ip || adb_d.serial.starts_with(&dev.ip)))
+                    || (dev.esfera_device_id.is_some() && (adb_d.serial.to_uppercase().starts_with(dev.esfera_device_id.as_deref().unwrap_or("___")) || dev.serial.to_uppercase().starts_with(dev.esfera_device_id.as_deref().unwrap_or("___"))))
+            });
+            if let Some(adb_d) = matching_adb {
                 // Presente no ADB local ativo: online e limpa qualquer timer de connecting.
-                dev.status = "online".to_string();
+                dev.status = if adb_d.state == "device" { "online".to_string() } else { "connecting".to_string() };
+                if dev.current_adb_address.as_deref() != Some(&adb_d.serial) {
+                    dev.current_adb_address = Some(adb_d.serial.clone());
+                }
                 let _ = CONNECTING_SINCE.write().map(|mut m| m.remove(&connecting_key(dev)));
             } else if dev.esfera_device_id.is_some() || dev.current_adb_address.is_some() || !dev.ip.is_empty() {
                 // Possui identidade/endereço mas NÃO está no ADB local agora:
@@ -1358,7 +1366,8 @@ pub fn update_device(state: State<'_, AppState>, token: String, device: Device) 
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, device.company_id)?;
     let db = &state.db;
-    db.upsert_device(&device);
+    let _ = db.update_device_config(&device);
+    let _ = db.upsert_device(&device);
     // Propaga o nome para a VPS (Hub) para que apareça consistente em todos os
     // clientes. Se o hub não estiver conectado, ignora (o nome fica salvo localmente).
     if let Some(esfera_id) = &device.esfera_device_id {
@@ -1648,6 +1657,49 @@ pub async fn send_adb_keyevent(state: State<'_, AppState>, token: String, serial
     }
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::send_keyevent(&serial, keycode)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn send_adb_input_text(state: State<'_, AppState>, token: String, serial: String, text: String) -> Result<(), String> {
+    validate_session(&state.sessions, &token)?;
+    if let Some(company_id) = resolve_remote_target(&state, &serial) {
+        let escaped = text.replace(' ', "%s").replace('\'', "\\'");
+        let cmd = format!("input text '{}'", escaped);
+        send_remote_adb_command(&state, company_id, &serial, &cmd).await?;
+        return Ok(());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::input_text(&serial, &text)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn apply_device_settings(
+    state: State<'_, AppState>,
+    token: String,
+    serial: String,
+    stay_awake: Option<bool>,
+    dark_mode: Option<bool>,
+    show_touches: Option<bool>,
+    animation_scale: Option<f32>,
+    dpi: Option<i32>,
+) -> Result<String, String> {
+    validate_session(&state.sessions, &token)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::apply_advanced_settings(&serial, stay_awake, dark_mode, show_touches, animation_scale, dpi)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn reboot_adb_device(
+    state: State<'_, AppState>,
+    token: String,
+    serial: String,
+) -> Result<String, String> {
+    validate_session(&state.sessions, &token)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::reboot_device(&serial)
     }).await.map_err(|e| e.to_string())?
 }
 

@@ -1107,20 +1107,21 @@ impl AdbManager {
 
     /// Captura a tela do dispositivo via `adb -s <serial> exec-out screencap -p` e aplica sanitização nativa C++ HPC
     pub fn capture_screen(serial: &str) -> Result<String, String> {
-        let raw_bytes: Vec<u8> = if Self::use_native_adb(serial) {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
+        let raw_bytes: Vec<u8> = if Self::use_native_adb(&target_serial) {
             // Wi-Fi: protocolo ADB nativo (bytes crus do frame)
-            match crate::adb_tcp::exec_shell_bytes(serial, "screencap -p") {
+            match crate::adb_tcp::exec_shell_bytes(&target_serial, "screencap -p") {
                 Ok((stdout, _, true)) => stdout,
                 Ok((_, _, false)) => return Err("Comando screencap nativo falhou".to_string()),
                 Err(_) => {
                     let fallback = create_cmd("adb")
-                        .args(["-s", serial, "exec-out", "screencap", "-p"])
+                        .args(["-s", &target_serial, "exec-out", "screencap", "-p"])
                         .output()
                         .map_err(|e| format!("Falha ao executar screencap ADB: {}", e))?;
                     if !fallback.status.success() || fallback.stdout.is_empty() {
                         return Err(format!(
                             "Não foi possível capturar o frame da tela do celular ({})",
-                            serial
+                            target_serial
                         ));
                     }
                     fallback.stdout
@@ -1128,13 +1129,13 @@ impl AdbManager {
             }
         } else {
             let output = create_cmd("adb")
-                .args(["-s", serial, "exec-out", "screencap", "-p"])
+                .args(["-s", &target_serial, "exec-out", "screencap", "-p"])
                 .output()
                 .map_err(|e| format!("Falha ao executar screencap ADB: {}", e))?;
             if !output.status.success() || output.stdout.is_empty() {
                 return Err(format!(
                     "Não foi possível capturar o frame da tela do celular ({})",
-                    serial
+                    target_serial
                 ));
             }
             output.stdout
@@ -1166,15 +1167,16 @@ impl AdbManager {
 
     /// Envia um toque na tela via `adb -s <serial> shell input tap x y`
     pub fn tap_screen(serial: &str, x: u32, y: u32) -> Result<(), String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         let tap_cmd = format!("input tap {} {}", x, y);
 
         // Wi-Fi: protocolo ADB nativo em vez de adb.exe
-        if Self::use_native_adb(serial) && crate::adb_tcp::exec_shell_bytes(serial, &tap_cmd).is_ok() {
+        if Self::use_native_adb(&target_serial) && crate::adb_tcp::exec_shell_bytes(&target_serial, &tap_cmd).is_ok() {
             return Ok(());
         }
 
         let output = create_cmd("adb")
-            .args(["-s", serial, "shell", "input", "tap", &x.to_string(), &y.to_string()])
+            .args(["-s", &target_serial, "shell", "input", "tap", &x.to_string(), &y.to_string()])
             .output()
             .map_err(|e| format!("Falha ao enviar toque ADB: {}", e))?;
 
@@ -1187,17 +1189,18 @@ impl AdbManager {
 
     /// Envia um evento de tecla via `adb -s <serial> shell input keyevent <keycode>`
     pub fn send_keyevent(serial: &str, keycode: u32) -> Result<(), String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         let key_cmd = format!("input keyevent {}", keycode);
 
         // Wi-Fi: protocolo ADB nativo em vez de adb.exe
-        if Self::use_native_adb(serial) && crate::adb_tcp::exec_shell_bytes(serial, &key_cmd).is_ok() {
+        if Self::use_native_adb(&target_serial) && crate::adb_tcp::exec_shell_bytes(&target_serial, &key_cmd).is_ok() {
             return Ok(());
         }
 
         let output = create_cmd("adb")
             .args([
                 "-s",
-                serial,
+                &target_serial,
                 "shell",
                 "input",
                 "keyevent",
@@ -1213,8 +1216,14 @@ impl AdbManager {
         }
     }
 
+    /// Digitação direta de texto no celular via ADB
+    pub fn input_text(serial: &str, text: &str) -> Result<(), String> {
+        Self::type_text_human_hpc(serial, text)
+    }
+
     /// Digitação humana com delays Gaussianos — batch único ADB shell
     pub fn type_text_human_hpc(serial: &str, text: &str) -> Result<(), String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         let mut shell_cmds = Vec::new();
         for ch in text.chars() {
             let delay_ms = Self::calculate_gaussian_delay(45, 160);
@@ -1237,14 +1246,14 @@ impl AdbManager {
         let full_cmd = shell_cmds.join(" ");
 
         // Wi-Fi: protocolo ADB nativo em vez de adb.exe
-        if Self::use_native_adb(serial) {
-            if let Ok((_, _, _)) = crate::adb_tcp::exec_shell_bytes(serial, &full_cmd) {
+        if Self::use_native_adb(&target_serial) {
+            if let Ok((_, _, _)) = crate::adb_tcp::exec_shell_bytes(&target_serial, &full_cmd) {
                 return Ok(());
             }
         }
 
         let output = create_cmd("adb")
-            .args(["-s", serial, "shell", &full_cmd])
+            .args(["-s", &target_serial, "shell", &full_cmd])
             .output()
             .map_err(|e| format!("Falha ao digitar texto: {}", e))?;
 
@@ -1341,25 +1350,27 @@ impl AdbManager {
         };
         let title = format!("Esfera v3 — Stream H.264 ({}){}", target_serial, mode_label);
         let is_wireless = target_serial.contains(':') || target_serial.contains('.');
+        let max_size = if is_wireless { "1080" } else { "1280" };
+        let fps = if is_wireless { "30" } else { "60" };
         let bitrate = if is_wireless { "2M" } else { "4M" };
         let mut cmd = create_cmd("scrcpy");
         cmd.args([
             "-s",
             &target_serial,
             "--max-size",
-            "1080",
+            max_size,
             "--max-fps",
-            "60",
+            fps,
             "--video-bit-rate",
             bitrate,
             "--no-audio",
+            "--stay-awake",
             "--window-title",
             &title,
         ]);
 
         if turn_screen_off {
             cmd.arg("--turn-screen-off");
-            cmd.arg("--stay-awake");
         }
 
         let result = cmd.spawn();
@@ -1497,11 +1508,11 @@ impl AdbManager {
 
         // 1. Tenta obter o SDK level do Android (Android 12+ / SDK 31+ suporta --video-source=camera nativo no scrcpy)
         let mut sdk_level = 0;
-        let sdk_native = if Self::use_native_adb(serial) {
-            crate::adb_tcp::exec_shell(serial, "getprop ro.build.version.sdk")
+        let sdk_native = if Self::use_native_adb(&target_serial) {
+            crate::adb_tcp::exec_shell(&target_serial, "getprop ro.build.version.sdk")
         } else {
             let mut sdk_cmd = create_cmd("adb");
-            sdk_cmd.args(["-s", serial, "shell", "getprop", "ro.build.version.sdk"]);
+            sdk_cmd.args(["-s", &target_serial, "shell", "getprop", "ro.build.version.sdk"]);
             run_cmd_timeout(sdk_cmd, Duration::from_secs(3)).map(|o| {
                 String::from_utf8_lossy(&o.stdout).trim().to_string()
             })
@@ -1515,7 +1526,7 @@ impl AdbManager {
             let mut cam_intent = create_cmd("adb");
             cam_intent.args([
                 "-s",
-                serial,
+                &target_serial,
                 "shell",
                 "am",
                 "start",
@@ -1526,11 +1537,11 @@ impl AdbManager {
             std::thread::sleep(Duration::from_millis(500));
 
             let result = create_cmd("scrcpy")
-                .args(["-s", serial, "--window-title", &title])
+                .args(["-s", &target_serial, "--stay-awake", "--window-title", &title])
                 .spawn();
 
             return match result {
-                Ok(_) => Ok(format!("Câmera nativa iniciada para {} (Android SDK {}) com espelhamento!", serial, sdk_level)),
+                Ok(_) => Ok(format!("Câmera nativa iniciada para {} (Android SDK {}) com espelhamento!", target_serial, sdk_level)),
                 Err(e) => Err(format!("Falha ao iniciar espelhamento de câmera: {}", e)),
             };
         }
@@ -1539,11 +1550,14 @@ impl AdbManager {
         let result = create_cmd("scrcpy")
             .args([
                 "-s",
-                serial,
+                &target_serial,
                 "--video-source=camera",
                 &format!("--camera-facing={}", camera_arg),
+                "--stay-awake",
                 "--max-fps",
-                "60",
+                "30",
+                "--video-bit-rate",
+                "2M",
                 "--window-title",
                 &title,
             ])
@@ -1557,7 +1571,7 @@ impl AdbManager {
                         let mut cam_intent = create_cmd("adb");
                         cam_intent.args([
                             "-s",
-                            serial,
+                            &target_serial,
                             "shell",
                             "am",
                             "start",
@@ -1567,25 +1581,25 @@ impl AdbManager {
                         let _ = run_cmd_timeout(cam_intent, Duration::from_secs(3));
 
                         let fallback = create_cmd("scrcpy")
-                            .args(["-s", serial, "--window-title", &title])
+                            .args(["-s", &target_serial, "--stay-awake", "--window-title", &title])
                             .spawn();
                         match fallback {
-                            Ok(_) => Ok(format!("Câmera aberta via fallback e espelhamento ativado para {}!", serial)),
+                            Ok(_) => Ok(format!("Câmera aberta e espelhamento ativado para {}!", target_serial)),
                             Err(_) => Err("Falha ao iniciar scrcpy fallback.".to_string()),
                         }
                     }
                     _ => Ok(format!(
                         "Transmissão de Câmera ({}) iniciada com sucesso para {}!",
-                        camera_arg, serial
+                        camera_arg, target_serial
                     )),
                 }
             }
             Err(e) => {
                 let fallback = create_cmd("scrcpy")
-                    .args(["-s", serial, "--window-title", &title])
+                    .args(["-s", &target_serial, "--window-title", &title])
                     .spawn();
                 match fallback {
-                    Ok(_) => Ok(format!("Espelhamento de tela ativado para {}!", serial)),
+                    Ok(_) => Ok(format!("Espelhamento de tela ativado para {}!", target_serial)),
                     Err(_) => Err(format!("Falha ao iniciar transmissão de câmera: {}", e)),
                 }
             }
@@ -2768,8 +2782,13 @@ impl AdbManager {
         }
         let target_serial = Self::resolve_target_serial(serial)?;
 
-        let uuid = Uuid::new_v4().to_string();
-        let device_id = format!("ESF-{}", uuid);
+        let device_id = Self::get_persistent_device_id(&target_serial)
+            .unwrap_or_else(|| {
+                let s = target_serial.to_uppercase();
+                let clean = s.split(':').next().unwrap_or(&s);
+                let p8 = if clean.len() >= 8 { &clean[..8] } else { clean };
+                format!("ESF-{}", p8)
+            });
         let config = crate::config::load_config();
 
         let url = match server_url {
@@ -2779,7 +2798,9 @@ impl AdbManager {
 
         Self::inject_persistent_device_id(&target_serial, &device_id)?;
         Self::inject_server_config(&target_serial, &url, &device_id, company_id)?;
+        let _ = Self::write_identity_config(&target_serial, company_id, &url);
         Self::inject_device_immunity(&target_serial, Some(&device_id))?;
+        let _ = Self::set_device_owner(&target_serial);
 
         let is_usb = !target_serial.contains(':');
         if is_usb {
@@ -2791,7 +2812,7 @@ impl AdbManager {
             Ok(msg) => {
                 let _ = Self::start_agent_service(&target_serial);
                 Ok(format!(
-                    "Provisionado: {} com ID {} ({})",
+                    "Provisionado com sucesso: {} (ID: {}) — {}",
                     target_serial, device_id, msg
                 ))
             }
@@ -2810,10 +2831,66 @@ impl AdbManager {
                 let _ = Self::push_agent_script(&target_serial);
                 let _ = Self::start_agent_script(&target_serial);
                 Ok(format!(
-                    "Provisionado: {} com ID {} (script fallback ativado)",
+                    "Provisionado com sucesso: {} (ID: {}) — Script ativo",
                     target_serial, device_id
                 ))
             }
+        }
+    }
+
+    /// Aplica configurações avançadas de sistema Android no dispositivo
+    pub fn apply_advanced_settings(
+        serial: &str,
+        stay_awake: Option<bool>,
+        dark_mode: Option<bool>,
+        show_touches: Option<bool>,
+        animation_scale: Option<f32>,
+        dpi: Option<i32>,
+    ) -> Result<String, String> {
+        let target = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
+        let mut cmds = Vec::new();
+
+        if let Some(sa) = stay_awake {
+            cmds.push(format!("settings put global stay_on_while_plugged_in {}", if sa { 7 } else { 0 }));
+        }
+        if let Some(dm) = dark_mode {
+            cmds.push(format!("cmd uimode night {}", if dm { "yes" } else { "no" }));
+        }
+        if let Some(st) = show_touches {
+            cmds.push(format!("settings put system show_touches {}", if st { 1 } else { 0 }));
+        }
+        if let Some(scale) = animation_scale {
+            cmds.push(format!("settings put global window_animation_scale {}", scale));
+            cmds.push(format!("settings put global transition_animation_scale {}", scale));
+            cmds.push(format!("settings put global animator_duration_scale {}", scale));
+        }
+        if let Some(d) = dpi {
+            if d > 0 {
+                cmds.push(format!("wm density {}", d));
+            } else {
+                cmds.push("wm density reset".to_string());
+            }
+        }
+
+        if !cmds.is_empty() {
+            let full_cmd = cmds.join("; ");
+            let _ = create_cmd("adb").args(["-s", &target, "shell", &full_cmd]).output();
+        }
+
+        Ok("Configurações aplicadas no dispositivo com sucesso!".to_string())
+    }
+
+    /// Reinicia o dispositivo Android via comando ADB reboot
+    pub fn reboot_device(serial: &str) -> Result<String, String> {
+        let target = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
+        let output = create_cmd("adb")
+            .args(["-s", &target, "reboot"])
+            .output()
+            .map_err(|e| format!("Falha ao reiniciar dispositivo: {}", e))?;
+        if output.status.success() {
+            Ok(format!("Dispositivo {} reiniciado com sucesso!", target))
+        } else {
+            Err("Falha ao enviar comando reboot".to_string())
         }
     }
 

@@ -44,39 +44,39 @@ export default function Modal({ isOpen, onClose, title, children, footer, size =
   return (
     <div
       ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 animate-fade-in"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 animate-fade-in"
       onClick={(e) => {
         if (e.target === overlayRef.current) onClose();
       }}
     >
       {/* Overlay */}
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-md" />
 
-      {/* Modal Content */}
+      {/* Modal Content Card */}
       <div
-        className={`relative w-full ${sizeClasses[size]} rounded-xl border
-          bg-[#141418] border-white/[0.08] shadow-2xl shadow-black/60 animate-scale-in`}
+        className={`relative w-full ${sizeClasses[size]} max-h-[90vh] flex flex-col rounded-xl border
+          bg-[#121216] border-white/[0.08] shadow-2xl shadow-black/80 animate-scale-in overflow-hidden`}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-3.5 border-b border-white/[0.06]">
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-white/[0.06] bg-[#141419] shrink-0">
           <h2 className="text-sm font-semibold text-zinc-100 tracking-tight">{title}</h2>
           <button
             onClick={onClose}
-            className="p-1 rounded-md text-zinc-400 hover:text-zinc-100
+            className="p-1.5 rounded-lg text-zinc-400 hover:text-zinc-100
               hover:bg-white/[0.06] transition-all cursor-pointer"
           >
-            <X size={16} />
+            <X size={15} />
           </button>
         </div>
 
-        {/* Body */}
-        <div className="px-5 py-4 max-h-[75vh] overflow-y-auto custom-scrollbar">
+        {/* Body (Scrollable) */}
+        <div className="px-5 py-4 overflow-y-auto flex-1 custom-scrollbar min-h-0">
           {children}
         </div>
 
-        {/* Footer */}
+        {/* Footer (Fixed at Bottom of Modal) */}
         {footer && (
-          <div className="flex items-center justify-end gap-2.5 px-5 py-3 border-t border-white/[0.06]">
+          <div className="flex items-center justify-end gap-2.5 px-5 py-3 border-t border-white/[0.06] bg-[#141419] shrink-0">
             {footer}
           </div>
         )}
