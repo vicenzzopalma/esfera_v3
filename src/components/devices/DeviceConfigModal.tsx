@@ -3,7 +3,7 @@
 // Painel completo de configurações de hardware, display, rede e sistema Android
 // ============================================================
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Modal from "../ui/Modal";
 import Button from "../ui/Button";
 import Toggle from "../ui/Toggle";
@@ -58,6 +58,20 @@ export function DeviceConfigModal({
   const [sectorInput, setSectorInput] = useState<SectorType>((device.sector as SectorType) || "junior");
   const [deviceNumberInput, setDeviceNumberInput] = useState(String(device.deviceNumber || 1));
   const [copiedId, setCopiedId] = useState(false);
+
+  useEffect(() => {
+    if (isOpen) {
+      setNameInput(device.name || `Aparelho ${device.deviceNumber || 1}`);
+      setModelInput(device.model || "");
+      setSectorInput((device.sector as SectorType) || "junior");
+      setDeviceNumberInput(String(device.deviceNumber || 1));
+      setDisplayStatus(null);
+      setNetStatus(null);
+      setOptStatus(null);
+      setSystemMsg(null);
+      setConfirmDeleteOpen(false);
+    }
+  }, [isOpen, device]);
 
   // Display Tab
   const [stayAwake, setStayAwake] = useState(true);
