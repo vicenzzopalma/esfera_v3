@@ -396,29 +396,27 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
     let state_sessions = state.sessions.clone();
     let hub_client = state.hub_client.clone();
 
-    // AUTO-CONEXÃO DO HUB: se o cliente VPS não estiver conectado, tenta conectar
-    // usando as credenciais da sessão. Garante que o celular remoto (via_tunnel)
-    // apareça MESMO SEM o frontend chamar connect_hub explicitamente — regra do
-    // usuário: "aparece mesmo reiniciando o WiFi e desplugado".
+    // AUTO-CONEXÃO DO HUB: Conexão assíncrona em background para NUNCA travar o retorno do get_devices
     {
-        let connected = hub_client.lock().await.is_some();
-        if !connected {
-            if let Ok(creds) = get_hub_credentials(state.clone(), token.clone()) {
-                // TIMEOUT: nunca trava o get_devices se o hub não responder
-                // (token vazio/default rejeitado, VPS down, firewall). Sem isso,
-                // o await do connect pendura e a UI fica em "processando ADB" infinito.
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(8),
-                    HubClient::connect(
-                        &creds.hub_address, &creds.hub_token, &creds.role,
-                        creds.company_id, &creds.company_name,
-                    ),
-                ).await {
-                    Ok(Ok(client)) => { *hub_client.lock().await = Some(client); }
-                    _ => { /* hub indisponível: segue com ADB local apenas */ }
+        let hub_client_clone = hub_client.clone();
+        let state_clone = state.clone();
+        let token_clone = token.clone();
+        tokio::spawn(async move {
+            let is_connected = hub_client_clone.lock().await.is_some();
+            if !is_connected {
+                if let Ok(creds) = get_hub_credentials(state_clone, token_clone) {
+                    if let Ok(Ok(client)) = tokio::time::timeout(
+                        std::time::Duration::from_secs(4),
+                        HubClient::connect(
+                            &creds.hub_address, &creds.hub_token, &creds.role,
+                            creds.company_id, &creds.company_name,
+                        ),
+                    ).await {
+                        *hub_client_clone.lock().await = Some(client);
+                    }
                 }
             }
-        }
+        });
     }
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -640,44 +638,19 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             }
         }
 
-        // PONTE VPS -> LOCAL: o app desktop conecta ao Hub VPS (34.29.70.113:8555).
-        // Se o hub_client ainda não estiver conectado, estabelece a conexão automaticamente.
+        // PONTE VPS -> LOCAL: consulta dispositivos ao vivo da VPS com timeout ultra-rápido (400ms)
         let live_vps: Vec<serde_json::Value> = {
             let rt = tokio::runtime::Handle::try_current();
             if let Ok(_h) = rt {
                 tauri::async_runtime::block_on(async {
-                    let mut guard = hub_client.lock().await;
-                    if guard.is_none() {
-                        let app_cfg = config::load_config();
-                        let hub_addr = if app_cfg.hub_address.is_empty() {
-                            "34.29.70.113:8555".to_string()
-                        } else {
-                            app_cfg.hub_address.clone()
-                        };
-                        let token = if !app_cfg.hub_token.trim().is_empty() {
-                            app_cfg.hub_token.trim().to_string()
-                        } else {
-                            std::env::var("ESFERA_HUB_TOKEN")
-                                .or_else(|_| std::env::var("HUB_MASTER_TOKEN"))
-                                .unwrap_or_else(|_| "root123".to_string())
-                        };
-                        let is_master_tok = token == "root123"
-                            || token == "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b"
-                            || token == std::env::var("HUB_MASTER_TOKEN").unwrap_or_default()
-                            || token.starts_with("EsferaHubMaster_");
-                        let role = if is_master_tok || session.role == "master" { "master" } else { "empresa" };
-                        let cid = session.company_id.unwrap_or(0);
-                        if let Ok(client) = HubClient::connect(&hub_addr, &token, role, cid, "Empresa").await {
-                            *guard = Some(client);
-                        }
-                    }
+                    let guard = hub_client.lock().await;
                     if let Some(client) = guard.as_ref() {
-                        match tokio::time::timeout(std::time::Duration::from_secs(2), client.send_command(0, "get_live_devices", serde_json::json!({"companyId": target_company_id}))).await {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(400),
+                            client.send_command(0, "get_live_devices", serde_json::json!({"companyId": target_company_id}))
+                        ).await {
                             Ok(Ok(val)) => val.as_array().cloned().unwrap_or_default(),
-                            _ => {
-                                *guard = None; // Força reconexão na próxima chamada
-                                Vec::new()
-                            }
+                            _ => Vec::new(),
                         }
                     } else {
                         Vec::new()
