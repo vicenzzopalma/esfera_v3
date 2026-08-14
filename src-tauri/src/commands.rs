@@ -481,21 +481,6 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
 
             let (brand, model) = AdbManager::get_device_info(&adb_dev.serial);
 
-            // Obtém dados persistentes ancorados na tabela ESF_DeviceIdentity pelo Hardware ID
-            let (resolved_name, resolved_sector, resolved_num) = if let Some(ref pid) = persistent_id {
-                if let Some((saved_n, saved_s, saved_num, _)) = state_db.get_device_identity(pid) {
-                    (saved_n, saved_s, saved_num)
-                } else {
-                    let next_num = state_db.get_next_device_number();
-                    let gen_name = format!("Aparelho {}", next_num);
-                    let _ = state_db.save_device_identity(pid, &gen_name, "junior", next_num, &model);
-                    (gen_name, "junior".to_string(), next_num)
-                }
-            } else {
-                let next_num = state_db.get_next_device_number();
-                (format!("Aparelho {}", next_num), "junior".to_string(), next_num)
-            };
-
             let existing_idx = db_devices.iter().position(|d| {
                 d.serial == adb_dev.serial
                     || persistent_id.as_ref().is_some_and(|id| d.esfera_device_id.as_ref() == Some(id))
@@ -503,6 +488,32 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     || d.current_adb_address.as_deref() == Some(&adb_dev.serial)
                     || d.esfera_device_id.as_deref() == Some(&adb_dev.serial)
             });
+
+            // PROTEÇÃO ABSOLUTA DE IDENTIDADE:
+            // 1. Se já estiver no ESF_DeviceIdentity pelo Hardware ID (persistente), usa o nome salvo lá.
+            // 2. Se já existir no banco local (db_devices), PRESERVA rigorosamente o nome que o usuário deu.
+            // 3. Apenas se for um dispositivo 100% INÉDITO (nunca visto), cria um registro inicial.
+            let (resolved_name, resolved_sector, resolved_num) = if let Some(ref pid) = persistent_id {
+                if let Some((saved_n, saved_s, saved_num, _)) = state_db.get_device_identity(pid) {
+                    (saved_n, saved_s, saved_num)
+                } else if let Some(idx) = existing_idx {
+                    let d = &db_devices[idx];
+                    let chosen_name = if !d.name.is_empty() { d.name.clone() } else { format!("Aparelho {}", d.device_number) };
+                    let _ = state_db.save_device_identity(pid, &chosen_name, &d.sector, d.device_number, &model);
+                    (chosen_name, d.sector.clone(), d.device_number)
+                } else {
+                    let next_num = state_db.get_next_device_number();
+                    let gen_name = format!("Aparelho {}", next_num);
+                    let _ = state_db.save_device_identity(pid, &gen_name, "junior", next_num, &model);
+                    (gen_name, "junior".to_string(), next_num)
+                }
+            } else if let Some(idx) = existing_idx {
+                let d = &db_devices[idx];
+                (d.name.clone(), d.sector.clone(), d.device_number)
+            } else {
+                let next_num = state_db.get_next_device_number();
+                (format!("Aparelho {}", next_num), "junior".to_string(), next_num)
+            };
 
             if let Some(idx) = existing_idx {
                 let old_status = db_devices[idx].status.clone();
@@ -824,7 +835,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     if merged.esfera_device_id.is_none() {
                         merged.esfera_device_id = final_deduped[pos].esfera_device_id.clone();
                     }
-                    if merged.name.starts_with("Aparelho ") && !final_deduped[pos].name.starts_with("Aparelho ") && !final_deduped[pos].name.is_empty() {
+                    if !final_deduped[pos].name.is_empty() {
                         merged.name = final_deduped[pos].name.clone();
                     }
                     final_deduped[pos] = merged;
