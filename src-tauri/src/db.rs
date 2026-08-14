@@ -1177,12 +1177,23 @@ impl Database {
         ).ok()
     }
 
-    /// Gera o próximo número único sequencial global para um novo aparelho (evita duplicatas como 2x Aparelho 1)
+    /// Gera o menor número sequencial único global disponível (1, 2, 3...) para evitar saltos ou duplicatas
     pub fn get_next_device_number(&self) -> i32 {
         let conn = self.conn();
-        let max_dev: i32 = conn.query_row("SELECT COALESCE(MAX(DeviceNumber), 0) FROM ESF_Device", [], |r| r.get(0)).unwrap_or(0);
-        let max_id: i32 = conn.query_row("SELECT COALESCE(MAX(DeviceNumber), 0) FROM ESF_DeviceIdentity", [], |r| r.get(0)).unwrap_or(0);
-        std::cmp::max(max_dev, max_id) + 1
+        let mut used = std::collections::HashSet::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT DeviceNumber FROM ESF_DeviceIdentity WHERE DeviceNumber > 0 UNION SELECT DeviceNumber FROM ESF_Device WHERE DeviceNumber > 0") {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, i32>(0)) {
+                for r in rows.flatten() {
+                    used.insert(r);
+                }
+            }
+        }
+        for n in 1..=999 {
+            if !used.contains(&n) {
+                return n;
+            }
+        }
+        1
     }
 
     pub fn update_device_config(&self, device: &Device) -> Result<(), String> {
@@ -1201,9 +1212,11 @@ impl Database {
                 DeviceName = ?1,
                 Model = ?2,
                 Sector = ?3,
-                DeviceNumber = ?4
-             WHERE (AdbDeviceId = ?5 OR CurrentAdbAddress = ?5
-                    OR (?6 != '' AND EsferaDeviceId = ?6)
+                DeviceNumber = ?4,
+                EsferaDeviceId = CASE WHEN ?6 != '' THEN ?6 ELSE EsferaDeviceId END
+             WHERE ((?6 != '' AND EsferaDeviceId = ?6)
+                    OR AdbDeviceId = ?5
+                    OR CurrentAdbAddress = ?5
                     OR (?7 != '' AND CurrentAdbAddress = ?7))
                AND CompanyId = ?8",
             params![
