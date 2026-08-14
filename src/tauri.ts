@@ -23,6 +23,16 @@ export function getToken(): string | null {
   return _token;
 }
 
+const LOCAL_ONLY_COMMANDS = new Set([
+  "connect_adb_device",
+  "force_enable_wireless_adb",
+  "pair_and_connect_adb_device",
+  "link_usb_to_wireless",
+  "get_devices",
+  "restart_adb_server",
+  "run_adb_diagnostic",
+]);
+
 export async function api<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
   await ensureConfig();
 
@@ -30,8 +40,8 @@ export async function api<T>(cmd: string, args: Record<string, unknown> = {}): P
   try {
     return await invoke<T>(cmd, { token: _token || "default-token", ...args });
   } catch (err) {
-    // Se o comando falhar no IPC local e for modo master configurado, tenta rotear via Hub
-    if (_mode === "master") {
+    // Se o comando falhar no IPC local e for modo master configurado, tenta rotear via Hub (exceto comandos estritamente locais)
+    if (_mode === "master" && !LOCAL_ONLY_COMMANDS.has(cmd)) {
       const companyId = (args.companyId ?? args.company_id ?? 1) as number;
       return await invoke<T>("hub_invoke", {
         token: _token || "default-token",

@@ -287,6 +287,10 @@ fn normalize_serial(serial: &str) -> String {
 ///   serial `4200da8501667545` -> `ESF-4200DA85`
 ///   (8 primeiros caracteres do serial em MAIÚSCULO, prefixados de "ESF-")
 fn device_id_from_serial(serial: &str) -> String {
+    let clean = strip_port(serial);
+    if clean.contains('.') || clean.contains(':') {
+        return String::new();
+    }
     let s = serial.to_uppercase();
     if s.len() >= 8 {
         format!("ESF-{}", &s[0..8])
@@ -796,8 +800,8 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         let active_adb_set: std::collections::HashSet<String> =
             active_adb_list.iter().map(|a| a.serial.clone()).collect();
         refreshed_db.retain(|d| {
-            if d.via_tunnel || d.esfera_device_id.is_some() {
-                true // dispositivo remoto ou provisionado (EsferaDeviceId) é mantido na lista
+            if d.via_tunnel || d.esfera_device_id.is_some() || d.status == "connecting" {
+                true // dispositivo remoto, provisionado ou em processo de conexão é mantido na lista
             } else {
                 active_adb_set.contains(&d.serial)
                     || d.current_adb_address.as_deref().map_or(false, |a| active_adb_set.contains(a))
@@ -819,16 +823,31 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     || (!strip_port(&dev.ip).is_empty() && strip_port(&dev.ip) == strip_port(&existing.current_adb_address.clone().unwrap_or_default()))
                     || (!strip_port(&existing.serial).is_empty() && (strip_port(&existing.serial) == strip_port(&dev.current_adb_address.clone().unwrap_or_default()) || strip_port(&existing.serial) == strip_port(&dev.ip)))
             }) {
-                // Mescla os dados priorizando o card online/túnel ativo
-                if dev.status == "online" || dev.via_tunnel {
-                    if final_deduped[pos].name.starts_with("Celular ESF-") && !dev.name.starts_with("Celular ESF-") {
-                        // Preserva nomes customizados mais amigáveis (ex: Celular 192.168.1.151)
-                    }
+                // Mescla os dados priorizando o card mais ativo (online > connecting > degraded > offline)
+                let existing_weight = match final_deduped[pos].status.as_str() {
+                    "online" => 3,
+                    "connecting" => 2,
+                    "degraded" => 1,
+                    _ => 0,
+                };
+                let dev_weight = match dev.status.as_str() {
+                    "online" => 3,
+                    "connecting" => 2,
+                    "degraded" => 1,
+                    _ => 0,
+                };
+
+                if dev_weight >= existing_weight || dev.via_tunnel {
                     let mut merged = dev;
                     if merged.esfera_device_id.is_none() {
                         merged.esfera_device_id = final_deduped[pos].esfera_device_id.clone();
                     }
+                    if merged.name.starts_with("Celular ESF-") && !final_deduped[pos].name.starts_with("Celular ESF-") {
+                        merged.name = final_deduped[pos].name.clone();
+                    }
                     final_deduped[pos] = merged;
+                } else if final_deduped[pos].esfera_device_id.is_none() && dev.esfera_device_id.is_some() {
+                    final_deduped[pos].esfera_device_id = dev.esfera_device_id;
                 }
             } else {
                 final_deduped.push(dev);
@@ -1182,13 +1201,17 @@ pub async fn connect_adb_device(
             log_connect(&format!("[CONNECT] persistent_id_end pid={}", persistent_id));
 
             if adb_conn_res.is_ok() {
-                log_connect("[CONNECT] inject_immunity_start");
-                let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
-                log_connect("[CONNECT] inject_immunity_end");
+                let s_clone = serial.clone();
+                let pid_clone = persistent_id.clone();
+                std::thread::spawn(move || {
+                    log_connect("[CONNECT] inject_immunity_start");
+                    let _ = AdbManager::inject_device_immunity(&s_clone, Some(&pid_clone));
+                    log_connect("[CONNECT] inject_immunity_end");
 
-                log_connect("[CONNECT] deploy_keepalive_start");
-                let _ = AdbManager::deploy_keepalive(&serial);
-                log_connect("[CONNECT] deploy_keepalive_end");
+                    log_connect("[CONNECT] deploy_keepalive_start");
+                    let _ = AdbManager::deploy_keepalive(&s_clone);
+                    log_connect("[CONNECT] deploy_keepalive_end");
+                });
             }
 
             let is_tunnel_active = crate::tunnel_server::is_tunnel_active(&persistent_id)
@@ -1202,7 +1225,7 @@ pub async fn connect_adb_device(
 
             log_connect("[CONNECT] db_upsert_start");
             let dev = Device {
-                id: 0,
+                id: existing_dev.as_ref().map(|d| d.id).unwrap_or(0),
                 serial: serial.clone(),
                 name: final_name.clone(),
                 brand,
@@ -1996,10 +2019,15 @@ pub async fn link_usb_to_wireless(
             via_tunnel: false,
         };
         state_db.upsert_device(&device)?;
-        let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
-        let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
-        let _ = AdbManager::deploy_keepalive(&wireless_serial);
-        let _ = AdbManager::deploy_keepalive(&serial);
+        let ws_clone = wireless_serial.clone();
+        let s_clone = serial.clone();
+        let pid_clone = persistent_id.clone();
+        std::thread::spawn(move || {
+            let _ = AdbManager::inject_device_immunity(&ws_clone, Some(&pid_clone));
+            let _ = AdbManager::inject_device_immunity(&s_clone, Some(&pid_clone));
+            let _ = AdbManager::deploy_keepalive(&ws_clone);
+            let _ = AdbManager::deploy_keepalive(&s_clone);
+        });
         Ok(format!(
             "Sucesso! Dispositivo pareado sem fio: {}",
             link_msg
@@ -2284,13 +2312,17 @@ pub async fn force_enable_wireless_adb(
             let wireless_serial = if ip != "127.0.0.1" && ip != "0.0.0.0" { format!("{}:5555", ip) } else { serial.clone() };
 
             if connect_res.is_some() || is_usb_attached {
-                log_connect("[CONNECT] inject_immunity_start");
-                let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
-                log_connect("[CONNECT] inject_immunity_end");
+                let ws_clone = wireless_serial.clone();
+                let pid_clone = persistent_id.clone();
+                std::thread::spawn(move || {
+                    log_connect("[CONNECT] inject_immunity_start");
+                    let _ = AdbManager::inject_device_immunity(&ws_clone, Some(&pid_clone));
+                    log_connect("[CONNECT] inject_immunity_end");
 
-                log_connect("[CONNECT] deploy_keepalive_start");
-                let _ = AdbManager::deploy_keepalive(&wireless_serial);
-                log_connect("[CONNECT] deploy_keepalive_end");
+                    log_connect("[CONNECT] deploy_keepalive_start");
+                    let _ = AdbManager::deploy_keepalive(&ws_clone);
+                    log_connect("[CONNECT] deploy_keepalive_end");
+                });
             }
 
             let final_name = device_name

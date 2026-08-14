@@ -854,9 +854,9 @@ impl AdbManager {
         Ok(devices)
     }
 
-    /// Decide se usa o protocolo ADB nativo (IP Wi-Fi ou serial de túnel esfera-agent)
+    /// Decide se usa o protocolo ADB nativo (apenas para serial de túnel reverso esfera-agent)
     fn use_native_adb(serial: &str) -> bool {
-        serial.contains('.') || crate::adb_tcp::is_tunnel_serial(serial)
+        crate::adb_tcp::is_tunnel_serial(serial)
     }
 
     /// Obtém o endereço IP do wlan0 via shell único combinado (3 métodos em 1 chamada)
@@ -2300,6 +2300,36 @@ impl AdbManager {
             }
         }
 
+        // 3. Fallback: ro.serialno (hardware serial da CPU/dispositivo)
+        let hw_serial = if is_native {
+            crate::adb_tcp::exec_shell(serial, "getprop ro.serialno").ok()
+        } else {
+            let mut cmd3 = create_cmd("adb");
+            cmd3.args(["-s", serial, "shell", "getprop", "ro.serialno"]);
+            run_cmd_timeout(cmd3, Duration::from_secs(2))
+                .ok()
+                .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+        };
+
+        if let Some(s) = hw_serial {
+            let val = s.trim().to_uppercase();
+            if !val.is_empty() && val != "UNKNOWN" && !val.contains(' ') && !val.contains('.') && !val.contains(':') {
+                let prefix8 = if val.len() >= 8 { &val[0..8] } else { &val };
+                let derived = format!("ESF-{}", prefix8);
+                let _ = Self::inject_persistent_device_id(serial, &derived);
+                return Some(derived);
+            }
+        }
+
+        // 4. Fallback final: se o próprio serial ADB for um hardware serial (sem IP/porta)
+        let clean_serial = serial.trim().to_uppercase();
+        if !clean_serial.contains('.') && !clean_serial.contains(':') && !clean_serial.is_empty() {
+            let prefix8 = if clean_serial.len() >= 8 { &clean_serial[0..8] } else { &clean_serial };
+            let derived = format!("ESF-{}", prefix8);
+            let _ = Self::inject_persistent_device_id(serial, &derived);
+            return Some(derived);
+        }
+
         None
     }
 
@@ -2428,7 +2458,29 @@ impl AdbManager {
         company_id: i32,
         server_url: &str,
     ) -> Result<String, String> {
-        let serial_upper = serial.to_uppercase();
+        let is_network = serial.contains(':') || serial.contains('.');
+        let actual_serial = if is_network {
+            let mut cmd = create_cmd("adb");
+            cmd.args(["-s", serial, "shell", "getprop", "ro.serialno"]);
+            if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !stdout.is_empty() && stdout != "unknown" && !stdout.contains(' ') && !stdout.contains('.') {
+                    stdout
+                } else if let Some(pid) = Self::get_persistent_device_id(serial) {
+                    pid.trim_start_matches("ESF-").to_string()
+                } else {
+                    return Err(format!("Não foi possível obter hardware serial do Wi-Fi {}", serial));
+                }
+            } else if let Some(pid) = Self::get_persistent_device_id(serial) {
+                pid.trim_start_matches("ESF-").to_string()
+            } else {
+                return Err(format!("Não foi possível obter hardware serial do Wi-Fi {}", serial));
+            }
+        } else {
+            serial.to_string()
+        };
+
+        let serial_upper = actual_serial.to_uppercase();
         let prefix8: &str = if serial_upper.len() >= 8 {
             &serial_upper[0..8]
         } else if !serial_upper.is_empty() {
@@ -2449,7 +2501,7 @@ impl AdbManager {
             "-s",
             serial,
             "shell",
-            &format!("echo '{}' > /sdcard/esfera_config.json", json),
+            &format!("echo '{}' > /sdcard/esfera_config.json; echo '{}' > /sdcard/.esfera_device_id", json, device_id),
         ]);
 
         match run_cmd_timeout(cmd, Duration::from_secs(5)) {
@@ -2586,29 +2638,18 @@ impl AdbManager {
             return Ok(requested.to_string());
         }
 
-        // 1. Tenta reconexão prévia se for IP Wi-Fi
-        if requested.contains(':') || requested.contains('.') {
-            let parts: Vec<&str> = requested.split(':').collect();
-            let ip = parts[0];
-            let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
-            let _ = Self::connect_device_flushed(ip, port);
-            std::thread::sleep(Duration::from_millis(400));
-        }
+        let mut active_devices = Self::list_devices().unwrap_or_default();
 
-        let active_devices = Self::list_devices().unwrap_or_default();
-
-        // 2. Procura correspondência exata de serial no ADB ativo
+        // 1. Procura correspondência exata de serial no ADB ativo
         if let Some(dev) = active_devices.iter().find(|d| d.serial == requested) {
             if dev.state == "device" {
                 return Ok(dev.serial.clone());
             } else if dev.state == "unauthorized" {
                 return Err(format!("Dispositivo '{}' exige autorização de depuração USB. Aceite a mensagem exibida na tela do celular.", requested));
-            } else if dev.state == "offline" {
-                return Err(format!("Dispositivo '{}' está OFFLINE no ADB. Reconecte o cabo USB ou refaça a conexão Wi-Fi.", requested));
             }
         }
 
-        // 3. Procura por IP ou sufixo/prefixo de serial nos ativos
+        // 2. Procura por IP ou sufixo/prefixo de serial nos ativos
         let requested_ip = requested.split(':').next().unwrap_or(requested);
         if let Some(dev) = active_devices.iter().find(|d| {
             d.serial.contains(requested_ip) || requested.contains(&d.serial)
@@ -2617,8 +2658,21 @@ impl AdbManager {
                 return Ok(dev.serial.clone());
             } else if dev.state == "unauthorized" {
                 return Err(format!("Dispositivo '{}' exige autorização de depuração USB na tela do celular.", dev.serial));
-            } else if dev.state == "offline" {
-                return Err(format!("Dispositivo '{}' está OFFLINE no ADB.", dev.serial));
+            }
+        }
+
+        // 3. Se for IP Wi-Fi e NÃO estiver ativo no ADB, tenta conectar agora
+        if requested.contains(':') || requested.contains('.') {
+            let parts: Vec<&str> = requested.split(':').collect();
+            let ip = parts[0];
+            let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
+            let _ = Self::connect_device(ip, port);
+            active_devices = Self::list_devices().unwrap_or_default();
+
+            if let Some(dev) = active_devices.iter().find(|d| d.serial == requested || d.serial.contains(ip)) {
+                if dev.state == "device" {
+                    return Ok(dev.serial.clone());
+                }
             }
         }
 
