@@ -1,5 +1,0 @@
-   Compiling esfera_v3 v0.1.0 (D:\Novo\Esfera v3\src-tauri)
-error: failed to run custom build command for `esfera_v3 v0.1.0 (D:\Novo\Esfera v3\src-tauri)`
-
-Caused by:
-  process didn't exit successfully: `D:\Novo\Esfera v3\src-tauri\target\debug\build\esfera_v3/4194bbe7598d27a9\out\build_script_build` (exit code: 1)
