@@ -429,8 +429,8 @@ export default function DevicesTab() {
         return true;
       })
       .sort((a, b) => {
-        const nameA = String(a.name || a.model || `Aparelho ${a.deviceNumber || 1}`);
-        const nameB = String(b.name || b.model || `Aparelho ${b.deviceNumber || 1}`);
+        const nameA = String(a.name || a.model || a.serial || "");
+        const nameB = String(b.name || b.model || b.serial || "");
         return nameA.localeCompare(nameB, undefined, { numeric: true, sensitivity: "base" });
       });
   }, [devicesList, sectorTab, searchQuery]);

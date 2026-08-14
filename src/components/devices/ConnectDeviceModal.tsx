@@ -172,32 +172,18 @@ export function ConnectDeviceModal({
             />
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-medium text-zinc-300 mb-1">Número do Slot</label>
-              <input
-                type="number"
-                min="1"
-                max="100"
-                value={deviceNumberInput}
-                onChange={(e) => setDeviceNumberInput(e.target.value)}
-                className="w-full px-3 py-1.5 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs font-mono focus:outline-none focus:border-[#5E6AD2]"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-zinc-300 mb-1">Setor</label>
-              <select
-                value={sectorInput}
-                onChange={(e) => setSectorInput(e.target.value)}
-                className="w-full px-3 py-1.5 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs focus:outline-none focus:border-[#5E6AD2]"
-              >
-                <option value="junior">Junior</option>
-                <option value="senior">Senior</option>
-                <option value="pa_fixa">PA Fixa</option>
-                <option value="pesquisa">Pesquisa</option>
-              </select>
-            </div>
+          <div>
+            <label className="block text-xs font-medium text-zinc-300 mb-1">Setor Operacional</label>
+            <select
+              value={sectorInput}
+              onChange={(e) => setSectorInput(e.target.value)}
+              className="w-full px-3 py-1.5 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs focus:outline-none focus:border-[#5E6AD2]"
+            >
+              <option value="junior">Junior</option>
+              <option value="senior">Senior</option>
+              <option value="pa_fixa">PA Fixa</option>
+              <option value="pesquisa">Pesquisa</option>
+            </select>
           </div>
 
           {linkingStatus && (

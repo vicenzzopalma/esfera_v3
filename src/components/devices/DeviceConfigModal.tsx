@@ -53,18 +53,16 @@ export function DeviceConfigModal({
   const [activeTab, setActiveTab] = useState<ConfigTab>("general");
 
   // General Tab
-  const [nameInput, setNameInput] = useState(device.name || `Aparelho ${device.deviceNumber || 1}`);
+  const [nameInput, setNameInput] = useState(device.name || device.model || "Aparelho");
   const [modelInput, setModelInput] = useState(device.model || "");
   const [sectorInput, setSectorInput] = useState<SectorType>((device.sector as SectorType) || "junior");
-  const [deviceNumberInput, setDeviceNumberInput] = useState(String(device.deviceNumber || 1));
   const [copiedId, setCopiedId] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
-      setNameInput(device.name || `Aparelho ${device.deviceNumber || 1}`);
+      setNameInput(device.name || device.model || "Aparelho");
       setModelInput(device.model || "");
       setSectorInput((device.sector as SectorType) || "junior");
-      setDeviceNumberInput(String(device.deviceNumber || 1));
       setDisplayStatus(null);
       setNetStatus(null);
       setOptStatus(null);
@@ -245,10 +243,9 @@ export function DeviceConfigModal({
             onClick={() => {
               onSave({
                 ...device,
-                name: nameInput || device.name || `Aparelho ${device.deviceNumber || 1}`,
+                name: nameInput.trim() || device.name || device.model || "Aparelho",
                 model: modelInput || device.model,
                 sector: sectorInput,
-                deviceNumber: parseInt(deviceNumberInput, 10) || device.deviceNumber || 1,
               });
             }}
           >
@@ -388,29 +385,18 @@ export function DeviceConfigModal({
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-zinc-300 mb-1">Número do Slot / Ordem</label>
-                <input
-                  type="number"
-                  value={deviceNumberInput}
-                  onChange={(e) => setDeviceNumberInput(e.target.value)}
-                  min={1}
-                  className="w-full h-9 px-3 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs font-medium focus:outline-none focus:border-[#5E6AD2]"
-                />
+                <label className="block text-xs font-medium text-zinc-300 mb-1">Setor Operacional</label>
+                <select
+                  value={sectorInput}
+                  onChange={(e) => setSectorInput(e.target.value as SectorType)}
+                  className="w-full h-9 px-3 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs focus:outline-none focus:border-[#5E6AD2]"
+                >
+                  <option value="junior">Junior</option>
+                  <option value="senior">Senior</option>
+                  <option value="pa_fixa">PA FIXA</option>
+                  <option value="pesquisa">Pesquisa</option>
+                </select>
               </div>
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-zinc-300 mb-1">Setor Operacional</label>
-              <select
-                value={sectorInput}
-                onChange={(e) => setSectorInput(e.target.value as SectorType)}
-                className="w-full h-9 px-3 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs focus:outline-none focus:border-[#5E6AD2]"
-              >
-                <option value="junior">Junior</option>
-                <option value="senior">Senior</option>
-                <option value="pa_fixa">PA FIXA</option>
-                <option value="pesquisa">Pesquisa</option>
-              </select>
             </div>
 
             {/* Informações Técnicas */}
