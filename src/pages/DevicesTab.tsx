@@ -414,7 +414,11 @@ export default function DevicesTab() {
 
         if (searchQuery) {
           const q = searchQuery.toLowerCase().trim();
+          const name = String(device.name || "");
+          const esfId = String(device.esferaDeviceId || "");
           return (
+            name.toLowerCase().includes(q) ||
+            esfId.toLowerCase().includes(q) ||
             model.toLowerCase().includes(q) ||
             brand.toLowerCase().includes(q) ||
             serial.toLowerCase().includes(q) ||

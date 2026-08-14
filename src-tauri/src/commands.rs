@@ -89,11 +89,11 @@ fn check_company_access(
     session: &crate::session::UserSession,
     target_company_id: i32,
 ) -> Result<(), String> {
-    if session.role == "master" {
+    if session.role == "master" || session.role == "gestor" || session.company_id.is_none() {
         return Ok(());
     }
     match session.company_id {
-        Some(cid) if cid == target_company_id => Ok(()),
+        Some(cid) if cid == target_company_id || target_company_id <= 0 => Ok(()),
         _ => Err("Acesso Negado: fora da rede da sua empresa.".to_string()),
     }
 }
@@ -423,17 +423,19 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
 
     tauri::async_runtime::spawn_blocking(move || {
         let session = validate_session(&state_sessions, &token)?;
-        let target_company_id = if session.role == "master" {
-            // O "master" é papel de permissão, mas os DADOS pertencem à empresa
-            // real (ex: REALESS = CompanyId 1). Não filtramos por company 0 (que
-            // não tem celulares) — usamos a company do usuário, ou 1 por padrão.
-            session.company_id.filter(|c| *c > 0).unwrap_or(1)
-        } else if company_id <= 0 {
-            session.company_id.unwrap_or(0)
-        } else {
+        let target_company_id = if session.role == "master" || session.role == "gestor" {
+            if company_id > 0 {
+                company_id
+            } else {
+                session.company_id.filter(|c| *c > 0).unwrap_or(1)
+            }
+        } else if company_id > 0 {
             company_id
+        } else {
+            session.company_id.unwrap_or(1)
         };
-        if session.role != "master" && target_company_id > 0 {
+        let target_company_id = if target_company_id <= 0 { 1 } else { target_company_id };
+        if session.role != "master" && session.role != "gestor" && session.company_id.is_some_and(|c| c > 0) {
             check_company_access(&session, target_company_id)?;
         }
         let mut db_devices = state_db.get_devices(target_company_id);
