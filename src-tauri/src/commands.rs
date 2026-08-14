@@ -1160,11 +1160,13 @@ pub async fn connect_adb_device(
             let adb_conn_res = AdbManager::connect_device(&target_ip, target_port);
             log_connect(&format!("[CONNECT] adb_connect_end ok={}", adb_conn_res.is_ok()));
 
+            log_connect("[CONNECT] device_info_start");
             let (brand, model) = if adb_conn_res.is_ok() {
                 AdbManager::get_device_info(&serial)
             } else {
                 ("Android".to_string(), "Smartphone".to_string())
             };
+            log_connect(&format!("[CONNECT] device_info_end brand={} model={}", brand, model));
 
             let final_name = device_name
                 .filter(|n| !n.trim().is_empty())
@@ -1180,8 +1182,13 @@ pub async fn connect_adb_device(
             log_connect(&format!("[CONNECT] persistent_id_end pid={}", persistent_id));
 
             if adb_conn_res.is_ok() {
+                log_connect("[CONNECT] inject_immunity_start");
                 let _ = AdbManager::inject_device_immunity(&serial, Some(&persistent_id));
+                log_connect("[CONNECT] inject_immunity_end");
+
+                log_connect("[CONNECT] deploy_keepalive_start");
                 let _ = AdbManager::deploy_keepalive(&serial);
+                log_connect("[CONNECT] deploy_keepalive_end");
             }
 
             let is_tunnel_active = crate::tunnel_server::is_tunnel_active(&persistent_id)
@@ -2270,19 +2277,27 @@ pub async fn force_enable_wireless_adb(
                 None
             };
 
+            log_connect("[CONNECT] device_info_start");
             let (brand, model) = AdbManager::get_device_info(&serial);
+            log_connect(&format!("[CONNECT] device_info_end brand={} model={}", brand, model));
+
             let wireless_serial = if ip != "127.0.0.1" && ip != "0.0.0.0" { format!("{}:5555", ip) } else { serial.clone() };
 
             if connect_res.is_some() || is_usb_attached {
+                log_connect("[CONNECT] inject_immunity_start");
                 let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
+                log_connect("[CONNECT] inject_immunity_end");
+
+                log_connect("[CONNECT] deploy_keepalive_start");
                 let _ = AdbManager::deploy_keepalive(&wireless_serial);
+                log_connect("[CONNECT] deploy_keepalive_end");
             }
 
             let final_name = device_name
                 .filter(|n| !n.trim().is_empty())
                 .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { serial.clone() });
 
-            let is_tunnel_active = crate::tunnel_server::is_tunnel_active(&persistent_id);
+            let is_tunnel_active = active_by_serial || active_by_eid;
             let status_str = if connect_res.is_some() || is_usb_attached || is_tunnel_active {
                 "online".to_string()
             } else {
@@ -2303,11 +2318,33 @@ pub async fn force_enable_wireless_adb(
                 company_id,
                 device_number,
                 sector,
-        println!("[CONNECT] db_upsert_end");
+                esfera_device_id: Some(persistent_id),
+                current_adb_address: Some(wireless_serial),
+                last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
+                via_tunnel: connect_res.is_none() && !is_usb_attached,
+            };
+            state_db.upsert_device(&device)?;
+            log_connect("[CONNECT] db_upsert_end");
 
-        let elapsed = start_time.elapsed().as_millis();
-        println!("[CONNECT] returning elapsed_ms={}", elapsed);
-        Ok(format!("✅ Dispositivo {} configurado com sucesso em {}ms!", final_name, elapsed))
+            let elapsed = start_time.elapsed().as_millis();
+            log_connect(&format!("[CONNECT] returning elapsed_ms={}", elapsed));
+            Ok(format!("✅ Dispositivo {} configurado com sucesso em {}ms!", final_name, elapsed))
+        }));
+
+        match panic_res {
+            Ok(res) => res,
+            Err(e) => {
+                let panic_msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Erro interno / panic no worker".to_string()
+                };
+                log_connect(&format!("[CONNECT] PANIC_DETECTED msg={}", panic_msg));
+                Err(format!("Erro no processo: {}", panic_msg))
+            }
+        }
     }).await.map_err(|e| e.to_string())?
 }
 
