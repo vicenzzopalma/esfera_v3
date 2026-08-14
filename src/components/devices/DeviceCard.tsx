@@ -53,6 +53,16 @@ export const DeviceCard = memo(function DeviceCard({
   const origin = getConnectionOrigin(device);
   const originBadge = CONNECTION_BADGE_CONFIG[origin];
 
+  const [copiedId, setCopiedId] = useState(false);
+
+  const handleCopyId = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const id = device.esferaDeviceId || device.serial;
+    navigator.clipboard.writeText(id);
+    setCopiedId(true);
+    setTimeout(() => setCopiedId(false), 1500);
+  };
+
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
@@ -68,7 +78,7 @@ export const DeviceCard = memo(function DeviceCard({
       className={`rounded-lg bg-[#141418] border transition-all duration-150 p-3.5 flex flex-col justify-between space-y-3 relative group ${
         isSelected
           ? "border-[#5E6AD2] bg-[#5E6AD2]/[0.04] ring-1 ring-[#5E6AD2]/30"
-          : "border-white/[0.07] hover:border-white/[0.15]"
+          : "border-white/[0.07] hover:border-[#5E6AD2]/40 hover:bg-[#16161b]"
       }`}
     >
       <div className="flex items-center justify-between gap-2 border-b border-white/[0.06] pb-2.5">
@@ -195,15 +205,23 @@ export const DeviceCard = memo(function DeviceCard({
 
       <div className="flex flex-col gap-1 text-[10px] font-mono bg-white/[0.02] p-2 rounded border border-white/[0.04]">
         <div className="flex items-center justify-between">
-          <span className="text-zinc-300 font-semibold flex items-center gap-1 min-w-0">
+          <button
+            type="button"
+            onClick={handleCopyId}
+            className="text-zinc-300 font-semibold flex items-center gap-1 min-w-0 hover:text-white transition-colors cursor-pointer group/id"
+            title="Clique para copiar ID de hardware"
+          >
             <span className="text-[#828DF7] font-bold">ID:</span>
-            <span className="truncate max-w-[130px] text-zinc-200" title={device.esferaDeviceId || device.serial}>
+            <span className="truncate max-w-[125px] text-zinc-200 group-hover/id:text-[#828DF7]" title={device.esferaDeviceId || device.serial}>
               {device.esferaDeviceId || device.serial}
             </span>
-          </span>
+            <span className="text-[9px] px-1 py-0.2 rounded bg-white/[0.06] text-zinc-400 shrink-0 font-sans">
+              {copiedId ? "Copiado!" : "copiar"}
+            </span>
+          </button>
           <div className="flex items-center gap-1 text-zinc-300 shrink-0 ml-2">
-            <BatteryCharging size={11} className="text-zinc-500" />
-            <span>{device.battery}%</span>
+            <BatteryCharging size={11} className={device.battery > 50 ? "text-emerald-400" : device.battery > 20 ? "text-amber-400" : "text-red-400"} />
+            <span className="font-mono">{device.battery}%</span>
           </div>
         </div>
         <div className="flex items-center justify-between text-zinc-500 text-[9px] pt-1 border-t border-white/[0.03]">

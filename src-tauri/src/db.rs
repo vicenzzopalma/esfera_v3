@@ -1122,6 +1122,37 @@ impl Database {
         }
     }
 
+    pub fn update_device_config(&self, device: &Device) -> Result<(), String> {
+        let target_comp = if device.company_id <= 0 { 1 } else { device.company_id };
+        let serial = &device.serial;
+        let esfera_id = device.esfera_device_id.as_deref().unwrap_or("");
+        let adb_addr = device.current_adb_address.as_deref().unwrap_or("");
+
+        self.exec_retry(
+            "UPDATE ESF_Device SET
+                DeviceName = ?1,
+                Model = ?2,
+                Sector = ?3,
+                DeviceNumber = ?4
+             WHERE (AdbDeviceId = ?5 OR CurrentAdbAddress = ?5
+                    OR (?6 != '' AND EsferaDeviceId = ?6)
+                    OR (?7 != '' AND CurrentAdbAddress = ?7))
+               AND CompanyId = ?8",
+            params![
+                device.name,
+                device.model,
+                device.sector,
+                device.device_number,
+                serial,
+                esfera_id,
+                adb_addr,
+                target_comp,
+            ],
+        ).map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
     pub fn upsert_device(&self, device: &Device) -> Result<(), String> {
         let target_comp = if device.company_id <= 0 { 1 } else { device.company_id };
 
@@ -1130,7 +1161,11 @@ impl Database {
             if !esfera_id.trim().is_empty() {
                 let affected = self.exec_retry(
                     "UPDATE ESF_Device SET
-                        DeviceName = CASE WHEN ?2 IS NOT NULL AND ?2 != '' THEN ?2 ELSE ESF_Device.DeviceName END,
+                        DeviceName = CASE 
+                            WHEN ESF_Device.DeviceName IS NOT NULL AND ESF_Device.DeviceName != '' THEN ESF_Device.DeviceName
+                            WHEN ?2 IS NOT NULL AND ?2 != '' THEN ?2 
+                            ELSE ESF_Device.DeviceName 
+                        END,
                         Brand=?1, Model=?3, DeviceIp=?4,
                         DevicePort=?5, Status=?6, BatteryLevel=?7,
                         CurrentAdbAddress=?8, LastSeenUTC=?9
@@ -1147,7 +1182,11 @@ impl Database {
             "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(AdbDeviceId) DO UPDATE SET
-            DeviceName=CASE WHEN excluded.DeviceName IS NOT NULL AND excluded.DeviceName != '' THEN excluded.DeviceName ELSE ESF_Device.DeviceName END,
+            DeviceName=CASE 
+                WHEN ESF_Device.DeviceName IS NOT NULL AND ESF_Device.DeviceName != '' THEN ESF_Device.DeviceName
+                WHEN excluded.DeviceName IS NOT NULL AND excluded.DeviceName != '' THEN excluded.DeviceName 
+                ELSE ESF_Device.DeviceName 
+            END,
             Brand=excluded.Brand, Model=excluded.Model,
             DeviceIp=excluded.DeviceIp, DevicePort=excluded.DevicePort, Status=excluded.Status,
             BatteryLevel=excluded.BatteryLevel,

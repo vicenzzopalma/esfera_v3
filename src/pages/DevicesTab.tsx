@@ -604,6 +604,7 @@ export default function DevicesTab() {
         onClose={() => setConnectModalOpen(false)}
         usbDevices={usbDevices}
         loadingUsb={loadingUsb}
+        existingDevices={devicesList}
         onFetchUsb={fetchUsbDevices}
         onForceWirelessAdb={handleForceWirelessAdb}
         onConnectDevice={handleConnectDevice}
