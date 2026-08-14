@@ -603,7 +603,15 @@ export default function DevicesTab() {
             } catch (e) {
               console.warn("Erro ao salvar no SQLite:", e);
             }
-            setDevicesList((prev) => prev.map((d) => (d.serial === updated.serial ? updated : d)));
+            setDevicesList((prev) =>
+              prev.map((d) => {
+                const isMatch =
+                  (d.esferaDeviceId && updated.esferaDeviceId && d.esferaDeviceId === updated.esferaDeviceId) ||
+                  d.serial === updated.serial ||
+                  (d.currentAdbAddress && updated.currentAdbAddress && d.currentAdbAddress === updated.currentAdbAddress);
+                return isMatch ? { ...d, ...updated } : d;
+              })
+            );
             setConfigModalOpen(false);
             refreshDevices();
           }}
