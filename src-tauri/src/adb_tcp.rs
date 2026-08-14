@@ -278,6 +278,7 @@ impl AdbConn {
                         ID_STDERR => stderr.extend_from_slice(data),
                         ID_EXIT => {
                             exited = true;
+                            break;
                         }
                         _ => {}
                     }
@@ -387,15 +388,15 @@ pub fn exec_shell(serial: &str, cmd: &str) -> Result<String, String> {
 }
 
 pub fn exec_shell_bytes(serial: &str, cmd: &str) -> Result<(Vec<u8>, Vec<u8>, bool), String> {
-    if !is_tcp_serial(serial) {
-        return Err("serial USB não suporta protocolo nativo (use Wi-Fi)".to_string());
+    if !is_tcp_serial(serial) && !is_tunnel_serial(serial) {
+        return Err("serial não suporta protocolo nativo".to_string());
     }
 
     sweep();
 
     let now = Instant::now();
     {
-        let mut pool = POOL.lock().unwrap();
+        let pool = POOL.lock().unwrap();
         if let Some(existing) = pool.get(serial).cloned() {
             drop(pool);
             let mut guard = existing.lock().unwrap();
@@ -416,7 +417,7 @@ pub fn exec_shell_bytes(serial: &str, cmd: &str) -> Result<(Vec<u8>, Vec<u8>, bo
     // Conexão nova (Wi-Fi direto ou ponte do túnel inverso)
     let stream = connect_transport(serial)?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(20)))
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
     let key = load_adb_key();
     handshake(&mut stream.try_clone().unwrap(), key.as_ref())

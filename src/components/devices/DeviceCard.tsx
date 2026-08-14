@@ -193,13 +193,28 @@ export const DeviceCard = memo(function DeviceCard({
         </div>
       )}
 
-      <div className="flex items-center justify-between text-[10px] font-mono text-zinc-400 bg-white/[0.02] p-1.5 rounded border border-white/[0.04]">
-        <span className="text-zinc-500 truncate max-w-[140px]" title={device.currentAdbAddress || device.serial}>
-          {device.currentAdbAddress || device.serial}
-        </span>
-        <div className="flex items-center gap-1 text-zinc-300 shrink-0">
-          <BatteryCharging size={11} className="text-zinc-500" />
-          <span>{device.battery}%</span>
+      <div className="flex flex-col gap-1 text-[10px] font-mono bg-white/[0.02] p-2 rounded border border-white/[0.04]">
+        <div className="flex items-center justify-between">
+          <span className="text-zinc-300 font-semibold flex items-center gap-1 min-w-0">
+            <span className="text-[#828DF7] font-bold">ID:</span>
+            <span className="truncate max-w-[130px] text-zinc-200" title={device.esferaDeviceId || device.serial}>
+              {device.esferaDeviceId || device.serial}
+            </span>
+          </span>
+          <div className="flex items-center gap-1 text-zinc-300 shrink-0 ml-2">
+            <BatteryCharging size={11} className="text-zinc-500" />
+            <span>{device.battery}%</span>
+          </div>
+        </div>
+        <div className="flex items-center justify-between text-zinc-500 text-[9px] pt-1 border-t border-white/[0.03]">
+          <span className="truncate max-w-[140px]" title={device.currentAdbAddress || device.ip || device.serial}>
+            {device.currentAdbAddress || device.ip || device.serial}
+          </span>
+          {device.viaTunnel && (
+            <span className="text-emerald-400 font-sans font-medium text-[8px] bg-emerald-500/10 px-1 rounded">
+              Túnel
+            </span>
+          )}
         </div>
       </div>
 
