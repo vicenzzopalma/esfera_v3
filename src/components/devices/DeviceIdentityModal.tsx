@@ -71,7 +71,7 @@ export function DeviceIdentityModal({ isOpen, onClose, device }: DeviceIdentityM
 
   const origin = getConnectionOrigin(device);
   const badge = CONNECTION_BADGE_CONFIG[origin];
-  const displayName = device.name || device.model || `Aparelho ${device.deviceNumber}`;
+  const displayName = device.name || device.model || device.serial;
 
   const statusConfig = {
     online: { label: "Online", dot: "bg-emerald-400", text: "text-emerald-400" },

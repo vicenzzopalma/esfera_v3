@@ -40,14 +40,7 @@ export const DeviceCard = memo(function DeviceCard({
   onOpenDiagnostic,
 }: DeviceCardProps) {
 
-  const displayName = (() => {
-    if (device.name && device.name.trim()) {
-      const n = device.name.trim();
-      if (/^\d+$/.test(n)) return `Aparelho ${n}`;
-      return n;
-    }
-    return device.deviceNumber ? `Aparelho ${device.deviceNumber}` : device.serial;
-  })();
+  const displayName = device.name && device.name.trim() ? device.name.trim() : (device.model || device.serial);
   const displayModel = device.model && device.model !== "Smartphone" && device.model !== "Android"
     ? device.model
     : (device.brand && device.brand !== "Android" ? `${device.brand} Smartphone` : "Android Smartphone");
