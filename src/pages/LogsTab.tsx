@@ -195,14 +195,14 @@ export default function LogsTab() {
       <Card padding="sm">
         <div className="flex flex-col lg:flex-row items-end gap-3">
           {/* Search */}
-          <div className="relative w-full lg:w-80">
-            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-tertiary pointer-events-none" />
+          <div className="relative w-full lg:w-80 flex items-center">
+            <Search size={14} className="input-icon-left text-tertiary" />
             <input
               type="text"
               placeholder="Pesquisar mensagem, origem ou device..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 rounded-xl bg-white/5 border border-border text-xs font-mono text-primary placeholder:text-tertiary focus:border-violet-500/40 transition-all"
+              className="w-full input-with-icon-left pr-3 py-2 rounded-xl bg-white/5 border border-border text-xs font-mono text-primary placeholder:text-tertiary focus:border-violet-500/40 transition-all"
             />
           </div>
 

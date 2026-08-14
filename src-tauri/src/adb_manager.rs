@@ -3180,19 +3180,16 @@ impl AdbManager {
             // 1. Marca offline devices com check-in expirado (>120s sem heartbeat)
             let _ = db_conn.mark_stale_devices_offline(120);
 
-            // 2. Reconecta todo device offline que tenha CurrentAdbAddress (com ou sem EsferaDeviceId)
+            // 2. Consulta lista ativa atual do ADB
+            let active_list = Self::list_devices().unwrap_or_default();
+
+            // 3. Reconecta somente devices que estejam offline
             let devices = db_conn.get_devices(0);
             for dev in devices {
-                let has_checkin = dev.last_seen_utc.is_some();
                 let is_online = dev.status == "online";
 
+                // Se o dispositivo já está online, NUNCA disparar reconnect/disconnect preventivo!
                 if is_online {
-                    // Preventivo: devices online também tentam reconnect no CurrentAdbAddress
-                    if let Some(ref addr) = dev.current_adb_address {
-                        if addr.contains(':') && addr.contains('.') && !crate::adb_tcp::is_tunnel_serial(addr) {
-                            let _ = Self::connect_target_flushed(addr);
-                        }
-                    }
                     continue;
                 }
 
@@ -3215,12 +3212,23 @@ impl AdbManager {
                     continue;
                 };
 
-                let _ = Self::connect_target_flushed(&target);
+                let ip_part = target.split(':').next().unwrap_or(&target);
+
+                // Se já estiver na lista ativa do ADB como "device", apenas atualiza status no banco
+                if active_list.iter().any(|d| (d.serial == target || d.serial.contains(ip_part)) && d.state == "device") {
+                    let _ = db_conn.mark_device_online(dev.id, &target);
+                    continue;
+                }
+
+                // Conecta usando adb connect padrão (não desconecta)
+                let parts: Vec<&str> = target.split(':').collect();
+                let ip = parts[0];
+                let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
+                let _ = Self::connect_device(ip, port);
 
                 // Se conectou, marca online
                 if let Ok(active) = Self::list_devices() {
-                    let ip_part = target.split(':').next().unwrap_or(&target);
-                    if active.iter().any(|d| d.serial == target || d.serial.contains(ip_part)) {
+                    if active.iter().any(|d| (d.serial == target || d.serial.contains(ip)) && d.state == "device") {
                         let _ = db_conn.mark_device_online(dev.id, &target);
                     }
                 }

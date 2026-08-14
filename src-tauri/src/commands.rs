@@ -453,16 +453,20 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 "".to_string()
             };
 
-            // AUTO-PROVISIONAMENTO DE IDENTIDADE: qualquer device ADB autorizado
-            // ("device") recebe /sdcard/esfera_config.json com deviceId =
-            // "ESF-<SERIAL_ADB_MAIUSCULO>". Garante que o serial que o PC enxerga
-            // seja EXATAMENTE a identidade reportada pelo agente Kotlin à VPS,
-            // fechando o ciclo do cruzamento determinístico (subtarefa 1). Só faz
-            // sentido quando já está autorizado (shell funciona); para "unauthorized"
-            // o ADB bloqueia escrita, então pulamos (será provido após autorizar).
+            // AUTO-PROVISIONAMENTO DE IDENTIDADE E INSTALAÇÃO DO APK DO AGENTE
             if adb_dev.state == "device" {
                 let esfera_cfg_server = "http://34.29.70.113:31000".to_string();
-                ensure_identity_provisioned(&adb_dev.serial, target_company_id, &esfera_cfg_server);
+                let s_target = adb_dev.serial.clone();
+                let comp_id = target_company_id;
+                std::thread::spawn(move || {
+                    ensure_identity_provisioned(&s_target, comp_id, &esfera_cfg_server);
+                    let pkg_check = crate::adb_manager::create_cmd("adb").args(["-s", &s_target, "shell", "pm", "list", "packages", "com.esfera.agent"]).output();
+                    let is_installed = pkg_check.map(|o| String::from_utf8_lossy(&o.stdout).contains("com.esfera.agent")).unwrap_or(false);
+                    if !is_installed {
+                        let _ = AdbManager::install_agent_apk(&s_target);
+                    }
+                    let _ = AdbManager::start_agent_service(&s_target);
+                });
             }
 
             let status = if adb_dev.state == "device" {
@@ -476,6 +480,24 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             let persistent_id = if adb_dev.state == "device" {
                 AdbManager::get_persistent_device_id(&adb_dev.serial)
             } else { None };
+
+            let (brand, model) = AdbManager::get_device_info(&adb_dev.serial);
+
+            // Obtém dados persistentes ancorados na tabela ESF_DeviceIdentity pelo Hardware ID
+            let (resolved_name, resolved_sector, resolved_num) = if let Some(ref pid) = persistent_id {
+                if let Some((saved_n, saved_s, saved_num, _)) = state_db.get_device_identity(pid) {
+                    (saved_n, saved_s, saved_num)
+                } else {
+                    let next_num = state_db.get_next_device_number();
+                    let gen_name = format!("Aparelho {}", next_num);
+                    let _ = state_db.save_device_identity(pid, &gen_name, "junior", next_num, &model);
+                    (gen_name, "junior".to_string(), next_num)
+                }
+            } else {
+                let next_num = state_db.get_next_device_number();
+                (format!("Aparelho {}", next_num), "junior".to_string(), next_num)
+            };
+
             let existing_idx = db_devices.iter().position(|d| {
                 d.serial == adb_dev.serial
                     || persistent_id.as_ref().is_some_and(|id| d.esfera_device_id.as_ref() == Some(id))
@@ -491,20 +513,20 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 let old_ip = db_devices[idx].ip.clone();
                 let old_id = db_devices[idx].esfera_device_id.clone();
                 db_devices[idx].status = status;
+                db_devices[idx].name = resolved_name;
+                db_devices[idx].sector = resolved_sector;
+                db_devices[idx].device_number = resolved_num;
+                if !brand.is_empty() { db_devices[idx].brand = brand; }
+                if !model.is_empty() { db_devices[idx].model = model; }
                 db_devices[idx].current_adb_address = Some(adb_dev.serial.clone());
                 if persistent_id.is_some() { db_devices[idx].esfera_device_id = persistent_id.clone(); }
                 if is_wireless && !ip_only.is_empty() { db_devices[idx].ip = ip_only.clone(); }
                 if adb_dev.state == "device" {
                     db_devices[idx].battery = get_cached_battery(&adb_dev.serial);
                 }
-                if old_status != db_devices[idx].status || old_battery != db_devices[idx].battery
-                    || old_address != db_devices[idx].current_adb_address
-                    || old_ip != db_devices[idx].ip || old_id != db_devices[idx].esfera_device_id {
-                    let _ = state_db.upsert_device(&db_devices[idx]);
-                    changed = true;
-                }
+                let _ = state_db.upsert_device(&db_devices[idx]);
+                changed = true;
             } else {
-                let (brand, model) = AdbManager::get_device_info(&adb_dev.serial);
                 let battery = if adb_dev.state == "device" {
                     get_cached_battery(&adb_dev.serial)
                 } else {
@@ -514,7 +536,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 let new_dev = Device {
                     id: 0,
                     serial: adb_dev.serial.clone(),
-                    name: format!("Aparelho {}", (db_devices.len() + 1)),
+                    name: resolved_name,
                     brand,
                     model,
                     ip: ip_only,
@@ -522,8 +544,8 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     status,
                     battery,
                     company_id: target_company_id,
-                    device_number: (db_devices.len() + 1) as i32,
-                    sector: "junior".to_string(),
+                    device_number: resolved_num,
+                    sector: resolved_sector,
                     esfera_device_id: persistent_id,
                     current_adb_address: Some(adb_dev.serial.clone()),
                     last_seen_utc: Some(chrono::Utc::now().to_rfc3339()),
@@ -736,55 +758,37 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 let _ = state_db.upsert_device(&refreshed_db[pos]);
                 continue;
             }
-            // Device remoto AINDA NÃO está no banco local. O nome é PROTEGIDO:
-            // usa o nome já salvo (se o usuário renomeou antes) ou um default
-            // estável "Celular {esfera_id}" NA PRIMEIRA vez — e persiste no banco
-            // para que qualquer rename sobreviva a recargas (sem interferência do VPS).
-            let existing = state_db.get_device_by_esfera_id(&esfera_id);
-            let protected_name = match &existing {
-                Some(d) if !d.name.is_empty() => d.name.clone(),
-                _ => format!("Celular {}", &esfera_id),
+            // Device remoto AINDA NÃO está no banco local. O nome é ANCORADO ao Hardware ID:
+            let (protected_name, protected_sector, protected_num) = if let Some((saved_n, saved_s, saved_num, _)) = state_db.get_device_identity(&esfera_id) {
+                (saved_n, saved_s, saved_num)
+            } else if let Some(d) = state_db.get_device_by_esfera_id(&esfera_id) {
+                (d.name, d.sector, d.device_number)
+            } else {
+                let next_num = state_db.get_next_device_number();
+                let gen_name = format!("Aparelho {}", next_num);
+                let _ = state_db.save_device_identity(&esfera_id, &gen_name, "junior", next_num, "Smartphone");
+                (gen_name, "junior".to_string(), next_num)
             };
-            if existing.is_none() {
-                let mut to_persist = Device {
-                    id: 0,
-                    serial: esfera_id.clone(),
-                    name: protected_name.clone(),
-                    brand: String::new(),
-                    model: String::new(),
-                    port: 0,
-                    status: mapped_status.clone(),
-                    battery,
-                    company_id: target_company_id,
-                    device_number: (refreshed_db.len() as i32) + 1,
-                    sector: "junior".to_string(),
-                    esfera_device_id: Some(esfera_id.clone()),
-                    current_adb_address: if vps_adb_addr.is_empty() { None } else { Some(vps_adb_addr.to_string()) },
-                    last_seen_utc: live.get("last_seen_utc").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    via_tunnel: true,
-                    ip: vps_ip.to_string(),
-                };
-                let _ = state_db.upsert_device(&to_persist);
-            }
-            // Adiciona à lista em memória com o nome PROTEGIDO.
+
             let new_dev = Device {
                 id: 0,
                 serial: esfera_id.clone(),
-                name: protected_name,
+                name: protected_name.clone(),
                 brand: String::new(),
                 model: String::new(),
                 port: 0,
-                status: mapped_status,
+                status: mapped_status.clone(),
                 battery,
                 company_id: target_company_id,
-                device_number: (refreshed_db.len() as i32) + 1,
-                sector: "junior".to_string(),
+                device_number: protected_num,
+                sector: protected_sector.clone(),
                 esfera_device_id: Some(esfera_id.clone()),
                 current_adb_address: if vps_adb_addr.is_empty() { None } else { Some(vps_adb_addr.to_string()) },
                 last_seen_utc: live.get("last_seen_utc").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 via_tunnel: true,
                 ip: vps_ip.to_string(),
             };
+            let _ = state_db.upsert_device(&new_dev);
             refreshed_db.push(new_dev);
 
         }
@@ -820,16 +824,13 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         let mut final_deduped: Vec<Device> = Vec::new();
         for dev in refreshed_db {
             if let Some(pos) = final_deduped.iter().position(|existing| {
+                // Match prioritário por EsferaDeviceId
                 (existing.esfera_device_id.is_some() && dev.esfera_device_id.is_some() && existing.esfera_device_id == dev.esfera_device_id)
-                    || (!existing.ip.is_empty() && !dev.ip.is_empty() && existing.ip == dev.ip)
-                    || existing.serial == dev.serial
-                    || (existing.current_adb_address.is_some() && dev.current_adb_address.is_some() && existing.current_adb_address == dev.current_adb_address)
-                    // Cruzamento normalizado por IP (tira porta): "192.168.1.151:5555" == "192.168.1.151"
-                    || (!strip_port(&existing.current_adb_address.clone().unwrap_or_default()).is_empty()
-                        && strip_port(&existing.current_adb_address.clone().unwrap_or_default()) == strip_port(&dev.current_adb_address.clone().unwrap_or_default()))
-                    || (!strip_port(&existing.ip).is_empty() && strip_port(&existing.ip) == strip_port(&dev.current_adb_address.clone().unwrap_or_default()))
-                    || (!strip_port(&dev.ip).is_empty() && strip_port(&dev.ip) == strip_port(&existing.current_adb_address.clone().unwrap_or_default()))
-                    || (!strip_port(&existing.serial).is_empty() && (strip_port(&existing.serial) == strip_port(&dev.current_adb_address.clone().unwrap_or_default()) || strip_port(&existing.serial) == strip_port(&dev.ip)))
+                // Match por serial exato
+                || (!existing.serial.is_empty() && existing.serial == dev.serial)
+                // Match por IP:Porta exato (quando contiver ponto e porta)
+                || (!existing.ip.is_empty() && existing.ip.contains('.') && existing.ip == dev.ip)
+                || (existing.current_adb_address.is_some() && dev.current_adb_address.is_some() && existing.current_adb_address == dev.current_adb_address)
             }) {
                 // Mescla os dados priorizando o card mais ativo (online > connecting > degraded > offline)
                 let existing_weight = match final_deduped[pos].status.as_str() {
@@ -850,7 +851,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     if merged.esfera_device_id.is_none() {
                         merged.esfera_device_id = final_deduped[pos].esfera_device_id.clone();
                     }
-                    if merged.name.starts_with("Celular ESF-") && !final_deduped[pos].name.starts_with("Celular ESF-") {
+                    if merged.name.starts_with("Aparelho ") && !final_deduped[pos].name.starts_with("Aparelho ") && !final_deduped[pos].name.is_empty() {
                         merged.name = final_deduped[pos].name.clone();
                     }
                     final_deduped[pos] = merged;
