@@ -6,6 +6,17 @@
 // Fase 1: Novos comandos para DB, Chips, Campanhas, IA, Permissões
 // ============================================================
 
+/// Log de diagnóstico em disco — arquivo aberto/fechado a cada chamada para
+/// não perder dados se o processo crashar (flush imediato via drop).
+fn cmd_diag(s: &str) {
+    use std::io::Write;
+    let path = "D:/Novo/Esfera v3/esfera_runtime_debug.log";
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let _ = writeln!(f, "[{}] [CMD] {}", ts, s);
+    }
+}
+
 use crate::adb_manager::{AdbDeviceInfo, AdbManager};
 use crate::config::{self, AppConfig};
 use crate::db::{
@@ -612,9 +623,13 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 // permite "connecting" SÓ durante a janela de reconexão de IP (15s).
                 // Após o timeout, vira "offline" (subtarefa 3) — nunca amarelo eterno.
                 let key = connecting_key(dev);
-                let entered_at = {
-                    let mut map = CONNECTING_SINCE.write().unwrap();
-                    *map.entry(key.clone()).or_insert_with(Instant::now)
+                let entered_at = match CONNECTING_SINCE.write() {
+                    Ok(mut map) => *map.entry(key.clone()).or_insert_with(Instant::now),
+                    Err(_) => {
+                        // RwLock envenenada: trata como timeout expirado para não crashar
+                        dev.status = "offline".to_string();
+                        continue;
+                    }
                 };
                 let elapsed = Instant::now().duration_since(entered_at);
                 if elapsed <= CONNECTING_TIMEOUT {
@@ -1362,7 +1377,14 @@ pub fn update_device(state: State<'_, AppState>, token: String, device: Device) 
     let _ = db.upsert_device(&device);
 
     // Propaga o novo nome para o Banco de Dados da VPS (Hub) imediatamente
-    if let Some(esfera_id) = &device.esfera_device_id {
+    let esfera_id_opt = device.esfera_device_id
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            db.get_device_by_esfera_id(&device.serial)
+                .and_then(|d| d.esfera_device_id)
+        });
+
+    if let Some(esfera_id) = esfera_id_opt {
         if !esfera_id.is_empty() {
             let hub = state.hub_client.clone();
             let id2 = esfera_id.clone();
@@ -1370,10 +1392,9 @@ pub fn update_device(state: State<'_, AppState>, token: String, device: Device) 
             let cid = device.company_id;
             tauri::async_runtime::spawn(async move {
                 // 1. Envia via Hub WebSocket se conectado
-                let connected = hub.lock().await.is_some();
-                if connected {
-                    let _ = HubClient::send_command(
-                        &hub.lock().await.as_ref().unwrap(),
+                let guard = hub.lock().await;
+                if let Some(client) = guard.as_ref() {
+                    let _ = client.send_command(
                         cid,
                         "rename_device",
                         serde_json::json!({ "esferaDeviceId": id2, "name": name2 }),
