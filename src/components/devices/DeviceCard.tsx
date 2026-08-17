@@ -44,7 +44,8 @@ export const DeviceCard = memo(function DeviceCard({
   const displayModel = device.model && device.model !== "Smartphone" && device.model !== "Android"
     ? device.model
     : (device.brand && device.brand !== "Android" ? `${device.brand} Smartphone` : "Android Smartphone");
-  const isUsbOnly = device.status === "online" && !device.serial.includes(":") && !device.viaTunnel;
+  const isWireless = (device.serial && device.serial.includes(":")) || (device.currentAdbAddress && device.currentAdbAddress.includes(":"));
+  const isUsbOnly = device.status === "online" && !isWireless && !device.viaTunnel;
   const origin = getConnectionOrigin(device);
   const originBadge = CONNECTION_BADGE_CONFIG[origin];
 
