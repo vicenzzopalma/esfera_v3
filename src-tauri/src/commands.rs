@@ -2837,6 +2837,20 @@ pub async fn debloat_device(_token: String, serial: String) -> Result<String, St
 }
 
 #[tauri::command]
+pub async fn debloat_device_profile(_token: String, serial: String, profile: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::debloat_device_profile(&serial, &profile)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn apply_hardware_profile(_token: String, serial: String, profile: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        AdbManager::apply_hardware_profile(&serial, &profile)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn debloat_all_devices(_token: String) -> Result<Vec<String>, String> {
     let results = tauri::async_runtime::spawn_blocking(move || {
         AdbManager::debloat_all_devices()
@@ -3077,6 +3091,17 @@ pub fn get_assigned_devices_for_user(
     let target_user = if session.role == "colaborador" { session.user_id } else { user_id };
     let target_company = session.company_id.unwrap_or(company_id);
     Ok(state.db.get_assigned_devices_for_user(target_user, target_company))
+}
+
+#[tauri::command]
+pub fn get_all_device_assignments(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<Vec<crate::db::DeviceAssignmentInfo>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let target_company = session.company_id.unwrap_or(company_id);
+    Ok(state.db.get_all_device_assignments(target_company))
 }
 
 #[tauri::command]

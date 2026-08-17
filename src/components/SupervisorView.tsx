@@ -5,7 +5,7 @@
 // está no momento utilizando cada celular.
 // ============================================================
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useAuth } from "../context/AuthContext";
 import { api } from "../tauri";
 import type { DeviceWithActiveUser } from "../types";
@@ -18,6 +18,9 @@ import {
   Home,
   Activity,
   Layers,
+  Monitor,
+  Camera,
+
 } from "lucide-react";
 import Button from "./ui/Button";
 import Card from "./ui/Card";
@@ -29,6 +32,8 @@ export default function SupervisorView() {
   const [loading, setLoading] = useState(true);
   const [screenImages, setScreenImages] = useState<Record<string, string>>({});
   const [capturing, setCapturing] = useState<Record<string, boolean>>({});
+  const [launchingScrcpy, setLaunchingScrcpy] = useState<Record<string, boolean>>({});
+  const autoRefreshRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
 
   const companyId = selectedCompanyId || user?.companyId || 1;
 
@@ -51,24 +56,51 @@ export default function SupervisorView() {
     return () => clearInterval(interval);
   }, [loadData]);
 
-  const captureScreen = async (serial: string) => {
+  // ---- Auto-captura da tela a cada 3s por aparelho online ----
+  const captureScreen = useCallback(async (serial: string) => {
     setCapturing((prev) => ({ ...prev, [serial]: true }));
     try {
       const base64 = await api<string>("capture_device_screen", { serial });
-      if (base64) {
+      if (base64 && base64.length > 100) {
         setScreenImages((prev) => ({ ...prev, [serial]: `data:image/png;base64,${base64}` }));
       }
-    } catch (err) {
-      console.error(`Erro ao capturar tela de ${serial}:`, err);
+    } catch {
+      // silencioso: dispositivo pode estar ocupado
     } finally {
       setCapturing((prev) => ({ ...prev, [serial]: false }));
     }
-  };
+  }, []);
+
+  // Inicia auto-refresh de tela para cada aparelho online
+  useEffect(() => {
+    const serials = devicesWithUsers
+      .filter((d) => d.status === "online")
+      .map((d) => d.serial);
+
+    // Para aparelhos que ficaram offline
+    Object.keys(autoRefreshRef.current).forEach((s) => {
+      if (!serials.includes(s)) {
+        clearInterval(autoRefreshRef.current[s]);
+        delete autoRefreshRef.current[s];
+      }
+    });
+
+    // Inicia para os novos aparelhos online
+    serials.forEach((s) => {
+      if (!autoRefreshRef.current[s]) {
+        captureScreen(s); // primeira captura imediata
+        autoRefreshRef.current[s] = setInterval(() => captureScreen(s), 3000);
+      }
+    });
+
+    return () => {
+      Object.values(autoRefreshRef.current).forEach(clearInterval);
+    };
+  }, [devicesWithUsers, captureScreen]);
 
   const handleAdbTap = async (serial: string, x: number, y: number) => {
     try {
       await api("send_adb_tap", { serial, x, y });
-      setTimeout(() => captureScreen(serial), 300);
     } catch (err) {
       console.error("Erro ao enviar toque ADB:", err);
     }
@@ -77,9 +109,20 @@ export default function SupervisorView() {
   const handleAdbKey = async (serial: string, keycode: number) => {
     try {
       await api("send_adb_keyevent", { serial, keycode });
-      setTimeout(() => captureScreen(serial), 400);
     } catch (err) {
       console.error("Erro ao enviar keyevent:", err);
+    }
+  };
+
+  const handleLaunchScrcpy = async (dev: DeviceWithActiveUser) => {
+    const serial = dev.currentAdbAddress || dev.serial;
+    setLaunchingScrcpy((prev) => ({ ...prev, [dev.serial]: true }));
+    try {
+      await api<string>("launch_scrcpy_stream", { serial, turnScreenOff: false });
+    } catch (e: any) {
+      console.error("Erro ao iniciar Scrcpy:", e);
+    } finally {
+      setTimeout(() => setLaunchingScrcpy((prev) => ({ ...prev, [dev.serial]: false })), 2000);
     }
   };
 
@@ -101,7 +144,7 @@ export default function SupervisorView() {
               </div>
               <h1 className="text-2xl font-bold text-white mt-1">Visão Geral dos Celulares Conectados</h1>
               <p className="text-slate-300 text-sm">
-                Monitore em tempo real quem é o colaborador operando cada celular e interaja diretamente com qualquer aparelho via ADB.
+                Preview automático a cada 3s • Clique na tela para enviar toque ADB • Abra o Scrcpy para controle completo.
               </p>
             </div>
           </div>
@@ -113,7 +156,7 @@ export default function SupervisorView() {
             className="flex items-center gap-2 text-slate-300 hover:text-white border border-slate-700"
           >
             <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
-            Atualizar Mapeamento
+            Atualizar
           </Button>
         </div>
       </div>
@@ -135,6 +178,7 @@ export default function SupervisorView() {
           {devicesWithUsers.map((dev) => {
             const hasActiveUser = !!dev.activeUserDisplayName;
             const screenImg = screenImages[dev.serial];
+            const isOnline = dev.status === "online";
 
             return (
               <Card
@@ -145,7 +189,7 @@ export default function SupervisorView() {
                     : "border-slate-800 bg-slate-900/80 hover:border-slate-700"
                 }`}
               >
-                {/* Banner Destacado do Colaborador Ativo no Presente */}
+                {/* Banner Destacado do Colaborador Ativo */}
                 <div
                   className={`px-4 py-2.5 flex items-center justify-between text-xs font-bold ${
                     hasActiveUser
@@ -181,7 +225,7 @@ export default function SupervisorView() {
 
                     <div className="flex flex-col items-end gap-1">
                       <Badge
-                        variant={dev.status === "online" ? "success" : "neutral"}
+                        variant={isOnline ? "success" : "neutral"}
                         className="capitalize"
                       >
                         {dev.status}
@@ -192,7 +236,7 @@ export default function SupervisorView() {
                     </div>
                   </div>
 
-                  {/* Informações de Atribuição de Responsável */}
+                  {/* Responsável Vinculado */}
                   {dev.assignedUserName && (
                     <div className="p-2.5 rounded-lg bg-slate-950/50 border border-slate-800 text-xs flex items-center justify-between">
                       <span className="text-slate-400">Responsável Vinculado:</span>
@@ -200,8 +244,8 @@ export default function SupervisorView() {
                     </div>
                   )}
 
-                  {/* Tela / Preview do Celular */}
-                  <div className="relative rounded-xl overflow-hidden bg-slate-950 border border-slate-800 aspect-[9/16] max-h-64 flex flex-col items-center justify-center">
+                  {/* Preview da Tela do Celular */}
+                  <div className="relative rounded-xl overflow-hidden bg-slate-950 border border-slate-800 aspect-[9/16] max-h-72 flex flex-col items-center justify-center">
                     {screenImg ? (
                       <img
                         src={screenImg}
@@ -215,32 +259,65 @@ export default function SupervisorView() {
                         }}
                       />
                     ) : (
-                      <div className="text-center p-4 space-y-2">
+                      <div className="text-center p-4 space-y-3">
                         <Smartphone size={36} className="mx-auto text-slate-700" />
-                        <p className="text-xs text-slate-500">Preview de tela não carregado</p>
+                        <p className="text-xs text-slate-500">
+                          {isOnline ? "Carregando preview..." : "Aparelho offline"}
+                        </p>
+                        {isOnline && (
+                          <div className="flex justify-center">
+                            <RefreshCw size={14} className="animate-spin text-purple-400" />
+                          </div>
+                        )}
                       </div>
                     )}
 
+                    {/* Badge de status da captura */}
+                    {screenImg && capturing[dev.serial] && (
+                      <div className="absolute top-2 left-2 bg-slate-900/80 rounded-full px-2 py-0.5 flex items-center gap-1 text-[10px] text-purple-300">
+                        <RefreshCw size={10} className="animate-spin" />
+                        Atualizando
+                      </div>
+                    )}
+
+                    {/* Botão de captura manual */}
                     <Button
                       variant="ghost"
                       onClick={() => captureScreen(dev.serial)}
-                      disabled={capturing[dev.serial]}
+                      disabled={capturing[dev.serial] || !isOnline}
                       className="absolute bottom-2 right-2 bg-slate-900/80 hover:bg-slate-800 text-xs px-2.5 py-1 text-slate-200 border border-slate-700 backdrop-blur-sm"
                     >
-                      <RefreshCw size={12} className={capturing[dev.serial] ? "animate-spin" : ""} />
-                      Capturar Tela
+                      <Camera size={11} />
                     </Button>
                   </div>
 
-                  {/* Controles Rápido do Supervisor */}
+                  {/* Controles Rápidos */}
                   <div className="space-y-2 pt-1">
                     <span className="text-xs font-semibold text-slate-400 block uppercase">
                       Ações do Supervisor:
                     </span>
+
+                    {/* Botão Scrcpy — Controle Completo */}
+                    <Button
+                      variant="primary"
+                      onClick={() => handleLaunchScrcpy(dev)}
+                      disabled={launchingScrcpy[dev.serial] || !isOnline}
+                      className="w-full flex items-center justify-center gap-2 py-2 text-xs font-bold bg-gradient-to-r from-[#5E6AD2] to-[#6C77D8] hover:from-[#6B77E0] hover:to-[#7882E4] border-0"
+                    >
+                      {launchingScrcpy[dev.serial] ? (
+                        <RefreshCw size={14} className="animate-spin" />
+                      ) : (
+                        <Monitor size={14} />
+                      )}
+                      {launchingScrcpy[dev.serial] ? "Abrindo Scrcpy..." : "Espelhamento Scrcpy — Controle Total"}
+                    </Button>
+
+                    {/* Botões ADB Rápidos */}
                     <div className="grid grid-cols-3 gap-2">
                       <Button
                         variant="secondary"
                         onClick={() => handleAdbKey(dev.serial, 4)} // BACK
+                        disabled={!isOnline}
                         className="text-xs py-1.5 flex items-center justify-center gap-1"
                       >
                         <ArrowLeft size={12} /> Voltar
@@ -248,6 +325,7 @@ export default function SupervisorView() {
                       <Button
                         variant="secondary"
                         onClick={() => handleAdbKey(dev.serial, 3)} // HOME
+                        disabled={!isOnline}
                         className="text-xs py-1.5 flex items-center justify-center gap-1"
                       >
                         <Home size={12} /> Home
@@ -255,6 +333,7 @@ export default function SupervisorView() {
                       <Button
                         variant="secondary"
                         onClick={() => handleAdbKey(dev.serial, 187)} // APP_SWITCH
+                        disabled={!isOnline}
                         className="text-xs py-1.5 flex items-center justify-center gap-1"
                       >
                         <Layers size={12} /> Apps

@@ -372,6 +372,70 @@ const LG_BLOAT: &[&str] = &[
     "com.booking",
 ];
 
+const POSITIVO_BLOAT: &[&str] = &[
+    "com.google.android.apps.photos",
+    "com.google.android.youtube",
+    "com.google.android.gm",
+    "com.google.android.apps.maps",
+    "com.google.android.apps.docs",
+    "com.google.android.apps.walletnfcrel",
+    "com.google.android.apps.magazines",
+    "com.google.android.apps.fitness",
+    "com.google.android.apps.chromecast.app",
+    "com.google.android.apps.subscriptions.red",
+    "com.google.android.apps.nbu.files",
+    "com.android.chrome",
+    "com.google.android.music",
+    "com.google.android.videos",
+    "com.google.android.keep",
+    "com.google.android.calendar",
+    "com.netflix.mediaclient",
+    "com.facebook.katana",
+    "com.facebook.appmanager",
+    "com.facebook.system",
+    "com.linkedin.android",
+    "com.spotify.music",
+    "com.amazon.mp3",
+    "com.amazon.mShop.android.shopping",
+    "com.zhiliaoapp.musically",
+    "com.kwai.video",
+    "com.booking",
+    "com.shopee.br",
+    "com.alibaba.aliexpresshd",
+    "com.positivo.launcher",
+    "com.positivo.customizer",
+    "com.positivo.setupwizard",
+    "com.positivo.manual",
+];
+
+const GOOGLE_HEAVY_BLOAT: &[&str] = &[
+    "com.google.android.googlequicksearchbox",
+    "com.google.android.apps.googleassistant",
+    "com.google.android.tts",
+    "com.google.android.feedback",
+    "com.google.android.printservice.recommendation",
+    "com.google.android.marvin.talkback",
+    "com.google.android.overlay.gmsconfig.common",
+    "com.google.android.projection.gearhead",
+    "com.google.android.videos",
+    "com.google.android.music",
+    "com.google.android.apps.photos",
+    "com.google.android.youtube",
+    "com.google.android.apps.youtube.music",
+    "com.google.android.apps.magazines",
+    "com.google.android.apps.docs",
+    "com.google.android.apps.docs.editors.docs",
+    "com.google.android.apps.docs.editors.sheets",
+    "com.google.android.apps.docs.editors.slides",
+    "com.google.android.apps.tachyon",
+    "com.google.android.apps.messaging",
+    "com.android.chrome",
+    "com.google.android.apps.maps",
+    "com.google.android.gm",
+    "com.google.android.keep",
+    "com.google.android.calendar",
+];
+
 const GENERIC_BLOAT: &[&str] = &[
     "com.facebook.katana",
     "com.facebook.appmanager",
@@ -2215,31 +2279,55 @@ impl AdbManager {
         ))
     }
 
-    /// Remove/disables bloatware packages do dispositivo baseado no fabricante
+    /// Remove/disables bloatware packages do dispositivo baseado no perfil selecionado
     pub fn debloat_device(serial: &str) -> Result<String, String> {
-        let manufacturer = Self::get_device_manufacturer(serial);
+        Self::debloat_device_profile(serial, "safe")
+    }
 
-        let bloat_list: &[&str] = match manufacturer.to_lowercase().as_str() {
+    /// Executa o Debloat por Nível/Perfil (Estilo UAD-ng / Canta via ADB)
+    pub fn debloat_device_profile(serial: &str, profile: &str) -> Result<String, String> {
+        let manufacturer = Self::get_device_manufacturer(serial);
+        let m_lower = manufacturer.to_lowercase();
+
+        let mut pkg_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+        // 1. Pacotes por Fabricante
+        let m_bloat: &[&str] = match m_lower.as_str() {
             m if m.contains("samsung") => &SAMSUNG_BLOAT,
             m if m.contains("realme") | m.contains("oppo") | m.contains("oneplus") => &REALME_BLOAT,
             m if m.contains("xiaomi") | m.contains("redmi") | m.contains("poco") => &XIAOMI_BLOAT,
             m if m.contains("motorola") => &MOTOROLA_BLOAT,
             m if m.contains("multilaser") => &MULTILASER_BLOAT,
+            m if m.contains("positivo") => &POSITIVO_BLOAT,
             m if m.contains("lg") => &LG_BLOAT,
             _ => &GENERIC_BLOAT,
         };
 
-        let mut disabled = 0;
+        for p in m_bloat { pkg_set.insert(p); }
+        for p in GENERIC_BLOAT { pkg_set.insert(p); }
+
+        // 2. Se perfil for Agressivo ou Extremo, inclui Google Apps pesados (Assistente, YouTube, Chrome, etc.)
+        if profile == "aggressive" || profile == "extreme" || profile == "extreme_worker" {
+            for p in GOOGLE_HEAVY_BLOAT { pkg_set.insert(p); }
+        }
+
+        let is_restore = profile == "restore";
+        let mut processed = 0;
         let mut errors = Vec::new();
 
-        for pkg in bloat_list {
+        for pkg in &pkg_set {
             let mut cmd = create_cmd("adb");
-            cmd.args(["-s", serial, "shell", "pm", "disable-user", "--user", "0", pkg]);
-            match run_cmd_timeout(cmd, Duration::from_secs(5)) {
-                Ok(out) if out.status.success() => disabled += 1,
+            if is_restore {
+                cmd.args(["-s", serial, "shell", "pm", "enable", pkg]);
+            } else {
+                cmd.args(["-s", serial, "shell", "pm", "disable-user", "--user", "0", pkg]);
+            }
+
+            match run_cmd_timeout(cmd, Duration::from_secs(4)) {
+                Ok(out) if out.status.success() => processed += 1,
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
-                    if !stderr.contains("not found") && !stderr.contains("already") {
+                    if !stderr.contains("not found") && !stderr.contains("already") && !stderr.is_empty() {
                         errors.push(format!("{}: {}", pkg, stderr.trim()));
                     }
                 }
@@ -2251,18 +2339,94 @@ impl AdbManager {
             }
         }
 
-        // Força limpeza de cache e stop dos apps desativados
-        let _ = create_cmd("adb").args(["-s", serial, "shell", "am", "force-stop", "com.whatsapp"]).output();
-        let _ = create_cmd("adb").args(["-s", serial, "shell", "am", "force-stop", "com.whatsapp.w4b"]).output();
+        // Limpeza de cache e trim
+        let _ = create_cmd("adb").args(["-s", serial, "shell", "pm", "trim-caches", "999G"]).output();
+
+        let action_label = if is_restore { "Restauração de Apps" } else { "Debloat UAD-ng" };
+        let profile_label = match profile {
+            "safe" => "Seguro (Fabricante/Operadora)",
+            "aggressive" => "Agressivo (Google + Bloatwares)",
+            "extreme" | "extreme_worker" => "Extremo (Nó Dedicado)",
+            "restore" => "Restaurar Apps Nativos",
+            _ => profile,
+        };
 
         let mut result = format!(
-            "Debloat concluido em {} [{}]: {}/{} apps desativados",
-            serial, manufacturer, disabled, bloat_list.len()
+            "✅ {} [{}] concluído em {} [{}]: {}/{} apps processados!",
+            action_label, profile_label, serial, manufacturer, processed, pkg_set.len()
         );
-        if !errors.is_empty() {
-            result.push_str(&format!("\nErros: {}", errors.join("; ")));
+        if !errors.is_empty() && errors.len() <= 5 {
+            result.push_str(&format!("\nNotas: {}", errors.join("; ")));
         }
         Ok(result)
+    }
+
+    /// Aplica Perfis de Hardware Dedicado (Worker WhatsApp, Nó Linux/Termux, Câmera RTSP)
+    pub fn apply_hardware_profile(serial: &str, profile: &str) -> Result<String, String> {
+        match profile {
+            "worker" | "esfera_worker" => {
+                // Modo 1: Nó de Disparos / Automação Pura (100% RAM para WhatsApp + Agente)
+                let cmds = [
+                    "settings put global window_animation_scale 0.0",
+                    "settings put global transition_animation_scale 0.0",
+                    "settings put global animator_duration_scale 0.0",
+                    "setprop debug.sf.hw 1",
+                    "settings put global force_gpu_rendering 1",
+                    "device_config put activity_manager max_phantom_processes 2147483647",
+                    "dumpsys deviceidle whitelist +com.whatsapp",
+                    "dumpsys deviceidle whitelist +com.whatsapp.w4b",
+                    "dumpsys deviceidle whitelist +com.esfera.agent",
+                    "cmd appops set com.esfera.agent RUN_IN_BACKGROUND allow",
+                    "cmd appops set com.whatsapp RUN_IN_BACKGROUND allow",
+                    "settings put global stay_on_while_plugged_in 7",
+                    "settings put global wifi_sleep_policy 2",
+                    "pm trim-caches 999G",
+                    "cmd package compile -m speed-profile com.whatsapp",
+                    "cmd package compile -m speed-profile com.esfera.agent",
+                ];
+                for c in &cmds {
+                    let mut cmd = create_cmd("adb");
+                    cmd.args(["-s", serial, "shell", c]);
+                    let _ = run_cmd_timeout(cmd, Duration::from_secs(4));
+                }
+                Ok("🚀 Perfil [Nó de Disparos Esfera Worker] ativado! Animações 0x, GPU forçada, WhatsApp e Agente imunizados e priorizados na RAM.".to_string())
+            }
+            "termux" | "linux_node" => {
+                // Modo 2: Micro-Servidor Linux / Termux
+                let cmds = [
+                    "device_config put activity_manager max_phantom_processes 2147483647",
+                    "dumpsys deviceidle whitelist +com.termux",
+                    "dumpsys deviceidle whitelist +com.esfera.agent",
+                    "cmd appops set com.termux RUN_IN_BACKGROUND allow",
+                    "settings put global stay_on_while_plugged_in 7",
+                    "settings put global wifi_sleep_policy 2",
+                    "pm trim-caches 999G",
+                ];
+                for c in &cmds {
+                    let mut cmd = create_cmd("adb");
+                    cmd.args(["-s", serial, "shell", c]);
+                    let _ = run_cmd_timeout(cmd, Duration::from_secs(4));
+                }
+                Ok("🐧 Perfil [Micro-Servidor Linux / Termux] ativado! Limite de processos fantasmas removido e conexão Wi-Fi permanente.".to_string())
+            }
+            "camera" | "rtsp_cam" => {
+                // Modo 3: Câmera RTSP / VCam Dedicada
+                let cmds = [
+                    "settings put system screen_off_timeout 2147483647",
+                    "settings put global stay_on_while_plugged_in 7",
+                    "settings put global wifi_sleep_policy 2",
+                    "dumpsys deviceidle whitelist +com.esfera.agent",
+                    "dumpsys deviceidle whitelist +com.vcam",
+                ];
+                for c in &cmds {
+                    let mut cmd = create_cmd("adb");
+                    cmd.args(["-s", serial, "shell", c]);
+                    let _ = run_cmd_timeout(cmd, Duration::from_secs(4));
+                }
+                Ok("📷 Perfil [Câmera / Sensor Dedicado] ativado! Prevenção total de sleep e prioridade de streaming de vídeo.".to_string())
+            }
+            _ => Err(format!("Perfil desconhecido: {}", profile)),
+        }
     }
 
     fn get_device_manufacturer(serial: &str) -> String {

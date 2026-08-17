@@ -22,6 +22,18 @@ export interface DeviceAssignment {
   createdAt: string;
 }
 
+export interface DeviceAssignmentInfo {
+  assignmentId: number;
+  adbDeviceId: string;
+  userId: number;
+  userName?: string;
+  userDisplayName?: string;
+  deviceName?: string;
+  deviceNumber?: number;
+  model?: string;
+  createdAt: string;
+}
+
 export type PermissionRequestStatus = "pending" | "approved" | "rejected" | "active" | "ended";
 
 export interface DevicePermissionRequest {

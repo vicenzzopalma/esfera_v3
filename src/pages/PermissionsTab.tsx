@@ -8,7 +8,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
 import { api } from "../tauri";
-import type { User, Role, Device, DevicePermissionRequest } from "../types";
+import type { User, Role, Device, DevicePermissionRequest, DeviceAssignmentInfo } from "../types";
 import {
   Shield,
   Users,
@@ -24,6 +24,8 @@ import {
   Eye,
   ShieldCheck,
   Link,
+  Unlink,
+  Smartphone,
 } from "lucide-react";
 import Button from "../components/ui/Button";
 import Badge from "../components/ui/Badge";
@@ -37,6 +39,7 @@ export default function PermissionsTab() {
   const [usersList, setUsersList] = useState<User[]>([]);
   const [permissionRequests, setPermissionRequests] = useState<DevicePermissionRequest[]>([]);
   const [companyDevices, setCompanyDevices] = useState<Device[]>([]);
+  const [assignmentsList, setAssignmentsList] = useState<DeviceAssignmentInfo[]>([]);
   const [loading, setLoading] = useState(true);
 
   // Formulário de Criação de Usuário
@@ -51,20 +54,23 @@ export default function PermissionsTab() {
   const [selectedUserForAssign, setSelectedUserForAssign] = useState<number | "">("");
   const [selectedDeviceForAssign, setSelectedDeviceForAssign] = useState<string>("");
   const [assigning, setAssigning] = useState(false);
+  const [unassigning, setUnassigning] = useState<number | null>(null);
 
   const [feedbackMsg, setFeedbackMsg] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const [usersData, reqsData, devsData] = await Promise.all([
+      const [usersData, reqsData, devsData, assignData] = await Promise.all([
         api<User[]>("get_users", { companyId }),
         api<DevicePermissionRequest[]>("get_device_permission_requests", { companyId }),
         api<Device[]>("get_devices", { companyId }),
+        api<DeviceAssignmentInfo[]>("get_all_device_assignments", { companyId }),
       ]);
       setUsersList(usersData || []);
       setPermissionRequests(reqsData || []);
       setCompanyDevices(devsData || []);
+      setAssignmentsList(assignData || []);
     } catch (err) {
       console.error("Erro ao carregar dados de permissões:", err);
     } finally {
@@ -154,6 +160,22 @@ export default function PermissionsTab() {
       setFeedbackMsg({ type: "error", text: err.toString() || "Erro ao vincular celular." });
     } finally {
       setAssigning(false);
+    }
+  };
+
+  const handleUnassignDevice = async (assignment: DeviceAssignmentInfo) => {
+    setUnassigning(assignment.assignmentId);
+    try {
+      await api("unassign_device_from_user", {
+        deviceSerial: assignment.adbDeviceId,
+        userId: assignment.userId,
+      });
+      setFeedbackMsg({ type: "success", text: `Vínculo removido com sucesso.` });
+      await loadData();
+    } catch (err: any) {
+      setFeedbackMsg({ type: "error", text: err.toString() || "Erro ao desvincular celular." });
+    } finally {
+      setUnassigning(null);
     }
   };
 
@@ -514,6 +536,65 @@ export default function PermissionsTab() {
               </div>
             </form>
           </Card>
+
+          {/* Lista de Vínculos Existentes */}
+          <div className="space-y-3">
+            <h4 className="text-sm font-bold text-white flex items-center gap-2">
+              <Users size={16} className="text-indigo-400" />
+              Colaboradores e Celulares Vinculados Atualmente ({assignmentsList.length})
+            </h4>
+
+            {assignmentsList.length === 0 ? (
+              <Card className="p-6 text-center border border-slate-800 bg-slate-900/60">
+                <p className="text-xs text-slate-400">Nenhum celular vinculado a colaboradores no momento.</p>
+              </Card>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {assignmentsList.map((a) => (
+                  <Card key={a.assignmentId} className="p-4 border border-slate-800 bg-slate-900/80 space-y-3">
+                    <div className="flex items-start justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2.5 bg-indigo-500/20 border border-indigo-500/40 rounded-xl text-indigo-400">
+                          <Smartphone size={20} />
+                        </div>
+                        <div>
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-400">
+                            Aparelho #{a.deviceNumber || "?"}
+                          </span>
+                          <h5 className="text-sm font-bold text-white mt-0.5">
+                            {a.deviceName || a.model || a.adbDeviceId}
+                          </h5>
+                          <p className="text-[11px] text-slate-400 font-mono">{a.adbDeviceId}</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="p-2.5 bg-slate-950/60 rounded-xl border border-slate-800/80 text-xs flex items-center justify-between">
+                      <div>
+                        <span className="text-[10px] text-slate-500 block uppercase font-semibold">Responsável:</span>
+                        <span className="font-semibold text-slate-200">{a.userDisplayName || a.userName}</span>
+                      </div>
+
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleUnassignDevice(a)}
+                        disabled={unassigning === a.assignmentId}
+                        className="text-red-400 hover:text-red-300 hover:bg-red-500/10 text-xs px-2 py-1 flex items-center gap-1 border border-red-500/20"
+                      >
+                        {unassigning === a.assignmentId ? (
+                          <RefreshCw size={12} className="animate-spin" />
+                        ) : (
+                          <Unlink size={12} />
+                        )}
+                        Desvincular
+                      </Button>
+                    </div>
+                  </Card>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       )}
 

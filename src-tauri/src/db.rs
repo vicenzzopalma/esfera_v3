@@ -217,6 +217,20 @@ pub struct DeviceAssignment {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct DeviceAssignmentInfo {
+    pub assignment_id: i32,
+    pub adb_device_id: String,
+    pub user_id: i32,
+    pub user_name: Option<String>,
+    pub user_display_name: Option<String>,
+    pub device_name: Option<String>,
+    pub device_number: Option<i32>,
+    pub model: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct DevicePermissionRequest {
     pub request_id: i32,
     pub adb_device_id: String,
@@ -2465,7 +2479,9 @@ impl Database {
 
     pub fn unassign_device_from_user(&self, device_serial: &str, user_id: i32) -> Result<(), String> {
         self.conn().execute(
-            "DELETE FROM ESF_DeviceAssignment WHERE AdbDeviceId = ?1 AND UserId = ?2;",
+            "DELETE FROM ESF_DeviceAssignment WHERE (AdbDeviceId = ?1 OR AdbDeviceId IN (
+                SELECT AdbDeviceId FROM ESF_Device WHERE EsferaDeviceId = ?1 OR CurrentAdbAddress = ?1
+             )) AND UserId = ?2;",
             params![device_serial, user_id],
         ).map_err(|e| e.to_string())?;
         Ok(())
@@ -2473,11 +2489,16 @@ impl Database {
 
     pub fn get_assigned_devices_for_user(&self, user_id: i32, company_id: i32) -> Vec<Device> {
         let conn = self.conn();
-        let sql = "SELECT rowid, d.AdbDeviceId, d.DeviceName, d.Brand, d.Model, d.DeviceIp, d.DevicePort, d.Status, d.BatteryLevel, d.CompanyId, d.DeviceNumber, d.Sector,
+        let sql = "SELECT d.rowid, d.AdbDeviceId, d.DeviceName, d.Brand, d.Model, d.DeviceIp, d.DevicePort, d.Status, d.BatteryLevel, d.CompanyId, d.DeviceNumber, d.Sector,
                           d.EsferaDeviceId, d.CurrentAdbAddress, d.LastSeenUTC
                    FROM ESF_Device d
-                   INNER JOIN ESF_DeviceAssignment da ON d.AdbDeviceId = da.AdbDeviceId
-                   WHERE da.UserId = ?1 AND (d.CompanyId = ?2 OR ?2 <= 0);";
+                   INNER JOIN ESF_DeviceAssignment da ON (
+                       d.AdbDeviceId = da.AdbDeviceId
+                       OR (d.EsferaDeviceId IS NOT NULL AND d.EsferaDeviceId = da.AdbDeviceId)
+                       OR (d.CurrentAdbAddress IS NOT NULL AND d.CurrentAdbAddress = da.AdbDeviceId)
+                   )
+                   WHERE da.UserId = ?1 AND (d.CompanyId = ?2 OR ?2 <= 0)
+                   GROUP BY COALESCE(d.EsferaDeviceId, d.AdbDeviceId);";
 
         let mut stmt = match conn.prepare_cached(sql) {
             Ok(s) => s,
@@ -2502,6 +2523,42 @@ impl Database {
                 current_adb_address: row.get(13)?,
                 last_seen_utc: row.get(14)?,
                 via_tunnel: false,
+            })
+        });
+
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    pub fn get_all_device_assignments(&self, company_id: i32) -> Vec<DeviceAssignmentInfo> {
+        let conn = self.conn();
+        let sql = "SELECT da.AssignmentId, da.AdbDeviceId, da.UserId, u.Username, u.DisplayName,
+                          d.DeviceName, d.DeviceNumber, d.Model, da.CreatedAt
+                   FROM ESF_DeviceAssignment da
+                   INNER JOIN ESF_User u ON da.UserId = u.UserId
+                   LEFT JOIN ESF_Device d ON (da.AdbDeviceId = d.AdbDeviceId OR da.AdbDeviceId = d.EsferaDeviceId OR da.AdbDeviceId = d.CurrentAdbAddress)
+                   WHERE (u.CompanyId = ?1 OR ?1 <= 0)
+                   GROUP BY da.AssignmentId
+                   ORDER BY da.AssignmentId DESC;";
+
+        let mut stmt = match conn.prepare_cached(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        let rows = stmt.query_map(params![company_id], |row| {
+            Ok(DeviceAssignmentInfo {
+                assignment_id: row.get(0)?,
+                adb_device_id: row.get(1)?,
+                user_id: row.get(2)?,
+                user_name: row.get(3)?,
+                user_display_name: row.get(4)?,
+                device_name: row.get(5)?,
+                device_number: row.get(6)?,
+                model: row.get(7)?,
+                created_at: row.get(8)?,
             })
         });
 
