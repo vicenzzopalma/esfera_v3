@@ -3182,17 +3182,27 @@ pub struct GitUpdateStatus {
 
 #[tauri::command]
 pub fn check_git_auto_update() -> Result<GitUpdateStatus, String> {
-    let _ = std::process::Command::new("git")
-        .arg("fetch")
-        .output();
+    #[cfg(target_os = "windows")]
+    fn silent_cmd(prog: &str) -> std::process::Command {
+        use std::os::windows::process::CommandExt;
+        let mut c = std::process::Command::new(prog);
+        c.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        c
+    }
+    #[cfg(not(target_os = "windows"))]
+    fn silent_cmd(prog: &str) -> std::process::Command {
+        std::process::Command::new(prog)
+    }
 
-    let current = std::process::Command::new("git")
+    let _ = silent_cmd("git").arg("fetch").output();
+
+    let current = silent_cmd("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "main".to_string());
 
-    let log_cmd = std::process::Command::new("git")
+    let log_cmd = silent_cmd("git")
         .args(["log", "-1", "--pretty=format:%h - %s", "origin/main"])
         .output();
 
@@ -3227,7 +3237,19 @@ pub fn scan_orphan_processes() -> Result<Vec<crate::scrcpy_manager::OrphanProces
 
 #[tauri::command]
 pub fn apply_git_auto_update() -> Result<String, String> {
-    let pull_out = std::process::Command::new("git")
+    #[cfg(target_os = "windows")]
+    fn silent_cmd(prog: &str) -> std::process::Command {
+        use std::os::windows::process::CommandExt;
+        let mut c = std::process::Command::new(prog);
+        c.creation_flags(0x08000000);
+        c
+    }
+    #[cfg(not(target_os = "windows"))]
+    fn silent_cmd(prog: &str) -> std::process::Command {
+        std::process::Command::new(prog)
+    }
+
+    let pull_out = silent_cmd("git")
         .args(["pull", "--rebase", "origin", "main"])
         .output()
         .map_err(|e| format!("Falha ao executar git pull: {}", e))?;

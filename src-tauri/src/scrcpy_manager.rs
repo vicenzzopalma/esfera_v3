@@ -221,9 +221,13 @@ impl OrphanOtto {
         {
             let targets = ["scrcpy.exe", "adb.exe"];
             for target in targets {
-                let output = Command::new("tasklist")
-                    .args(["/FO", "CSV", "/NH", "/FI", &format!("IMAGENAME eq {target}")])
-                    .output();
+                let output = {
+                    use std::os::windows::process::CommandExt;
+                    Command::new("tasklist")
+                        .args(["/FO", "CSV", "/NH", "/FI", &format!("IMAGENAME eq {target}")])
+                        .creation_flags(0x08000000)
+                        .output()
+                };
 
                 if let Ok(out) = output {
                     let stdout = String::from_utf8_lossy(&out.stdout);
