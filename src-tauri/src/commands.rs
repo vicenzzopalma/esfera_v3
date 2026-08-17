@@ -488,10 +488,8 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
 
             let existing_idx = db_devices.iter().position(|d| {
                 d.serial == adb_dev.serial
-                    || persistent_id.as_ref().is_some_and(|id| d.esfera_device_id.as_ref() == Some(id))
-                    || (!ip_only.is_empty() && (d.ip == ip_only || d.serial.starts_with(&ip_only) || d.current_adb_address.as_deref().unwrap_or("").starts_with(&ip_only)))
-                    || d.current_adb_address.as_deref() == Some(&adb_dev.serial)
-                    || d.esfera_device_id.as_deref() == Some(&adb_dev.serial)
+                    || (persistent_id.is_some() && d.esfera_device_id.as_deref() == persistent_id.as_deref())
+                    || (persistent_id.is_some() && d.serial == persistent_id.as_deref().unwrap())
             });
 
             // PROTEÇÃO ABSOLUTA DE IDENTIDADE:

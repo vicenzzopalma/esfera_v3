@@ -1260,12 +1260,12 @@ impl Database {
 
         // Se existir identidade permanente na ESF_DeviceIdentity para este Hardware ID, sincroniza
         let (final_name, final_sector, final_num) = if let Some(ref esfera_id) = device.esfera_device_id {
-            if !device.name.is_empty() {
-                // Nome explícito fornecido — salva como nova identidade oficial permanente
+            if let Some((saved_name, saved_sec, saved_num, _)) = self.get_device_identity(esfera_id) {
+                // SOBERANIA DO OPERADOR: Nome existente é 100% IMUTÁVEL e PERPÉTUO
+                (saved_name, saved_sec, saved_num)
+            } else if !device.name.is_empty() && device.name != "Aparelho 1" && !device.name.starts_with("Aparelho ") {
                 let _ = self.save_device_identity(esfera_id, &device.name, &device.sector, device.device_number, &device.model);
                 (device.name.clone(), device.sector.clone(), device.device_number)
-            } else if let Some((saved_name, saved_sec, saved_num, _)) = self.get_device_identity(esfera_id) {
-                (saved_name, saved_sec, saved_num)
             } else {
                 let next_num = self.get_next_device_number();
                 let gen_name = format!("Aparelho {}", next_num);
