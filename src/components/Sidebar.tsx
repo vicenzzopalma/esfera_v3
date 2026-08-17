@@ -186,11 +186,13 @@ export default function Sidebar() {
       {/* Brand Header */}
       <div className="flex items-center justify-between px-4 h-14 border-b border-white/[0.07]">
         <div className="flex items-center gap-2.5">
-          <div className="flex items-center justify-center w-7 h-7 rounded-lg bg-[#5E6AD2] text-white font-black text-xs shadow-md shadow-[#5E6AD2]/20">
-            E
-          </div>
+          <img
+            src="/logo.png"
+            alt="Esfera Logo"
+            className="w-8 h-8 object-contain drop-shadow-[0_0_12px_rgba(94,106,210,0.55)]"
+          />
           <div>
-            <h1 className="text-xs font-bold text-white tracking-tight leading-tight">Esfera</h1>
+            <h1 className="text-sm font-bold text-white tracking-tight leading-tight">Esfera</h1>
           </div>
         </div>
       </div>

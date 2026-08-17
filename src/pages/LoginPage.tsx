@@ -61,10 +61,14 @@ export default function LoginPage() {
         <div className="rounded-xl bg-[#141418] border border-white/[0.08] p-6 sm:p-7 space-y-5 shadow-2xl shadow-black/80">
           {/* Header */}
           <div className="text-center">
-            <div className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-[#5E6AD2] text-white font-black text-base shadow-md shadow-[#5E6AD2]/25 mb-3">
-              E
+            <div className="inline-flex items-center justify-center mb-3">
+              <img
+                src="/logo.png"
+                alt="Esfera Logo"
+                className="w-16 h-16 object-contain drop-shadow-[0_0_20px_rgba(94,106,210,0.65)] hover:scale-105 transition-transform"
+              />
             </div>
-            <h1 className="text-lg font-bold text-zinc-100 tracking-tight">Esfera Hub</h1>
+            <h1 className="text-xl font-bold text-zinc-100 tracking-tight">Esfera Hub</h1>
             <p className="text-xs text-zinc-400 mt-0.5">
               Gestão ADB & Disparos Inteligentes
             </p>

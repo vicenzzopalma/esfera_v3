@@ -9,7 +9,7 @@ import { useAuth } from "../context/AuthContext";
 import Card from "../components/ui/Card";
 import Button from "../components/ui/Button";
 import Toggle from "../components/ui/Toggle";
-import { api } from "../tauri";
+import { api, setAppMode as setTauriAppMode, reloadConfig } from "../tauri";
 import type { AppConfig } from "../types";
 import {
   Save,
@@ -89,17 +89,14 @@ export default function SettingsTab() {
         setHubAddress(cfg.hub_address || "34.29.70.113:8555");
         setHubToken(cfg.hub_token || "");
         setEmpresaServerEnabled(cfg.empresa_server_enabled);
-        setEmpresaServerPort(cfg.empresa_server_port);
+        setEmpresaServerPort(cfg.empresa_server_port || 7777);
         setTunnelServerEnabled(cfg.tunnel_server_enabled ?? false);
         setTunnelServerPort(cfg.tunnel_server_port ?? 8888);
-        // Garante que apenas master possa ter modo 'master'
-        if (cfg.mode === "master" && !isMasterUser) {
-          setAppMode("empresa");
-        } else {
-          setAppMode(cfg.mode);
-        }
+        setAppMode(cfg.mode || "empresa");
       })
-      .catch(() => {});
+      .catch((err) => {
+        console.error("Erro ao carregar app_config:", err);
+      });
     if (selectedCompanyId) {
       api<import("../types").AiConfig | null>("get_ai_config", { company_id: selectedCompanyId })
         .then((cfg) => {
@@ -114,7 +111,7 @@ export default function SettingsTab() {
         .catch(() => {});
     }
     return () => { mounted = false; };
-  }, [isMasterUser, selectedCompanyId]);
+  }, [selectedCompanyId]);
 
   const handleSaveAi = async () => {
     if (!selectedCompanyId) return;
@@ -137,20 +134,26 @@ export default function SettingsTab() {
   };
 
   const handleSaveAll = async () => {
-    if (!selectedCompanyId) return;
     try {
-      await api("save_app_config", {
+      const payload: AppConfig = {
         hub_enabled: hubEnabled,
         hub_address: hubAddress,
         hub_token: hubToken,
         empresa_server_enabled: empresaServerEnabled,
         empresa_server_port: empresaServerPort,
+        checkin_server_enabled: true,
+        checkin_server_port: 8080,
         tunnel_server_enabled: tunnelServerEnabled,
         tunnel_server_port: tunnelServerPort,
         mode: appMode,
-      });
+      };
+      await api("save_app_config", { config: payload, ...payload });
+      setTauriAppMode(appMode);
+      reloadConfig();
       setHubStatus("Configurações salvas com sucesso!");
-    } catch { /* noop */ }
+    } catch (err: any) {
+      setHubStatus("Erro ao salvar configurações: " + (err?.message || String(err)));
+    }
   };
 
   // Atualizar VPS (self-update remoto do hub-standalone) — master only
@@ -289,9 +292,7 @@ export default function SettingsTab() {
                     <select value={appMode} onChange={(e) => setAppMode(e.target.value as "local" | "empresa" | "master")} className="w-full input-setting">
                       <option value="empresa">Modo Empresa (Conecta ao Hub Nuvem VPS)</option>
                       <option value="local">Modo Standalone (Offline / Local apenas)</option>
-                      {isMasterUser && (
-                        <option value="master">Modo Master (Controle Administrativo Remoto)</option>
-                      )}
+                      <option value="master">Modo Master (Controle Administrativo Remoto)</option>
                     </select>
                   </div>
 
@@ -303,7 +304,7 @@ export default function SettingsTab() {
                           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 bg-emerald-950/40 border border-emerald-500/30 rounded-xl">
                             <div className="flex items-center gap-2.5 text-emerald-300 font-mono text-sm font-bold">
                               <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                              34.29.70.113:8888 (VPS Oficial Fixa)
+                              {hubAddress || "34.29.70.113:8555"} (VPS Oficial Fixa)
                             </div>
                             <button
                               type="button"
@@ -320,13 +321,13 @@ export default function SettingsTab() {
                                 type="text"
                                 value={hubAddress}
                                 onChange={(e) => setHubAddress(e.target.value)}
-                                placeholder="34.29.70.113:8888"
+                                placeholder="34.29.70.113:8555"
                                 className="flex-1 input-setting font-mono text-sm"
                               />
                               <button
                                 type="button"
                                 onClick={() => {
-                                  setHubAddress("34.29.70.113:8888");
+                                  setHubAddress("34.29.70.113:8555");
                                   setCustomIpOverride(false);
                                 }}
                                 className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-2.5 rounded-lg border border-slate-700 font-bold"
@@ -345,18 +346,18 @@ export default function SettingsTab() {
                       {(appMode === "master" || appMode === "empresa") && (
                         <div className="space-y-2 pt-4 border-t border-border">
                           <label className="block font-semibold text-secondary mb-2 text-sm">
-                            {appMode === "master" || isMasterUser ? "Token do Hub (Master)" : "Token da Empresa (REALESS)"}
+                            {appMode === "master" ? "Token do Hub (Master)" : "Token da Empresa (REALESS)"}
                           </label>
                           <input
                             type="password"
                             value={hubToken}
                             onChange={(e) => setHubToken(e.target.value)}
-                            placeholder={appMode === "master" || isMasterUser ? "root123" : "Ope@2025"}
+                            placeholder={appMode === "master" ? "root123" : "Ope@2025"}
                             className="w-full input-setting font-mono text-sm"
                           />
                           <p className="text-[11px] text-amber-400 font-medium">
-                            {appMode === "master" || isMasterUser
-                              ? "Alinhe com HUB_MASTER_TOKEN da VPS (root123)."
+                            {appMode === "master"
+                              ? "Alinhe com HUB_MASTER_TOKEN da VPS (padrão: root123)."
                               : "Token da empresa REALESS (Ope@2025). Sem ele, os celulares remotos não aparecem."}
                           </p>
                           <div className="flex items-center gap-3 pt-2">

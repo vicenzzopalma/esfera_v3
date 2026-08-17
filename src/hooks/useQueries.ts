@@ -267,7 +267,7 @@ export function useSaveAiConfig() {
 export function useSaveAppConfig() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (args: AppConfig) => api("save_app_config", args as unknown as Record<string, unknown>),
+    mutationFn: (args: AppConfig) => api("save_app_config", { config: args, ...args }),
     onSuccess: () => qc.invalidateQueries({ queryKey: keys.appConfig }),
   });
 }

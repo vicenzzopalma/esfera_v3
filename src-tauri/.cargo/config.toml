@@ -6,6 +6,6 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.x86_64-pc-windows-gnu]
 rustflags = [
-    "-C", "link-args=-static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic"
+    "-C", "link-args=-static-libgcc -static-libstdc++"
 ]
 
