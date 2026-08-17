@@ -1363,10 +1363,23 @@ pub fn update_device(state: State<'_, AppState>, token: String, mut device: Devi
         device.device_number = num;
     }
 
-    if let Some(ref esfera_id) = device.esfera_device_id {
-        if !esfera_id.trim().is_empty() {
-            let _ = db.save_device_identity(esfera_id, &device.name, &device.sector, device.device_number, &device.model);
-        }
+    let target_serial = if !device.serial.is_empty() {
+        device.serial.clone()
+    } else {
+        device.current_adb_address.clone().unwrap_or_default()
+    };
+
+    let actual_esfera_id = if !target_serial.is_empty() {
+        AdbManager::get_persistent_device_id(&target_serial)
+            .or_else(|| device.esfera_device_id.clone())
+            .unwrap_or_else(|| target_serial.clone())
+    } else {
+        device.esfera_device_id.clone().unwrap_or_default()
+    };
+
+    if !actual_esfera_id.is_empty() {
+        device.esfera_device_id = Some(actual_esfera_id.clone());
+        let _ = db.save_device_identity(&actual_esfera_id, &device.name, &device.sector, device.device_number, &device.model);
     }
 
     let _ = db.update_device_config(&device);

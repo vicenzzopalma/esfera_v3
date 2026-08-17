@@ -185,7 +185,7 @@ export function DeviceConfigModal({
     setInstallingApk(true);
     setSystemMsg("Instalando versão mais recente do Esfera_Agent_ADB.apk...");
     try {
-      const msg = await api<string>("remote_update_agent", { serial });
+      const msg = await api<string>("install_agent_apk", { serial });
       setSystemMsg(`✅ ${msg}`);
     } catch (e: any) {
       setSystemMsg(`❌ Erro: ${typeof e === "string" ? e : e?.message || "Falha na instalação do APK"}`);

@@ -33,9 +33,12 @@ fn tools_dir_candidates() -> Vec<PathBuf> {
     if let Some(dir) = exe_dir() {
         candidates.push(dir.join("resources").join("binaries"));
         candidates.push(dir.join("binaries"));
+        candidates.push(dir);
     }
     if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("distributable").join("binaries"));
         candidates.push(cwd.join("src-tauri").join("binaries"));
+        candidates.push(cwd.join("binaries"));
     }
     candidates
 }
@@ -1374,8 +1377,7 @@ impl AdbManager {
             bitrate,
             "--video-codec",
             "h264",
-            "--video-buffer",
-            "50",
+            "--display-buffer=50",
             "--no-audio",
             "--stay-awake",
             "--window-title",
@@ -2293,7 +2295,7 @@ impl AdbManager {
         if is_native {
             if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "cat /sdcard/.esfera_device_id") {
                 let val = stdout.trim().to_string();
-                if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
+                if !val.is_empty() && val.starts_with("ESF-") && !val.starts_with("ESF-192.") {
                     return Some(val);
                 }
             }
@@ -2302,7 +2304,7 @@ impl AdbManager {
             cmd.args(["-s", serial, "shell", "cat", "/sdcard/.esfera_device_id"]);
             if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
                 let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
+                if !val.is_empty() && val.starts_with("ESF-") && !val.starts_with("ESF-192.") {
                     return Some(val);
                 }
             }
@@ -2312,7 +2314,7 @@ impl AdbManager {
         if is_native {
             if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "getprop persist.esfera.device_id") {
                 let val = stdout.trim().to_string();
-                if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
+                if !val.is_empty() && val.starts_with("ESF-") && !val.starts_with("ESF-192.") {
                     return Some(val);
                 }
             }
@@ -2321,7 +2323,7 @@ impl AdbManager {
             cmd2.args(["-s", serial, "shell", "getprop", "persist.esfera.device_id"]);
             if let Ok(out) = run_cmd_timeout(cmd2, Duration::from_secs(2)) {
                 let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !val.is_empty() && (val.starts_with("ESF-") || val.starts_with("ESFERA_")) {
+                if !val.is_empty() && val.starts_with("ESF-") && !val.starts_with("ESF-192.") {
                     return Some(val);
                 }
             }
