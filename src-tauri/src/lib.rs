@@ -253,6 +253,8 @@ pub fn run() {
             provision_device,
             provision_all_devices,
             debloat_device,
+            debloat_device_profile,
+            apply_hardware_profile,
             debloat_all_devices,
             get_device_by_esfera_id,
             // AI Config
@@ -281,6 +283,7 @@ pub fn run() {
             set_device_responsible_collaborator,
             remove_device_responsible_collaborator,
             get_assigned_devices_for_user,
+            get_all_device_assignments,
             request_device_access,
             get_device_permission_requests,
             generate_company_token,
