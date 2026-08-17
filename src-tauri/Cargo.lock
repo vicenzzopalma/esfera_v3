@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "esfera_v3"
-version = "0.1.0"
+version = "3.19.0"
 dependencies = [
  "axum",
  "base64 0.22.1",

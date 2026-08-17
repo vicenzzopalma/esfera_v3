@@ -20,7 +20,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Activity,
-  Eye,
+  Monitor,
 } from "lucide-react";
 import Button from "./ui/Button";
 import Card from "./ui/Card";
@@ -34,9 +34,36 @@ export default function CollaboratorView() {
   const [requestingSerial, setRequestingSerial] = useState<string | null>(null);
   const [reasonInput, setReasonInput] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [launchingScrcpy, setLaunchingScrcpy] = useState<Record<string, boolean>>({});
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   const companyId = selectedCompanyId || user?.companyId || 1;
+
+  const handleLaunchScrcpy = async (dev: Device, turnScreenOff: boolean = false) => {
+    const devKey = dev.serial;
+    const targetSerial = dev.currentAdbAddress || dev.serial || dev.esferaDeviceId || "";
+    setLaunchingScrcpy((prev) => ({ ...prev, [devKey]: true }));
+    setMessage(null);
+    try {
+      const res = await api<string>("launch_scrcpy_stream", {
+        serial: targetSerial,
+        turnScreenOff,
+      });
+      setMessage({
+        type: "success",
+        text: `Scrcpy aberto com sucesso para ${dev.name || dev.model || dev.serial}! (${res})`,
+      });
+    } catch (err: any) {
+      console.error("Erro ao iniciar Scrcpy para o colaborador:", err);
+      const errMsg = typeof err === "string" ? err : err?.message || JSON.stringify(err);
+      setMessage({
+        type: "error",
+        text: `Falha ao abrir Scrcpy: ${errMsg}`,
+      });
+    } finally {
+      setLaunchingScrcpy((prev) => ({ ...prev, [devKey]: false }));
+    }
+  };
 
   const loadData = useCallback(async () => {
     if (!user) return;
@@ -95,9 +122,14 @@ export default function CollaboratorView() {
     }
   };
 
-  const getDeviceRequestStatus = (serial: string) => {
+  const getDeviceRequestStatus = (dev: Device) => {
     const userReqs = permissionRequests.filter(
-      (r) => r.adbDeviceId === serial && r.userId === user?.id
+      (r) =>
+        r.userId === user?.id &&
+        (r.adbDeviceId === dev.serial ||
+          r.adbDeviceId === dev.esferaDeviceId ||
+          r.adbDeviceId === dev.currentAdbAddress ||
+          (dev.currentAdbAddress && r.adbDeviceId.includes(dev.currentAdbAddress.split(":")[0])))
     );
     if (userReqs.length === 0) return null;
     return userReqs[0];
@@ -168,7 +200,7 @@ export default function CollaboratorView() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {assignedDevices.map((dev) => {
-            const req = getDeviceRequestStatus(dev.serial);
+            const req = getDeviceRequestStatus(dev);
             const isApproved = req && req.status === "approved";
             const isPending = req && req.status === "pending";
             const isRejected = req && req.status === "rejected";
@@ -259,22 +291,38 @@ export default function CollaboratorView() {
                           </p>
                         </div>
 
-                        {/* Botão Único Permitido: Visualizar Tela */}
-                        <Button
-                          variant="primary"
-                          onClick={async () => {
-                            try {
-                              await api("launch_scrcpy_stream", { serial: dev.serial, turnScreenOff: false });
-                              setMessage({ type: "success", text: `Visualização de tela iniciada para ${dev.name || dev.serial}.` });
-                            } catch (e: any) {
-                              setMessage({ type: "error", text: `Erro ao abrir tela: ${e.toString()}` });
-                            }
-                          }}
-                          className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 font-bold py-2.5 shadow-lg shadow-blue-950/40"
-                        >
-                          <Eye size={18} />
-                          Visualizar Tela do Celular
-                        </Button>
+                        {/* Botões do Scrcpy para o Colaborador */}
+                        <div className="space-y-1.5">
+                          <Button
+                            variant="primary"
+                            disabled={launchingScrcpy[dev.serial]}
+                            onClick={() => handleLaunchScrcpy(dev, false)}
+                            className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 font-bold py-2.5 shadow-lg shadow-blue-950/40"
+                          >
+                            {launchingScrcpy[dev.serial] ? (
+                              <>
+                                <RefreshCw size={16} className="animate-spin" />
+                                <span>Iniciando Scrcpy...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Monitor size={18} />
+                                <span>Abrir Scrcpy (Espelhar Tela)</span>
+                              </>
+                            )}
+                          </Button>
+
+                          <Button
+                            variant="secondary"
+                            disabled={launchingScrcpy[dev.serial]}
+                            onClick={() => handleLaunchScrcpy(dev, true)}
+                            className="w-full flex items-center justify-center gap-2 text-xs py-1.5 bg-slate-900/80 hover:bg-slate-800 text-slate-300 border border-slate-700"
+                            title="Abre o Scrcpy no computador mantendo a tela física do celular desligada"
+                          >
+                            <Smartphone size={14} />
+                            <span>Abrir com Tela do Celular Apagada</span>
+                          </Button>
+                        </div>
 
                         <Button
                           variant="danger"

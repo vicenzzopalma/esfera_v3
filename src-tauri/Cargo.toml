@@ -1,6 +1,6 @@
 [package]
 name = "esfera_v3"
-version = "0.1.0"
+version = "3.19.0"
 description = "Esfera v3 — Plataforma de Disparos e Automação ADB"
 authors = ["vicenzzopalma"]
 edition = "2021"

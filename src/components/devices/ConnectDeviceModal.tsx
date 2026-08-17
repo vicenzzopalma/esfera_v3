@@ -182,6 +182,8 @@ export function ConnectDeviceModal({
               <option value="senior">Senior</option>
               <option value="pa_fixa">PA Fixa</option>
               <option value="pesquisa">Pesquisa</option>
+              <option value="juridico">Juridico</option>
+              <option value="comercial">Comercial</option>
             </select>
           </div>
 

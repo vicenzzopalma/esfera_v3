@@ -3133,8 +3133,8 @@ pub fn approve_device_access(
     request_id: i32,
 ) -> Result<(), String> {
     let session = validate_session(&state.sessions, &token)?;
-    if session.role != "master" && session.role != "gestor" {
-        return Err("Acesso Negado: apenas Gestores podem aprovar solicitações.".to_string());
+    if session.role != "master" && session.role != "gestor" && session.role != "supervisor" {
+        return Err("Acesso Negado: apenas Gestores e Supervisores podem aprovar solicitações.".to_string());
     }
     state.db.approve_permission_request(request_id, session.user_id)
 }
@@ -3146,8 +3146,8 @@ pub fn reject_device_access(
     request_id: i32,
 ) -> Result<(), String> {
     let session = validate_session(&state.sessions, &token)?;
-    if session.role != "master" && session.role != "gestor" {
-        return Err("Acesso Negado: apenas Gestores podem rejeitar solicitações.".to_string());
+    if session.role != "master" && session.role != "gestor" && session.role != "supervisor" {
+        return Err("Acesso Negado: apenas Gestores e Supervisores podem rejeitar solicitações.".to_string());
     }
     state.db.reject_permission_request(request_id)
 }

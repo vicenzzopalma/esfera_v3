@@ -13,7 +13,7 @@ import SupervisorView from "../components/SupervisorView";
 import Card from "../components/ui/Card";
 import Badge from "../components/ui/Badge";
 import Button from "../components/ui/Button";
-import type { Device, DeviceStatus, DeviceWithActiveUser } from "../types";
+import type { Device, DeviceStatus, DeviceWithActiveUser, DevicePermissionRequest } from "../types";
 import { api } from "../tauri";
 
 // Sub-componentes modularizados
@@ -31,6 +31,7 @@ import {
   Plus,
   RefreshCw,
   Eye,
+  Bell,
 } from "lucide-react";
 
 export default function DevicesTab() {
@@ -42,12 +43,13 @@ export default function DevicesTab() {
 
   // Filter & View State
   const [searchQuery, setSearchQuery] = useState("");
-  const [sectorTab, setSectorTab] = useState<string>("all");
+  const [sectorTab, setSectorTab] = useState<string>("junior");
   const [viewMode, setViewMode] = useState<"grid" | "table">("grid");
 
   // Device Data & Selection
   const [devicesList, setDevicesList] = useState<Device[]>([]);
   const [selectedSerials, setSelectedSerials] = useState<string[]>([]);
+  const [permissionRequests, setPermissionRequests] = useState<DevicePermissionRequest[]>([]);
   const [activeUserMap, setActiveUserMap] = useState<
     Record<string, { activeUserId?: number; activeUserDisplayName?: string }>
   >({});
@@ -101,7 +103,31 @@ export default function DevicesTab() {
         }
       })
       .catch(() => {});
+
+    api<DevicePermissionRequest[]>("get_device_permission_requests", { companyId: effectiveCompanyId })
+      .then((data) => {
+        if (data && Array.isArray(data)) setPermissionRequests(data);
+      })
+      .catch(() => {});
   }, [effectiveCompanyId]);
+
+  const handleApproveRequest = async (requestId: number) => {
+    try {
+      await api("approve_device_access", { requestId });
+      refreshDevices();
+    } catch (err: any) {
+      alert(typeof err === "string" ? err : err?.message || "Erro ao aprovar solicitação.");
+    }
+  };
+
+  const handleRejectRequest = async (requestId: number) => {
+    try {
+      await api("reject_device_access", { requestId });
+      refreshDevices();
+    } catch (err: any) {
+      alert(typeof err === "string" ? err : err?.message || "Erro ao rejeitar solicitação.");
+    }
+  };
 
   useEffect(() => {
     refreshDevices();
@@ -408,13 +434,21 @@ export default function DevicesTab() {
           const q = searchQuery.toLowerCase().trim();
           const name = String(device.name || "");
           const esfId = String(device.esferaDeviceId || "");
+          const curAdb = String(device.currentAdbAddress || "");
+          const devNum = String(device.deviceNumber ?? "");
+          const devNumPad = devNum.padStart(2, "0");
           return (
             name.toLowerCase().includes(q) ||
             esfId.toLowerCase().includes(q) ||
             model.toLowerCase().includes(q) ||
             brand.toLowerCase().includes(q) ||
             serial.toLowerCase().includes(q) ||
-            ip.toLowerCase().includes(q)
+            ip.toLowerCase().includes(q) ||
+            curAdb.toLowerCase().includes(q) ||
+            devNum === q ||
+            devNumPad === q ||
+            `#${devNum}`.includes(q) ||
+            `#${devNumPad}`.includes(q)
           );
         }
 
@@ -427,8 +461,73 @@ export default function DevicesTab() {
       });
   }, [devicesList, sectorTab, searchQuery]);
 
+  const pendingRequests = useMemo(() => {
+    return (permissionRequests || []).filter((r) => r.status === "pending");
+  }, [permissionRequests]);
+
   return (
     <div className="space-y-4 animate-fade-in font-sans text-zinc-100 pb-8">
+      {/* Banner de Solicitações Pendentes para o Gestor */}
+      {pendingRequests.length > 0 && (
+        <div className="p-3.5 rounded-xl bg-gradient-to-r from-amber-950/60 via-amber-900/30 to-slate-900 border border-amber-500/40 shadow-xl space-y-2.5 animate-scale-in">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="flex h-2 w-2 relative">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
+              </span>
+              <h3 className="text-xs font-bold text-amber-300 flex items-center gap-1.5 uppercase tracking-wider">
+                <Bell size={14} /> {pendingRequests.length} Solicitação(ões) de Acesso Pendente(s)
+              </h3>
+            </div>
+            <span className="text-[10px] text-amber-400/80 font-mono">
+              Aprovação imediata de celular
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+            {pendingRequests.map((req) => (
+              <div
+                key={req.requestId}
+                className="p-2.5 rounded-lg bg-black/40 border border-amber-500/30 flex items-center justify-between gap-2.5 text-xs"
+              >
+                <div className="min-w-0">
+                  <p className="font-bold text-white truncate">
+                    {req.userDisplayName || req.userName}
+                  </p>
+                  <p className="text-[11px] text-amber-300/90 truncate font-mono">
+                    Aparelho: {req.adbDeviceId}
+                  </p>
+                  {req.requestedReason && (
+                    <p className="text-[10px] text-zinc-400 italic truncate">
+                      "{req.requestedReason}"
+                    </p>
+                  )}
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    onClick={() => handleApproveRequest(req.requestId)}
+                    className="bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] px-2.5 py-1 font-bold"
+                  >
+                    Aprovar
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    onClick={() => handleRejectRequest(req.requestId)}
+                    className="text-[10px] px-2 py-1 font-bold"
+                  >
+                    Recusar
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Reusable Clean Toolbar */}
       <DeviceToolbar
         searchQuery={searchQuery}
@@ -450,39 +549,53 @@ export default function DevicesTab() {
       {viewMode === "grid" ? (
         filteredDevices.length > 0 ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3.5">
-            {filteredDevices.map((device) => (
-              <DeviceCard
-                key={device.serial}
-                device={device}
-                activeUserDisplayName={activeUserMap[device.serial]?.activeUserDisplayName}
-                isSelected={selectedSerials.includes(device.serial)}
-                onToggleSelect={() => toggleSelectDevice(device.serial)}
-                onOpenMirror={() => {
-                  setSelectedDeviceForMirror(device);
-                  setMirrorModalOpen(true);
-                }}
-                onOpenConfig={() => {
-                  setSelectedDeviceForConfig(device);
-                  setConfigModalOpen(true);
-                }}
-                onOpenRegion={() => {
-                  setSelectedSerialForRegion(device.serial);
-                  setRegionModalOpen(true);
-                }}
-                onForceWireless={() => {
-                  handleForceWirelessAdb(
-                    device.serial,
-                    device.deviceNumber,
-                    device.sector,
-                    device.name || device.model || device.serial
-                  );
-                }}
-                onOpenDiagnostic={() => {
-                  setSelectedDeviceForDiagnostic(device);
-                  setIdentityModalOpen(true);
-                }}
-              />
-            ))}
+            {filteredDevices.map((device) => {
+              const devPendingReq = pendingRequests.find(
+                (r) =>
+                  r.status === "pending" &&
+                  (r.adbDeviceId === device.serial ||
+                    r.adbDeviceId === device.currentAdbAddress ||
+                    r.adbDeviceId === device.esferaDeviceId ||
+                    (device.currentAdbAddress && r.adbDeviceId.includes(device.currentAdbAddress.split(":")[0])))
+              );
+
+              return (
+                <DeviceCard
+                  key={device.serial}
+                  device={device}
+                  activeUserDisplayName={activeUserMap[device.serial]?.activeUserDisplayName}
+                  pendingRequest={devPendingReq}
+                  onApproveRequest={handleApproveRequest}
+                  onRejectRequest={handleRejectRequest}
+                  isSelected={selectedSerials.includes(device.serial)}
+                  onToggleSelect={() => toggleSelectDevice(device.serial)}
+                  onOpenMirror={() => {
+                    setSelectedDeviceForMirror(device);
+                    setMirrorModalOpen(true);
+                  }}
+                  onOpenConfig={() => {
+                    setSelectedDeviceForConfig(device);
+                    setConfigModalOpen(true);
+                  }}
+                  onOpenRegion={() => {
+                    setSelectedSerialForRegion(device.serial);
+                    setRegionModalOpen(true);
+                  }}
+                  onForceWireless={() => {
+                    handleForceWirelessAdb(
+                      device.serial,
+                      device.deviceNumber,
+                      device.sector,
+                      device.name || device.model || device.serial
+                    );
+                  }}
+                  onOpenDiagnostic={() => {
+                    setSelectedDeviceForDiagnostic(device);
+                    setIdentityModalOpen(true);
+                  }}
+                />
+              );
+            })}
           </div>
         ) : (
           /* Empty State */

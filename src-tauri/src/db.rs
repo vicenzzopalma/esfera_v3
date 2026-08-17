@@ -2596,7 +2596,7 @@ impl Database {
                    FROM ESF_DevicePermissionRequest pr
                    JOIN ESF_User u ON pr.UserId = u.UserId
                    LEFT JOIN ESF_User ab ON pr.ApprovedBy = ab.UserId
-                   WHERE (u.CompanyId = ?1 OR ?1 <= 0)
+                   WHERE (u.CompanyId = ?1 OR ?1 <= 0 OR u.CompanyId IS NULL)
                    ORDER BY pr.RequestId DESC LIMIT 100;";
 
         let mut stmt = match conn.prepare_cached(sql) {
