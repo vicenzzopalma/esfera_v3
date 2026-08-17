@@ -197,9 +197,15 @@ impl Dispatcher {
     pub fn start_persistent_adb_keepalive_loop(db_arc: Arc<Database>) {
         tauri::async_runtime::spawn(async move {
             loop {
-                sleep(Duration::from_secs(60)).await;
+                sleep(Duration::from_secs(45)).await;
 
                 let db = db_arc.clone();
+                // 1. Varredura assíncrona da subnet local para rastrear mudanças de IP (DHCP)
+                let db_discover = db.clone();
+                spawn_blocking(move || {
+                    AdbManager::auto_discover_lan_devices(&db_discover);
+                });
+
                 let saved_devices = match spawn_blocking(move || db.get_all_devices()).await {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -235,13 +241,19 @@ impl Dispatcher {
                     if attempted {
                         let full_serial = format!("{}:{}", ip_target, if dev.port > 0 { dev.port } else { 5555 });
                         let key2 = key.clone();
-                        let deploy = spawn_blocking(move || AdbManager::deploy_keepalive(&full_serial)).await;
+                        let deploy = spawn_blocking(move || {
+                            let _ = AdbManager::start_agent_service(&full_serial);
+                            AdbManager::deploy_keepalive(&full_serial)
+                        }).await;
                         let ok = deploy.map(|r| r.is_ok()).unwrap_or(false);
                         KEEPALIVE_LAST_ATTEMPT.lock().unwrap().insert(key2, (now_ms, ok));
                     } else if !dev.serial.is_empty() && !dev.serial.contains(':') {
                         let s = dev.serial.clone();
                         let key2 = key.clone();
-                        let deploy = spawn_blocking(move || AdbManager::deploy_keepalive(&s)).await;
+                        let deploy = spawn_blocking(move || {
+                            let _ = AdbManager::start_agent_service(&s);
+                            AdbManager::deploy_keepalive(&s)
+                        }).await;
                         let ok = deploy.map(|r| r.is_ok()).unwrap_or(false);
                         KEEPALIVE_LAST_ATTEMPT.lock().unwrap().insert(key2, (now_ms, ok));
                     }

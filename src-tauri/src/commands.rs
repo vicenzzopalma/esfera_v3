@@ -462,19 +462,13 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 "".to_string()
             };
 
-            // AUTO-PROVISIONAMENTO DE IDENTIDADE E INSTALAÇÃO DO APK DO AGENTE
+            // AUTO-PROVISIONAMENTO, AUTO-CURA E IMUNIDADE TOTAL NATIVA
             if adb_dev.state == "device" {
                 let esfera_cfg_server = "http://34.29.70.113:31000".to_string();
                 let s_target = adb_dev.serial.clone();
                 let comp_id = target_company_id;
                 std::thread::spawn(move || {
-                    ensure_identity_provisioned(&s_target, comp_id, &esfera_cfg_server);
-                    let pkg_check = crate::adb_manager::create_cmd("adb").args(["-s", &s_target, "shell", "pm", "list", "packages", "com.esfera.agent"]).output();
-                    let is_installed = pkg_check.map(|o| String::from_utf8_lossy(&o.stdout).contains("com.esfera.agent")).unwrap_or(false);
-                    if !is_installed {
-                        let _ = AdbManager::install_agent_apk(&s_target);
-                    }
-                    let _ = AdbManager::start_agent_service(&s_target);
+                    let _ = AdbManager::auto_heal_and_immunize_device(&s_target, comp_id, &esfera_cfg_server);
                 });
             }
 

@@ -2543,6 +2543,91 @@ impl AdbManager {
         }
     }
 
+    /// Executa o pipeline completo de Auto-Cura, Provisionamento e Imunidade Total (Zero-Touch)
+    pub fn auto_heal_and_immunize_device(serial: &str, company_id: i32, server_url: &str) -> Result<(), String> {
+        // 1. Grava a identidade no /sdcard/esfera_config.json
+        let _ = Self::write_identity_config(serial, company_id, server_url);
+
+        // 2. Semeia as chaves ADB do Windows para autorização perpétua
+        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+            let key_path = std::path::Path::new(&home).join(".android").join("adbkey.pub");
+            if let Ok(key) = std::fs::read_to_string(&key_path) {
+                let key_trim = key.trim();
+                if !key_trim.is_empty() {
+                    let seed = format!(
+                        "mkdir -p /data/misc/adb 2>/dev/null; (cat /data/misc/adb/adb_keys 2>/dev/null | grep -qF \"{}\" || echo \"{}\" >> /data/misc/adb/adb_keys); chmod 640 /data/misc/adb/adb_keys; restorecon /data/misc/adb/adb_keys 2>/dev/null",
+                        key_trim, key_trim
+                    );
+                    let mut sk = create_cmd("adb");
+                    sk.args(["-s", serial, "shell", &seed]);
+                    let _ = run_cmd_timeout(sk, Duration::from_secs(4));
+                }
+            }
+        }
+
+        // 3. Verifica se o APK do agente está instalado; caso ausente, instala imediatamente
+        let pkg_check = create_cmd("adb")
+            .args(["-s", serial, "shell", "pm", "list", "packages", "com.esfera.agent"])
+            .output();
+        let is_installed = pkg_check.map(|o| String::from_utf8_lossy(&o.stdout).contains("com.esfera.agent")).unwrap_or(false);
+        if !is_installed {
+            let _ = Self::install_agent_apk(serial);
+        }
+
+        // 4. Aplica a imunidade de bateria, prevencao de sono e wake lock
+        let pid = Self::get_persistent_device_id(serial);
+        let _ = Self::inject_device_immunity(serial, pid.as_deref());
+
+        // 5. Inicia o serviço em primeiro plano
+        let _ = Self::start_agent_service(serial);
+
+        Ok(())
+    }
+
+    /// Varredura assíncrona ultra-rápida (HPC) na subnet local para auto-adoção de celulares que mudarem de IP via DHCP
+    pub fn auto_discover_lan_devices(db: &crate::db::Database) {
+        use std::net::{TcpStream, SocketAddr, IpAddr, Ipv4Addr};
+
+        let base_subnets = vec![
+            (192, 168, 1),
+            (192, 168, 0),
+            (192, 168, 15),
+            (10, 0, 0),
+        ];
+
+        for (o1, o2, o3) in base_subnets {
+            let mut handles = Vec::new();
+            for last in 2..254 {
+                handles.push(std::thread::spawn(move || {
+                    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(o1, o2, o3, last)), 5555);
+                    if TcpStream::connect_timeout(&addr, Duration::from_millis(120)).is_ok() {
+                        Some(format!("{}.{}.{}.{}", o1, o2, o3, last))
+                    } else {
+                        None
+                    }
+                }));
+            }
+
+            let mut found_ips = Vec::new();
+            for h in handles {
+                if let Ok(Some(ip)) = h.join() {
+                    found_ips.push(ip);
+                }
+            }
+
+            if !found_ips.is_empty() {
+                for ip in found_ips {
+                    let full_addr = format!("{}:5555", ip);
+                    let _ = Self::connect_device(&ip, 5555);
+                    if let Some(pid) = Self::get_persistent_device_id(&full_addr) {
+                        let _ = db.process_checkin(&pid, &full_addr, &ip, 5555, &chrono::Utc::now().to_rfc3339());
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     /// Extrai só o host de uma URL (o device-agent Rust espera host puro em
     /// `persist.esfera.hub`, não uma URL completa).
     fn host_of(server_url: &str) -> String {
