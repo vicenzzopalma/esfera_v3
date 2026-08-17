@@ -1354,10 +1354,14 @@ pub fn delete_device(state: State<'_, AppState>, token: String, serial: String) 
 }
 
 #[tauri::command]
-pub fn update_device(state: State<'_, AppState>, token: String, device: Device) -> Result<(), String> {
+pub fn update_device(state: State<'_, AppState>, token: String, mut device: Device) -> Result<(), String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, device.company_id)?;
     let db = &state.db;
+
+    if let Ok(num) = device.name.trim().parse::<i32>() {
+        device.device_number = num;
+    }
 
     if let Some(ref esfera_id) = device.esfera_device_id {
         if !esfera_id.trim().is_empty() {
