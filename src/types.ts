@@ -324,7 +324,7 @@ export const CONNECTION_BADGE_CONFIG: Record<
 
 export function getConnectionOrigin(device: Device): ConnectionOrigin {
   if (device.viaTunnel) return "vps";
-  if (device.serial.includes(":")) return "wifi";
+  if (device.serial.includes(":") || (device.currentAdbAddress && device.currentAdbAddress.includes(":"))) return "wifi";
   return "usb";
 }
 
