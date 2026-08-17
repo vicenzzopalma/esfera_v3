@@ -558,7 +558,23 @@ pub fn create_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
     }
     if name == "adb" || name == "scrcpy" {
         if let Some(dir) = bundled_tools_dir() {
-            cmd.current_dir(dir);
+            cmd.current_dir(&dir);
+            let adb_path = dir.join("adb.exe");
+            if adb_path.exists() {
+                cmd.env("ADB", &adb_path);
+            }
+            let server_path = dir.join("scrcpy-server");
+            let server_jar = dir.join("scrcpy-server.jar");
+            if server_path.exists() {
+                cmd.env("SCRCPY_SERVER_PATH", &server_path);
+            } else if server_jar.exists() {
+                cmd.env("SCRCPY_SERVER_PATH", &server_jar);
+            }
+            if let Ok(current_path) = std::env::var("PATH") {
+                cmd.env("PATH", format!("{};{}", dir.display(), current_path));
+            } else {
+                cmd.env("PATH", dir.display().to_string());
+            }
         }
     }
     cmd

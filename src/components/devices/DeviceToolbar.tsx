@@ -72,13 +72,15 @@ export function DeviceToolbar({
       {/* Top Main Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-3 bg-[#141418] border border-white/[0.07] p-3 rounded-xl">
         {/* Left: Sector Pills */}
-        <div className="flex items-center gap-1 overflow-x-auto custom-scrollbar">
+        <div className="flex items-center gap-1.5 overflow-x-auto custom-scrollbar py-0.5">
           {[
-            { id: "all", label: "Todos" },
             { id: "junior", label: "Junior" },
             { id: "senior", label: "Senior" },
-            { id: "pa_fixa", label: "PA Fixa" },
+            { id: "pa_fixa", label: "PA FIXA" },
             { id: "pesquisa", label: "Pesquisa" },
+            { id: "juridico", label: "Juridico" },
+            { id: "comercial", label: "Comercial" },
+            { id: "all", label: "Todos" },
           ].map((tab) => {
             const count =
               tab.id === "all"
@@ -96,16 +98,18 @@ export function DeviceToolbar({
               <button
                 key={tab.id}
                 onClick={() => onSectorChange(tab.id)}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all cursor-pointer flex items-center gap-1.5 ${
+                className={`px-4 py-1.5 rounded-full text-xs font-semibold transition-all duration-150 cursor-pointer flex items-center gap-1.5 shrink-0 ${
                   isActive
-                    ? "bg-[#5E6AD2]/15 text-[#828DF7] border border-[#5E6AD2]/30"
-                    : "bg-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]"
+                    ? "bg-[#5057D9] text-white shadow-md shadow-[#5057D9]/30 border border-[#636bf6]"
+                    : "bg-white/[0.04] text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.08] border border-white/[0.06]"
                 }`}
               >
                 <span>{tab.label}</span>
-                <span className={`px-1.5 py-0.2 rounded text-[10px] font-mono ${isActive ? "bg-[#5E6AD2]/20 text-[#828DF7]" : "bg-white/[0.06] text-zinc-500"}`}>
-                  {count}
-                </span>
+                {tab.id === "all" && (
+                  <span className={`px-1.5 py-0.2 rounded-full text-[10px] font-mono ${isActive ? "bg-white/20 text-white" : "bg-white/[0.08] text-zinc-400"}`}>
+                    {count}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -114,14 +118,14 @@ export function DeviceToolbar({
         {/* Right: Search, Conectar, Dropdown Menu */}
         <div className="flex items-center gap-2">
           {/* Search bar */}
-          <div className="relative min-w-[200px] sm:min-w-[260px] flex items-center">
-            <Search size={14} className="input-icon-left text-zinc-500" />
+          <div className="relative min-w-[220px] sm:min-w-[280px] flex items-center">
+            <Search size={14} className="input-icon-left text-cyan-400/80" />
             <input
               type="text"
-              placeholder="Buscar por modelo, serial ou IP..."
+              placeholder="Pesquisar por nome ou final do número..."
               value={searchQuery}
               onChange={(e) => onSearchChange(e.target.value)}
-              className="w-full h-8 bg-[#09090b] border border-white/[0.08] text-zinc-100 rounded-md input-with-icon-left pr-3 text-xs placeholder:text-zinc-600 focus:outline-none focus:border-[#5E6AD2]"
+              className="w-full h-8 bg-[#09090b] border border-white/[0.1] text-zinc-100 rounded-full input-with-icon-left pr-3 text-xs placeholder:text-zinc-500 focus:outline-none focus:border-[#5057D9] focus:ring-1 focus:ring-[#5057D9]/40 transition-all"
             />
           </div>
 

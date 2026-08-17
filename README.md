@@ -184,9 +184,40 @@ O botão de **3 pontinhos (`⋮`)** no card abre diretamente a central de config
 - **Runtime CPU Dispatching**: Detecção dinâmica de instruções via `__cpuid` no boot (0ms overhead), selecionando automaticamente ponteiros de função `AVX2`/`AVX-512` ou genéricos.
 - **Zero-Copy FFI**: Processamento de buffers de entrada de logs e frames de vídeo via FFI sem overhead de alocação de memória.
 
-### 5. 🎨 Design UIX & Correção Global de Inputs
+### 5. 🧠 Motor de Engenharia de Interação Humano-Computador (HCI) & Anti-Ban
+- **Trajetórias com Curvas de Bézier Cúbicas de 4 Pontos ($P_0, P_1, P_2, P_3$)**:
+  - Elimina deslocamentos lineares e previsíveis, calculando trajetórias balísticas humanas com perturbação estocástica perpendicular $\vec{n}(t)$ (simulando micro-tremores fisiológicos de 8 a 12 Hz).
+  - **Perfil de Velocidade Gaussiana**: Aceleração suave no arranque, velocidade de cruzeiro e desaceleração progressiva antes do toque (*touch down*).
+  - **Dwell Time Estocástico**: Tempo de contato físico do toque variável entre 60 ms e 140 ms.
+- **Modelo Psicomotor de Digitação**:
+  - Injeção de texto com amostragem via **Distribuição Normal Truncada** ($\mu = 110\text{ ms}, \sigma = 35\text{ ms}$, limites $[45\text{ ms}, 250\text{ ms}]$).
+  - **Penalidades Contextuais de Teclado**: Acréscimo dinâmico de $+80\text{ ms a } 180\text{ ms}$ para transição minúscula $\to$ maiúscula (*Shift*), números, símbolos e pausas reflexivas inter-palavras com distribuição log-normal.
+
+### 6. 🛡️ Gestão de Espelhamento Scrcpy & Controle de Concorrência
+- **Modo Somente Leitura (`--no-control` / `-n`)**:
+  - Durante o disparo ativo de campanhas ou em telas de colaboradores, o Scrcpy é acionado com a flag de visualização estrita (Read-Only), impedindo cliques ou toques acidentais do operador que poderiam quebrar o fluxo do motor de automação.
+- **Modo Controle Total**: Habilitado sob demanda exclusivamente para gestores/supervisores em manutenções manuais com aparelho ocioso.
+- **Trava Atômica de Concorrência**: Mutexes por dispositivo no backend Rust para prevenir conflitos de comandos paralelos.
+
+### 7. 🌐 Isolamento de IA, Proxies 4G/5G e Escopo por Campanha
+- **Configurações de IA Desacopladas no SQLite**: Chaves de API, endpoints, prompts e temperatura encapsulados no escopo de cada campanha (`ESF_Campaign`), eliminando vazamentos de contexto.
+- **Rotação de IP Móvel**: Integração com modems e proxies dedicados 4G/5G com rotação forçada via reset de modem.
+
+### 8. 🎨 Design UIX & Correção Global de Inputs
 - Interface moderna estilo Linear SaaS em Dark Mode.
 - Resolução da especificidade de CSS com classes utilitárias isoladas (`.input-with-icon-left`, `.input-icon-left`), impedindo a sobreposição de ícones sobre campos de texto em todas as páginas do sistema.
+
+---
+
+## 💰 Estudo de Precificação e Viabilidade Comercial (B2B SaaS / Enterprise)
+
+| Formato de Contratação | Capacidade de Aparelhos | Valor Sugerido (BRL) | Descrição do Escopo |
+| :--- | :--- | :--- | :--- |
+| **SaaS Starter** | 10 a 20 aparelhos | **R$ 1.800 – R$ 3.000 / mês** | Farm inicial, orquestração local, Scrcpy e motor HCI anti-ban |
+| **SaaS Professional** | 21 a 50 aparelhos | **R$ 4.000 – R$ 7.500 / mês** | Operações médias com múltiplos operadores e regras avançadas |
+| **SaaS Enterprise** | 51 a 100+ aparelhos | **R$ 8.000 – R$ 25.000 / mês** | Alta escala, túnel VPS com TLS 1.3, múltiplos setores e suporte dedicado |
+| **Taxa de Setup / Implantação** | 10 a 100 aparelhos | **R$ 3.500 – R$ 15.000 (taxa única)** | Instalação da infraestrutura de rede, hubs, proxies e treinamento |
+| **Licença On-Premise / Whitelabel** | Ilimitado (Infra própria) | **R$ 50.000 – R$ 90.000 + Manutenção** | Instalação fechada na infraestrutura corporativa do cliente |
 
 ---
 
@@ -195,14 +226,16 @@ O botão de **3 pontinhos (`⋮`)** no card abre diretamente a central de config
 ```text
 Esfera v3/
 ├── src/                        # Frontend React 18 + TypeScript (UI Desktop)
-│   ├── components/             # Sub-componentes (DeviceCard, DeviceConfigModal, Toolbar)
+│   ├── components/             # Sub-componentes (DeviceCard, DeviceConfigModal, CollaboratorView)
 │   ├── pages/                  # Páginas (DevicesTab, CampaignsTab, AutomationsTab, LogsTab)
 │   └── index.css               # Design System com utilitários de input e layout
 │
 ├── src-tauri/                  # Core Desktop em Rust & C++
 │   ├── src/
-│   │   ├── hpc_device_router.cpp # Motor C++ SIMD AVX2 com Runtime Dispatching
+│   │   ├── native_hpc/         # Motor C++ HPC (esfera_hpc.cpp, Bézier Cúbica, SIMD, HCI)
+│   │   ├── hpc_device_router.cpp # Roteador C++ SIMD AVX2 com Runtime Dispatching
 │   │   ├── commands.rs         # Comandos Tauri, Sincronização VPS & ADB
+│   │   ├── scrcpy_manager.rs   # Gerenciador de Espelhamento Scrcpy (--no-control)
 │   │   ├── db.rs               # SQLite com Identidade Permanente e Transações Atômicas
 │   │   ├── tunnel_server.rs    # Túnel Inverso TLS 1.3
 │   │   └── adb_manager.rs      # Gestor ADB de Alta Concorrência

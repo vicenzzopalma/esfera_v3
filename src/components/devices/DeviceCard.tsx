@@ -1,10 +1,5 @@
-// ============================================================
-// Esfera v3 — Sub-componente DeviceCard (Linear SaaS Style)
-// Card compacto e elegante para exibição do celular no Hub
-// ============================================================
-
 import { memo, useState } from "react";
-import type { Device } from "../../types";
+import type { Device, DevicePermissionRequest } from "../../types";
 import { getConnectionOrigin, CONNECTION_BADGE_CONFIG } from "../../types";
 import Button from "../ui/Button";
 import Badge from "../ui/Badge";
@@ -14,11 +9,15 @@ import {
   MoreVertical,
   BatteryCharging,
   Info,
+  Bell,
 } from "lucide-react";
 
 interface DeviceCardProps {
   device: Device;
   activeUserDisplayName?: string;
+  pendingRequest?: DevicePermissionRequest;
+  onApproveRequest?: (requestId: number) => void;
+  onRejectRequest?: (requestId: number) => void;
   isSelected: boolean;
   onToggleSelect: () => void;
   onOpenMirror: () => void;
@@ -31,6 +30,9 @@ interface DeviceCardProps {
 export const DeviceCard = memo(function DeviceCard({
   device,
   activeUserDisplayName,
+  pendingRequest,
+  onApproveRequest,
+  onRejectRequest,
   isSelected,
   onToggleSelect,
   onOpenMirror,
@@ -141,6 +143,49 @@ export const DeviceCard = memo(function DeviceCard({
         <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 text-[10px] text-emerald-300">
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
           <span>Em uso: <strong>{activeUserDisplayName}</strong></span>
+        </div>
+      )}
+
+      {pendingRequest && (
+        <div className="p-2.5 rounded-lg bg-amber-500/15 border border-amber-500/40 text-xs flex flex-col gap-1.5 animate-pulse">
+          <div className="flex items-center justify-between text-amber-300 font-bold text-[10px]">
+            <span className="flex items-center gap-1 truncate">
+              <Bell size={12} className="shrink-0 text-amber-400" />
+              <span className="truncate">{pendingRequest.userDisplayName || pendingRequest.userName} solicitou uso</span>
+            </span>
+            <span className="text-[8px] bg-amber-500/20 px-1.5 py-0.5 rounded text-amber-200 uppercase font-semibold shrink-0">
+              Pendente
+            </span>
+          </div>
+          {pendingRequest.requestedReason && (
+            <p className="text-[10px] text-zinc-400 italic truncate">
+              "{pendingRequest.requestedReason}"
+            </p>
+          )}
+          <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={(e) => {
+                e.stopPropagation();
+                onApproveRequest?.(pendingRequest.requestId);
+              }}
+              className="bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] py-1 font-bold"
+            >
+              Aprovar
+            </Button>
+            <Button
+              size="sm"
+              variant="danger"
+              onClick={(e) => {
+                e.stopPropagation();
+                onRejectRequest?.(pendingRequest.requestId);
+              }}
+              className="text-[10px] py-1 font-bold"
+            >
+              Recusar
+            </Button>
+          </div>
         </div>
       )}
 

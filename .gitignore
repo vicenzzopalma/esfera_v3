@@ -39,3 +39,5 @@ __pycache__/
 # eh obrigatorio no git independente de qualquer regra acima.
 !target/relatorio.md
 
+monstro.txt
+

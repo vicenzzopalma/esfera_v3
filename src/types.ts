@@ -4,7 +4,7 @@
 // ============================================================
 
 export type Role = "master" | "gestor" | "supervisor" | "colaborador";
-export type SectorType = "junior" | "senior" | "pa_fixa" | "pesquisa";
+export type SectorType = "junior" | "senior" | "pa_fixa" | "pesquisa" | "juridico" | "comercial";
 
 export interface User {
   id: number;
