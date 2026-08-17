@@ -1340,7 +1340,7 @@ impl AdbManager {
         (brand, model)
     }
 
-    /// Lança o Scrcpy H.264 nativo em 60 FPS com aceleração por hardware
+    /// Lança o Scrcpy H.264 nativo com aceleração por hardware e resiliência de rede
     pub fn launch_scrcpy(serial: &str, turn_screen_off: bool) -> Result<String, String> {
         let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         let mode_label = if turn_screen_off {
@@ -1348,11 +1348,20 @@ impl AdbManager {
         } else {
             ""
         };
-        let title = format!("Esfera v3 — Stream H.264 ({}){}", target_serial, mode_label);
+        let title = format!("Esfera v3 — Stream ({}){}", target_serial, mode_label);
         let is_wireless = target_serial.contains(':') || target_serial.contains('.');
+
+        if is_wireless {
+            let parts: Vec<&str> = target_serial.split(':').collect();
+            let ip = parts[0];
+            let port = parts.get(1).and_then(|p| p.parse::<i32>().ok()).unwrap_or(5555);
+            let _ = Self::connect_device(ip, port);
+        }
+
         let max_size = if is_wireless { "1080" } else { "1280" };
-        let fps = if is_wireless { "30" } else { "60" };
-        let bitrate = if is_wireless { "2M" } else { "4M" };
+        let fps = if is_wireless { "60" } else { "60" };
+        let bitrate = if is_wireless { "4M" } else { "8M" };
+
         let mut cmd = create_cmd("scrcpy");
         cmd.args([
             "-s",
@@ -1363,6 +1372,10 @@ impl AdbManager {
             fps,
             "--video-bit-rate",
             bitrate,
+            "--video-codec",
+            "h264",
+            "--video-buffer",
+            "50",
             "--no-audio",
             "--stay-awake",
             "--window-title",
