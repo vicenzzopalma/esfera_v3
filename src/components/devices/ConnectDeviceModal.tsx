@@ -79,8 +79,12 @@ export function ConnectDeviceModal({
   };
 
   const handlePrepareSetup = (data: { serial?: string; ip?: string; port?: number }) => {
+    const matchedUsb = usbDevices.find((u) => u.serial === data.serial);
+    const suggestedName = matchedUsb?.model && matchedUsb.model !== "Aparelho Android"
+      ? matchedUsb.model
+      : `Aparelho ${nextDeviceNumber}`;
     setDeviceNumberInput(nextDeviceNumber.toString());
-    setDeviceNameInput(`Aparelho ${nextDeviceNumber}`);
+    setDeviceNameInput(suggestedName);
     setSetupDeviceData(data);
   };
 

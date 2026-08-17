@@ -399,9 +399,30 @@ impl Database {
     }
 
     fn conn(&self) -> ConnGuard<'_> {
-        let mut guard = self.cached.lock().expect("db conn lock poisoned");
+        let mut guard = match self.cached.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                // Mutex envenenada — tenta recuperar os dados
+                db_log(&format!("AVISO CRITICO: db conn mutex envenenada, tentando recuperar: {:?}", e));
+                e.into_inner()
+            }
+        };
         if guard.is_none() {
-            *guard = Some(self.pool.get().expect("r2d2 pool exhausted (max_size=8)"));
+            // Tenta obter do pool com retry (até 3x) para não crashar em picos de contenção
+            let mut attempts = 0;
+            loop {
+                match self.pool.get() {
+                    Ok(c) => { *guard = Some(c); break; }
+                    Err(e) => {
+                        attempts += 1;
+                        db_log(&format!("AVISO: r2d2 pool.get() falhou (tentativa {}/3): {:?}", attempts, e));
+                        if attempts >= 3 {
+                            panic!("r2d2 pool exhausted após 3 tentativas (max_size=8)");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50 * attempts));
+                    }
+                }
+            }
         }
         ConnGuard(guard)
     }
@@ -1278,6 +1299,7 @@ impl Database {
             }
         }
 
+        // 2. Se não encontrou linha existente por EsferaDeviceId, insere ou atualiza por AdbDeviceId
         self.exec_retry(
             "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)

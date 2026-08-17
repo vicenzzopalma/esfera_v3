@@ -3615,8 +3615,13 @@ impl AdbManager {
         crate::adb_tcp::reset_pool();
         crate::adb_tcp::unregister_all_tunnel_serials();
 
-        let _ = create_cmd("adb").arg("kill-server").output();
-        let _ = create_cmd("adb").arg("start-server").output();
+        let mut kill_cmd = create_cmd("adb");
+        kill_cmd.arg("kill-server");
+        let _ = run_cmd_timeout(kill_cmd, Duration::from_secs(2));
+
+        let mut start_cmd = create_cmd("adb");
+        start_cmd.arg("start-server");
+        let _ = run_cmd_timeout(start_cmd, Duration::from_secs(3));
 
         let devices = db.get_all_devices();
         let mut count = 0;
@@ -3642,19 +3647,24 @@ impl AdbManager {
                 if let Ok(addr) = socket_addr.parse::<std::net::SocketAddr>() {
                     if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_ok() {
                         // 1. Expurga o soquete zumbi do Windows
-                        let _ = create_cmd("adb").arg("disconnect").arg(&target_ip).output();
-                        let _ = create_cmd("adb").arg("disconnect").arg(&ip_part).output();
+                        let mut disc1 = create_cmd("adb");
+                        disc1.arg("disconnect").arg(&target_ip);
+                        let _ = run_cmd_timeout(disc1, Duration::from_secs(2));
+
+                        let mut disc2 = create_cmd("adb");
+                        disc2.arg("disconnect").arg(&ip_part);
+                        let _ = run_cmd_timeout(disc2, Duration::from_secs(2));
 
                         // 2. Conecta no soquete novo
-                        let out = create_cmd("adb").arg("connect").arg(&target_ip).output();
-                        if let Ok(o) = out {
+                        let mut conn_cmd = create_cmd("adb");
+                        conn_cmd.arg("connect").arg(&target_ip);
+                        if let Ok(o) = run_cmd_timeout(conn_cmd, Duration::from_secs(3)) {
                             let txt = String::from_utf8_lossy(&o.stdout);
                             if txt.contains("connected to") || txt.contains("already connected") {
                                 // Lê o Hardware Serial ro.serialno e atualiza o banco
-                                let get_prop = create_cmd("adb")
-                                    .args(["-s", &target_ip, "shell", "getprop", "ro.serialno"])
-                                    .output();
-                                if let Ok(p) = get_prop {
+                                let mut prop_cmd = create_cmd("adb");
+                                prop_cmd.args(["-s", &target_ip, "shell", "getprop", "ro.serialno"]);
+                                if let Ok(p) = run_cmd_timeout(prop_cmd, Duration::from_secs(3)) {
                                     let serial_no = String::from_utf8_lossy(&p.stdout).trim().to_string();
                                     if !serial_no.is_empty() {
                                         let now = chrono::Utc::now().to_rfc3339();
@@ -3696,16 +3706,18 @@ impl AdbManager {
 
         while let Ok(found_ip) = rx.try_recv() {
             let target_addr = format!("{}:5555", found_ip);
-            let _ = create_cmd("adb").arg("disconnect").arg(&target_addr).output();
-            let out = create_cmd("adb").arg("connect").arg(&target_addr).output();
+            let mut disc_cmd = create_cmd("adb");
+            disc_cmd.arg("disconnect").arg(&target_addr);
+            let _ = run_cmd_timeout(disc_cmd, Duration::from_secs(2));
 
-            if let Ok(o) = out {
+            let mut conn_cmd = create_cmd("adb");
+            conn_cmd.arg("connect").arg(&target_addr);
+            if let Ok(o) = run_cmd_timeout(conn_cmd, Duration::from_secs(3)) {
                 let txt = String::from_utf8_lossy(&o.stdout);
                 if txt.contains("connected to") || txt.contains("already connected") {
-                    let get_prop = create_cmd("adb")
-                        .args(["-s", &target_addr, "shell", "getprop", "ro.serialno"])
-                        .output();
-                    if let Ok(p) = get_prop {
+                    let mut prop_cmd = create_cmd("adb");
+                    prop_cmd.args(["-s", &target_addr, "shell", "getprop", "ro.serialno"]);
+                    if let Ok(p) = run_cmd_timeout(prop_cmd, Duration::from_secs(3)) {
                         let serial_no = String::from_utf8_lossy(&p.stdout).trim().to_string();
                         if !serial_no.is_empty() {
                             let now = chrono::Utc::now().to_rfc3339();
