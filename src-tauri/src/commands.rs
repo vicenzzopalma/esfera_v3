@@ -464,7 +464,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
 
             // AUTO-PROVISIONAMENTO, AUTO-CURA E IMUNIDADE TOTAL NATIVA
             if adb_dev.state == "device" {
-                let esfera_cfg_server = "http://34.29.70.113:31000".to_string();
+                let esfera_cfg_server = "http://34.29.70.113:8080".to_string();
                 let s_target = adb_dev.serial.clone();
                 let comp_id = target_company_id;
                 std::thread::spawn(move || {
@@ -1410,12 +1410,12 @@ pub fn update_device(state: State<'_, AppState>, token: String, mut device: Devi
                     ).await;
                 }
 
-                // 2. Envia via HTTP Checkin Server da VPS (porta 31000)
+                // 2. Envia via HTTP Checkin Server da VPS (porta 8080)
                 let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(4))
                     .build();
                 if let Ok(c) = client {
-                    let _ = c.post("http://34.29.70.113:31000/api/devices/rename")
+                    let _ = c.post("http://34.29.70.113:8080/api/devices/rename")
                         .json(&serde_json::json!({
                             "esfera_device_id": id2,
                             "name": name2,
@@ -2871,13 +2871,41 @@ pub async fn debloat_all_devices(_token: String) -> Result<Vec<String>, String> 
 // ============================================================
 
 #[tauri::command]
-pub fn get_app_config(_token: String) -> AppConfig {
+pub fn get_app_config(_token: Option<String>) -> AppConfig {
     config::load_config()
 }
 
 #[tauri::command]
-pub fn save_app_config(_token: String, config: AppConfig) -> Result<(), String> {
-    config::save_config(&config)
+pub fn save_app_config(
+    _token: Option<String>,
+    config: Option<AppConfig>,
+    hub_enabled: Option<bool>,
+    hub_address: Option<String>,
+    hub_token: Option<String>,
+    empresa_server_enabled: Option<bool>,
+    empresa_server_port: Option<u16>,
+    checkin_server_enabled: Option<bool>,
+    checkin_server_port: Option<u16>,
+    tunnel_server_enabled: Option<bool>,
+    tunnel_server_port: Option<u16>,
+    mode: Option<String>,
+) -> Result<(), String> {
+    let mut final_cfg = config::load_config();
+    if let Some(c) = config {
+        final_cfg = c;
+    } else {
+        if let Some(v) = hub_enabled { final_cfg.hub_enabled = v; }
+        if let Some(v) = hub_address { final_cfg.hub_address = v; }
+        if let Some(v) = hub_token { final_cfg.hub_token = v; }
+        if let Some(v) = empresa_server_enabled { final_cfg.empresa_server_enabled = v; }
+        if let Some(v) = empresa_server_port { final_cfg.empresa_server_port = v; }
+        if let Some(v) = checkin_server_enabled { final_cfg.checkin_server_enabled = v; }
+        if let Some(v) = checkin_server_port { final_cfg.checkin_server_port = v; }
+        if let Some(v) = tunnel_server_enabled { final_cfg.tunnel_server_enabled = v; }
+        if let Some(v) = tunnel_server_port { final_cfg.tunnel_server_port = v; }
+        if let Some(v) = mode { final_cfg.mode = v; }
+    }
+    config::save_config(&final_cfg)
 }
 
 // ============================================================
@@ -2948,9 +2976,14 @@ pub fn get_hub_credentials(
     } else {
         "Master".to_string()
     };
+    let hub_address = if !cfg.hub_address.trim().is_empty() {
+        cfg.hub_address.trim().to_string()
+    } else {
+        std::env::var("ESFERA_HUB_ADDR")
+            .unwrap_or_else(|_| "34.29.70.113:8555".to_string())
+    };
     Ok(HubCredentials {
-        hub_address: std::env::var("ESFERA_HUB_ADDR")
-            .unwrap_or_else(|_| "34.29.70.113:8555".to_string()),
+        hub_address,
         hub_token,
         company_id,
         company_name,

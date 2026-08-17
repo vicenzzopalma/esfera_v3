@@ -85,7 +85,7 @@ export function DeviceConfigModal({
   const [applyingDisplay, setApplyingDisplay] = useState(false);
 
   // Network Tab
-  const [vpsUrl, setVpsUrl] = useState("http://34.29.70.113:31000");
+  const [vpsUrl, setVpsUrl] = useState("http://34.29.70.113:8080");
   const [netStatus, setNetStatus] = useState<string | null>(null);
   const [pinging, setPinging] = useState(false);
 
@@ -578,7 +578,7 @@ export function DeviceConfigModal({
                   type="text"
                   value={vpsUrl}
                   onChange={(e) => setVpsUrl(e.target.value)}
-                  placeholder="http://34.29.70.113:31000"
+                  placeholder="http://34.29.70.113:8080"
                   className="flex-1 h-9 px-3 rounded-md bg-[#121216] border border-white/[0.08] text-zinc-100 font-mono text-xs focus:outline-none focus:border-[#5E6AD2]"
                 />
                 <Button

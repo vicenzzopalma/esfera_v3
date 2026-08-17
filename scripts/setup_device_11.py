@@ -28,7 +28,7 @@ print(f"Resultado da instalacao: {inst_res.stdout.strip()}")
 
 # 4. Gravar arquivo de configuracao imutavel
 print("4. Gravando identidade no /sdcard/esfera_config.json...")
-cfg = json.dumps({"deviceId": "ESF-0N14619I", "companyId": 1, "serverUrl": "http://34.29.70.113:31000"})
+cfg = json.dumps({"deviceId": "ESF-0N14619I", "companyId": 1, "serverUrl": "http://34.29.70.113:8080"})
 subprocess.run([adb, "-s", serial, "shell", f"echo '{cfg}' > /sdcard/esfera_config.json"])
 subprocess.run([adb, "-s", serial, "shell", "echo 'ESF-0N14619I' > /sdcard/.esfera_device_id"])
 

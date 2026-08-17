@@ -9,10 +9,21 @@ let _configLoaded = false;
 async function ensureConfig(): Promise<void> {
   if (_configLoaded) return;
   try {
-    const cfg = await invoke<AppConfig>("get_app_config");
-    _mode = cfg.mode;
+    const cfg = await invoke<AppConfig>("get_app_config", { token: _token || "default-token" });
+    if (cfg?.mode) {
+      _mode = cfg.mode;
+    }
   } catch { /* fallback: local */ }
   _configLoaded = true;
+}
+
+export function setAppMode(m: "local" | "empresa" | "master") {
+  _mode = m;
+  _configLoaded = true;
+}
+
+export function reloadConfig(): void {
+  _configLoaded = false;
 }
 
 export function setToken(t: string | null) {

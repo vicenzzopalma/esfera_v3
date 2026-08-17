@@ -103,7 +103,7 @@ def deploy_to_device(serial, model):
         cfg = json.dumps({
             "deviceId": device_id,
             "companyId": 1,
-            "serverUrl": "http://34.29.70.113:31000",
+            "serverUrl": "http://34.29.70.113:8080",
             "heartbeatIntervalSec": 30
         })
         try:
