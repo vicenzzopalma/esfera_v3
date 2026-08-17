@@ -391,21 +391,13 @@ export default function DevicesTab() {
   // Filter logic
   const filteredDevices = useMemo(() => {
     return (devicesList || [])
-      .filter((device, _, arr) => {
+      .filter((device) => {
         if (!device) return false;
         const serial = String(device.serial || "");
-        const status = String(device.status || "offline");
         const model = String(device.model || "");
         const brand = String(device.brand || "");
         const ip = String(device.ip || "");
         const sector = String(device.sector || "junior").toLowerCase().replace(/[- _.]/g, "");
-
-        if (status === "offline" && !serial.includes(":")) {
-          const hasOnlineWireless = arr.some(
-            (other) => other && String(other.model || "") === model && String(other.status || "") === "online" && String(other.serial || "").includes(":")
-          );
-          if (hasOnlineWireless) return false;
-        }
 
         if (sectorTab !== "all") {
           const targetSector = sectorTab.toLowerCase().replace(/[- _.]/g, "");
