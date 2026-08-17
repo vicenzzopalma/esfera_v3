@@ -2545,10 +2545,32 @@ impl AdbManager {
 
     /// Executa o pipeline completo de Auto-Cura, Provisionamento e Imunidade Total (Zero-Touch)
     pub fn auto_heal_and_immunize_device(serial: &str, company_id: i32, server_url: &str) -> Result<(), String> {
-        // 1. Grava a identidade no /sdcard/esfera_config.json
+        // 1. Se for conexão USB inicial, ativa porta TCP/IP 5555 e conecta automaticamente no IP Wi-Fi
+        if !serial.contains(':') && !serial.contains('.') {
+            let mut tcp_cmd = create_cmd("adb");
+            tcp_cmd.args(["-s", serial, "tcpip", "5555"]);
+            let _ = run_cmd_timeout(tcp_cmd, Duration::from_secs(4));
+
+            let mut ip_cmd = create_cmd("adb");
+            ip_cmd.args(["-s", serial, "shell", "ip route || ip addr show wlan0"]);
+            if let Ok(out) = run_cmd_timeout(ip_cmd, Duration::from_secs(3)) {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                for word in stdout.split_whitespace() {
+                    if (word.starts_with("192.168.") || word.starts_with("10.")) && !word.ends_with(".255") {
+                        let clean_ip = word.split('/').next().unwrap_or(word);
+                        if clean_ip.contains('.') && clean_ip.split('.').count() == 4 {
+                            let _ = Self::connect_device_flushed(clean_ip, 5555);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Grava a identidade no /sdcard/esfera_config.json
         let _ = Self::write_identity_config(serial, company_id, server_url);
 
-        // 2. Semeia as chaves ADB do Windows para autorização perpétua
+        // 3. Semeia as chaves ADB do Windows para autorização perpétua
         if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
             let key_path = std::path::Path::new(&home).join(".android").join("adbkey.pub");
             if let Ok(key) = std::fs::read_to_string(&key_path) {
@@ -2565,7 +2587,7 @@ impl AdbManager {
             }
         }
 
-        // 3. Verifica se o APK do agente está instalado; caso ausente, instala imediatamente
+        // 4. Verifica se o APK do agente está instalado; caso ausente, instala imediatamente
         let pkg_check = create_cmd("adb")
             .args(["-s", serial, "shell", "pm", "list", "packages", "com.esfera.agent"])
             .output();
@@ -2574,11 +2596,11 @@ impl AdbManager {
             let _ = Self::install_agent_apk(serial);
         }
 
-        // 4. Aplica a imunidade de bateria, prevencao de sono e wake lock
+        // 5. Aplica a imunidade de bateria, prevencao de sono e wake lock
         let pid = Self::get_persistent_device_id(serial);
         let _ = Self::inject_device_immunity(serial, pid.as_deref());
 
-        // 5. Inicia o serviço em primeiro plano
+        // 6. Inicia o serviço em primeiro plano
         let _ = Self::start_agent_service(serial);
 
         Ok(())

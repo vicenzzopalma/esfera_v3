@@ -1374,7 +1374,12 @@ impl Database {
         }
     }
     pub fn delete_device(&self, serial: &str) -> Result<(), String> {
-        self.conn().execute(
+        let conn = self.conn();
+        let _ = conn.execute(
+            "DELETE FROM ESF_DeviceIdentity WHERE EsferaDeviceId = ?1 OR EsferaDeviceId IN (SELECT EsferaDeviceId FROM ESF_Device WHERE AdbDeviceId = ?1 OR CurrentAdbAddress = ?1);",
+            params![serial],
+        );
+        conn.execute(
             "DELETE FROM ESF_Device WHERE AdbDeviceId = ?1 OR EsferaDeviceId = ?1 OR CurrentAdbAddress = ?1;",
             params![serial],
         ).map_err(|e| e.to_string())?;
