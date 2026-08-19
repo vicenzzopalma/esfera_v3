@@ -166,9 +166,9 @@ async fn handle_agent(stream: TcpStream, db: Arc<Database>, app_handle: Option<A
         let ip2 = ip.clone();
         let now2 = now.clone();
         tokio::task::spawn_blocking(move || {
-            let updated = db2.process_checkin(&uuid2, &adb_addr2, &ip2, ADB_PORT, &now2);
+            let updated = db2.process_checkin(&uuid2, &adb_addr2, &ip2, ADB_PORT, &now2, "");
             if let Ok(0) = updated {
-                let _ = db2.insert_unknown_device(&uuid2, &adb_addr2, &ip2, ADB_PORT, &now2);
+                let _ = db2.insert_unknown_device(&uuid2, &adb_addr2, &ip2, ADB_PORT, &now2, "");
             }
         });
     }

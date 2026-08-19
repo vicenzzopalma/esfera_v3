@@ -11,6 +11,8 @@ use crate::db::Database;
 pub struct CheckInPayload {
     pub esfera_device_id: String,
     pub current_adb_address: String,
+    #[serde(default)]
+    pub adb_serial: String,
 }
 
 #[derive(Deserialize)]
@@ -20,6 +22,8 @@ pub struct UdpHandshakePayload {
     pub ip: String,
     pub port: Option<u16>,
     pub company_id: Option<i32>,
+    #[serde(default)]
+    pub adb_serial: String,
 }
 
 pub async fn start(db: Arc<Database>, port: u16, app_handle: Option<AppHandle>) {
@@ -67,9 +71,9 @@ pub fn start_udp_broadcast_listener(db: Arc<Database>, app_handle: Option<AppHan
 
                     println!("[UDP HANDSHAKE] Aparelho '{}' anunciado em {}:{}", payload.hardware_uuid, payload.ip, port);
 
-                    let updated = db.process_checkin(&payload.hardware_uuid, &target_addr, &payload.ip, port, &now);
+                    let updated = db.process_checkin(&payload.hardware_uuid, &target_addr, &payload.ip, port, &now, &payload.adb_serial);
                     if let Ok(0) = updated {
-                        let _ = db.insert_unknown_device(&payload.hardware_uuid, &target_addr, &payload.ip, port, &now);
+                        let _ = db.insert_unknown_device(&payload.hardware_uuid, &target_addr, &payload.ip, port, &now, &payload.adb_serial);
                     }
 
                     // Flush preventivo de socket zumbi antes de reconectar (evita "already connected")
@@ -114,11 +118,11 @@ async fn handle_checkin(
         None => (adb_address.clone(), 5555),
     };
 
-    let updated = db.process_checkin(&payload.esfera_device_id, adb_address, &ip, port, &now);
+    let updated = db.process_checkin(&payload.esfera_device_id, adb_address, &ip, port, &now, &payload.adb_serial);
 
     match updated {
         Ok(0) => {
-            let _ = db.insert_unknown_device(&payload.esfera_device_id, adb_address, &ip, port, &now);
+            let _ = db.insert_unknown_device(&payload.esfera_device_id, adb_address, &ip, port, &now, &payload.adb_serial);
         }
         Ok(_) => {}
         Err(e) => {
