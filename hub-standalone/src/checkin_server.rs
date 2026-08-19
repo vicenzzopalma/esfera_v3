@@ -61,6 +61,8 @@ pub struct CheckInPayload {
     pub esfera_device_id: String,
     pub current_adb_address: String,
     #[serde(default)]
+    pub adb_serial: String,
+    #[serde(default)]
     pub company_id: i32,
 }
 
@@ -122,6 +124,7 @@ pub async fn handle_checkin(
         port,
         &now,
         company_id,
+        &payload.adb_serial,
     );
 
     match updated {
@@ -133,6 +136,7 @@ pub async fn handle_checkin(
                 port,
                 &now,
                 company_id,
+                &payload.adb_serial,
             ) {
                 eprintln!("Check-in insert error: {}", e);
                 return (StatusCode::FORBIDDEN, "empresa invalida");

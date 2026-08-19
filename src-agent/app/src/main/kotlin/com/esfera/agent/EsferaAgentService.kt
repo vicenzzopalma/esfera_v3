@@ -72,6 +72,11 @@ data class EsferaConfig(
 data class CheckInRequest(
     val esferaDeviceId: String,
     val currentAdbAddress: String,
+    // SERIAL ADB FÍSICO (ro.serialno / Build.getSerial). É a CHAVE DE FUSÃO
+    // INDEPENDENTE DE IP: um celular em USB (sem IP) e em WiFi (IP muda) devem
+    // fundir no MESMO registro na VPS/desktop. Sem isso o app criava 2 cartões
+    // (USB vs WiFi) porque o cruzamento antigo era só por IP.
+    val adbSerial: String = "",
     val companyId: Int = 0,
     val batteryLevel: Int = 0,
     val isCharging: Boolean = false,
@@ -85,6 +90,9 @@ data class TunnelHandshake(
     val companyId: Int = 0,
     val macAddress: String = "",
     val serialNumber: String = "",
+    // SERIAL ADB FÍSICO: mesmo propósito do CheckInRequest — permite que o
+    // tunnel_server (e a VPS) fundam este celular por serial, não só por IP.
+    val adbSerial: String = "",
     val agentVersion: String = "1.0-tunnel",
     val currentLocalIp: String = ""
 )
@@ -404,6 +412,27 @@ class EsferaAgentService : Service() {
         return "ESF-$androidId"
     }
 
+    /**
+     * Serial ADB físico (ro.serialno). Tenta getprop ro.serialno (via shell),
+     * cai para Build.getSerial() e finalmente para ANDROID_ID se nada der.
+     * Usado como CHAVE DE FUSÃO INDEPENDENTE DE IP: garante que o celular em
+     * USB (sem IP) e em WiFi (IP volátil) colapsam no mesmo registro da VPS.
+     * Retorna "" se não conseguir resolver (o backend ignora e usa ESF- como antes).
+     */
+    private fun resolveAdbSerial(): String {
+        val fromProp = getProp("ro.serialno").uppercase()
+        if (fromProp.isNotBlank() && !fromProp.equals("unknown", ignoreCase = true)) {
+            return fromProp
+        }
+        val fromBuild = getSerialNumber().uppercase()
+        if (fromBuild.isNotBlank() && !fromBuild.equals("unknown", ignoreCase = true)) {
+            return fromBuild
+        }
+        return try {
+            Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: ""
+        } catch (_: Exception) { "" }
+    }
+
     private fun startPresenceLoop(config: EsferaConfig) {
         presenceClient?.stop()
         val cleaned = config.serverUrl
@@ -424,7 +453,8 @@ class EsferaAgentService : Service() {
             wsPort = wsPort,
             companyId = config.companyId,
             useTls = useTls,
-            adbAddressProvider = { resolveCurrentIp()?.let { "$it:5555" } ?: "" }
+            adbAddressProvider = { resolveCurrentIp()?.let { "$it:5555" } ?: "" },
+            adbSerial = resolveAdbSerial()
         ).apply { start() }
     }
 
@@ -494,6 +524,8 @@ class EsferaAgentService : Service() {
                 setBody(CheckInRequest(
                     esferaDeviceId = config.deviceId,
                     currentAdbAddress = "$ip:5555",
+                    // SERIAL ADB físico: chave de fusão independente de IP (USB vs WiFi).
+                    adbSerial = resolveAdbSerial(),
                     companyId = config.companyId,
                     batteryLevel = battery.first,
                     isCharging = battery.second,
@@ -607,7 +639,8 @@ class EsferaAgentService : Service() {
         val hs = TunnelHandshake(
             hardwareUuid = deviceId,
             companyId = companyId,
-            currentLocalIp = ip
+            currentLocalIp = ip,
+            adbSerial = resolveAdbSerial()
         )
         writer.println(json.encodeToString(TunnelHandshake.serializer(), hs))
         writer.flush()

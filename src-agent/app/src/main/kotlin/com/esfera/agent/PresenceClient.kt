@@ -32,6 +32,9 @@ data class HeartbeatPayload(
     val uuid: String,
     val esferaDeviceId: String = "",
     val currentAdbAddress: String = "",
+    // SERIAL ADB físico: chave de fusão independente de IP (USB vs WiFi).
+    // Permite que presence_server.rs cruze o celular por serial, não só por UUID.
+    val adbSerial: String = "",
     val batteryLevel: Int,
     val isCharging: Boolean,
     val isScreenOn: Boolean,
@@ -46,7 +49,8 @@ class PresenceClient(
     private val wsPort: Int = 7779,
     private val companyId: Int = 0,
     private val useTls: Boolean = false,
-    private val adbAddressProvider: () -> String = { "" }
+    private val adbAddressProvider: () -> String = { "" },
+    private val adbSerial: String = ""
 ) {
     // SupervisorJob: uma falha temporária do WebSocket (oscilação de rede) NUNCA
     // cancela coroutines irmãs do scope (regra de indelestrutibilidade do agente).
@@ -99,6 +103,7 @@ class PresenceClient(
                                 uuid = deviceId,
                                 esferaDeviceId = deviceId,
                                 currentAdbAddress = adbAddressProvider(),
+                                adbSerial = adbSerial,
                                 batteryLevel = batteryInfo.first,
                                 isCharging = batteryInfo.second,
                                 isScreenOn = screenOn,

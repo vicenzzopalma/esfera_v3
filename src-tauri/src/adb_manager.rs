@@ -785,8 +785,14 @@ impl AdbManager {
             "settings put global adb_allowed_connection_time 0",
             "settings put global tcp_keepalive_interval 15",
             "dumpsys deviceidle disable",
+            "dumpsys deviceidle whitelist +com.esfera.agent",
             "dumpsys deviceidle whitelist +com.android.shell",
             "dumpsys deviceidle whitelist +com.google.android.gms",
+            "cmd appops set com.esfera.agent RUN_IN_BACKGROUND allow",
+            "cmd appops set com.esfera.agent RUN_ANY_IN_BACKGROUND allow",
+            "cmd appops set com.esfera.agent REQUEST_IGNORE_BATTERY_OPTIMIZATIONS allow",
+            "am set-standby-bucket com.esfera.agent active",
+            "am start-foreground-service com.esfera.agent/.EsferaAgentService",
         ];
         let mut errors = Vec::new();
         for cmd in commands {
@@ -1136,11 +1142,14 @@ impl AdbManager {
         Ok(result)
     }
 
-    /// Obtém o nível de bateria via cache TTL de 15s + ADB sob demanda
+    /// Obtém o nível de bateria real em tempo real (0 a 100%) com dupla checagem (dumpsys + sysfs)
     pub fn get_battery_level(serial: &str) -> Result<i32, String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
+        
+        // Cache rápido de 3 segundos para evitar sobrecarga de chamadas repetidas
         if let Ok(cache) = BATTERY_CACHE.read() {
-            if let Some(&(level, ts)) = cache.get(serial) {
-                if ts.elapsed() < Duration::from_secs(15) {
+            if let Some(&(level, ts)) = cache.get(&target_serial) {
+                if ts.elapsed() < Duration::from_secs(3) {
                     return Ok(level);
                 }
             }
@@ -1148,44 +1157,70 @@ impl AdbManager {
 
         let mut level: Option<i32> = None;
 
-        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
-        if Self::use_native_adb(serial) {
-            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "dumpsys battery | grep level:") {
-                for line in stdout.lines() {
-                    let line = line.trim();
-                    if let Some(val) = line.strip_prefix("level:") {
-                        level = val.trim().parse::<i32>().ok();
+        // 1. Tenta dumpsys battery sem pipe (funciona em 100% dos Androids)
+        let out_text = if Self::use_native_adb(&target_serial) {
+            crate::adb_tcp::exec_shell(&target_serial, "dumpsys battery").ok()
+        } else {
+            let mut cmd = create_cmd("adb");
+            cmd.args(["-s", &target_serial, "shell", "dumpsys battery"]);
+            run_cmd_timeout(cmd, Duration::from_secs(3)).ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        };
+
+        if let Some(text) = out_text {
+            let mut raw_level = None;
+            let mut raw_scale = 100;
+            for line in text.lines() {
+                let l = line.trim();
+                let lower = l.to_lowercase();
+                if lower.starts_with("level:") {
+                    if let Some(val_str) = l.split(':').nth(1) {
+                        raw_level = val_str.trim().parse::<i32>().ok();
+                    }
+                } else if lower.starts_with("scale:") {
+                    if let Some(val_str) = l.split(':').nth(1) {
+                        if let Ok(sc) = val_str.trim().parse::<i32>() {
+                            if sc > 0 {
+                                raw_scale = sc;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(lvl) = raw_level {
+                let pct = (lvl * 100) / raw_scale;
+                level = Some(pct.clamp(0, 100));
+            }
+        }
+
+        // 2. Fallback via sysfs Linux (/sys/class/power_supply/*/capacity)
+        if level.is_none() {
+            let sysfs_out = if Self::use_native_adb(&target_serial) {
+                crate::adb_tcp::exec_shell(&target_serial, "cat /sys/class/power_supply/battery/capacity 2>/dev/null || cat /sys/class/power_supply/*/capacity 2>/dev/null").ok()
+            } else {
+                let mut cmd = create_cmd("adb");
+                cmd.args(["-s", &target_serial, "shell", "cat /sys/class/power_supply/battery/capacity 2>/dev/null || cat /sys/class/power_supply/*/capacity 2>/dev/null"]);
+                run_cmd_timeout(cmd, Duration::from_secs(3)).ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            };
+            if let Some(st) = sysfs_out {
+                for word in st.split_whitespace() {
+                    if let Ok(val) = word.trim().parse::<i32>() {
+                        if (0..=100).contains(&val) {
+                            level = Some(val);
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        if level.is_none() {
-            let output = create_cmd("adb")
-                .arg("-s")
-                .arg(serial)
-                .arg("shell")
-                .arg("dumpsys battery | grep level:")
-                .output()
-                .map_err(|e| format!("Falha ao consultar bateria via ADB: {}", e))?;
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let line = line.trim();
-                if let Some(val) = line.strip_prefix("level:") {
-                    level = val.trim().parse::<i32>().ok();
-                }
-            }
-        }
-
-        if let Some(level) = level {
+        if let Some(final_level) = level {
             if let Ok(mut cache) = BATTERY_CACHE.write() {
-                cache.insert(serial.to_string(), (level, Instant::now()));
+                cache.insert(target_serial.clone(), (final_level, Instant::now()));
             }
-            return Ok(level);
+            return Ok(final_level);
         }
 
-        Ok(85)
+        Err(format!("Não foi possível obter nível de bateria para {}", target_serial))
     }
 
     /// Captura a tela do dispositivo via `adb -s <serial> exec-out screencap -p` e aplica sanitização nativa C++ HPC
@@ -1423,7 +1458,7 @@ impl AdbManager {
         (brand, model)
     }
 
-    /// Lança o Scrcpy H.264 nativo com aceleração por hardware e resiliência de rede
+    /// Lança o Scrcpy H.264 nativo com inicialização ultra-rápida, tratamento de falha prematura e resiliência de rede
     pub fn launch_scrcpy(serial: &str, turn_screen_off: bool) -> Result<String, String> {
         let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         let mode_label = if turn_screen_off {
@@ -1441,9 +1476,15 @@ impl AdbManager {
             let _ = Self::connect_device(ip, port);
         }
 
-        let max_size = if is_wireless { "1080" } else { "1280" };
-        let fps = if is_wireless { "60" } else { "60" };
-        let bitrate = if is_wireless { "4M" } else { "8M" };
+        // Limpa instâncias prévias do scrcpy-server travadas no aparelho antes de abrir
+        let _ = create_cmd("adb")
+            .args(["-s", &target_serial, "shell", "pkill -f scrcpy"])
+            .output();
+
+        // Parâmetros de Inicialização Ultra-Rápida e Baixa Latência
+        let max_size = if is_wireless { "1024" } else { "1280" };
+        let fps = "60";
+        let bitrate = if is_wireless { "3M" } else { "8M" };
 
         let mut cmd = create_cmd("scrcpy");
         cmd.args([
@@ -1457,7 +1498,7 @@ impl AdbManager {
             bitrate,
             "--video-codec",
             "h264",
-            "--display-buffer=50",
+            "--tunnel-forward",
             "--no-audio",
             "--stay-awake",
             "--window-title",
@@ -1468,18 +1509,35 @@ impl AdbManager {
             cmd.arg("--turn-screen-off");
         }
 
-        let result = cmd.spawn();
-
-        match result {
-            Ok(_) => Ok(format!(
-                "Scrcpy H.264 inicializado com sucesso para {}! (Modo: {})",
-                serial,
-                if turn_screen_off { "Tela Física Desligada 🌙" } else { "Tela Física Ligada ⚡" }
-            )),
-            Err(e) => Err(format!(
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return Err(format!(
                 "Scrcpy nativo não encontrado no sistema ({}). Certifique-se de que o executável 'scrcpy.exe' esteja instalado e adicionado ao PATH do Windows.",
                 e
             )),
+        };
+
+        // VALIDAÇÃO EM TEMPO REAL: Aguarda 500ms para confirmar se o processo realmente permaneceu ativo.
+        // Se o scrcpy falhar ao conectar (porta bloqueada, dispositivo não autorizado, etc.), ele encerra em < 500ms.
+        std::thread::sleep(Duration::from_millis(500));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                Err(format!(
+                    "O Scrcpy tentou iniciar no dispositivo {}, mas encerrou prematuramente (código: {}). Verifique se o aparelho está desbloqueado, autorizado via USB/Wi-Fi ou se a rede está estável.",
+                    target_serial, status
+                ))
+            }
+            Ok(None) => {
+                // O processo permanece rodando em execução ativa na janela!
+                Ok(format!(
+                    "Scrcpy H.264 inicializado com sucesso e ativo para {}! (Modo: {})",
+                    serial,
+                    if turn_screen_off { "Tela Física Desligada 🌙" } else { "Tela Física Ligada ⚡" }
+                ))
+            }
+            Err(e) => {
+                Err(format!("Erro ao validar processo do Scrcpy: {}", e))
+            }
         }
     }
 
@@ -1504,22 +1562,36 @@ impl AdbManager {
             "60",
             "--video-bit-rate",
             "4M",
+            "--tunnel-forward",
+            "--no-audio",
             "--window-title",
             &title,
             "--stay-awake",
         ]);
 
-        let result = cmd.spawn();
-
-        match result {
-            Ok(_) => Ok(format!(
-                "🖥️ Área de Trabalho #2 (Display Virtual {}px) inicializada para o celular {}! O supervisor pode usar a tela física livremente.",
-                display_spec, target_serial
-            )),
-            Err(e) => Err(format!(
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return Err(format!(
                 "Falha ao iniciar Display Virtual Secundário ({}). Certifique-se de que o Scrcpy v2.2+ esteja instalado.",
                 e
             )),
+        };
+
+        std::thread::sleep(Duration::from_millis(500));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                Err(format!(
+                    "Falha ao abrir Área Virtual #2 para {}: processo encerrou prematuramente ({})",
+                    target_serial, status
+                ))
+            }
+            Ok(None) => {
+                Ok(format!(
+                    "🖥️ Área de Trabalho #2 (Display Virtual {}px) inicializada para o celular {}! O supervisor pode usar a tela física livremente.",
+                    display_spec, target_serial
+                ))
+            }
+            Err(e) => Err(format!("Erro ao verificar processo do Scrcpy: {}", e)),
         }
     }
 
@@ -2589,13 +2661,20 @@ impl AdbManager {
              settings put global wifi_sleep_policy 2; \
              settings put global wifi_scan_always_enabled 1; \
              settings put global stay_on_while_plugged_in 7; \
+             settings put global low_power 0; \
+             settings put global low_power_trigger_level 0; \
+             settings put global adb_allowed_connection_time 0; \
+             settings put global tcp_keepalive_interval 15; \
              device_config put activity_manager max_phantom_processes 2147483647; \
              dumpsys deviceidle disable; \
              dumpsys deviceidle whitelist +com.mouldybread.adbautoenable; \
              dumpsys deviceidle whitelist +com.android.shell; \
+             dumpsys deviceidle whitelist +com.google.android.gms; \
              dumpsys deviceidle whitelist +com.esfera.agent; \
              cmd appops set com.esfera.agent RUN_IN_BACKGROUND allow; \
              cmd appops set com.esfera.agent RUN_ANY_IN_BACKGROUND allow; \
+             cmd appops set com.esfera.agent REQUEST_IGNORE_BATTERY_OPTIMIZATIONS allow; \
+             am set-standby-bucket com.esfera.agent active; \
              am start-foreground-service com.esfera.agent/.EsferaAgentService; \
              am startservice com.esfera.agent/.EsferaAgentService",
             id_cmd
@@ -2824,7 +2903,7 @@ impl AdbManager {
                     let full_addr = format!("{}:5555", ip);
                     let _ = Self::connect_device(&ip, 5555);
                     if let Some(pid) = Self::get_persistent_device_id(&full_addr) {
-                        let _ = db.process_checkin(&pid, &full_addr, &ip, 5555, &chrono::Utc::now().to_rfc3339());
+                        let _ = db.process_checkin(&pid, &full_addr, &ip, 5555, &chrono::Utc::now().to_rfc3339(), "");
                     }
                 }
                 break;
@@ -2851,27 +2930,9 @@ impl AdbManager {
     pub fn start_agent_service(serial: &str) -> Result<String, String> {
         // Tenta iniciar o novo agente (v4), fallback para o antigo (mouldybread/tpn)
         let result = (|| -> Result<String, String> {
-            // 0. Abre a MainActivity primeiro: ela chama startForegroundService no
-            // onCreate, o que destrava o background-start em Android 8+ (app recém-
-            // instalado não pode receber start-foreground-service direto do adb).
-            let mut act = create_cmd("adb");
-            act.args([
-                "-s",
-                serial,
-                "shell",
-                "am",
-                "start",
-                "-n",
-                "com.esfera.agent/.MainActivity",
-            ]);
-            let _ = run_cmd_timeout(act, Duration::from_secs(3));
-            std::thread::sleep(Duration::from_millis(800));
-
-            // 0b. SEMEIA a chave ADB do PC no celular (/data/misc/adb/adb_keys)
+            // 0. Semeia a chave ADB do PC no celular (/data/misc/adb/adb_keys)
             // para que conexões ADB-over-TCP sejam autorizadas SEM popup e de forma
             // persistente (nunca mais "device still authorizing" ao reconectar na rede).
-            // Requer que o celular já esteja autorizado uma vez via USB (ou via agente
-            // com permissão de escrita). Se não conseguir, ignora — não bloqueia o fluxo.
             if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
                 let key_path = std::path::Path::new(&home).join(".android").join("adbkey.pub");
                 if let Ok(key) = std::fs::read_to_string(&key_path) {
@@ -2888,20 +2949,17 @@ impl AdbManager {
                 }
             }
 
-            // 1. Tenta novo agente v4 (com.esfera.agent)
+            // 1. Inicia o servico com.esfera.agent silenciosamente em background
             let mut cmd = create_cmd("adb");
             cmd.args([
                 "-s",
                 serial,
                 "shell",
-                "am",
-                "start-foreground-service",
-                "-n",
-                "com.esfera.agent/.EsferaAgentService",
+                "am start-foreground-service -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am startservice -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am broadcast -a com.esfera.agent.KEEP_ALIVE 2>/dev/null",
             ]);
             if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                if stdout.contains("Starting") || out.status.success() {
+                if stdout.contains("Starting") || stdout.contains("Broadcast") || out.status.success() {
                     return Ok("Agente Esfera v4 iniciado".to_string());
                 }
             }
@@ -3970,7 +4028,7 @@ impl AdbManager {
                                     let serial_no = String::from_utf8_lossy(&p.stdout).trim().to_string();
                                     if !serial_no.is_empty() {
                                         let now = chrono::Utc::now().to_rfc3339();
-                                        let _ = db.process_checkin(&serial_no, &target_ip, &ip_part, 5555, &now);
+                                        let _ = db.process_checkin(&serial_no, &target_ip, &ip_part, 5555, &now, "");
                                     }
                                 }
                                 reconnected.push(format!("✓ {} ({})", dev.name, target_ip));
@@ -4023,7 +4081,7 @@ impl AdbManager {
                         let serial_no = String::from_utf8_lossy(&p.stdout).trim().to_string();
                         if !serial_no.is_empty() {
                             let now = chrono::Utc::now().to_rfc3339();
-                            let _ = db.process_checkin(&serial_no, &target_addr, &found_ip, 5555, &now);
+                            let _ = db.process_checkin(&serial_no, &target_addr, &found_ip, 5555, &now, "");
                             if !reconnected.iter().any(|r| r.contains(&found_ip)) {
                                 reconnected.push(format!("✓ Autodetectado ({})", target_addr));
                             }

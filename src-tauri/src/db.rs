@@ -408,6 +408,8 @@ impl Database {
         db.migrate_existing_tables()?;
         db_log("Seeding data...");
         db.seed_data()?;
+        db_log("Auditando e curando identidades nativas de dispositivos...");
+        db.audit_and_heal_device_identities()?;
         db_log("DB init concluído com SUCESSO!");
         Ok(db)
     }
@@ -1032,6 +1034,60 @@ impl Database {
         Ok(())
     }
 
+    /// Executa a auditoria e cura nativa automática dos 11 dispositivos oficiais.
+    /// Exclui qualquer registro fantasma/legado e assegura a soberania de nomes do operador.
+    pub fn audit_and_heal_device_identities(&self) -> Result<()> {
+        let conn = self.conn();
+        
+        // 1. Limpa IDs fantasmas/legados/temporários
+        let _ = conn.execute("DELETE FROM ESF_DeviceIdentity WHERE EsferaDeviceId LIKE 'ESFERA_DEV_%' OR EsferaDeviceId LIKE 'ESF-LEGACY-%';", []);
+        let _ = conn.execute("DELETE FROM ESF_Device WHERE EsferaDeviceId LIKE 'ESFERA_DEV_%' OR EsferaDeviceId LIKE 'ESF-LEGACY-%' OR EsferaDeviceId IS NULL;", []);
+        
+        // 2. Tabela de Mapeamento Nativo dos 11 Aparelhos
+        let devices_map = [
+            ("ESF-MMULT000", "1", 1, "MMULT0003016521", "192.168.1.41:5555", "192.168.1.41", "Multilaser"),
+            ("ESF-52005950", "2", 2, "192.168.1.75:5555", "192.168.1.75:5555", "192.168.1.75", "Samsung"),
+            ("ESF-42000D48", "3", 3, "42000d4801386585", "192.168.1.56:5555", "192.168.1.56", "Samsung"),
+            ("ESF-1P924A80", "4", 4, "1P924A802201272", "192.168.1.42:5555", "192.168.1.42", "Multilaser"),
+            ("ESF-420012CA", "5", 5, "420012cad28ca5c7", "192.168.1.73:5555", "192.168.1.73", "Samsung"),
+            ("ESF-5A323K71", "6", 6, "5A323K71N", "192.168.1.63:5555", "192.168.1.63", "Positivo"),
+            ("ESF-4200DA85", "7", 7, "192.168.1.151:5555", "192.168.1.151:5555", "192.168.1.151", "Samsung"),
+            ("ESF-5A337TP0", "9", 9, "5A337TP07", "192.168.1.63:5555", "192.168.1.63", "Positivo"),
+            ("ESF-00829256", "10", 10, "192.168.1.83:5555", "192.168.1.83:5555", "192.168.1.83", "Motorola"),
+            ("ESF-0N14619I", "11", 11, "0N14619I241030D7", "192.168.1.100:5555", "192.168.1.100", "Realme"),
+            ("ESF-EH428L00", "12", 12, "192.168.1.82:5555", "192.168.1.82:5555", "192.168.1.82", "Redmi"),
+        ];
+
+        let now = chrono::Utc::now().to_rfc3339();
+
+        for (esf_id, default_name, num, usb_serial, adb_addr, ip, model) in devices_map {
+            // Garante que o ESF_DeviceIdentity exista (respeitando o CustomName caso já tenha sido personalizado pelo operador)
+            let _ = conn.execute(
+                "INSERT INTO ESF_DeviceIdentity (EsferaDeviceId, CustomName, Sector, DeviceNumber, Model, UpdatedAt)
+                 VALUES (?1, ?2, 'junior', ?3, ?4, ?5)
+                 ON CONFLICT(EsferaDeviceId) DO UPDATE SET
+                    DeviceNumber = excluded.DeviceNumber,
+                    Model = CASE WHEN ESF_DeviceIdentity.Model IS NULL OR ESF_DeviceIdentity.Model = '' THEN excluded.Model ELSE ESF_DeviceIdentity.Model END,
+                    UpdatedAt = excluded.UpdatedAt;",
+                params![esf_id, default_name, num, model, now],
+            );
+
+            // Garante que a linha ESF_Device esteja cadastrada com a chave primária oficial AdbDeviceId
+            let _ = conn.execute(
+                "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
+                 VALUES (?1, ?2, 'Android', ?3, ?4, 5555, 'online', 100, 1, ?5, 'junior', ?6, ?7, ?8)
+                 ON CONFLICT(AdbDeviceId) DO UPDATE SET
+                    DeviceNumber = excluded.DeviceNumber,
+                    EsferaDeviceId = excluded.EsferaDeviceId,
+                    CurrentAdbAddress = excluded.CurrentAdbAddress,
+                    DeviceIp = excluded.DeviceIp;",
+                params![usb_serial, default_name, model, ip, num, esf_id, adb_addr, now],
+            );
+        }
+
+        Ok(())
+    }
+
 
     // ============================================================
     // AUTENTICAÇÃO (com hash)
@@ -1312,8 +1368,31 @@ impl Database {
                 if affected > 0 { return Ok(()); }
             }
         }
+        // 1.5. Tenta por CurrentAdbAddress ou DeviceIp para prevenir duplicatas de IP
+        let target_addr = device.current_adb_address.as_deref().unwrap_or(&device.serial);
+        if !target_addr.is_empty() {
+            let affected = self.exec_retry(
+                "UPDATE ESF_Device SET
+                    Status = ?1,
+                    BatteryLevel = ?2,
+                    CurrentAdbAddress = ?3,
+                    LastSeenUTC = ?4,
+                    EsferaDeviceId = COALESCE(?5, EsferaDeviceId)
+                 WHERE CompanyId = ?6 AND (CurrentAdbAddress = ?3 OR (DeviceIp = ?7 AND ?7 != ''))",
+                params![
+                    device.status,
+                    device.battery,
+                    target_addr,
+                    device.last_seen_utc,
+                    device.esfera_device_id,
+                    target_comp,
+                    device.ip,
+                ],
+            ).unwrap_or(0);
+            if affected > 0 { return Ok(()); }
+        }
 
-        // 2. Se não encontrou linha existente por EsferaDeviceId, insere ou atualiza por AdbDeviceId
+        // 2. Se não encontrou linha existente por EsferaDeviceId ou IP, insere ou atualiza por AdbDeviceId
         self.exec_retry(
             "INSERT INTO ESF_Device (AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
@@ -1349,6 +1428,38 @@ impl Database {
             ],
         )
         .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Atualiza imediatamente o IP volátil e status online de um dispositivo usando o EsferaDeviceId perpétuo como única fonte da verdade
+    pub fn update_device_network_by_id(&self, device_id: &str, ip: &str, port: i32) -> Result<(), String> {
+        let adb_address = format!("{}:{}", ip, port);
+        let upper_id = device_id.to_uppercase();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let _ = self.exec_retry(
+            "UPDATE ESF_Device SET
+                CurrentAdbAddress = ?1,
+                DeviceIp = ?2,
+                DevicePort = ?3,
+                Status = 'online',
+                LastSeenUTC = ?4
+             WHERE EsferaDeviceId = ?5 OR UPPER(EsferaDeviceId) = ?6
+                OR AdbDeviceId = ?5 OR UPPER(AdbDeviceId) = ?6",
+            params![adb_address, ip, port, now, device_id, upper_id],
+        );
+
+        let _ = self.exec_retry(
+            "UPDATE ESF_DeviceIdentity SET
+                CurrentAdbAddress = ?1,
+                DeviceIp = ?2,
+                DevicePort = ?3,
+                Status = 'online',
+                LastSeenUTC = ?4
+             WHERE EsferaDeviceId = ?5 OR UPPER(EsferaDeviceId) = ?6",
+            params![adb_address, ip, port, now, device_id, upper_id],
+        );
+
         Ok(())
     }
 
@@ -1400,8 +1511,9 @@ impl Database {
         Ok(())
     }
 
-    pub fn process_checkin(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
+    pub fn process_checkin(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str, adb_serial: &str) -> Result<usize, String> {
         let upper_id = device_id.to_uppercase();
+        let upper_serial = adb_serial.to_uppercase();
         let affected = self.exec_retry(
             "UPDATE ESF_Device SET
                 CurrentAdbAddress = ?1,
@@ -1409,21 +1521,24 @@ impl Database {
                 LastSeenUTC = ?2,
                 DeviceIp = ?3,
                 DevicePort = ?4,
-                EsferaDeviceId = COALESCE(EsferaDeviceId, ?5)
+                EsferaDeviceId = COALESCE(EsferaDeviceId, ?5),
+                AdbDeviceId = COALESCE(NULLIF(?7, ''), AdbDeviceId)
              WHERE EsferaDeviceId = ?5
                 OR UPPER(EsferaDeviceId) = ?6
                 OR AdbDeviceId = ?5
                 OR UPPER(AdbDeviceId) = ?6
+                OR (NULLIF(?7, '') IS NOT NULL AND (AdbDeviceId = ?7 OR UPPER(AdbDeviceId) = ?8))
                 OR DeviceIp = ?3
                 OR CurrentAdbAddress = ?1",
-            params![adb_address, now, ip, port, device_id, upper_id],
+            params![adb_address, now, ip, port, device_id, upper_id, adb_serial, upper_serial],
         ).map_err(|e| e.to_string())?;
 
         Ok(affected)
     }
 
-    pub fn insert_unknown_device(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str) -> Result<usize, String> {
+    pub fn insert_unknown_device(&self, device_id: &str, adb_address: &str, ip: &str, port: u16, now: &str, adb_serial: &str) -> Result<usize, String> {
         let upper_id = device_id.to_uppercase();
+        let upper_serial = adb_serial.to_uppercase();
         let affected = self.exec_retry(
             "UPDATE ESF_Device SET
                 EsferaDeviceId = COALESCE(EsferaDeviceId, ?1),
@@ -1431,19 +1546,22 @@ impl Database {
                 Status = 'online',
                 LastSeenUTC = ?3,
                 DeviceIp = ?4,
-                DevicePort = ?5
-             WHERE DeviceIp = ?4 OR CurrentAdbAddress = ?2 OR AdbDeviceId = ?1 OR UPPER(AdbDeviceId) = ?6",
-            params![device_id, adb_address, now, ip, port, upper_id],
+                DevicePort = ?5,
+                AdbDeviceId = COALESCE(NULLIF(?7, ''), AdbDeviceId)
+             WHERE DeviceIp = ?4 OR CurrentAdbAddress = ?2 OR AdbDeviceId = ?1 OR UPPER(AdbDeviceId) = ?6
+                OR (NULLIF(?7, '') IS NOT NULL AND (AdbDeviceId = ?7 OR UPPER(AdbDeviceId) = ?8))",
+            params![device_id, adb_address, now, ip, port, upper_id, adb_serial, upper_serial],
         ).map_err(|e| e.to_string())?;
 
         if affected > 0 {
             return Ok(affected);
         }
 
+        let final_adb_id = if !adb_serial.is_empty() { adb_serial.to_string() } else { device_id.to_string() };
         self.exec_retry(
             "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
-             VALUES (?1, ?1, ?2, 'Android', 'Smartphone', ?3, ?4, 'online', 100, 1, 0, 'junior', ?5, ?6)",
-            params![device_id, format!("Celular {}", ip), ip, port, adb_address, now],
+             VALUES (?1, ?2, ?3, 'Android', 'Smartphone', ?4, ?5, 'online', 100, 1, 0, 'junior', ?6, ?7)",
+            params![final_adb_id, device_id, format!("Celular {}", ip), ip, port, adb_address, now],
         ).map_err(|e| e.to_string())
     }
 
