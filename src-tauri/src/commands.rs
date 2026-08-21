@@ -264,8 +264,15 @@ fn get_cached_adb_devices() -> Vec<AdbDeviceInfo> {
 }
 
 fn get_cached_battery(serial: &str) -> i32 {
-    // Usa cache do AdbManager (15s TTL)
-    AdbManager::get_battery_level(serial).unwrap_or(85)
+    if let Ok(lvl) = AdbManager::get_battery_level(serial) {
+        return lvl;
+    }
+    if let Some(session) = crate::session_manager::get_session(serial) {
+        if session.battery_level > 0 {
+            return session.battery_level as i32;
+        }
+    }
+    0
 }
 
 /// Extrai o host/IP de um endereço, ignorando a porta (ex.: "192.168.1.151:5555" -> "192.168.1.151").
@@ -490,6 +497,8 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 d.serial == adb_dev.serial
                     || (persistent_id.is_some() && d.esfera_device_id.as_deref() == persistent_id.as_deref())
                     || (persistent_id.is_some() && d.serial == persistent_id.as_deref().unwrap())
+                    || (!ip_only.is_empty() && d.ip == ip_only)
+                    || d.current_adb_address.as_deref() == Some(&adb_dev.serial)
             });
 
             // PROTEÇÃO ABSOLUTA DE IDENTIDADE:
@@ -570,11 +579,30 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
 
         let mut refreshed_db = if changed { state_db.get_devices(target_company_id) } else { db_devices };
 
-        // Cruza o estado de túnel reverso com o DB: devices com sessão ativa de túnel
-        // passam a ser apresentados com identidade estável (EsferaDeviceId), e NÃO como
-        // endpoint ADB volátil (ip:porta). Isso evita a "aparência de modelo antigo".
+        // Cruza o estado de Presença WebSocket (SessionManager) e Túnel Reverso com o DB:
+        // O Hardware ID (EsferaDeviceId) é a ÚNICA FONTE DA VERDADE. O IP é volátil.
         for dev in &mut refreshed_db {
             if let Some(ref uuid) = dev.esfera_device_id {
+                // 1. Presença WebSocket direta do APK (esfera-agent)
+                if let Some(sess) = crate::session_manager::get_session(uuid) {
+                    if sess.ws_connected {
+                        dev.status = "online".to_string();
+                        if sess.battery_level > 0 {
+                            dev.battery = sess.battery_level as i32;
+                        }
+                        if !sess.ip.is_empty() && dev.ip != sess.ip {
+                            dev.ip = sess.ip.clone();
+                            let new_adb_addr = format!("{}:5555", sess.ip);
+                            dev.current_adb_address = Some(new_adb_addr);
+                            let ip_to_connect = sess.ip.clone();
+                            std::thread::spawn(move || {
+                                let _ = AdbManager::connect_device(&ip_to_connect, 5555);
+                            });
+                        }
+                    }
+                }
+
+                // 2. Túnel Reverso de Execução
                 if crate::tunnel_server::is_tunnel_active(uuid) {
                     dev.via_tunnel = true;
                     dev.status = "online".to_string();
@@ -732,7 +760,24 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
 
             if let Some(pos) = existing_pos {
                 refreshed_db[pos].via_tunnel = true;
-                refreshed_db[pos].status = mapped_status.clone();
+                // FIX (2026-08-21): ADB local fresco SEMPRE vence sobre VPS stale.
+                // Se o celular responde como `device` no ADB local, ele ESTÁ online
+                // independente do que a VPS (que pode estar desatualizada quando o
+                // agente Kotlin não reporta presença/túnel) diga. Sem isso, o app
+                // mostrava "offline"/ausente mesmo com o aparelho conectado no ADB.
+                let adb_local_online = active_adb_list.iter().any(|adb_d| {
+                    adb_d.state == "device"
+                        && (adb_d.serial == refreshed_db[pos].serial
+                            || refreshed_db[pos].current_adb_address.as_deref() == Some(&adb_d.serial)
+                            || (!refreshed_db[pos].ip.is_empty()
+                                && (adb_d.serial == refreshed_db[pos].ip
+                                    || adb_d.serial.starts_with(&refreshed_db[pos].ip))))
+                });
+                if adb_local_online {
+                    refreshed_db[pos].status = "online".to_string();
+                } else {
+                    refreshed_db[pos].status = mapped_status.clone();
+                }
                 if refreshed_db[pos].esfera_device_id.is_none() {
                     refreshed_db[pos].esfera_device_id = Some(esfera_id.clone());
                 }
@@ -791,7 +836,20 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             if dev.via_tunnel {
                 if let Some(ref id) = dev.esfera_device_id {
                     if dev.serial == *id && !live_ids.contains(id) {
-                        dev.status = "offline".to_string();
+                        // FIX (2026-08-21): não marcar offline se o ADB local diz
+                        // `device`. O ADB local fresco é verdadeiro mesmo quando a VPS
+                        // (agentes Kotlin sem reportar) está desatualizada.
+                        let adb_local_online = active_adb_list.iter().any(|adb_d| {
+                            adb_d.state == "device"
+                                && (adb_d.serial == dev.serial
+                                    || dev.current_adb_address.as_deref() == Some(&adb_d.serial)
+                                    || (!dev.ip.is_empty()
+                                        && (adb_d.serial == dev.ip
+                                            || adb_d.serial.starts_with(&dev.ip))))
+                        });
+                        if !adb_local_online {
+                            dev.status = "offline".to_string();
+                        }
                     }
                 }
             }
