@@ -53,7 +53,7 @@ class MainActivity : AppCompatActivity() {
             startService(svc)
         }
 
-        Toast.makeText(this, "Esfera Agent ativo — mantenha a bateria sem restrição e ative o administrador.", Toast.LENGTH_LONG).show()
+        // Toast removido para evitar popups intermitentes na tela
         finish()
     }
 

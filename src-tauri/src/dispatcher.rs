@@ -219,8 +219,8 @@ impl Dispatcher {
                     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
                     let last = KEEPALIVE_LAST_ATTEMPT.lock().unwrap().get(&key).copied();
 
-                    if let Some((ts, ok)) = last {
-                        if !ok && now_ms - ts < KEEPALIVE_COOLDOWN_SECS * 1000 {
+                    if let Some((ts, _)) = last {
+                        if now_ms - ts < KEEPALIVE_COOLDOWN_SECS * 1000 {
                             continue;
                         }
                     }

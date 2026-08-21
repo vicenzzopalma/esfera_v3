@@ -85,8 +85,9 @@ pub fn disconnect_presence(uuid: &str) {
 fn recalculate_status(entry: &mut DeviceSession) {
     entry.status = match (entry.ws_connected, entry.adb_tunnel_connected) {
         (true, true) => DeviceStatus::Online,
-        (true, false) => DeviceStatus::Degraded,
-        (false, _) => DeviceStatus::Offline,
+        (true, false) => DeviceStatus::Online,
+        (false, true) => DeviceStatus::Online,
+        (false, false) => DeviceStatus::Offline,
     };
 }
 
