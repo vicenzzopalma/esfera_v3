@@ -3540,8 +3540,29 @@ impl AdbManager {
             // 1. Marca offline devices com check-in expirado (>120s sem heartbeat)
             let _ = db_conn.mark_stale_devices_offline(120);
 
-            // 2. Consulta lista ativa atual do ADB
-            let active_list = Self::list_devices().unwrap_or_default();
+            // 1b. NÍVEL 3 (watchdog self-healing): se o ADB server travar ou a
+            // lista de devices sumir repentinamente, reinicia o server e re-conecta
+            // os IPs conhecidos do banco. Evita que um `adb kill-server`/travamento
+            // deixe a frota inteira offline sem recovery (Gemini: "USB reset / aparelho
+            // desapareceu" -> restart de transporte).
+            let active_list = match Self::list_devices() {
+                Ok(list) => list,
+                Err(_) => {
+                    // ADB server indisponível: reinicia e tenta recuperar.
+                    let _ = Self::restart_server();
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let known = db_conn.get_devices(0);
+                    for dev in &known {
+                        let ip = if let Some(ref a) = dev.current_adb_address {
+                            a.split(':').next().unwrap_or("").to_string()
+                        } else { dev.ip.clone() };
+                        if !ip.is_empty() && ip.contains('.') {
+                            let _ = Self::connect_device(&ip, 5555);
+                        }
+                    }
+                    Self::list_devices().unwrap_or_default()
+                }
+            };
 
             // 3. Reconecta somente devices que estejam offline
             let devices = db_conn.get_devices(0);
