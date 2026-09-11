@@ -10,6 +10,9 @@ class BootReceiver : BroadcastReceiver() {
             Intent.ACTION_BOOT_COMPLETED,
             "android.intent.action.QUICKBOOT_POWERON",
             "android.intent.action.MY_PACKAGE_REPLACED" -> {
+                // Auto-habilitação imediata do serviço de acessibilidade no boot
+                com.esfera.agent.accessibility.AccessibilitySelfEnabler.ensureEnabled(context)
+
                 // Android 12+ proíbe startService em background a partir de receiver;
                 // usa startForegroundService para subir o agente automaticamente.
                 val serviceIntent = Intent(context, EsferaAgentService::class.java)

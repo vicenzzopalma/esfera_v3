@@ -2320,7 +2320,7 @@ impl AdbManager {
                 "force_gpu_rendering",
                 "1",
             ],
-            // 3. Imuniza o WhatsApp no Doze Mode para evitar que o Android mate em segundo plano
+            // 3. Imuniza o WhatsApp e o Agente Esfera no Doze Mode
             vec![
                 "shell",
                 "dumpsys",
@@ -2335,23 +2335,61 @@ impl AdbManager {
                 "whitelist",
                 "+com.whatsapp.w4b",
             ],
-            // 4. Libera memória RAM e otimiza compilação DEX AOT (Speed Profile)
+            vec![
+                "shell",
+                "dumpsys",
+                "deviceidle",
+                "whitelist",
+                "+com.esfera.agent",
+            ],
+            // 4. Regras de permanência ativa e Wi-Fi sem sono
+            vec!["shell", "settings", "put", "global", "wifi_sleep_policy", "2"],
+            vec!["shell", "settings", "put", "global", "stay_on_while_plugged_in", "7"],
+            vec!["shell", "dumpsys", "deviceidle", "disable"],
+            // 5. Desativação do RAM Plus / Swap lento na memória Flash (Samsung)
+            vec!["shell", "settings", "put", "global", "ram_expand_size", "0"],
+            // 6. Fix de Phantom Processes (impede o Android de matar ADB/Agente em background)
+            vec!["shell", "device_config", "put", "activity_manager", "max_phantom_processes", "2147483647"],
+            // 7. Compilação AOT (Ahead-Of-Time Speed) para execução sem compilação JIT em CPUs fracas
             vec![
                 "shell",
                 "cmd",
                 "package",
                 "compile",
                 "-m",
-                "speed-profile",
+                "speed",
+                "-f",
                 "com.whatsapp",
             ],
+            vec![
+                "shell",
+                "cmd",
+                "package",
+                "compile",
+                "-m",
+                "speed",
+                "-f",
+                "com.whatsapp.w4b",
+            ],
+            vec![
+                "shell",
+                "cmd",
+                "package",
+                "compile",
+                "-m",
+                "speed",
+                "-f",
+                "com.esfera.agent",
+            ],
+            // 8. Limpeza de caches residuais e trim de armazenamento flash
+            vec!["shell", "pm", "trim-caches", "999G"],
         ];
 
         let mut success_count = 0;
         for cmd in &commands {
             let mut adb = create_cmd("adb");
             adb.arg("-s").arg(serial).args(cmd);
-            let res = run_cmd_timeout(adb, Duration::from_secs(6));
+            let res = run_cmd_timeout(adb, Duration::from_secs(12));
             if let Ok(o) = res {
                 if o.status.success() {
                     success_count += 1;
@@ -2359,11 +2397,16 @@ impl AdbManager {
             }
         }
 
+        // Executa debloat de fábrica seguro (desativa telemetrias inúteis e apps de operadora)
+        let debloat_msg = Self::debloat_device_profile(serial, "safe")
+            .unwrap_or_else(|e| format!("Debloat parcial: {}", e));
+
         Ok(format!(
-            "🚀 Otimização HPC aplicada com sucesso em {}! ({}/{} otimizações ativadas)",
+            "🚀 Otimização HPC XDA aplicada em {}!\n✓ {}/{} regras ativadas (AOT Speed, Zero Animação, RAM Fix, Doze Immunity)\n✓ {}",
             serial,
             success_count,
-            commands.len()
+            commands.len(),
+            debloat_msg
         ))
     }
 
@@ -3295,17 +3338,17 @@ impl AdbManager {
         "127.0.0.1".to_string()
     }
 
-    fn resolve_server_url(serial: &str, config: &crate::config::AppConfig) -> String {
-        if !config.hub_address.is_empty() {
+    pub fn resolve_server_url(serial: &str, config: &crate::config::AppConfig) -> String {
+        let port = config.checkin_server_port;
+        if config.hub_enabled && config.mode != "standalone" && !config.hub_address.is_empty() {
             let host = config
                 .hub_address
                 .split(':')
                 .next()
-                .unwrap_or("34.29.70.113");
-            return format!("http://{}:{}", host, config.checkin_server_port);
+                .unwrap_or("127.0.0.1");
+            return format!("http://{}:{}", host, port);
         }
-        let port = config.checkin_server_port;
-        let is_usb = !serial.contains(':');
+        let is_usb = !serial.contains(':') && !serial.contains('.');
         if is_usb {
             return format!("http://localhost:{}", port);
         }

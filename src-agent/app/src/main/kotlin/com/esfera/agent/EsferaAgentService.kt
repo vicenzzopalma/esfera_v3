@@ -72,15 +72,17 @@ data class EsferaConfig(
 data class CheckInRequest(
     val esferaDeviceId: String,
     val currentAdbAddress: String,
-    // SERIAL ADB FÍSICO (ro.serialno / Build.getSerial). É a CHAVE DE FUSÃO
-    // INDEPENDENTE DE IP: um celular em USB (sem IP) e em WiFi (IP muda) devem
-    // fundir no MESMO registro na VPS/desktop. Sem isso o app criava 2 cartões
-    // (USB vs WiFi) porque o cruzamento antigo era só por IP.
     val adbSerial: String = "",
     val companyId: Int = 0,
     val batteryLevel: Int = 0,
     val isCharging: Boolean = false,
-    val isScreenOn: Boolean = false
+    val isScreenOn: Boolean = false,
+    // PORTA LÓGICA LOCAL onde o adbd ESCUTA AGORA (descoberta, não fixa 5555).
+    // É TEMPORÁRIA: muda quando o aparelho reinicia/revoga a porta. Nunca é
+    // identidade — só o endpoint atual do transporte ADB.
+    val localPort: Int = 5555,
+    val accessibility_enabled: Boolean = false,
+    val write_secure_settings_granted: Boolean = false
 )
 
 @Serializable
@@ -90,13 +92,30 @@ data class TunnelHandshake(
     val companyId: Int = 0,
     val macAddress: String = "",
     val serialNumber: String = "",
-    // SERIAL ADB FÍSICO: mesmo propósito do CheckInRequest — permite que o
-    // tunnel_server (e a VPS) fundam este celular por serial, não só por IP.
     val adbSerial: String = "",
     val agentVersion: String = "1.0-tunnel",
-    val currentLocalIp: String = ""
+    val currentLocalIp: String = "",
+    // Porta local ADB atual (descoberta). Temporária.
+    val localPort: Int = 5555
 )
 
+/**
+ * Mega Prompt §23 — Máquina de estados da conexão do agente.
+ * Transições explícitas: INITIALIZING → REGISTERING → CONNECTING → ONLINE
+ *                        → DISCONNECTED → RECONNECTING → ONLINE
+ * Adicional: NETWORK_UNAVAILABLE, AUTH_FAILED, SERVER_UNAVAILABLE.
+ */
+enum class AgentState {
+    INITIALIZING,
+    REGISTERING,
+    CONNECTING,
+    ONLINE,
+    DISCONNECTED,
+    RECONNECTING,
+    NETWORK_UNAVAILABLE,
+    AUTH_FAILED,
+    SERVER_UNAVAILABLE
+}
 class EsferaAgentService : Service() {
 
     companion object {
@@ -164,12 +183,27 @@ class EsferaAgentService : Service() {
         return ALLOWED_PREFIXES.any { c.startsWith(it) }
     }
 
-    // ----------------------------------------------------------------\n
+    // ----------------------------------------------------------------\
     private var checkInJob: Job? = null
     private var tunnelJob: Job? = null
     private var lastKnownIp: String? = null
     private var agentConfig: EsferaConfig? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // Mega Prompt §23: estado atual da máquina de estados.
+    @Volatile private var agentState: AgentState = AgentState.INITIALIZING
+    private var reconnectCount: Int = 0
+    private var lastDisconnectReason: String = ""
+
+    /** Transição explícita de estado (Mega Prompt §23). Logada no Logcat. */
+    private fun transition(newState: AgentState, reason: String = "") {
+        val prev = agentState
+        agentState = newState
+        if (prev == AgentState.RECONNECTING && newState == AgentState.ONLINE) {
+            reconnectCount++
+        }
+        android.util.Log.i("EsferaAgent", "[STATE] $prev → $newState ($reason) reconnects=$reconnectCount")
+    }
 
     // URLs do check-in (base + fallback HTTP 8080) compartilhadas entre o loop
     // periódico e o disparo imediato do NetworkCallback (troca de rede/reboot).
@@ -344,9 +378,13 @@ class EsferaAgentService : Service() {
         val propServer = getProp("persist.esfera.server_address").ifEmpty { getProp("persist.esfera.hub") }
 
         // Mescla: arquivo tem precedência; prop preenche o que faltar (caso root).
+        // FALLBACK STANDALONE / WIREGUARD P2P: se nenhum source trouxer serverUrl,
+        // usamos o gateway padrão do WireGuard (10.8.0.1) ou localhost via adb reverse.
+        val FALLBACK_SERVER_URL: String = "http://10.8.0.1:8080"
+        val FALLBACK_COMPANY_ID: Int = 1
         val resolvedDeviceId = fileConfig.deviceId.ifBlank { propDeviceId }
-        val resolvedCompany = if (fileConfig.companyId > 0) fileConfig.companyId else propCompany
-        val resolvedServer = fileConfig.serverUrl.ifBlank { propServer }
+        val resolvedCompany = if (fileConfig.companyId > 0) fileConfig.companyId else if (propCompany > 0) propCompany else FALLBACK_COMPANY_ID
+        val resolvedServer = fileConfig.serverUrl.ifBlank { if (propServer.isNotBlank()) propServer else FALLBACK_SERVER_URL }
 
         // BLOQUEIO DE IDENTIDADE FACTUAL: um deviceId ESF- vindo do arquivo/prop é
         // IMUTÁVEL — nunca é substituído por ANDROID_ID (que muda em reinstall/clear
@@ -460,6 +498,7 @@ class EsferaAgentService : Service() {
 
     private fun loadConfigAndStart() {
         android.util.Log.d("EsferaAgent", "loadConfigAndStart: lendo config")
+        transition(AgentState.INITIALIZING, "loadConfigAndStart")
         val config = loadConfig()
         android.util.Log.d("EsferaAgent", "loadConfigAndStart: serverUrl='${config.serverUrl}' deviceId='${config.deviceId}' companyId=${config.companyId}")
         android.util.Log.i("EsferaAgent", "[TUNNEL] service_started")
@@ -470,6 +509,7 @@ class EsferaAgentService : Service() {
             return
         }
         agentConfig = config
+        transition(AgentState.REGISTERING, "config carregada, iniciando check-in")
         startCheckInLoop(config)
         if (config.tunnelEnabled) {
             startTunnelLoop(config)
@@ -482,7 +522,7 @@ class EsferaAgentService : Service() {
         checkInJob?.cancel()
         val host = config.serverUrl
             .replace("https://", "").replace("http://", "")
-            .substringBefore(':').substringBefore('/').ifEmpty { "34.29.70.113" }
+            .substringBefore(':').substringBefore('/').ifEmpty { "10.8.0.1" }
         // Compartilhado com o disparo imediato do NetworkCallback (troca de rede).
         checkInUrls = config.serverUrl to "http://$host:8080"
         checkInJob = scope.launch {
@@ -496,6 +536,11 @@ class EsferaAgentService : Service() {
                     delay(CHECK_IN_INTERVAL_MS)
                 } else {
                     android.util.Log.w("EsferaAgent", "Check-in falhou; retentando em ${backoffMs}ms")
+                    if (agentState == AgentState.ONLINE) {
+                        transition(AgentState.DISCONNECTED, "check-in falhou")
+                    } else if (agentState != AgentState.RECONNECTING && agentState != AgentState.NETWORK_UNAVAILABLE) {
+                        transition(AgentState.RECONNECTING, "backoff retry")
+                    }
                     delay(backoffMs + (0..1000).random().toLong())
                     backoffMs = (backoffMs * 2).coerceIn(2_000L, 30_000L)
                 }
@@ -510,33 +555,46 @@ class EsferaAgentService : Service() {
      */
     private suspend fun doCheckIn(config: EsferaConfig): Boolean {
         val urls = checkInUrls ?: return false
-        val ip = resolveCurrentIp()
-        if (ip == null) {
-            android.util.Log.w("EsferaAgent", "doCheckIn: sem IP ativo (rede indisponível)")
+        // Endpoint ADB ATUAL (IP:PORTA descobertos). Se não houver adbd em TCP,
+        // tenta reativar (ensureAdbdTcp) e re-descobre — nunca fixa 5555.
+        val endpoint = resolveAdbEndpoint() ?: run {
+            ensureAdbdTcp(currentAdbPort)
+            resolveAdbEndpoint()
+        }
+        val ip = endpoint?.substringBefore(':') ?: run {
+            transition(AgentState.NETWORK_UNAVAILABLE, "sem IP ativo")
             return false
         }
         lastKnownIp = ip
         val battery = batteryInfo()
+        val isAccEnabled = com.esfera.agent.accessibility.AccessibilitySelfEnabler.isAccessibilityEnabled(this)
+        val hasSecurePerm = com.esfera.agent.accessibility.AccessibilitySelfEnabler.hasWriteSecureSettings(this)
         return try {
             val base = if (useHttpFallback) urls.second else urls.first
             val response: HttpResponse = httpClient.post("$base/api/devices/check-in") {
                 contentType(ContentType.Application.Json)
                 setBody(CheckInRequest(
                     esferaDeviceId = config.deviceId,
-                    currentAdbAddress = "$ip:5555",
-                    // SERIAL ADB físico: chave de fusão independente de IP (USB vs WiFi).
+                    currentAdbAddress = endpoint,
                     adbSerial = resolveAdbSerial(),
                     companyId = config.companyId,
                     batteryLevel = battery.first,
                     isCharging = battery.second,
-                    isScreenOn = isScreenInteractive()
+                    isScreenOn = isScreenInteractive(),
+                    localPort = currentAdbPort,
+                    accessibility_enabled = isAccEnabled,
+                    write_secure_settings_granted = hasSecurePerm
                 ))
             }
             val ok = response.status.value == 200
             if (ok) {
                 android.util.Log.d("EsferaAgent", "Check-in OK: $ip")
+                if (agentState != AgentState.ONLINE) {
+                    transition(AgentState.ONLINE, "check-in sucesso")
+                }
             } else {
                 android.util.Log.w("EsferaAgent", "Check-in status ${response.status.value}: $ip")
+                transition(AgentState.SERVER_UNAVAILABLE, "HTTP ${response.status.value}")
             }
             ok
         } catch (e: Exception) {
@@ -576,11 +634,32 @@ class EsferaAgentService : Service() {
         }
     }
 
+    /** Resolve o endpoint ADB atual (IP:PORTA) onde o adbd ESCUTA de fato.
+     *  NÃO fixa 5555: descobre a porta real que o adbd abriu (o ensureAdbdTcp
+     *  pode ter usado outra, ou o aparelho já estava em TCP numa porta diferente).
+     *  A porta é TEMPORÁRIA e descartável — nunca é identidade. */
+    private fun resolveAdbEndpoint(): String? {
+        val ip = resolveCurrentIp() ?: return null
+        val port = discoverAdbdPort()
+        currentAdbPort = port
+        return "$ip:$port"
+    }
+
+    /** Descobre a porta TCP em que o adbd local está escutando (testa as comuns). */
+    private fun discoverAdbdPort(): Int {
+        for (p in listOf(5555, 5554, 5037, 7305, 8888)) {
+            if (isAdbdListening(p)) return p
+        }
+        return 5555
+    }
+
     private fun isScreenInteractive(): Boolean {
         return try { powerManager.isInteractive } catch (_: Exception) { false }
     }
 
     @Volatile private var currentTunnelSocket: Socket? = null
+    @Volatile private var currentAdbPort: Int = 5555
+    @Volatile private var currentProxyLocal: Socket? = null
 
     // ----------------------------------------------------------------
     // Tunnel reverso (celular -> servidor, handshake por Hardware UUID)
@@ -604,15 +683,20 @@ class EsferaAgentService : Service() {
                     .replace("https://", "")
                     .substringBefore(':')
                     .substringBefore('/')
-                    .ifEmpty { "34.29.70.113" }
+                    .ifEmpty { "10.8.0.1" }
                 android.util.Log.i("EsferaAgent", "[TUNNEL] server_url=$host instance=$instanceUuid")
                 android.util.Log.i("EsferaAgent", "[TUNNEL] tunnel_port=${config.tunnelPort}")
                 try {
                     android.util.Log.i("EsferaAgent", "[TUNNEL] connect_attempt instance=$instanceUuid")
+                    if (agentState != AgentState.ONLINE) {
+                        transition(AgentState.CONNECTING, "conectando túnel $host:${config.tunnelPort}")
+                    }
                     openTunnel(host, config.tunnelPort, config.deviceId, if (config.companyId <= 0) 1 else config.companyId, instanceUuid)
                     backoffMs = 5_000L
                 } catch (e: Exception) {
                     android.util.Log.e("EsferaAgent", "[TUNNEL] connect_error instance=$instanceUuid: ${e.javaClass.simpleName}: ${e.message}")
+                    lastDisconnectReason = "tunnel_error: ${e.message}"
+                    transition(AgentState.RECONNECTING, "erro túnel: ${e.message}")
                 }
                 if (first) { first = false; backoffMs = 1_000L }
                 
@@ -640,7 +724,8 @@ class EsferaAgentService : Service() {
             hardwareUuid = deviceId,
             companyId = companyId,
             currentLocalIp = ip,
-            adbSerial = resolveAdbSerial()
+            adbSerial = resolveAdbSerial(),
+            localPort = currentAdbPort
         )
         writer.println(json.encodeToString(TunnelHandshake.serializer(), hs))
         writer.flush()
@@ -664,20 +749,38 @@ class EsferaAgentService : Service() {
                             line.contains("\"type\":\"welcome\"") -> {
                                 android.util.Log.i("EsferaAgent", "[TUNNEL] welcome_received instance=$instanceUuid")
                                 android.util.Log.i("EsferaAgent", "[TUNNEL] heartbeat_started instance=$instanceUuid")
+                                transition(AgentState.ONLINE, "túnel autenticado")
                             }
                             line.contains("\"type\":\"proxy\"") -> {
                                 val pPort = Regex("\"port\"\\s*:\\s*(\\d+)").find(line)
                                     ?.groupValues?.get(1)?.toInt() ?: 5555
+                                currentAdbPort = pPort
                                 ensureAdbdTcp(pPort)
                                 try {
                                     val local = Socket("127.0.0.1", pPort)
+                                    currentProxyLocal = local
                                     writer.println("""{"type":"proxy-ack"}""")
                                     writer.flush()
-                                    launch(Dispatchers.IO) { relayToLocal(local, socket) }
+                                    launch(Dispatchers.IO) { proxyPump(local, writer) }
                                 } catch (e: Exception) {
                                     android.util.Log.e("EsferaAgent", "proxy falhou: adbd nao escuta em 127.0.0.1:$pPort (${e.message})")
                                     writer.println("""{"type":"proxy-error","message":"adbd nao escuta em 127.0.0.1:$pPort"}""")
                                     writer.flush()
+                                }
+                            }
+                            line.contains("\"type\":\"proxy-data\"") -> {
+                                // Bytes do PROGRAMA CENTRAL (via router VPS) destinados
+                                // ao adbd local. Decodifica e escreve no socket local.
+                                val b64 = Regex("\"b64\"\\s*:\\s*\"([^\"]*)\"").find(line)
+                                    ?.groupValues?.get(1)
+                                if (b64 != null) {
+                                    try {
+                                        val data = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                                        currentProxyLocal?.getOutputStream()?.let { os ->
+                                            os.write(data)
+                                            os.flush()
+                                        }
+                                    } catch (_: Exception) {}
                                 }
                             }
                             line.contains("\"type\":\"adb_cmd\"") -> {
@@ -729,6 +832,30 @@ class EsferaAgentService : Service() {
             if (currentTunnelSocket == socket) {
                 currentTunnelSocket = null
             }
+        }
+    }
+
+    /// Pump do adbd local -> túnel: lê bytes do adbd e envia como
+    /// {"type":"proxy-data","b64":...} para a VPS (que repassa ao programa
+    /// central conectado na porta lógica). Substitui o relayToLocal cru, que
+    /// a VPS agora não consome como proxy-data.
+    private suspend fun proxyPump(local: Socket, tunnelWriter: PrintWriter) {
+        try {
+            val buf = ByteArray(8192)
+            val inStream = local.getInputStream()
+            var n: Int
+            while (kotlinx.coroutines.currentCoroutineContext().isActive && !local.isClosed) {
+                n = inStream.read(buf)
+                if (n <= 0) break
+                val b64 = android.util.Base64.encodeToString(buf, 0, n, android.util.Base64.NO_WRAP)
+                tunnelWriter.println("""{"type":"proxy-data","b64":"$b64"}""")
+                tunnelWriter.flush()
+            }
+        } catch (_: Exception) {
+            // adbd local fechou ou túnel caiu.
+        } finally {
+            try { local.close() } catch (_: Exception) {}
+            if (currentProxyLocal == local) currentProxyLocal = null
         }
     }
 
@@ -853,7 +980,14 @@ class EsferaAgentService : Service() {
         // trocar de rede, ser desplugado do USB ou reiniciar.
         override fun onAvailable(network: Network) {
             android.util.Log.d("EsferaAgent", "onAvailable: rede ganhou conectividade — check-in imediato")
+            transition(AgentState.REGISTERING, "rede disponível")
             fireImmediateCheckIn()
+        }
+
+        override fun onLost(network: Network) {
+            android.util.Log.w("EsferaAgent", "onLost: rede perdida")
+            lastDisconnectReason = "rede_perdida"
+            transition(AgentState.NETWORK_UNAVAILABLE, "conexão de rede perdida")
         }
 
         override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {

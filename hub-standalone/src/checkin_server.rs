@@ -64,6 +64,8 @@ pub struct CheckInPayload {
     pub adb_serial: String,
     #[serde(default)]
     pub company_id: i32,
+    #[serde(default)]
+    pub local_port: u16,
 }
 
 #[derive(Deserialize)]
@@ -100,20 +102,26 @@ pub async fn start(db: Arc<Database>, port: u16) {
 pub async fn handle_checkin(
     State((db, _port)): State<(Arc<Database>, u16)>,
     Json(payload): Json<CheckInPayload>,
-) -> (axum::http::StatusCode, &'static str) {
+) -> (axum::http::StatusCode, String) {
     use axum::http::StatusCode;
 
     let company_id = payload.company_id;
     if company_id <= 0 {
-        return (StatusCode::BAD_REQUEST, "companyId ausente ou invalido");
+        return (StatusCode::BAD_REQUEST, "companyId ausente ou invalido".into());
     }
 
     let now = Utc::now().to_rfc3339();
     let adb_address = &payload.current_adb_address;
-
-    let (ip, port) = match adb_address.rsplit_once(':') {
-        Some((ip_str, port_str)) => (ip_str.to_string(), port_str.parse::<u16>().unwrap_or(5555)),
-        None => (adb_address.clone(), 5555),
+    // Porta local ADB: o agente reporta a porta REAL (local_port), não a do
+    // endereço fixo. Se o agente não mandou, cai no parse do endereço.
+    let ip = adb_address.rsplit_once(':').map(|(ip_str, _)| ip_str.to_string()).unwrap_or_default();
+    let port = if payload.local_port > 0 {
+        payload.local_port
+    } else {
+        match adb_address.rsplit_once(':') {
+            Some((_, p)) => p.parse::<u16>().unwrap_or(5555),
+            None => 5555,
+        }
     };
 
     // Grava com company_id para isolar a presença no VPS.
@@ -139,23 +147,30 @@ pub async fn handle_checkin(
                 &payload.adb_serial,
             ) {
                 eprintln!("Check-in insert error: {}", e);
-                return (StatusCode::FORBIDDEN, "empresa invalida");
+                return (StatusCode::FORBIDDEN, "empresa invalida".into());
             }
         }
         Ok(_) => {}
         Err(e) => {
             eprintln!("Check-in DB error: {}", e);
-            return (StatusCode::FORBIDDEN, "empresa invalida");
+            return (StatusCode::FORBIDDEN, "empresa invalida".into());
         }
     }
 
     // REGISTRA a presença (kotlin) no session_manager para que o device SURJA
     // no get_live_devices (o app só marca verde os devices com sessão ativa).
-    // Antes, o check-in só gravava o DB e o session_manager ficava vazio ->
-    // celulares eternamente "connecting" (amarelo) no app.
-    crate::session_manager::touch_presence(company_id, &payload.esfera_device_id, &payload.current_adb_address);
+    crate::session_manager::touch_presence(company_id, &payload.esfera_device_id, adb_address);
 
-    (StatusCode::OK, "ok")
+    // Devolve a porta lógica VPS atribuída (router escuta nela).
+    let vps_port = db.get_assigned_vps_port(&payload.esfera_device_id).unwrap_or(0);
+    if vps_port > 0 {
+        crate::router::register_route(vps_port, company_id, &payload.esfera_device_id);
+        crate::session_manager::set_assigned_vps_port(company_id, &payload.esfera_device_id, vps_port);
+    }
+    (
+        StatusCode::OK,
+        format!("{{\"ok\":true,\"assignedVpsPort\":{}}}", vps_port),
+    )
 }
 
 pub async fn handle_rename_device(

@@ -39,6 +39,8 @@ pub struct HeartbeatPayload {
     pub is_screen_on: bool,
     #[serde(default)]
     pub company_id: i32,
+    #[serde(default)]
+    pub accessibility_enabled: bool,
 }
 
 pub async fn start(port: u16) {

@@ -28,6 +28,8 @@ pub struct HeartbeatPayload {
     // (que cruza por AdbDeviceId) funda USB (sem IP) e WiFi no mesmo cartão.
     #[serde(default)]
     pub adb_serial: String,
+    #[serde(default)]
+    pub accessibility_enabled: bool,
 }
 
 fn create_socket2_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener, String> {

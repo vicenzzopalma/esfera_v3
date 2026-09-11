@@ -55,8 +55,8 @@ export default function SettingsTab() {
   const [sessionTimeout, setSessionTimeout] = useState("60");
 
   // Hub config
-  const [hubEnabled, setHubEnabled] = useState(true);
-  const [hubAddress, setHubAddress] = useState("34.29.70.113:8555");
+  const [hubEnabled, setHubEnabled] = useState(false);
+  const [hubAddress, setHubAddress] = useState("127.0.0.1:8555");
   const [hubToken, setHubToken] = useState("");
   const [customIpOverride, setCustomIpOverride] = useState(false);
   const [empresaServerEnabled, setEmpresaServerEnabled] = useState(false);
@@ -86,7 +86,7 @@ export default function SettingsTab() {
       .then((cfg) => {
         if (!mounted || !cfg) return;
         setHubEnabled(cfg.hub_enabled);
-        setHubAddress(cfg.hub_address || "34.29.70.113:8555");
+        setHubAddress(cfg.hub_address || "127.0.0.1:8555");
         setHubToken(cfg.hub_token || "");
         setEmpresaServerEnabled(cfg.empresa_server_enabled);
         setEmpresaServerPort(cfg.empresa_server_port || 7777);
@@ -299,19 +299,19 @@ export default function SettingsTab() {
                   {(appMode === "empresa" || appMode === "master" || isMasterUser) && (
                     <div className="space-y-6 pt-4 border-t border-border">
                       <div>
-                        <label className="block font-semibold text-secondary mb-2 text-sm">Servidor Hub Nuvem</label>
+                        <label className="block font-semibold text-secondary mb-2 text-sm">Servidor Hub / P2P Local</label>
                         {!customIpOverride ? (
                           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 bg-emerald-950/40 border border-emerald-500/30 rounded-xl">
                             <div className="flex items-center gap-2.5 text-emerald-300 font-mono text-sm font-bold">
                               <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                              {hubAddress || "34.29.70.113:8555"} (VPS Oficial Fixa)
+                              {hubAddress || "127.0.0.1:8555"} (Padrão Local / VPN)
                             </div>
                             <button
                               type="button"
                               onClick={() => setCustomIpOverride(true)}
                               className="text-xs bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 px-3 py-1.5 rounded-lg transition-all font-medium cursor-pointer"
                             >
-                              ⚠️ Alterar IP (Caso VPS Caia)
+                              ⚙️ Alterar Endereço
                             </button>
                           </div>
                         ) : (
@@ -321,22 +321,22 @@ export default function SettingsTab() {
                                 type="text"
                                 value={hubAddress}
                                 onChange={(e) => setHubAddress(e.target.value)}
-                                placeholder="34.29.70.113:8555"
+                                placeholder="127.0.0.1:8555"
                                 className="flex-1 input-setting font-mono text-sm"
                               />
                               <button
                                 type="button"
                                 onClick={() => {
-                                  setHubAddress("34.29.70.113:8555");
+                                  setHubAddress("127.0.0.1:8555");
                                   setCustomIpOverride(false);
                                 }}
                                 className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-2.5 rounded-lg border border-slate-700 font-bold"
                               >
-                                Restaurar VPS Oficial
+                                Restaurar Padrão Local
                               </button>
                             </div>
                             <p className="text-[11px] text-amber-400 font-medium">
-                              ⚠️ Altere este IP apenas se a VPS principal cair e for necessário redirecionar para um IP de contingência.
+                              ℹ️ Endereço do túnel ou IP de rede para sincronização de instâncias.
                             </p>
                           </div>
                         )}
