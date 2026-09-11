@@ -14,11 +14,33 @@ echo Pressione qualquer tecla para ativar a conexao sem fio...
 pause >nul
 
 echo.
-echo [1/4] Ativando porta TCP 5555 no celular...
+echo [1/6] Ativando porta TCP 5555 no celular...
 adb tcpip 5555
 
 echo.
-echo [2/4] Extraindo endereco IP do celular na rede Wi-Fi...
+echo [2/6] Provisionando Permissao WRITE_SECURE_SETTINGS (Controle Remoto Resiliente)...
+adb shell dumpsys package com.esfera.agent 2>nul | findstr /i "WRITE_SECURE_SETTINGS" | findstr /i "granted=true" >nul
+if %errorlevel%==0 (
+    echo [OK] Permissao WRITE_SECURE_SETTINGS ja esta concedida no aparelho.
+) else (
+    echo [*] Concedendo android.permission.WRITE_SECURE_SETTINGS ao com.esfera.agent...
+    adb shell pm grant com.esfera.agent android.permission.WRITE_SECURE_SETTINGS 2>nul
+    adb shell dumpsys package com.esfera.agent 2>nul | findstr /i "WRITE_SECURE_SETTINGS" | findstr /i "granted=true" >nul
+    if %errorlevel%==0 (
+        echo [V] Permissao WRITE_SECURE_SETTINGS concedida com sucesso!
+    ) else (
+        echo [!] AVISO: Falha ao conceder WRITE_SECURE_SETTINGS via ADB.
+        echo [!] A telemetria do check-in HTTP registrara este modelo para analise.
+    )
+)
+
+echo.
+echo [3/6] Inicializando servidor Shizuku (Best-effort, se instalado)...
+adb shell "sh /sdcard/Android/data/moe.shizuku.privileged.api/start.sh 2>/dev/null || sh /storage/emulated/0/Android/data/moe.shizuku.privileged.api/start.sh 2>/dev/null || sh /data/local/tmp/shizuku_starter 2>/dev/null || /system/bin/sh /data/data/moe.shizuku.privileged.api/files/start.sh 2>/dev/null" >nul 2>&1
+echo [OK] Verificacao do Shizuku concluida (best-effort).
+
+echo.
+echo [4/6] Extraindo endereco IP do celular na rede Wi-Fi...
 for /f "tokens=*" %%a in ('adb shell "ip route | grep wlan0 | grep src"' ) do (
     for /f "tokens=9" %%b in ("%%a") do set PHONE_IP=%%b
 )
@@ -34,20 +56,22 @@ if "%PHONE_IP%"=="" (
     goto FIM
 )
 
-echo [3/4] IP do Celular Detectado: %PHONE_IP%
-echo [3/4] Conectando via rede sem fio ao Esfera v3...
+echo [5/6] IP do Celular Detectado: %PHONE_IP%
+echo [5/6] Conectando via rede sem fio ao Esfera v3...
 adb connect %PHONE_IP%:5555
 
 echo.
-echo [4/4] Injetando regras de imunidade e persistencia no Android...
+echo [6/6] Injetando regras de imunidade, persistencia e auto-cura no Android...
 adb -s %PHONE_IP%:5555 shell "setprop persist.adb.tcp.port 5555"
 adb -s %PHONE_IP%:5555 shell "settings put global wifi_sleep_policy 2"
 adb -s %PHONE_IP%:5555 shell "settings put global stay_on_while_plugged_in 7"
 adb -s %PHONE_IP%:5555 shell "dumpsys deviceidle disable"
+adb -s %PHONE_IP%:5555 shell "settings put secure accessibility_enabled 1"
 
 echo.
 echo ============================================================
-echo [V] SUCESSO! Celular conectado via Wi-Fi no Esfera v3!
+echo [V] SUCESSO! Celular configurado e conectado via Wi-Fi!
+echo [V] Camada de Acessibilidade e Permissoes Provisionadas!
 echo [V] Voce ja pode REMOVER o cabo USB do computador!
 echo ============================================================
 

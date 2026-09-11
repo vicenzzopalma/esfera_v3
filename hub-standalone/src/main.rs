@@ -1,5 +1,5 @@
 use esfera_hub_standalone::{
-    checkin_server, db, hub, mqtt_fallback_server, presence_server, protocol, session_manager, tls_server, tunnel_server,
+    checkin_server, db, hub, mqtt_fallback_server, presence_server, protocol, router, session_manager, tls_server, tunnel_server,
 };
 use std::env;
 use std::io::Write;
@@ -59,6 +59,12 @@ async fn main() {
     println!("Status monitor iniciado (sweep de presença/túnel + reconciliação RAM->DB)");
     let _ = std::io::stdout().flush();
 
+    // 3b. Heartbeat reaper: marca devices como OFFLINE após timeout sem heartbeat.
+    // Mega Prompt §11: "heartbeat ausente → suspeita → timeout → OFFLINE"
+    tokio::spawn(async move {
+        session_manager::heartbeat_reaper().await;
+    });
+
     // 4. Check-in HTTP (agente Kotlin) :8080
     let http_port: u16 = env::var("HTTP_PORT")
         .ok()
@@ -67,6 +73,12 @@ async fn main() {
     let db_checkin = db.clone();
     tokio::spawn(async move {
         checkin_server::start(db_checkin, http_port).await;
+    });
+
+    // 4b. Router de porta lógica (proxy reverso VPS:porta_lógica -> túnel -> adbd)
+    let db_router = db.clone();
+    tokio::spawn(async move {
+        router::start(db_router).await;
     });
 
     // 5. Tunnel server (agente RUST) :8888 — canal de CONTROLE ADB

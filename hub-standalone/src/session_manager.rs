@@ -91,6 +91,8 @@ pub struct DeviceState {
     // mesmo quando não há sessão WS/túnel ativa.
     #[serde(skip)]
     pub last_touch_instant: Option<Instant>,
+    /// Porta lógica atribuída na VPS para este dispositivo (router de porta lógica)
+    pub assigned_vps_port: u16,
 }
 
 impl DeviceState {
@@ -140,12 +142,14 @@ fn new_session(agent_id: &str) -> ChannelSession {
 // ---- API PÚBLICA ----
 
 /// Canal TÚNEL (agente rust). Substitui a sessão de túnel do device; não toca presença.
-pub fn open_tunnel(company_id: i32, esfera_device_id: &str, current_local_ip: &str) -> String {
+/// `local_port`: porta ADB real reportada pelo agente (NÃO fixar 5555).
+pub fn open_tunnel(company_id: i32, esfera_device_id: &str, current_local_ip: &str, local_port: u16) -> String {
     let key = derive_device_key(company_id, esfera_device_id);
+    let port = if local_port > 0 { local_port } else { 5555 };
     let adb_addr = if current_local_ip.is_empty() {
         String::new()
     } else {
-        format!("{}:5555", current_local_ip)
+        format!("{}:{}", current_local_ip, port)
     };
     let mut map = STATES.lock().unwrap();
     let now = chrono::Utc::now().to_rfc3339();
@@ -163,6 +167,7 @@ pub fn open_tunnel(company_id: i32, esfera_device_id: &str, current_local_ip: &s
         presence: None,
         last_seen_utc: now.clone(),
         last_touch_instant: None,
+        assigned_vps_port: 0,
     });
     entry.esfera_device_id = esfera_device_id.to_string();
     entry.company_id = company_id;
@@ -203,6 +208,7 @@ pub fn open_presence(
         presence: None,
         last_seen_utc: now.clone(),
         last_touch_instant: None,
+        assigned_vps_port: 0,
     });
     entry.esfera_device_id = esfera_device_id.to_string();
     entry.company_id = company_id;
@@ -266,6 +272,7 @@ pub fn touch_presence(company_id: i32, esfera_device_id: &str, current_adb_addre
         presence: None,
         last_seen_utc: now.clone(),
         last_touch_instant: Some(Instant::now()),
+        assigned_vps_port: 0,
     });
     entry.esfera_device_id = esfera_device_id.to_string();
     entry.company_id = company_id;
@@ -285,6 +292,15 @@ pub fn touch_presence(company_id: i32, esfera_device_id: &str, current_adb_addre
     // inclua este device mesmo sem sessão WS/túnel ativa.
     entry.last_touch_instant = Some(Instant::now());
     entry.recalc();
+}
+
+/// Define/atualiza a porta lógica VPS atribuída a um dispositivo no estado em RAM.
+pub fn set_assigned_vps_port(company_id: i32, esfera_device_id: &str, port: u16) {
+    let key = derive_device_key(company_id, esfera_device_id);
+    let mut map = STATES.lock().unwrap();
+    if let Some(entry) = map.get_mut(&key) {
+        entry.assigned_vps_port = port;
+    }
 }
 
 /// Heartbeat de túnel (rust) — renovado pelo loop ping/pong do tunnel_server.
@@ -433,6 +449,52 @@ pub fn live_snapshot() -> Vec<crate::db::LiveDeviceState> {
             last_seen_utc: s.last_seen_utc.clone(),
             ip: s.ip.clone(),
             current_adb_address: s.current_adb_address.clone(),
+            assigned_vps_port: s.assigned_vps_port,
         })
         .collect()
+}
+
+/// Heartbeat reaper: roda periodicamente e marca como OFFLINE os devices que
+/// não mandaram heartbeat dentro do timeout. Limpa sessões mortas (túnel e/ou
+/// presença) para liberar recursos. Sem essa rotina, um device que perde conexão
+/// fica "online" eternamente no sistema.
+///
+/// Mega Prompt §11: "heartbeat ausente → suspeita → timeout → OFFLINE"
+pub async fn heartbeat_reaper() {
+    let timeout = Duration::from_secs(90);
+    let interval = Duration::from_secs(30);
+    loop {
+        tokio::time::sleep(interval).await;
+        let now = Instant::now();
+        let mut map = STATES.lock().unwrap();
+        for state in map.values_mut() {
+            // Verifica se o túnel está morto (sem heartbeat dentro do timeout)
+            if let Some(ref t) = state.tunnel {
+                if t.last_heartbeat_instant.map_or(true, |i| now.duration_since(i) > timeout) {
+                    state.tunnel = None;
+                }
+            }
+            // Verifica se a presença está morta
+            if let Some(ref p) = state.presence {
+                if p.last_heartbeat_instant.map_or(true, |i| now.duration_since(i) > timeout) {
+                    state.presence = None;
+                }
+            }
+            // Verifica se o touch_presence (check-in HTTP) está expirado
+            let touch_alive = state.last_touch_instant
+                .map_or(false, |i| now.duration_since(i) <= timeout);
+            // Se nenhum canal está vivo E o touch está expirado → OFFLINE
+            if state.tunnel.is_none() && state.presence.is_none() && !touch_alive {
+                if state.status != ConnectionStatus::Offline {
+                    println!(
+                        "[reaper] device {} (company={}) → OFFLINE (timeout {}s)",
+                        state.esfera_device_id, state.company_id, timeout.as_secs()
+                    );
+                    state.status = ConnectionStatus::Offline;
+                }
+            } else {
+                state.recalc();
+            }
+        }
+    }
 }

@@ -22,19 +22,17 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            hub_enabled: true,
-            // Hub master na VPS (fonte de verdade — Opção A do HERMES_CONTEXT).
-            // Porta 8555 = hub TCP master (Auth/Command/Register). NÃO é a :8888
-            // (tunnel server do device-agent) nem localhost.
-            hub_address: "34.29.70.113:8555".to_string(),
+            hub_enabled: false,
+            // Modo Standalone Local (Opera direto via USB ou WireGuard VPN P2P)
+            hub_address: "127.0.0.1:8555".to_string(),
             hub_token: "root123".to_string(),
             empresa_server_enabled: false,
             empresa_server_port: 7777,
             checkin_server_enabled: true,
             checkin_server_port: 8080,
-            tunnel_server_enabled: true,
+            tunnel_server_enabled: false,
             tunnel_server_port: 8888,
-            mode: "empresa".to_string(),
+            mode: "standalone".to_string(),
         }
     }
 }

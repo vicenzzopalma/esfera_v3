@@ -1,0 +1,7 @@
+{
+  "serverUrl": "http://127.0.0.1:8080",
+  "deviceId": "",
+  "tunnelEnabled": true,
+  "tunnelPort": 8888,
+  "companyId": 1
+}

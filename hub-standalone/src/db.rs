@@ -27,6 +27,8 @@ pub struct LiveDeviceState {
     /// (fix do status amarelo "connecting").
     pub ip: String,
     pub current_adb_address: String,
+    /// Porta lógica atribuída na VPS (router de porta lógica: 30000..30099)
+    pub assigned_vps_port: u16,
 }
 
 // ============================================================
@@ -477,10 +479,21 @@ impl Database {
                 BatteryLevel INTEGER NOT NULL DEFAULT 0,
                 CompanyId INTEGER NOT NULL REFERENCES ESF_Company(CompanyId),
                 DeviceNumber INTEGER NOT NULL DEFAULT 1,
-                Sector TEXT NOT NULL DEFAULT 'junior'
+                Sector TEXT NOT NULL DEFAULT 'junior',
+                EsferaDeviceId TEXT,
+                CurrentAdbAddress TEXT,
+                LastSeenUTC TEXT,
+                AssignedVpsPort INTEGER NOT NULL DEFAULT 0
             );",
             [],
         )?;
+
+        // Migração: garante a coluna AssignedVpsPort (porta lógica da VPS) mesmo
+        // em bancos antigos. Ignora erro de "column already exists".
+        let _ = self.conn().execute(
+            "ALTER TABLE ESF_Device ADD COLUMN AssignedVpsPort INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         // 4. ESF_Campaign (com SelectedDevices e ExcluidoEm)
         self.conn().execute(
@@ -1286,14 +1299,88 @@ impl Database {
             } else {
                 format!("agent-{}", device_id)
             };
-            return self.conn().execute(
-                "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC)
-                 VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?5, 0, 'junior', ?6, ?7)",
-                params![final_adb_id, device_id, ip, port, resolved, adb_address, now],
-            ).map_err(|e| e.to_string());
+            // Porta lógica VPS: MAX(AssignedVpsPort)+1 garante sequencialidade
+            // estável mesmo se devices forem deletados. O router escuta nela e
+            // proxia pro endpoint atual do aparelho.
+            let vps_port = self.next_vps_port();
+            let r = self.conn().execute(
+                "INSERT INTO ESF_Device (AdbDeviceId, EsferaDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, CurrentAdbAddress, LastSeenUTC, AssignedVpsPort)
+                 VALUES (?1, ?2, 'Desconhecido', 'Android', 'Smartphone', ?3, ?4, 'online', 100, ?5, 0, 'junior', ?6, ?7, ?8)",
+                params![final_adb_id, device_id, ip, port, resolved, adb_address, now, vps_port],
+            ).map_err(|e| e.to_string())?;
+            return Ok(r);
+        }
+        // Device conhecido: garante que a porta lógica VPS esteja atribuída.
+        if self.get_assigned_vps_port(device_id).is_none() {
+            let next = self.next_vps_port();
+            let _ = self.conn().execute(
+                "UPDATE ESF_Device SET AssignedVpsPort = ?1 WHERE EsferaDeviceId = ?2 AND COALESCE(AssignedVpsPort,0) = 0",
+                params![next, device_id],
+            );
         }
         Ok(updated)
     }
+
+    /// Próxima porta lógica VPS disponível (MAX+1, base 30001). Nunca colide
+    /// mesmo se devices forem deletados — a sequência só cresce.
+    fn next_vps_port(&self) -> i32 {
+        self.conn()
+            .query_row(
+                "SELECT COALESCE(MAX(AssignedVpsPort), 30000) + 1 FROM ESF_Device WHERE AssignedVpsPort > 0",
+                params![],
+                |r| r.get::<_, i32>(0),
+            )
+            .unwrap_or(30001)
+    }
+
+    /// Porta lógica VPS atribuída a um device (router escuta nela). 0 = não atribuída.
+    pub fn get_assigned_vps_port(&self, esfera_device_id: &str) -> Option<u16> {
+        self.conn()
+            .query_row(
+                "SELECT AssignedVpsPort FROM ESF_Device WHERE EsferaDeviceId = ?1",
+                params![esfera_device_id],
+                |r| r.get::<_, i32>(0),
+            )
+            .ok()
+            .and_then(|p| if p > 0 { Some(p as u16) } else { None })
+    }
+
+    /// Carrega todas as rotas de porta lógica já atribuídas (porta, company, id).
+    pub fn load_all_assigned_ports(&self) -> Result<Vec<(u16, i32, String)>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT AssignedVpsPort, CompanyId, EsferaDeviceId FROM ESF_Device \
+                 WHERE COALESCE(AssignedVpsPort,0) > 0 AND EsferaDeviceId IS NOT NULL",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i32>(0)? as u16,
+                    r.get::<_, i32>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
+    /// Dada uma porta lógica, devolve (company_id, esfera_device_id).
+    pub fn lookup_by_assigned_port(&self, port: u16) -> Option<(i32, String)> {
+        self.conn()
+            .query_row(
+                "SELECT CompanyId, EsferaDeviceId FROM ESF_Device WHERE AssignedVpsPort = ?1",
+                params![port as i32],
+                |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok()
+    }
+
 
     pub fn insert_unknown_device(
         &self,

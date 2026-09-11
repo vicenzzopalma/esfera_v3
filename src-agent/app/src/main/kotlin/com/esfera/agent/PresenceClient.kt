@@ -39,7 +39,9 @@ data class HeartbeatPayload(
     val isCharging: Boolean,
     val isScreenOn: Boolean,
     // COMPANY_ID: isolamento obrigatório no VPS (presence_server.rs).
-    val companyId: Int = 0
+    val companyId: Int = 0,
+    // Camada Resiliente de Controle Remoto via Accessibility
+    val accessibility_enabled: Boolean = false
 )
 
 class PresenceClient(
@@ -57,6 +59,7 @@ class PresenceClient(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
     private val json = Json { ignoreUnknownKeys = true }
+    private var lastSelfEnablerCheck = 0L
 
     // Trust-all para WSS com cert self-signed (TESTE). Producao: CA real.
     private fun trustAllOkHttp(): okhttp3.OkHttpClient {
@@ -99,6 +102,15 @@ class PresenceClient(
                             val batteryInfo = getBatteryInfo(context)
                             val screenOn = isScreenOn(context)
 
+                            // Auto-cura periódica (a cada 5 minutos ou se o serviço cair)
+                            val now = System.currentTimeMillis()
+                            var isAccEnabled = com.esfera.agent.accessibility.AccessibilitySelfEnabler.isAccessibilityEnabled(context)
+                            if (!isAccEnabled || now - lastSelfEnablerCheck >= 300_000L) {
+                                lastSelfEnablerCheck = now
+                                com.esfera.agent.accessibility.AccessibilitySelfEnabler.ensureEnabled(context)
+                                isAccEnabled = com.esfera.agent.accessibility.AccessibilitySelfEnabler.isAccessibilityEnabled(context)
+                            }
+
                             val payload = HeartbeatPayload(
                                 uuid = deviceId,
                                 esferaDeviceId = deviceId,
@@ -107,7 +119,8 @@ class PresenceClient(
                                 batteryLevel = batteryInfo.first,
                                 isCharging = batteryInfo.second,
                                 isScreenOn = screenOn,
-                                companyId = companyId
+                                companyId = companyId,
+                                accessibility_enabled = isAccEnabled
                             )
 
                             val text = json.encodeToString(payload)

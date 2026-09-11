@@ -85,7 +85,7 @@ export function DeviceConfigModal({
   const [applyingDisplay, setApplyingDisplay] = useState(false);
 
   // Network Tab
-  const [vpsUrl, setVpsUrl] = useState("http://34.29.70.113:8080");
+  const [vpsUrl, setVpsUrl] = useState("http://127.0.0.1:8080");
   const [netStatus, setNetStatus] = useState<string | null>(null);
   const [pinging, setPinging] = useState(false);
 
@@ -568,17 +568,17 @@ export function DeviceConfigModal({
             {/* Configuração VPS do Hub */}
             <div className="p-3 rounded-lg bg-[#09090b] border border-white/[0.08] space-y-2.5">
               <span className="font-semibold text-zinc-200 flex items-center gap-1.5 text-xs">
-                <Server size={13} className="text-[#828DF7]" /> Endereço do Servidor Central (VPS)
+                <Server size={13} className="text-[#828DF7]" /> Endereço do Servidor Central (Local / WireGuard)
               </span>
               <p className="text-[11px] text-zinc-400">
-                Endereço HTTP/WebSocket onde o Agente APK no celular se registra e mantém presença.
+                Endereço HTTP onde o Agente APK no celular se registra e sincroniza presença (P2P / USB / VPN).
               </p>
               <div className="flex gap-2">
                 <input
                   type="text"
                   value={vpsUrl}
                   onChange={(e) => setVpsUrl(e.target.value)}
-                  placeholder="http://34.29.70.113:8080"
+                  placeholder="http://127.0.0.1:8080 ou http://10.8.0.1:8080"
                   className="flex-1 h-9 px-3 rounded-md bg-[#121216] border border-white/[0.08] text-zinc-100 font-mono text-xs focus:outline-none focus:border-[#5E6AD2]"
                 />
                 <Button
@@ -586,12 +586,12 @@ export function DeviceConfigModal({
                   size="sm"
                   onClick={async () => {
                     setPinging(true);
-                    setNetStatus("Testando conexão com a VPS...");
+                    setNetStatus("Testando conexão com o servidor...");
                     try {
                       await fetch(vpsUrl, { method: "GET", mode: "no-cors" });
-                      setNetStatus("✅ Servidor VPS respondeu com sucesso!");
+                      setNetStatus("✅ Servidor respondeu com sucesso!");
                     } catch {
-                      setNetStatus("ℹ️ Requisição enviada para a VPS.");
+                      setNetStatus("ℹ️ Requisição enviada para o servidor.");
                     } finally {
                       setPinging(false);
                     }

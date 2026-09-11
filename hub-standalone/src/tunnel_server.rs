@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use base64::Engine;
 
 use crate::session_manager::{close_tunnel, heartbeat_tunnel, open_tunnel};
 
@@ -38,7 +39,11 @@ struct TunnelHandshake {
     company_id: i32,
     #[serde(default)]
     current_local_ip: String,
+    #[serde(default = "default_adb_port")]
+    local_port: u16,
 }
+
+fn default_adb_port() -> u16 { 5555 }
 
 /// Timeout de inatividade L7 sem heartbeat (45 segundos)
 const HEARTBEAT_GRACE_SECS: u64 = 45;
@@ -55,6 +60,13 @@ pub fn request_proxy(company_id: i32, esfera_device_id: &str, adb_port: u16) -> 
         .ok_or_else(|| "device sem túnel ativo para esta empresa".to_string())?;
     tx.send(format!("{{\"type\":\"proxy\",\"port\":{}}}", adb_port))
         .map_err(|_| "sessão de túnel encerrada".to_string())
+}
+
+/// Envia dados de proxy (do programa central, via router) para o agente pelo
+/// canal de controle. Usado pelo router de porta lógica para fazer proxy
+/// reverso: cliente -> VPS:porta_lógica -> túnel -> agente -> adbd local.
+pub fn send_proxy_data(company_id: i32, esfera_device_id: &str, line: &str) -> Result<(), String> {
+    send_control(company_id, esfera_device_id, line)
 }
 
 /// Envia uma linha JSON arbitrária pelo túnel de controle do device.
@@ -192,7 +204,7 @@ pub async fn handle_agent(mut stream: TcpStream) -> Result<(), Box<dyn std::erro
     write_line(&mut writer, "{\"type\":\"welcome\"}").await?;
 
     // 3. Abre a sessão de TÚNEL. Gera novo SESSION_ID.
-    let session_id = open_tunnel(company_id, &uuid, &hs.current_local_ip);
+    let session_id = open_tunnel(company_id, &uuid, &hs.current_local_ip, hs.local_port);
 
     // 4. Registra no mapa de CONTROLE (deduplica substituindo a sessão anterior se houver)
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -232,6 +244,14 @@ pub async fn handle_agent(mut stream: TcpStream) -> Result<(), Box<dyn std::erro
                     }
                     Some("proxy") => {
                         let _ = write_line(&mut writer, "{\"type\":\"proxy-ack\"}").await;
+                    }
+                    Some("proxy-data") => {
+                        // Bytes do adbd local do agente, vindos pelo túnel,
+                        // destinados ao programa central conectado na porta lógica.
+                        let b64 = v.get("b64").and_then(|s| s.as_str()).unwrap_or("");
+                        if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                            crate::router::deliver_proxy_data(&uuid, data);
+                        }
                     }
                     Some("adb_result") => {
                         let cmd_id = v.get("id").and_then(|s| s.as_str()).unwrap_or("");

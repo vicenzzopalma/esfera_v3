@@ -471,9 +471,10 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
 
             // AUTO-PROVISIONAMENTO, AUTO-CURA E IMUNIDADE TOTAL NATIVA
             if adb_dev.state == "device" {
-                let esfera_cfg_server = "http://34.29.70.113:8080".to_string();
                 let s_target = adb_dev.serial.clone();
                 let comp_id = target_company_id;
+                let cfg = crate::config::load_config();
+                let esfera_cfg_server = AdbManager::resolve_server_url(&s_target, &cfg);
                 std::thread::spawn(move || {
                     let _ = AdbManager::auto_heal_and_immunize_device(&s_target, comp_id, &esfera_cfg_server);
                 });
@@ -787,8 +788,9 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 if refreshed_db[pos].current_adb_address.is_none() && !vps_adb_addr.is_empty() {
                     refreshed_db[pos].current_adb_address = Some(vps_adb_addr.to_string());
                 }
-                if refreshed_db[pos].ip.is_empty() && !vps_ip.is_empty() {
-                    refreshed_db[pos].ip = vps_ip.to_string();
+                let vps_assigned_port = live.get("assigned_vps_port").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
+                if vps_assigned_port > 0 {
+                    refreshed_db[pos].port = vps_assigned_port;
                 }
                 if battery > 0 { refreshed_db[pos].battery = battery; }
                 let _ = state_db.upsert_device(&refreshed_db[pos]);
@@ -806,13 +808,15 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 (gen_name, "junior".to_string(), next_num)
             };
 
+            let vps_assigned_port = live.get("assigned_vps_port").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
+
             let new_dev = Device {
                 id: 0,
                 serial: esfera_id.clone(),
                 name: protected_name.clone(),
                 brand: String::new(),
                 model: String::new(),
-                port: 0,
+                port: vps_assigned_port,
                 status: mapped_status.clone(),
                 battery,
                 company_id: target_company_id,
@@ -1468,19 +1472,23 @@ pub fn update_device(state: State<'_, AppState>, token: String, mut device: Devi
                     ).await;
                 }
 
-                // 2. Envia via HTTP Checkin Server da VPS (porta 8080)
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(4))
-                    .build();
-                if let Ok(c) = client {
-                    let _ = c.post("http://34.29.70.113:8080/api/devices/rename")
-                        .json(&serde_json::json!({
-                            "esfera_device_id": id2,
-                            "name": name2,
-                            "company_id": cid
-                        }))
-                        .send()
-                        .await;
+                // 2. Envia via HTTP Checkin Server se hub remoto estiver ativo
+                let cfg = crate::config::load_config();
+                if cfg.hub_enabled && cfg.mode != "standalone" && !cfg.hub_address.is_empty() {
+                    let host = cfg.hub_address.split(':').next().unwrap_or("127.0.0.1");
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(4))
+                        .build();
+                    if let Ok(c) = client {
+                        let _ = c.post(format!("http://{}:{}/api/devices/rename", host, cfg.checkin_server_port))
+                            .json(&serde_json::json!({
+                                "esfera_device_id": id2,
+                                "name": name2,
+                                "company_id": cid
+                            }))
+                            .send()
+                            .await;
+                    }
                 }
             });
         }
@@ -3038,7 +3046,7 @@ pub fn get_hub_credentials(
         cfg.hub_address.trim().to_string()
     } else {
         std::env::var("ESFERA_HUB_ADDR")
-            .unwrap_or_else(|_| "34.29.70.113:8555".to_string())
+            .unwrap_or_else(|_| "127.0.0.1:8555".to_string())
     };
     Ok(HubCredentials {
         hub_address,
@@ -3078,8 +3086,8 @@ pub async fn update_vps_hub(state: State<'_, AppState>, token: String, base64_bi
     if bin.is_empty() { return Err("Binario vazio.".into()); }
     let token_master = std::env::var("HUB_MASTER_TOKEN")
         .unwrap_or_else(|_| "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string());
-    let vps = std::env::var("ESFERA_HUB_ADDR").unwrap_or_else(|_| "34.29.70.113:8555".to_string());
-    let host = vps.split(':').next().unwrap_or("34.29.70.113");
+    let vps = std::env::var("ESFERA_HUB_ADDR").unwrap_or_else(|_| "127.0.0.1:8555".to_string());
+    let host = vps.split(':').next().unwrap_or("127.0.0.1");
     let url = format!("http://{}:8080/admin/update", host);
     let client = reqwest::Client::new();
     let resp = client.post(&url)
