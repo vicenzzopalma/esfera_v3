@@ -8,6 +8,7 @@
 
 /// Log de diagnóstico em disco — arquivo aberto/fechado a cada chamada para
 /// não perder dados se o processo crashar (flush imediato via drop).
+#[allow(dead_code)]
 fn cmd_diag(s: &str) {
     use std::io::Write;
     let path = "D:/Novo/Esfera v3/esfera_runtime_debug.log";
@@ -86,7 +87,7 @@ fn validate_session(
     sessions: &Arc<Mutex<SessionManager>>,
     token: &str,
 ) -> Result<crate::session::UserSession, String> {
-    let mut sess = sessions.lock().map_err(|e| e.to_string())?;
+    let sess = sessions.lock().map_err(|e| e.to_string())?;
     if !token.is_empty() {
         if let Some(session) = sess.validate_token(token) {
             return Ok(session);
@@ -197,6 +198,7 @@ static ADB_LIST_CACHE: std::sync::LazyLock<RwLock<(Vec<AdbDeviceInfo>, Instant)>
 /// ESF-xxxx) gravado nesta sessão, para NÃO reescrever o arquivo a cada
 /// tick de 5s do get_devices (evita I/O ADB desnecessário e desgaste do flash).
 /// Chave = serial ADB; Valor = (Instant do último write, company_id usado).
+#[allow(dead_code)]
 static PROVISIONED_IDENTITY_CACHE: std::sync::LazyLock<
     RwLock<std::collections::HashMap<String, (Instant, i32)>>,
 > = std::sync::LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
@@ -226,6 +228,7 @@ fn connecting_key(dev: &Device) -> String {
 /// = "ESF-<SERIAL_ADB_MAIUSCULO>", para que o cruzamento local x VPS seja
 /// determinístico. Reescreve no máximo 1x a cada 60s por serial (ou se a
 /// empresa mudou). Falhas (device não autorizado) são ignoradas — não bloqueiam.
+#[allow(dead_code)]
 fn ensure_identity_provisioned(serial: &str, company_id: i32, server_url: &str) {
     let now = Instant::now();
     let needs_write = {
@@ -469,15 +472,32 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 "".to_string()
             };
 
-            // AUTO-PROVISIONAMENTO, AUTO-CURA E IMUNIDADE TOTAL NATIVA
+            // AUTO-PROVISIONAMENTO, AUTO-CURA E IMUNIDADE TOTAL NATIVA (com rate-limit por dispositivo)
             if adb_dev.state == "device" {
                 let s_target = adb_dev.serial.clone();
                 let comp_id = target_company_id;
-                let cfg = crate::config::load_config();
-                let esfera_cfg_server = AdbManager::resolve_server_url(&s_target, &cfg);
-                std::thread::spawn(move || {
-                    let _ = AdbManager::auto_heal_and_immunize_device(&s_target, comp_id, &esfera_cfg_server);
-                });
+                let now = Instant::now();
+                let should_heal = PROVISIONED_IDENTITY_CACHE
+                    .read()
+                    .map(|cache| match cache.get(&s_target) {
+                        Some((last_time, last_cid)) => {
+                            now.duration_since(*last_time).as_secs() >= 1800 || *last_cid != comp_id
+                        }
+                        None => true,
+                    })
+                    .unwrap_or(true);
+                if should_heal {
+                    if let Ok(mut cache) = PROVISIONED_IDENTITY_CACHE.write() {
+                        cache.insert(s_target.clone(), (now, comp_id));
+                    }
+                    let cfg = crate::config::load_config();
+                    let esfera_cfg_server = AdbManager::resolve_server_url(&s_target, &cfg);
+                    std::thread::spawn(move || {
+                        let _ = AdbManager::auto_heal_and_immunize_device(&s_target, comp_id, &esfera_cfg_server);
+                    });
+                }
+            } else if let Ok(mut cache) = PROVISIONED_IDENTITY_CACHE.write() {
+                cache.remove(&adb_dev.serial);
             }
 
             let status = if adb_dev.state == "device" {
@@ -502,38 +522,44 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     || d.current_adb_address.as_deref() == Some(&adb_dev.serial)
             });
 
-            // PROTEÇÃO ABSOLUTA DE IDENTIDADE:
+            // PROTEÇÃO ABSOLUTA DE IDENTIDADE (regra §5 skill: nome protegido contra VPS):
             // 1. Se já estiver no ESF_DeviceIdentity pelo Hardware ID (persistente), usa o nome salvo lá.
             // 2. Se já existir no banco local (db_devices), PRESERVA rigorosamente o nome que o usuário deu.
-            // 3. Apenas se for um dispositivo 100% INÉDITO (nunca visto), cria um registro inicial.
+            // 3. Se for um dispositivo INÉDITO com persistent_id, cria com nome derivado do serial.
+            //    Sem persistent_id: NÃO cria registro nem gera nome — mantém offline (anti-ghost).
             let (resolved_name, resolved_sector, resolved_num) = if let Some(ref pid) = persistent_id {
                 if let Some((saved_n, saved_s, saved_num, _)) = state_db.get_device_identity(pid) {
                     (saved_n, saved_s, saved_num)
                 } else if let Some(idx) = existing_idx {
                     let d = &db_devices[idx];
-                    let chosen_name = if !d.name.is_empty() { d.name.clone() } else { format!("Aparelho {}", d.device_number) };
+                    let chosen_name = if !d.name.is_empty() {
+                        d.name.clone()
+                    } else {
+                        // Fallback determinístico: "Celular <Serial>" — NUNCA "Aparelho X"
+                                    format!("Celular {}", d.serial.to_uppercase().replace(':', "").replace('.', ""))
+                    };
                     let _ = state_db.save_device_identity(pid, &chosen_name, &d.sector, d.device_number, &model);
                     (chosen_name, d.sector.clone(), d.device_number)
                 } else {
+                    // Dispositivo inédito com persistent_id: usa serial ADB limpo
+                            let serial_clean = adb_dev.serial.to_uppercase().replace(':', "").replace('.', "");
+                    let gen_name = format!("Celular {}", serial_clean);
                     let next_num = state_db.get_next_device_number();
-                    let gen_name = format!("Aparelho {}", next_num);
                     let _ = state_db.save_device_identity(pid, &gen_name, "junior", next_num, &model);
                     (gen_name, "junior".to_string(), next_num)
                 }
-            } else if let Some(idx) = existing_idx {
-                let d = &db_devices[idx];
-                (d.name.clone(), d.sector.clone(), d.device_number)
             } else {
-                let next_num = state_db.get_next_device_number();
-                (format!("Aparelho {}", next_num), "junior".to_string(), next_num)
+                // SEM persistent_id: não cria registro (anti-ghost rule). Pula para próximo.
+                // Mantém status offline já definido acima.
+                continue;
             };
 
             if let Some(idx) = existing_idx {
-                let old_status = db_devices[idx].status.clone();
-                let old_battery = db_devices[idx].battery;
-                let old_address = db_devices[idx].current_adb_address.clone();
-                let old_ip = db_devices[idx].ip.clone();
-                let old_id = db_devices[idx].esfera_device_id.clone();
+                let _old_status = db_devices[idx].status.clone();
+                let _old_battery = db_devices[idx].battery;
+                let _old_address = db_devices[idx].current_adb_address.clone();
+                let _old_ip = db_devices[idx].ip.clone();
+                let _old_id = db_devices[idx].esfera_device_id.clone();
                 db_devices[idx].status = status;
                 db_devices[idx].name = resolved_name;
                 db_devices[idx].sector = resolved_sector;
@@ -545,6 +571,8 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 if is_wireless && !ip_only.is_empty() { db_devices[idx].ip = ip_only.clone(); }
                 if adb_dev.state == "device" {
                     db_devices[idx].battery = get_cached_battery(&adb_dev.serial);
+                } else {
+                    db_devices[idx].battery = 0;
                 }
                 let _ = state_db.upsert_device(&db_devices[idx]);
                 changed = true;
@@ -582,11 +610,13 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
 
         // Cruza o estado de Presença WebSocket (SessionManager) e Túnel Reverso com o DB:
         // O Hardware ID (EsferaDeviceId) é a ÚNICA FONTE DA VERDADE. O IP é volátil.
+        let mut ws_online_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for dev in &mut refreshed_db {
             if let Some(ref uuid) = dev.esfera_device_id {
                 // 1. Presença WebSocket direta do APK (esfera-agent)
                 if let Some(sess) = crate::session_manager::get_session(uuid) {
                     if sess.ws_connected {
+                        ws_online_ids.insert(uuid.clone());
                         dev.status = "online".to_string();
                         if sess.battery_level > 0 {
                             dev.battery = sess.battery_level as i32;
@@ -618,67 +648,60 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
 
         for dev in &mut refreshed_db {
             if dev.via_tunnel {
-                // Celular remoto (via VPS) ou túnel direto desktop<->celular.
-                // O status de verdade JÁ foi definido acima:
-                //   - túnel direto: o bloco is_tunnel_active setou via_tunnel=true e status="online".
-                //   - remoto VPS: o loop get_live_devices (abaixo) setou status conforme a VPS.
-                // Não sobrescrever: confia no que veio da VPS.
                 continue;
             }
-
-            let matching_adb = active_adb_list.iter().find(|adb_d| {
-                adb_d.serial == dev.serial
-                    || dev.current_adb_address.as_deref() == Some(&adb_d.serial)
-                    || (!dev.ip.is_empty() && (adb_d.serial == dev.ip || adb_d.serial.starts_with(&dev.ip)))
-                    || (dev.esfera_device_id.is_some() && (adb_d.serial.to_uppercase().starts_with(dev.esfera_device_id.as_deref().unwrap_or("___")) || dev.serial.to_uppercase().starts_with(dev.esfera_device_id.as_deref().unwrap_or("___"))))
-            });
-            if let Some(adb_d) = matching_adb {
-                // Presente no ADB local ativo: online e limpa qualquer timer de connecting.
-                dev.status = if adb_d.state == "device" { "online".to_string() } else { "connecting".to_string() };
-                if dev.current_adb_address.as_deref() != Some(&adb_d.serial) {
-                    dev.current_adb_address = Some(adb_d.serial.clone());
+            if let Some(ref uuid) = dev.esfera_device_id {
+                if ws_online_ids.contains(uuid) {
+                    continue;
                 }
-                let _ = CONNECTING_SINCE.write().map(|mut m| m.remove(&connecting_key(dev)));
-            } else if dev.esfera_device_id.is_some() || dev.current_adb_address.is_some() || !dev.ip.is_empty() {
-                // Possui identidade/endereço mas NÃO está no ADB local agora:
-                // permite "connecting" SÓ durante a janela de reconexão de IP (15s).
-                // Após o timeout, vira "offline" (subtarefa 3) — nunca amarelo eterno.
-                let key = connecting_key(dev);
-                let entered_at = match CONNECTING_SINCE.write() {
-                    Ok(mut map) => *map.entry(key.clone()).or_insert_with(Instant::now),
-                    Err(_) => {
-                        // RwLock envenenada: trata como timeout expirado para não crashar
-                        dev.status = "offline".to_string();
-                        continue;
+            }
+
+            let matching_adb = active_adb_list
+                .iter()
+                .filter(|adb_d| {
+                    adb_d.serial == dev.serial
+                        || dev.current_adb_address.as_deref() == Some(&adb_d.serial)
+                        || (!dev.ip.is_empty() && (adb_d.serial == dev.ip || adb_d.serial.starts_with(&format!("{}:", dev.ip))))
+                        || (dev.esfera_device_id.is_some()
+                            && (adb_d.serial.to_uppercase().starts_with(dev.esfera_device_id.as_deref().unwrap_or("___"))
+                                || dev.serial.to_uppercase().starts_with(dev.esfera_device_id.as_deref().unwrap_or("___"))))
+                })
+                .max_by_key(|adb_d| match adb_d.state.as_str() {
+                    "device" => 2,
+                    "unauthorized" => 1,
+                    _ => 0,
+                });
+
+            if let Some(adb_d) = matching_adb {
+                if adb_d.state == "device" {
+                    dev.status = "online".to_string();
+                    if dev.current_adb_address.as_deref() != Some(&adb_d.serial) {
+                        dev.current_adb_address = Some(adb_d.serial.clone());
                     }
-                };
-                let elapsed = Instant::now().duration_since(entered_at);
-                if elapsed <= CONNECTING_TIMEOUT {
-                    // Ainda dentro da janela: mantém "connecting" e dispara 1 tentativa de reconexão.
-                    if dev.status != "connecting" {
-                        dev.status = "connecting".to_string();
-                    }
-                    let ip_target = if !dev.ip.is_empty() {
-                        dev.ip.clone()
-                    } else if dev.serial.contains(':') {
-                        dev.serial.split(':').next().unwrap_or("").to_string()
-                    } else {
-                        "".to_string()
-                    };
-                    // Só Wi-Fi (IP) tenta reconexão ADB; USB sem presença vira offline no timeout.
-                    if !ip_target.is_empty() && ip_target.contains('.') {
-                        let port = if dev.port > 0 { dev.port } else { 5555 };
-                        std::thread::spawn(move || {
-                            let _ = AdbManager::connect_device(&ip_target, port);
-                        });
-                    }
+                    let _ = CONNECTING_SINCE.write().map(|mut m| m.remove(&connecting_key(dev)));
+                } else if adb_d.state == "unauthorized" {
+                    let key = connecting_key(dev);
+                    let entered_at = CONNECTING_SINCE
+                        .write()
+                        .ok()
+                        .map(|mut map| *map.entry(key).or_insert_with(Instant::now));
+                    let within_timeout = entered_at
+                        .map(|t| Instant::now().duration_since(t) <= CONNECTING_TIMEOUT)
+                        .unwrap_or(false);
+                    dev.status = if within_timeout { "connecting".to_string() } else { "offline".to_string() };
+                    dev.battery = 0;
+                    dev.via_tunnel = false;
                 } else {
-                    // Janela estourou: sem ADB local e sem VPS -> offline definitivo.
                     dev.status = "offline".to_string();
-                    let _ = CONNECTING_SINCE.write().map(|mut m| m.remove(&key));
+                    dev.battery = 0;
+                    dev.via_tunnel = false;
+                    let _ = CONNECTING_SINCE.write().map(|mut m| m.remove(&connecting_key(dev)));
                 }
             } else {
+                // Dispositivo ausente do ADB local e sem presença WS/Túnel ativa -> offline imediato
                 dev.status = "offline".to_string();
+                dev.battery = 0;
+                dev.via_tunnel = false;
                 let _ = CONNECTING_SINCE.write().map(|mut m| m.remove(&connecting_key(dev)));
             }
         }
@@ -726,65 +749,56 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         // IDs que o VPS considera vivos (para marcar offline os que saíram).
         let live_ids: std::collections::HashSet<String> = live_vps
             .iter()
-            .filter_map(|v| v.get("esfera_device_id").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .filter_map(|v| {
+                let st = v.get("status").and_then(|s| s.as_str()).unwrap_or("offline").to_lowercase();
+                if st == "online" || st == "degraded" {
+                    v.get("esfera_device_id").and_then(|s| s.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
             .collect();
 
         for live in &live_vps {
             let esfera_id = live.get("esfera_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if esfera_id.is_empty() { continue; }
             let vps_status = live.get("status").and_then(|v| v.as_str()).unwrap_or("offline");
-            // A VPS reporta status em lowercase ("online"/"degraded"/"offline").
-            // Comparar case-insensitive para nao cair sempre no branch "offline"
-            // (o que deixava os celulares remotos vermelhos/ausentes no app).
             let mapped_status = match vps_status.to_lowercase().as_str() {
                 "online" => "online",
-                // DEGRADED = presença WS viva, mas túnel ADB indisponível.
-                // NÃO forjar "online": o app precisa mostrar estado real para que o
-                // usuário saiba que o espelhamento/ADB não funciona até o túnel voltar.
                 "degraded" => "degraded",
                 _ => "offline",
             }.to_string();
+            let is_vps_active = mapped_status == "online" || mapped_status == "degraded";
             let battery = live.get("battery_level").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             let vps_adb_addr = live.get("current_adb_address").and_then(|v| v.as_str()).unwrap_or("");
             let vps_ip = live.get("ip").and_then(|v| v.as_str()).unwrap_or("");
 
-            // Cruzamento determinístico local ADB + VPS remoto (subtarefa 2):
-            // usa device_matches_live() que testa em ordem de precedência
-            // (a) esfera_device_id == live.esfera_device_id;
-            // (b) serial (ou limpa de porta) == live.esfera_device_id (ou vice-versa);
-            // (c) "ESF-" + 8 primeiros do serial == live.esfera_device_id;
-            // (d) IP local / ADB address normalizado (sem porta).
-            // NUNCA cria um segundo cartão quando há match em qualquer critério.
             let existing_pos = refreshed_db
                 .iter()
                 .position(|d| device_matches_live(d, live));
 
             if let Some(pos) = existing_pos {
-                refreshed_db[pos].via_tunnel = true;
-                // FIX (2026-08-21): ADB local fresco SEMPRE vence sobre VPS stale.
-                // Se o celular responde como `device` no ADB local, ele ESTÁ online
-                // independente do que a VPS (que pode estar desatualizada quando o
-                // agente Kotlin não reporta presença/túnel) diga. Sem isso, o app
-                // mostrava "offline"/ausente mesmo com o aparelho conectado no ADB.
                 let adb_local_online = active_adb_list.iter().any(|adb_d| {
                     adb_d.state == "device"
                         && (adb_d.serial == refreshed_db[pos].serial
                             || refreshed_db[pos].current_adb_address.as_deref() == Some(&adb_d.serial)
                             || (!refreshed_db[pos].ip.is_empty()
                                 && (adb_d.serial == refreshed_db[pos].ip
-                                    || adb_d.serial.starts_with(&refreshed_db[pos].ip))))
+                                    || adb_d.serial.starts_with(&format!("{}:", refreshed_db[pos].ip)))))
                 });
                 if adb_local_online {
                     refreshed_db[pos].status = "online".to_string();
-                } else {
+                } else if is_vps_active {
                     refreshed_db[pos].status = mapped_status.clone();
+                    refreshed_db[pos].via_tunnel = true;
+                } else if refreshed_db[pos].status != "online" {
+                    refreshed_db[pos].status = "offline".to_string();
+                    refreshed_db[pos].via_tunnel = false;
+                    refreshed_db[pos].battery = 0;
                 }
                 if refreshed_db[pos].esfera_device_id.is_none() {
                     refreshed_db[pos].esfera_device_id = Some(esfera_id.clone());
                 }
-                // Propaga o endereço ADB / IP do VPS para o cartão local, para que o
-                // dedup final (que cruza por current_adb_address/ip) reconheça como o
-                // mesmo celular físico e NÃO crie um segundo cartão.
                 if refreshed_db[pos].current_adb_address.is_none() && !vps_adb_addr.is_empty() {
                     refreshed_db[pos].current_adb_address = Some(vps_adb_addr.to_string());
                 }
@@ -792,7 +806,9 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 if vps_assigned_port > 0 {
                     refreshed_db[pos].port = vps_assigned_port;
                 }
-                if battery > 0 { refreshed_db[pos].battery = battery; }
+                if is_vps_active && battery > 0 {
+                    refreshed_db[pos].battery = battery;
+                }
                 let _ = state_db.upsert_device(&refreshed_db[pos]);
                 continue;
             }
@@ -802,8 +818,10 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             } else if let Some(d) = state_db.get_device_by_esfera_id(&esfera_id) {
                 (d.name, d.sector, d.device_number)
             } else {
+                // Regra §5: nome de fallback é ANCORAADO ao EsferaDeviceId (hardware ID),
+                // nunca um rótulo genérico em lote ("Aparelho X").
+                let gen_name = format!("Celular {}", esfera_id);
                 let next_num = state_db.get_next_device_number();
-                let gen_name = format!("Aparelho {}", next_num);
                 let _ = state_db.save_device_identity(&esfera_id, &gen_name, "junior", next_num, "Smartphone");
                 (gen_name, "junior".to_string(), next_num)
             };
@@ -818,41 +836,38 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 model: String::new(),
                 port: vps_assigned_port,
                 status: mapped_status.clone(),
-                battery,
+                battery: if is_vps_active { battery } else { 0 },
                 company_id: target_company_id,
                 device_number: protected_num,
                 sector: protected_sector.clone(),
                 esfera_device_id: Some(esfera_id.clone()),
                 current_adb_address: if vps_adb_addr.is_empty() { None } else { Some(vps_adb_addr.to_string()) },
                 last_seen_utc: live.get("last_seen_utc").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                via_tunnel: true,
+                via_tunnel: is_vps_active,
                 ip: vps_ip.to_string(),
             };
             let _ = state_db.upsert_device(&new_dev);
             refreshed_db.push(new_dev);
-
         }
 
-        // Remove/marca offline devices remotos (via_tunnel E serial==esfera_device_id)
-        // que NÃO estão mais no VPS. Sem isso, um celular desconectado do VPS ficaria
-        // "online" eternamente na lista do app desktop.
+        // Remove/marca offline devices remotos que NÃO estão mais ativos no VPS nem no túnel local.
         for dev in &mut refreshed_db {
             if dev.via_tunnel {
                 if let Some(ref id) = dev.esfera_device_id {
-                    if dev.serial == *id && !live_ids.contains(id) {
-                        // FIX (2026-08-21): não marcar offline se o ADB local diz
-                        // `device`. O ADB local fresco é verdadeiro mesmo quando a VPS
-                        // (agentes Kotlin sem reportar) está desatualizada.
+                    let local_tunnel_up = crate::tunnel_server::is_tunnel_active(id);
+                    if !local_tunnel_up && !live_ids.contains(id) {
                         let adb_local_online = active_adb_list.iter().any(|adb_d| {
                             adb_d.state == "device"
                                 && (adb_d.serial == dev.serial
                                     || dev.current_adb_address.as_deref() == Some(&adb_d.serial)
                                     || (!dev.ip.is_empty()
                                         && (adb_d.serial == dev.ip
-                                            || adb_d.serial.starts_with(&dev.ip))))
+                                            || adb_d.serial.starts_with(&format!("{}:", dev.ip)))))
                         });
                         if !adb_local_online {
                             dev.status = "offline".to_string();
+                            dev.via_tunnel = false;
+                            dev.battery = 0;
                         }
                     }
                 }
@@ -860,13 +875,12 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         }
 
         // FILTRO DE FANTASMAS: remove devices do DB local que NÃO estão nem no ADB
-        // local ativo nem no VPS (via_tunnel). Sem isso, celulares "usb" antigos de
-        // testes aparecem como conectados mesmo sem nada plugado. Só mostra o vivo.
+        // local ativo nem possuem identidade provisionada (EsferaDeviceId).
         let active_adb_set: std::collections::HashSet<String> =
             active_adb_list.iter().map(|a| a.serial.clone()).collect();
         refreshed_db.retain(|d| {
             if d.via_tunnel || d.esfera_device_id.is_some() || d.status == "connecting" {
-                true // dispositivo remoto, provisionado ou em processo de conexão é mantido na lista
+                true
             } else {
                 active_adb_set.contains(&d.serial)
                     || d.current_adb_address.as_deref().map_or(false, |a| active_adb_set.contains(a))
@@ -899,7 +913,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     _ => 0,
                 };
 
-                if dev_weight >= existing_weight || dev.via_tunnel {
+                if dev_weight > existing_weight || (dev_weight == existing_weight && dev.via_tunnel) {
                     let mut merged = dev;
                     if merged.esfera_device_id.is_none() {
                         merged.esfera_device_id = final_deduped[pos].esfera_device_id.clone();
@@ -915,12 +929,24 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 final_deduped.push(dev);
             }
         }
-        let refreshed_db = final_deduped;
+        let mut refreshed_db = final_deduped;
 
-        // DEBUG TEMP: despeja o resultado de get_devices para inspeção da fusão
-        // ARQUITETURA: o servidor (VPS) é a ÚNICA fonte de verdade. NÃO escrevemos
-        // dump de devices no PC local do operador (seria "verdade local"). O app é
-        // apenas cliente do hub. (Removido get_devices_dump.json — era debug.)
+        // Garante que qualquer aparelho desconectado/offline tenha battery=0, via_tunnel=false
+        // e persiste esse status em runtime no SQLite para todas as visualizações.
+        for dev in &mut refreshed_db {
+            let is_connected = dev.status == "online" || dev.status == "online_agent" || dev.status == "degraded";
+            if !is_connected {
+                dev.battery = 0;
+                dev.via_tunnel = false;
+            }
+            state_db.set_device_runtime_state(
+                &dev.serial,
+                dev.esfera_device_id.as_deref(),
+                dev.company_id,
+                &dev.status,
+                dev.battery,
+            );
+        }
 
         Ok(refreshed_db)
     }).await.map_err(|e| e.to_string())?
@@ -1737,7 +1763,7 @@ pub async fn capture_device_screen(state: State<'_, AppState>, _token: String, s
 }
 
 #[tauri::command]
-pub async fn send_adb_tap(state: State<'_, AppState>, token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
+pub async fn send_adb_tap(state: State<'_, AppState>, _token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
     // Bifurcação A: device remoto (via_tunnel) roteia comando para o VPS, que
     // empurra pelo túnel até o agente Kotlin executar localmente (sem root).
     if let Some(company_id) = resolve_remote_target(&state, &serial) {
@@ -1751,7 +1777,7 @@ pub async fn send_adb_tap(state: State<'_, AppState>, token: String, serial: Str
 }
 
 #[tauri::command]
-pub async fn send_adb_keyevent(state: State<'_, AppState>, token: String, serial: String, keycode: u32) -> Result<(), String> {
+pub async fn send_adb_keyevent(state: State<'_, AppState>, _token: String, serial: String, keycode: u32) -> Result<(), String> {
     if let Some(company_id) = resolve_remote_target(&state, &serial) {
         let cmd = format!("input keyevent {}", keycode);
         send_remote_adb_command(&state, company_id, &serial, &cmd).await?;
@@ -2209,7 +2235,7 @@ pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -
 
     let db_arc = state.db.clone();
     std::thread::spawn(move || {
-        for (idx, dev) in online_devices.iter().enumerate() {
+        for (_idx, dev) in online_devices.iter().enumerate() {
             let existing_id = AdbManager::get_persistent_device_id(&dev.serial);
             let pid = match existing_id {
                 Some(id) => id,
@@ -2552,7 +2578,8 @@ pub fn get_ai_config(
 
 #[tauri::command]
 pub fn save_ai_config(state: State<'_, AppState>, token: String, config: AiConfig) -> Result<(), String> {
-    let _session = validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, config.company_id)?;
     let db = &state.db;
     db.save_ai_config(&config)
 }
@@ -2667,53 +2694,152 @@ pub fn send_campaign(
     campaign_id: i32,
 ) -> Result<serde_json::Value, String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let db = &state.db;
-    db.send_campaign_next_batch(campaign_id)
+    let _ = campaign_id;
+    Err("O envio em lote antigo não aciona os aparelhos. Use start_campaign para iniciar o motor real.".to_string())
 }
 
 #[tauri::command]
 pub fn pause_campaign(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<(), String> {
-    let _session = validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
     let db = &state.db;
+    let company_id = db.get_campaign_company_id(campaign_id)
+        .ok_or_else(|| "Campanha não encontrada.".to_string())?;
+    check_company_access(&session, company_id)?;
     db.set_campaign_status(campaign_id, "paused")
 }
 
 #[tauri::command]
+pub fn stop_campaign(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let company_id = state.db.get_campaign_company_id(campaign_id)
+        .ok_or_else(|| "Campanha não encontrada.".to_string())?;
+    check_company_access(&session, company_id)?;
+    state.db.set_campaign_status(campaign_id, "stopped")
+}
+
+#[tauri::command]
+pub fn retry_failed_campaign_contacts(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<usize, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let company_id = state.db.get_campaign_company_id(campaign_id)
+        .ok_or_else(|| "Campanha não encontrada.".to_string())?;
+    check_company_access(&session, company_id)?;
+    if state.db.get_campaigns(company_id).iter().any(|c| c.id == campaign_id && c.status == "running") {
+        return Err("Pause a campanha antes de reprocessar falhas.".to_string());
+    }
+    state.db.retry_failed_contacts(campaign_id)
+}
+
+#[tauri::command]
 pub fn start_campaign(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<(), String> {
-    let _session = validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
     let db = &state.db;
+    let company_id = db.get_campaign_company_id(campaign_id)
+        .ok_or_else(|| "Campanha não encontrada.".to_string())?;
+    check_company_access(&session, company_id)?;
+    let campaign = db.get_campaigns(company_id).into_iter()
+        .find(|c| c.id == campaign_id)
+        .ok_or_else(|| "Campanha não encontrada nesta empresa.".to_string())?;
+    if campaign.device_ids.is_empty() { return Err("Selecione ao menos um aparelho para a campanha.".to_string()); }
+    if campaign.message.trim().is_empty() { return Err("Informe o corpo da mensagem.".to_string()); }
+    if campaign.delay_min < 1 || campaign.delay_max < campaign.delay_min {
+        return Err("Intervalo de envio inválido.".to_string());
+    }
+    if campaign.use_ai {
+        let config_opt = db.get_ai_config(company_id);
+        let effective_provider = if !campaign.ai_provider.is_empty() {
+            campaign.ai_provider.clone()
+        } else if let Some(ref cfg) = config_opt {
+            cfg.provider.clone()
+        } else {
+            "openrouter".to_string()
+        };
+
+        let prov = effective_provider.to_lowercase();
+        let is_local = prov == "ollama" || prov == "ollama_local" || prov == "lmstudio" || prov == "lm_studio";
+        if !is_local {
+            let config = config_opt
+                .ok_or_else(|| format!("Configure o provedor de IA '{effective_provider}' com chave de API em Parâmetros de IA antes de iniciar."))?;
+            let has_global_key = !config.api_key.trim().is_empty();
+            let has_specific_key = db.get_ai_provider_key(company_id, &effective_provider)
+                .map(|(k, _, _)| !k.trim().is_empty())
+                .unwrap_or(false);
+
+            if !has_global_key && !has_specific_key {
+                return Err(format!("Chave de API não configurada para o provedor '{effective_provider}'. Configure em Parâmetros de IA antes de iniciar."));
+            }
+        }
+    }
+    if !db.has_pending_contact(campaign_id) {
+        return Err("Não há contatos pendentes nesta campanha.".to_string());
+    }
+    if !db.get_devices(campaign.company_id).iter().any(|d| d.status == "online" && campaign.device_ids.iter().any(|id| d.esfera_device_id.as_deref() == Some(id.as_str()) || d.serial == *id)) {
+        return Err("Nenhum dos aparelhos selecionados está online.".to_string());
+    }
     db.set_campaign_status(campaign_id, "running")
 }
 
 #[tauri::command]
-pub fn rewrite_message_ai(_token: String, message: String, contact_name: String) -> Result<String, String> {
-    // Mock AI rewrite - adds temporal greeting and name personalization
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as usize;
+pub fn get_ai_provider_keys(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<std::collections::HashMap<String, serde_json::Value>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    Ok(state.db.get_all_ai_provider_keys(company_id))
+}
 
-    let hour_text = {
-        let total_secs = (seed / 1000) as i64;
-        let local_secs = total_secs - 3 * 3600; // UTC-3 Brasília
-        let h = ((local_secs / 3600) % 24 + 24) % 24;
-        if h >= 5 && h < 12 {
-            "Bom dia"
-        } else if h >= 12 && h < 18 {
-            "Boa tarde"
-        } else {
-            "Boa noite"
+#[tauri::command]
+pub async fn rewrite_message_ai(
+    state: State<'_, AppState>,
+    token: String,
+    message: String,
+    contact_name: String,
+    company_id: i32,
+    model: Option<String>,
+    prompt: Option<String>,
+    provider: Option<String>,
+    api_key: Option<String>,
+    endpoint: Option<String>,
+) -> Result<String, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    let selected_provider = provider.unwrap_or_default();
+    let mut config = if let Some(mut cfg) = state.db.get_ai_config(company_id) {
+        if !selected_provider.is_empty() && selected_provider != cfg.provider {
+            cfg.provider = selected_provider.clone();
+            cfg.endpoint = String::new();
+            if let Some((saved_key, saved_ep, saved_model)) = state.db.get_ai_provider_key(company_id, &selected_provider) {
+                cfg.api_key = saved_key;
+                if !saved_ep.is_empty() { cfg.endpoint = saved_ep; }
+                if !saved_model.is_empty() { cfg.model = saved_model; }
+            } else {
+                cfg.api_key = String::new();
+            }
         }
+        cfg
+    } else {
+        let mut cfg = AiConfig {
+            company_id,
+            provider: if !selected_provider.is_empty() { selected_provider.clone() } else { "openrouter".to_string() },
+            model: String::new(),
+            temperature: 0.7,
+            system_prompt: String::new(),
+            api_key: String::new(),
+            endpoint: String::new(),
+        };
+        if let Some((saved_key, saved_ep, saved_model)) = state.db.get_ai_provider_key(company_id, &cfg.provider) {
+            cfg.api_key = saved_key;
+            if !saved_ep.is_empty() { cfg.endpoint = saved_ep; }
+            if !saved_model.is_empty() { cfg.model = saved_model; }
+        }
+        cfg
     };
-
-    let greetings = ["Olá", "Oi", "Fala", "E aí"];
-    let closings = ["Abraços", "Att", "Equipe REALESS", "Setor Financeiro"];
-    let g = greetings[seed % greetings.len()];
-    let c = closings[(seed / 7) % closings.len()];
-
-    let personalized = message.replace("{nome}", &contact_name);
-    Ok(format!("{}, {}! {}\n\n{}", hour_text, g, personalized, c))
+    if let Some(model) = model.filter(|value| !value.trim().is_empty()) { config.model = model; }
+    if let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) { config.system_prompt = prompt; }
+    if let Some(key) = api_key.filter(|value| !value.trim().is_empty()) { config.api_key = key; }
+    if let Some(ep) = endpoint.filter(|value| !value.trim().is_empty()) { config.endpoint = ep; }
+    crate::ai_engine::AiEngine::generate_message(&config, &message, &contact_name).await
 }
 
 #[tauri::command]
@@ -3063,7 +3189,7 @@ pub async fn connect_hub(
     state: State<'_, AppState>,
     token: String,
 ) -> Result<(), String> {
-    let session = validate_session(&state.sessions, &token)?;
+    let _session = validate_session(&state.sessions, &token)?;
     let creds = get_hub_credentials(state.clone(), token.clone())?;
     let client = HubClient::connect(
         &creds.hub_address,
@@ -3082,7 +3208,10 @@ pub async fn connect_hub(
 #[tauri::command]
 pub async fn update_vps_hub(state: State<'_, AppState>, token: String, base64_bin: String) -> Result<String, String> {
     let _session = validate_session(&state.sessions, &token)?;
-    let bin = base64::decode(&base64_bin).map_err(|e| format!("Falha ao decodificar base64: {}", e))?;
+    use base64::Engine as _;
+    let bin = base64::engine::general_purpose::STANDARD
+        .decode(&base64_bin)
+        .map_err(|e| format!("Falha ao decodificar base64: {}", e))?;
     if bin.is_empty() { return Err("Binario vazio.".into()); }
     let token_master = std::env::var("HUB_MASTER_TOKEN")
         .unwrap_or_else(|_| "EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b".to_string());
@@ -3293,6 +3422,16 @@ pub fn trigger_manual_intent_bezier_dispatch(
 ) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
     AdbManager::send_whatsapp_intent_and_bezier_tap(&serial, &phone, &message)
+}
+
+#[tauri::command]
+pub fn clear_device_temporary_contacts(
+    state: State<'_, AppState>,
+    token: String,
+    serial: String,
+) -> Result<(), String> {
+    let _session = validate_session(&state.sessions, &token)?;
+    AdbManager::clear_all_temporary_contacts(&serial)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
