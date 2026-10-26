@@ -1,6 +1,6 @@
 // ============================================================
-// Esfera v3 — Componente Badge
-// Badges de status com cores e dot animado
+// Esfera v3 — Badge
+// Etiqueta de status legível (11px), com ponto opcional
 // ============================================================
 
 import type { ReactNode } from "react";
@@ -16,21 +16,21 @@ interface BadgeProps {
 }
 
 const variantClasses: Record<BadgeVariant, string> = {
-  success: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
-  warning: "bg-amber-500/10 text-amber-400 border-amber-500/20",
-  danger: "bg-red-500/10 text-red-400 border-red-500/20",
-  info: "bg-blue-500/10 text-blue-400 border-blue-500/20",
-  neutral: "bg-zinc-500/10 text-zinc-400 border-zinc-500/20",
-  purple: "bg-[#5E6AD2]/10 text-[#828DF7] border-[#5E6AD2]/20",
+  success: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/20",
+  warning: "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/20",
+  danger: "bg-red-500/10 text-red-700 dark:text-red-400 border-red-500/20",
+  info: "bg-sky-500/10 text-sky-700 dark:text-sky-400 border-sky-500/20",
+  neutral: "bg-hover text-secondary border-border",
+  purple: "bg-[var(--color-accent-glow)] text-[var(--color-accent-light)] border-[var(--color-border-accent)]",
 };
 
 const dotColors: Record<BadgeVariant, string> = {
-  success: "bg-emerald-400",
-  warning: "bg-amber-400",
-  danger: "bg-red-400",
-  info: "bg-blue-400",
+  success: "bg-emerald-500",
+  warning: "bg-amber-500",
+  danger: "bg-red-500",
+  info: "bg-sky-500",
   neutral: "bg-zinc-400",
-  purple: "bg-[#828DF7]",
+  purple: "bg-[var(--color-accent-light)]",
 };
 
 export default function Badge({
@@ -42,14 +42,14 @@ export default function Badge({
 }: BadgeProps) {
   return (
     <span
-      className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px]
+      className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] leading-4
         font-medium border whitespace-nowrap shrink-0 ${variantClasses[variant]} ${className}`}
     >
       {dot && (
         <span className="relative flex h-1.5 w-1.5">
           {pulse && (
             <span
-              className={`absolute inline-flex h-full w-full rounded-full opacity-75
+              className={`absolute inline-flex h-full w-full rounded-full opacity-60
                 animate-ping ${dotColors[variant]}`}
             />
           )}

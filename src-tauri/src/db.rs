@@ -6,7 +6,7 @@
 // Fase 1: WAL, Soft Delete, 4 tabelas novas, Hash SHA-256
 // ============================================================
 
-use rusqlite::{params, Connection, Result, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
 use std::sync::Mutex;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -80,7 +80,11 @@ pub struct Campaign {
     #[serde(alias = "useAI")]
     pub use_ai: bool,
     pub ai_model: String,
+    #[serde(default)]
+    pub ai_provider: String,
     pub ai_prompt: String,
+    #[serde(default)]
+    pub device_ids: Vec<String>,
     pub status: String,
     pub contacts_count: i32,
     pub sent_count: i32,
@@ -180,11 +184,14 @@ pub struct DevicePrefs {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AiConfig {
+    #[serde(alias = "company_id")]
     pub company_id: i32,
     pub provider: String,
     pub model: String,
     pub temperature: f64,
+    #[serde(alias = "system_prompt")]
     pub system_prompt: String,
+    #[serde(alias = "api_key")]
     pub api_key: String,
     pub endpoint: String,
 }
@@ -279,6 +286,7 @@ pub struct DeviceWithActiveUser {
 
 pub struct DatabaseTransaction<'a> {
     tx: Option<Transaction<'a>>,
+    #[allow(dead_code)]
     conn: &'a Connection,
 }
 
@@ -665,6 +673,7 @@ impl Database {
                 UseSpintax INTEGER NOT NULL DEFAULT 0,
                 UseAI INTEGER NOT NULL DEFAULT 0,
                 AiModel TEXT DEFAULT 'gpt-4o-mini',
+                AiProvider TEXT DEFAULT '',
                 AiPrompt TEXT DEFAULT '',
                 Status TEXT NOT NULL DEFAULT 'draft',
                 TotalContacts INTEGER NOT NULL DEFAULT 0,
@@ -806,6 +815,20 @@ impl Database {
             [],
         )?;
 
+        // 13b. ESF_AiProviderKey (registro persistente de chaves e endpoints por provedor por empresa)
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_AiProviderKey (
+                CompanyId INTEGER NOT NULL,
+                Provider TEXT NOT NULL,
+                ApiKey TEXT DEFAULT '',
+                Endpoint TEXT DEFAULT '',
+                Model TEXT DEFAULT '',
+                UpdatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (CompanyId, Provider)
+            );",
+            [],
+        )?;
+
         // 14. ESF_Permission (permissões granulares por usuário)
         self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_Permission (
@@ -884,8 +907,9 @@ impl Database {
         // 18. Performance Indexes (Microsecond Lookups)
         self.conn().execute_batch("
             CREATE INDEX IF NOT EXISTS idx_device_company ON ESF_Device (CompanyId);
+            CREATE INDEX IF NOT EXISTS idx_device_status ON ESF_Device (Status, CompanyId);
             CREATE INDEX IF NOT EXISTS idx_campaign_company ON ESF_Campaign (CompanyId, ExcluidoEm);
-            CREATE INDEX IF NOT EXISTS idx_contact_campaign ON ESF_Contact (CampaignId, Status, ExcluidoEm);
+            CREATE INDEX IF NOT EXISTS idx_contact_campaign ON ESF_Contact (CampaignId, Status, ExcluidoEm, ContactId);
             CREATE INDEX IF NOT EXISTS idx_chip_device ON ESF_Chip (DeviceId, ExcluidoEm);
             CREATE INDEX IF NOT EXISTS idx_audit_log_company ON ESF_AuditLog (CompanyId, LogId DESC);
             CREATE INDEX IF NOT EXISTS idx_automation_company ON ESF_AutomationRule (CompanyId, ExcluidoEm);
@@ -944,6 +968,7 @@ impl Database {
 
         // ESF_Campaign
         let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN SelectedDevices TEXT DEFAULT '';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN AiProvider TEXT DEFAULT '';", []);
         let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
 
         // ESF_AutomationRule
@@ -976,6 +1001,24 @@ impl Database {
 
         // Garante que a empresa #1 seja REALESS e que nenhuma informação seja perdida
         let _ = self.conn().execute("UPDATE ESF_Company SET CompanyName='REALESS' WHERE CompanyId=1 AND (CompanyName='Empresa Principal' OR CompanyName='');", []);
+
+        // Atualização automática de modelos de IA descontinuados/obsoletos do OpenRouter
+        let _ = self.conn().execute(
+            "UPDATE ESF_Campaign SET AiModel = 'openrouter/free' WHERE AiModel IN ('qwen/qwen-2.5-72b-instruct:free', 'qwen/qwen-2.5-72b-instruct', 'meta-llama/llama-3.3-70b-instruct:free') OR AiModel LIKE '%qwen%72b%';",
+            [],
+        );
+        let _ = self.conn().execute(
+            "UPDATE ESF_AiConfig SET Model = 'openrouter/free' WHERE Model IN ('qwen/qwen-2.5-72b-instruct:free', 'qwen/qwen-2.5-72b-instruct', 'meta-llama/llama-3.3-70b-instruct:free') OR Model LIKE '%qwen%72b%';",
+            [],
+        );
+        let _ = self.conn().execute(
+            "UPDATE ESF_AiProviderKey SET Model = 'openrouter/free' WHERE Model IN ('qwen/qwen-2.5-72b-instruct:free', 'qwen/qwen-2.5-72b-instruct', 'meta-llama/llama-3.3-70b-instruct:free') OR Model LIKE '%qwen%72b%';",
+            [],
+        );
+
+        // Performance indexes em tabelas existentes
+        let _ = self.conn().execute("CREATE INDEX IF NOT EXISTS idx_contact_campaign_v2 ON ESF_Contact (CampaignId, Status, ExcluidoEm, ContactId);", []);
+        let _ = self.conn().execute("CREATE INDEX IF NOT EXISTS idx_device_status ON ESF_Device (Status, CompanyId);", []);
 
         Ok(())
     }
@@ -1201,7 +1244,10 @@ impl Database {
             "SELECT rowid, AdbDeviceId, DeviceName, Brand, Model, DeviceIp, DevicePort, Status, BatteryLevel, CompanyId, DeviceNumber, Sector, EsferaDeviceId, CurrentAdbAddress, LastSeenUTC FROM ESF_Device"
         };
 
-        let conn = self.conn();
+        let conn = match self.pooled_conn() {
+            Ok(conn) => conn,
+            Err(_) => return vec![],
+        };
         let mut stmt = match conn.prepare_cached(sql) {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -1338,7 +1384,8 @@ impl Database {
                 (device.name.clone(), device.sector.clone(), device.device_number)
             } else {
                 let next_num = self.get_next_device_number();
-                let gen_name = format!("Aparelho {}", next_num);
+                let clean_id = esfera_id.replace("ESF-", "").to_uppercase().replace(':', "").replace('.', "");
+                let gen_name = format!("Celular {}", if clean_id.is_empty() { next_num.to_string() } else { clean_id.chars().take(8).collect() });
                 let _ = self.save_device_identity(esfera_id, &gen_name, &device.sector, next_num, &device.model);
                 (gen_name, device.sector.clone(), next_num)
             }
@@ -1430,6 +1477,27 @@ impl Database {
         .map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    /// Atualiza exclusivamente o status em tempo real e nível de bateria (ex: ao ficar offline),
+    /// preservando 100% intactos o nome, setor, numeração e identidade do aparelho.
+    pub fn set_device_runtime_state(
+        &self,
+        serial: &str,
+        esfera_id: Option<&str>,
+        company_id: i32,
+        status: &str,
+        battery: i32,
+    ) {
+        let target_comp = if company_id <= 0 { 1 } else { company_id };
+        let eid = esfera_id.unwrap_or("").trim();
+        let _ = self.exec_retry(
+            "UPDATE ESF_Device SET Status = ?1, BatteryLevel = ?2
+             WHERE CompanyId = ?3
+               AND (AdbDeviceId = ?4 OR (?5 != '' AND EsferaDeviceId = ?5))",
+            params![status, battery, target_comp, serial, eid],
+        );
+    }
+
 
     /// Atualiza imediatamente o IP volátil e status online de um dispositivo usando o EsferaDeviceId perpétuo como única fonte da verdade
     pub fn update_device_network_by_id(&self, device_id: &str, ip: &str, port: i32) -> Result<(), String> {
@@ -1630,7 +1698,7 @@ impl Database {
     pub fn get_campaigns(&self, company_id: i32) -> Vec<Campaign> {
         let conn = self.conn();
         let mut stmt = match conn.prepare_cached(
-            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt
+            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt, SelectedDevices, AiProvider
              FROM ESF_Campaign WHERE CompanyId = ?1 AND ExcluidoEm IS NULL"
         ) {
             Ok(s) => s,
@@ -1649,7 +1717,9 @@ impl Database {
                 use_spintax: row.get::<_, i32>(7)? == 1,
                 use_ai: row.get::<_, i32>(8)? == 1,
                 ai_model: row.get(9)?,
+                ai_provider: row.get(18)?,
                 ai_prompt: row.get(10)?,
+                device_ids: serde_json::from_str(&row.get::<_, String>(17)?).unwrap_or_default(),
                 status: row.get(11)?,
                 contacts_count: row.get(12)?,
                 sent_count: row.get(13)?,
@@ -1665,10 +1735,17 @@ impl Database {
         }
     }
 
+    pub fn get_campaign_company_id(&self, campaign_id: i32) -> Option<i32> {
+        self.conn().query_row(
+            "SELECT CompanyId FROM ESF_Campaign WHERE CampaignId=?1 AND ExcluidoEm IS NULL",
+            params![campaign_id], |row| row.get(0),
+        ).ok()
+    }
+
     pub fn create_campaign(&self, c: &Campaign) -> Result<i32, String> {
         self.conn().execute(
-            "INSERT INTO ESF_Campaign (CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15);",
+            "INSERT INTO ESF_Campaign (CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, SelectedDevices, AiProvider)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17);",
             params![
                 c.name,
                 c.greeting,
@@ -1685,15 +1762,17 @@ impl Database {
                 c.sent_count,
                 c.failed_count,
                 c.company_id,
+                serde_json::to_string(&c.device_ids).map_err(|e| e.to_string())?,
+                c.ai_provider,
             ]
         ).map_err(|e| e.to_string())?;
         Ok(self.conn().last_insert_rowid() as i32)
     }
 
     pub fn get_running_campaigns(&self) -> Result<Vec<Campaign>> {
-        let conn = self.conn();
+        let conn = self.pooled_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt FROM ESF_Campaign WHERE Status = 'running' AND ExcluidoEm IS NULL"
+            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt, SelectedDevices, AiProvider FROM ESF_Campaign WHERE Status = 'running' AND ExcluidoEm IS NULL"
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -1708,7 +1787,9 @@ impl Database {
                 use_spintax: row.get::<_, i32>(7)? == 1,
                 use_ai: row.get::<_, i32>(8)? == 1,
                 ai_model: row.get(9)?,
+                ai_provider: row.get(18)?,
                 ai_prompt: row.get(10)?,
+                device_ids: serde_json::from_str(&row.get::<_, String>(17)?).unwrap_or_default(),
                 status: row.get(11)?,
                 contacts_count: row.get(12)?,
                 sent_count: row.get(13)?,
@@ -1730,21 +1811,24 @@ impl Database {
     }
 
     pub fn update_campaign(&self, c: &Campaign) -> Result<(), String> {
-        self.conn().execute(
+        let updated = self.conn().execute(
             "UPDATE ESF_Campaign SET CampaignName=?1, MessageGreeting=?2, MessageBody=?3, MessageClosing=?4,
              DelayMin=?5, DelayMax=?6, UseSpintax=?7, UseAI=?8, AiModel=?9, AiPrompt=?10,
-             Status=?11, TotalContacts=?12, SentContacts=?13, FailedContacts=?14, UpdatedAt=datetime('now')
-             WHERE CampaignId=?15 AND ExcluidoEm IS NULL;",
+             SelectedDevices=?11, AiProvider=?12, UpdatedAt=datetime('now')
+             WHERE CampaignId=?13 AND CompanyId=?14 AND ExcluidoEm IS NULL;",
             params![
                 c.name, c.greeting, c.message, c.closing,
                 c.delay_min, c.delay_max,
                 if c.use_spintax { 1 } else { 0 },
                 if c.use_ai { 1 } else { 0 },
-                c.ai_model, c.ai_prompt, c.status,
-                c.contacts_count, c.sent_count, c.failed_count,
+                c.ai_model, c.ai_prompt,
+                serde_json::to_string(&c.device_ids).map_err(|e| e.to_string())?,
+                c.ai_provider,
                 c.id,
+                c.company_id,
             ]
         ).map_err(|e| e.to_string())?;
+        if updated == 0 { return Err("Campanha não encontrada nesta empresa.".to_string()); }
         Ok(())
     }
 
@@ -2079,19 +2163,29 @@ impl Database {
     }
 
     pub fn import_contacts(&self, campaign_id: i32, contacts_list: Vec<(String, String)>) -> Result<(), String> {
-        // Soft delete pending anteriores (substitui)
-        self.conn().execute(
-            "UPDATE ESF_Contact SET ExcluidoEm=datetime('now') WHERE CampaignId=?1 AND Status='pending' AND ExcluidoEm IS NULL;",
-            params![campaign_id],
-        ).map_err(|e| e.to_string())?;
-
-        for (name, phone) in contacts_list {
-            self.conn().execute(
-                "INSERT INTO ESF_Contact (CampaignId, ContactName, Phone, Status) VALUES (?1, ?2, ?3, 'pending');",
-                params![campaign_id, name, phone],
-            ).map_err(|e| e.to_string())?;
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<()> {
+            conn.execute(
+                "UPDATE ESF_Contact SET ExcluidoEm=datetime('now') WHERE CampaignId=?1 AND Status='pending' AND ExcluidoEm IS NULL;",
+                params![campaign_id],
+            )?;
+            for (name, phone) in contacts_list {
+                conn.execute(
+                    "INSERT INTO ESF_Contact (CampaignId, ContactName, Phone, Status) VALUES (?1, ?2, ?3, 'pending');",
+                    params![campaign_id, name, phone],
+                )?;
+            }
+            conn.execute(
+                "UPDATE ESF_Campaign SET TotalContacts=(SELECT COUNT(*) FROM ESF_Contact WHERE CampaignId=?1 AND ExcluidoEm IS NULL), UpdatedAt=datetime('now') WHERE CampaignId=?1;",
+                params![campaign_id],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;").map_err(|e| e.to_string()),
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK;"); Err(e.to_string()) }
         }
-        Ok(())
     }
 
     pub fn update_contact_status(&self, contact_id: i32, status: &str) -> Result<(), String> {
@@ -2100,6 +2194,63 @@ impl Database {
             params![status, contact_id],
         ).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn record_contact_send_failure(&self, campaign_id: i32, contact_id: i32) -> Result<(), String> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE ESF_Contact SET RetryCount=RetryCount+1,
+             Status=CASE WHEN RetryCount+1 >= 3 THEN 'failed' ELSE 'pending' END
+             WHERE ContactId=?1 AND CampaignId=?2 AND Status='pending' AND ExcluidoEm IS NULL",
+            params![contact_id, campaign_id],
+        ).map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE ESF_Campaign SET FailedContacts=(SELECT COUNT(*) FROM ESF_Contact WHERE CampaignId=?1 AND Status='failed' AND ExcluidoEm IS NULL)
+             WHERE CampaignId=?1",
+            params![campaign_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn retry_failed_contacts(&self, campaign_id: i32) -> Result<usize, String> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<usize> {
+            let count = conn.execute(
+                "UPDATE ESF_Contact SET Status='pending', RetryCount=0 WHERE CampaignId=?1 AND Status='failed' AND ExcluidoEm IS NULL",
+                params![campaign_id],
+            )?;
+            conn.execute(
+                "UPDATE ESF_Campaign SET FailedContacts=0, Status='paused', UpdatedAt=datetime('now') WHERE CampaignId=?1",
+                params![campaign_id],
+            )?;
+            Ok(count)
+        })();
+        match result {
+            Ok(count) => { conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?; Ok(count) }
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK;"); Err(e.to_string()) }
+        }
+    }
+
+    /// Reseta todos os contatos da campanha para 'pending' e zera contadores para permitir novo disparo completo
+    pub fn reset_campaign_contacts(&self, campaign_id: i32) -> Result<usize, String> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<usize> {
+            let count = conn.execute(
+                "UPDATE ESF_Contact SET Status='pending', RetryCount=0 WHERE CampaignId=?1 AND ExcluidoEm IS NULL",
+                params![campaign_id],
+            )?;
+            conn.execute(
+                "UPDATE ESF_Campaign SET SentContacts=0, FailedContacts=0, Status='draft', UpdatedAt=datetime('now') WHERE CampaignId=?1",
+                params![campaign_id],
+            )?;
+            Ok(count)
+        })();
+        match result {
+            Ok(count) => { conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?; Ok(count) }
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK;"); Err(e.to_string()) }
+        }
     }
 
     pub fn set_contact_custom_message(&self, contact_id: i32, message: &str) -> Result<(), String> {
@@ -2111,7 +2262,11 @@ impl Database {
     }
 
     pub fn get_next_pending_contact(&self, campaign_id: i32) -> Option<Contact> {
-        self.conn().query_row(
+        self.try_get_next_pending_contact(campaign_id).ok().flatten()
+    }
+
+    pub fn try_get_next_pending_contact(&self, campaign_id: i32) -> Result<Option<Contact>> {
+        self.pooled_conn()?.query_row(
             "SELECT ContactId, CampaignId, ContactName, Phone, Status, SentAt
              FROM ESF_Contact WHERE CampaignId = ?1 AND Status = 'pending' AND ExcluidoEm IS NULL
              ORDER BY ContactId ASC LIMIT 1",
@@ -2126,7 +2281,16 @@ impl Database {
                     sent_at: row.get(5)?,
                 })
             },
-        ).ok()
+        ).optional()
+    }
+
+    pub fn has_pending_contact(&self, campaign_id: i32) -> bool {
+        let Ok(conn) = self.pooled_conn() else { return false; };
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ESF_Contact WHERE CampaignId = ?1 AND Status = 'pending' AND ExcluidoEm IS NULL LIMIT 1)",
+            params![campaign_id],
+            |row| row.get::<_, bool>(0),
+        ).unwrap_or(false)
     }
 
     // ============================================================
@@ -2134,12 +2298,16 @@ impl Database {
     // ============================================================
 
     pub fn was_already_sent(&self, phone: &str, campaign_id: i32) -> bool {
-        let count: i32 = self.conn().query_row(
-            "SELECT COUNT(*) FROM ESF_SentHistory WHERE Phone = ?1 AND CampaignId = ?2;",
+        self.try_was_already_sent(phone, campaign_id).unwrap_or(false)
+    }
+
+    pub fn try_was_already_sent(&self, phone: &str, campaign_id: i32) -> Result<bool> {
+        let conn = self.pooled_conn()?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ESF_SentHistory WHERE Phone = ?1 AND CampaignId = ?2 LIMIT 1);",
             params![phone, campaign_id],
             |row| row.get(0),
-        ).unwrap_or(0);
-        count > 0
+        )
     }
 
     pub fn mark_as_sent(&self, phone: &str, campaign_id: i32) -> Result<(), String> {
@@ -2273,7 +2441,63 @@ impl Database {
                 config.system_prompt, config.api_key, config.endpoint,
             ],
         ).map_err(|e| e.to_string())?;
+
+        // Também salva/atualiza o registro persistente por provedor
+        if !config.provider.is_empty() {
+            let _ = self.save_ai_provider_key(
+                config.company_id,
+                &config.provider,
+                &config.api_key,
+                &config.endpoint,
+                &config.model,
+            );
+        }
         Ok(())
+    }
+
+    pub fn get_ai_provider_key(&self, company_id: i32, provider: &str) -> Option<(String, String, String)> {
+        self.conn().query_row(
+            "SELECT ApiKey, Endpoint, Model FROM ESF_AiProviderKey WHERE CompanyId = ?1 AND Provider = ?2;",
+            params![company_id, provider.to_lowercase()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).ok()
+    }
+
+    pub fn save_ai_provider_key(&self, company_id: i32, provider: &str, api_key: &str, endpoint: &str, model: &str) -> Result<(), String> {
+        self.conn().execute(
+            "INSERT INTO ESF_AiProviderKey (CompanyId, Provider, ApiKey, Endpoint, Model)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(CompanyId, Provider) DO UPDATE SET
+             ApiKey=excluded.ApiKey, Endpoint=excluded.Endpoint, Model=excluded.Model, UpdatedAt=datetime('now');",
+            params![company_id, provider.to_lowercase(), api_key, endpoint, model],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_all_ai_provider_keys(&self, company_id: i32) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut map = std::collections::HashMap::new();
+        let conn = self.conn();
+        let mut stmt = match conn.prepare_cached("SELECT Provider, ApiKey, Endpoint, Model FROM ESF_AiProviderKey WHERE CompanyId = ?1") {
+            Ok(s) => s,
+            Err(_) => return map,
+        };
+        let rows = stmt.query_map(params![company_id], |row| {
+            let prov: String = row.get(0)?;
+            let key: String = row.get(1)?;
+            let ep: String = row.get(2)?;
+            let mdl: String = row.get(3)?;
+            Ok((prov, serde_json::json!({
+                "apiKey": key,
+                "endpoint": ep,
+                "model": mdl
+            })))
+        });
+        if let Ok(iter) = rows {
+            for item in iter.flatten() {
+                map.insert(item.0, item.1);
+            }
+        }
+        map
     }
 
     // ============================================================

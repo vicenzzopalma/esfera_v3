@@ -1,6 +1,6 @@
 // ============================================================
-// Esfera v3 — Companies Tab (Layout Grid de Cards + Edição)
-// Visão geral das empresas com botões de Gerenciar e Editar Empresa
+// Esfera v3 — Empresas
+// Lista de empresas com cotas, entrada rápida e edição em modal
 // ============================================================
 
 import { useState, useEffect } from "react";
@@ -12,6 +12,10 @@ import Badge from "../components/ui/Badge";
 import Button from "../components/ui/Button";
 import Modal from "../components/ui/Modal";
 import Toggle from "../components/ui/Toggle";
+import PageHeader from "../components/ui/PageHeader";
+import StatCard from "../components/ui/StatCard";
+import EmptyState from "../components/ui/EmptyState";
+import Field from "../components/ui/Field";
 import { api } from "../tauri";
 import type { Company } from "../types";
 import {
@@ -23,6 +27,7 @@ import {
   CheckCircle2,
   Search,
   Pencil,
+  RefreshCw,
 } from "lucide-react";
 
 export default function CompaniesTab() {
@@ -30,6 +35,7 @@ export default function CompaniesTab() {
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
   const [companiesList, setCompaniesList] = useState<Company[]>([]);
+  const [loading, setLoading] = useState(true);
 
   // Modal State
   const [modalOpen, setModalOpen] = useState(false);
@@ -50,7 +56,8 @@ export default function CompaniesTab() {
           setCompaniesList(MOCK_COMPANIES);
         }
       })
-      .catch(() => { if (mounted) setCompaniesList(MOCK_COMPANIES); });
+      .catch(() => { if (mounted) setCompaniesList(MOCK_COMPANIES); })
+      .finally(() => { if (mounted) setLoading(false); });
     return () => { mounted = false; };
   }, []);
 
@@ -124,209 +131,177 @@ export default function CompaniesTab() {
 
   return (
     <div className="space-y-6 animate-fade-in">
-      {/* Header & Quick Action */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h2 className="text-xl font-bold text-primary tracking-tight">Gestão de Empresas</h2>
-          <p className="text-xs text-tertiary mt-1 leading-snug">
-            Gerencie permissões, cotas e instâncias de clientes no Esfera v3.
-          </p>
-        </div>
-        <Button icon={<Plus size={16} />} onClick={() => handleOpenEditModal()}>
-          Nova Empresa
-        </Button>
+      <PageHeader
+        title="Empresas"
+        description="Cotas, acesso e instâncias de cada cliente."
+        icon={<Building2 size={18} />}
+        actions={
+          <Button icon={<Plus size={15} />} onClick={() => handleOpenEditModal()}>
+            Nova empresa
+          </Button>
+        }
+      />
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <StatCard label="Empresas ativas" value={activeCompaniesCount} icon={<CheckCircle2 size={14} />} tone="success" hint={`de ${companiesList.length} cadastradas`} />
+        <StatCard label="Aparelhos alocados" value={totalDevicesAllocated} icon={<Smartphone size={14} />} tone="info" />
+        <StatCard label="Usuários" value={totalUsersAllocated} icon={<Users size={14} />} tone="accent" />
       </div>
 
-      {/* KPI Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-        <Card padding="md" className="flex items-center gap-4">
-          <div className="p-2.5 rounded-xl bg-violet-500/15 border border-violet-500/20 text-violet-400 shrink-0">
-            <CheckCircle2 size={20} />
-          </div>
-          <div>
-            <p className="text-2xl font-bold text-primary">{activeCompaniesCount}</p>
-            <p className="text-xs text-tertiary font-medium">Empresas Ativas</p>
-          </div>
-        </Card>
-
-        <Card padding="md" className="flex items-center gap-4">
-          <div className="p-2.5 rounded-xl bg-blue-500/15 border border-blue-500/20 text-blue-400 shrink-0">
-            <Smartphone size={20} />
-          </div>
-          <div>
-            <p className="text-2xl font-bold text-primary">{totalDevicesAllocated}</p>
-            <p className="text-xs text-tertiary font-medium">Dispositivos Alocados</p>
-          </div>
-        </Card>
-
-        <Card padding="md" className="flex items-center gap-4">
-          <div className="p-2.5 rounded-xl bg-emerald-500/15 border border-emerald-500/20 text-emerald-400 shrink-0">
-            <Users size={20} />
-          </div>
-          <div>
-            <p className="text-2xl font-bold text-primary">{totalUsersAllocated}</p>
-            <p className="text-xs text-tertiary font-medium">Usuários Totais</p>
-          </div>
-        </Card>
-      </div>
-
-      {/* Search Input */}
       <div className="relative max-w-md flex items-center">
         <Search size={16} className="input-icon-left text-tertiary" />
         <input
           type="text"
-          placeholder="Buscar empresa por nome..."
+          aria-label="Buscar empresa"
+          placeholder="Buscar empresa"
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           className="w-full input-with-icon-left"
         />
       </div>
 
-      {/* Grid de Cards de Empresas */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-        {filteredCompanies.map((company) => {
-          const devicePct = Math.round(((company.deviceCount || 0) / company.deviceLimit) * 100);
-          return (
-            <Card key={company.id} padding="md" hover className="flex flex-col justify-between">
-              <div>
-                {/* Header Card */}
-                <div className="flex items-start justify-between gap-3 mb-4">
-                  <div className="flex items-center gap-3">
-                    <div className="flex items-center justify-center w-11 h-11 rounded-2xl bg-violet-600/15 border border-violet-500/20 text-violet-400">
-                      <Building2 size={22} />
+      {loading ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="h-44 rounded-xl border border-border bg-card skeleton" />
+          ))}
+        </div>
+      ) : filteredCompanies.length === 0 ? (
+        <EmptyState
+          icon={<Building2 size={18} />}
+          title={searchQuery ? "Nenhuma empresa encontrada" : "Nenhuma empresa cadastrada"}
+          description={searchQuery ? "Revise o termo buscado." : "Crie a primeira empresa para começar."}
+          action={
+            searchQuery ? (
+              <Button variant="secondary" icon={<RefreshCw size={14} />} onClick={() => setSearchQuery("")}>
+                Limpar busca
+              </Button>
+            ) : (
+              <Button icon={<Plus size={15} />} onClick={() => handleOpenEditModal()}>
+                Nova empresa
+              </Button>
+            )
+          }
+        />
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          {filteredCompanies.map((company) => {
+            const devicePct = company.deviceLimit
+              ? Math.min(100, Math.round(((company.deviceCount || 0) / company.deviceLimit) * 100))
+              : 0;
+            const active = isCompanyActive(company);
+            const barTone = devicePct >= 90 ? "bg-red-400" : devicePct >= 70 ? "bg-amber-400" : "bg-[var(--color-accent)]";
+            return (
+              <Card key={company.id} padding="md" className="flex flex-col gap-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border bg-secondary text-secondary">
+                      <Building2 size={17} />
                     </div>
-                    <div>
-                      <h3 className="font-bold text-sm text-primary leading-tight">{company.name}</h3>
-                      <p className="text-[11px] text-tertiary mt-0.5">Criada em {company.createdAt}</p>
+                    <div className="min-w-0">
+                      <h3 className="text-sm font-semibold text-primary truncate">{company.name}</h3>
+                      <p className="text-xs text-tertiary">Criada em {company.createdAt}</p>
                     </div>
                   </div>
-
-                  <div className="flex items-center gap-2">
-                    <Badge variant={isCompanyActive(company) ? "success" : "neutral"} dot>
-                      {isCompanyActive(company) ? "Ativa" : "Inativa"}
-                    </Badge>
-                    <button
-                      onClick={() => handleOpenEditModal(company)}
-                      className="p-1.5 rounded-lg text-tertiary hover:text-violet-300 hover:bg-white/10 transition-colors cursor-pointer"
-                      title="Editar Empresa"
-                    >
-                      <Pencil size={15} />
-                    </button>
-                  </div>
+                  <Badge variant={active ? "success" : "neutral"} dot>
+                    {active ? "Ativa" : "Inativa"}
+                  </Badge>
                 </div>
 
-                {/* Cotas & Uso */}
-                <div className="space-y-3 my-4">
-                  <div className="grid grid-cols-2 gap-3 text-xs p-3 rounded-xl bg-white/[0.02] border border-white/[0.06]">
-                    <div>
-                      <span className="text-[11px] text-tertiary flex items-center gap-1">
-                        <Smartphone size={12} className="text-violet-400" /> Dispositivos
-                      </span>
-                      <p className="font-bold text-primary text-xs mt-0.5">
-                        {company.deviceCount || 0}<span className="text-tertiary font-normal">/{company.deviceLimit}</span>
-                      </p>
-                    </div>
-
-                    <div>
-                      <span className="text-[11px] text-tertiary flex items-center gap-1">
-                        <Users size={12} className="text-emerald-400" /> Usuários
-                      </span>
-                      <p className="font-bold text-primary text-xs mt-0.5">
-                        {company.userCount || 0}<span className="text-tertiary font-normal">/{company.userLimit}</span>
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Barra de Progresso de Ocupação */}
+                <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <div className="flex justify-between text-[11px] text-tertiary mb-1">
-                      <span>Ocupação da Cota</span>
-                      <span className="font-semibold text-secondary">{devicePct}%</span>
-                    </div>
-                    <div className="h-1.5 rounded-full bg-white/5 overflow-hidden">
-                      <div
-                        className="h-full rounded-full bg-gradient-to-r from-violet-600 to-indigo-500 transition-all duration-300"
-                        style={{ width: `${devicePct}%` }}
-                      />
-                    </div>
+                    <span className="flex items-center gap-1.5 text-xs text-secondary">
+                      <Smartphone size={13} /> Aparelhos
+                    </span>
+                    <p className="mt-0.5 text-sm font-semibold text-primary tabular-nums">
+                      {company.deviceCount || 0}<span className="font-normal text-tertiary"> / {company.deviceLimit}</span>
+                    </p>
+                  </div>
+                  <div>
+                    <span className="flex items-center gap-1.5 text-xs text-secondary">
+                      <Users size={13} /> Usuários
+                    </span>
+                    <p className="mt-0.5 text-sm font-semibold text-primary tabular-nums">
+                      {company.userCount || 0}<span className="font-normal text-tertiary"> / {company.userLimit}</span>
+                    </p>
                   </div>
                 </div>
-              </div>
 
-              {/* Ações Inferiores */}
-              <div className="pt-2 flex items-center gap-2">
-                <Button
-                  variant="primary"
-                  size="sm"
-                  className="flex-1"
-                  icon={<ArrowRight size={14} />}
-                  onClick={() => handleEnterCompany(company.id)}
-                >
-                  Gerenciar Empresa
-                </Button>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  icon={<Pencil size={14} />}
-                  onClick={() => handleOpenEditModal(company)}
-                >
-                  Editar
-                </Button>
-              </div>
-            </Card>
-          );
-        })}
-      </div>
+                <div>
+                  <div className="mb-1 flex justify-between text-xs text-tertiary">
+                    <span>Uso da cota de aparelhos</span>
+                    <span className="tabular-nums text-secondary">{devicePct}%</span>
+                  </div>
+                  <div className="h-1.5 rounded-full bg-secondary overflow-hidden">
+                    <div className={`h-full rounded-full transition-all ${barTone}`} style={{ width: `${devicePct}%` }} />
+                  </div>
+                </div>
 
-      {/* Modal Editar / Criar Empresa */}
+                <div className="mt-auto flex items-center gap-2">
+                  <Button size="sm" className="flex-1" icon={<ArrowRight size={14} />} onClick={() => handleEnterCompany(company.id)}>
+                    Entrar
+                  </Button>
+                  <Button variant="secondary" size="sm" icon={<Pencil size={13} />} onClick={() => handleOpenEditModal(company)} aria-label={`Editar ${company.name}`}>
+                    Editar
+                  </Button>
+                </div>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+
       <Modal
         isOpen={modalOpen}
         onClose={() => setModalOpen(false)}
-        title={editingCompany ? `Editar Empresa: ${editingCompany.name}` : "Nova Empresa"}
+        title={editingCompany ? "Editar empresa" : "Nova empresa"}
         footer={
           <>
             <Button variant="secondary" onClick={() => setModalOpen(false)}>
               Cancelar
             </Button>
-            <Button onClick={handleSaveCompany}>Salvar Alterações</Button>
+            <Button onClick={handleSaveCompany} disabled={!editName.trim()}>
+              {editingCompany ? "Salvar" : "Criar empresa"}
+            </Button>
           </>
         }
       >
-        <div className="space-y-4 text-xs">
-          <div>
-            <label className="block font-semibold text-secondary mb-1">Nome da Empresa</label>
+        <div className="space-y-4">
+          <Field label="Nome" required htmlFor="company-name">
             <input
+              id="company-name"
               type="text"
               value={editName}
               onChange={(e) => setEditName(e.target.value)}
-              placeholder="Ex: REALESS RM COBRANÇAS"
+              placeholder="Nome da empresa"
             />
-          </div>
+          </Field>
 
           <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block font-semibold text-secondary mb-1">Limite de Dispositivos</label>
+            <Field label="Limite de aparelhos" htmlFor="company-dev-limit">
               <input
+                id="company-dev-limit"
                 type="number"
+                min={0}
                 value={editDeviceLimit}
                 onChange={(e) => setEditDeviceLimit(parseInt(e.target.value, 10) || 0)}
               />
-            </div>
-
-            <div>
-              <label className="block font-semibold text-secondary mb-1">Limite de Usuários</label>
+            </Field>
+            <Field label="Limite de usuários" htmlFor="company-user-limit">
               <input
+                id="company-user-limit"
                 type="number"
+                min={0}
                 value={editUserLimit}
                 onChange={(e) => setEditUserLimit(parseInt(e.target.value, 10) || 0)}
               />
-            </div>
+            </Field>
           </div>
 
-          <div className="flex items-center justify-between pt-2">
+          <div className="flex items-center justify-between rounded-lg border border-border p-3">
             <div>
-              <span className="font-semibold text-primary block">Status da Empresa</span>
-              <span className="text-[11px] text-tertiary">Ativar ou suspender acesso desta instância</span>
+              <span className="block text-[0.8125rem] font-medium text-primary">Empresa ativa</span>
+              <span className="text-xs text-tertiary">Desative para suspender o acesso.</span>
             </div>
             <Toggle checked={editActive} onChange={setEditActive} size="sm" />
           </div>

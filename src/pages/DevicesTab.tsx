@@ -11,14 +11,17 @@ import { listen } from "@tauri-apps/api/event";
 import CollaboratorView from "../components/CollaboratorView";
 import SupervisorView from "../components/SupervisorView";
 import Card from "../components/ui/Card";
-import Badge from "../components/ui/Badge";
 import Button from "../components/ui/Button";
+import PageHeader from "../components/ui/PageHeader";
+import StatCard from "../components/ui/StatCard";
+import EmptyState from "../components/ui/EmptyState";
 import type { Device, DeviceStatus, DeviceWithActiveUser, DevicePermissionRequest } from "../types";
 import { api } from "../tauri";
 
 // Sub-componentes modularizados
-import { DeviceCard } from "../components/devices/DeviceCard";
-import { DeviceToolbar } from "../components/devices/DeviceToolbar";
+import { DeviceCard, DeviceRow } from "../components/devices/DeviceCard";
+import { DeviceToolbar, DeviceHeaderActions, type StatusFilter } from "../components/devices/DeviceToolbar";
+import { isOnlineStatus } from "../components/devices/deviceUi";
 import { ConnectDeviceModal } from "../components/devices/ConnectDeviceModal";
 import { DeviceConfigModal } from "../components/devices/DeviceConfigModal";
 import { MirrorModal } from "../components/devices/MirrorModal";
@@ -26,25 +29,28 @@ import { DiagnosticModal } from "../components/devices/DiagnosticModal";
 import { ScreenRegionModal } from "../components/devices/ScreenRegionModal";
 import { DeviceIdentityModal } from "../components/devices/DeviceIdentityModal";
 
-import {
-  Smartphone,
-  Plus,
-  RefreshCw,
-  Eye,
-  Bell,
-} from "lucide-react";
+import { Smartphone, Plus, RefreshCw, Bell, Wifi, WifiOff, UserCheck, AlertTriangle, SearchX } from "lucide-react";
 
 export default function DevicesTab() {
-  const { user, selectedCompanyId } = useAuth();
+  const { user } = useAuth();
 
-  // Role Gate
+  // Role Gate limpo sem violação das regras de hooks
   if (user?.role === "colaborador") return <CollaboratorView />;
   if (user?.role === "supervisor") return <SupervisorView />;
 
+  return <ManagerDevicesView />;
+}
+
+function ManagerDevicesView() {
+  const { selectedCompanyId } = useAuth();
+
   // Filter & View State
   const [searchQuery, setSearchQuery] = useState("");
-  const [sectorTab, setSectorTab] = useState<string>("junior");
+  const [sectorTab, setSectorTab] = useState<string>("all");
   const [viewMode, setViewMode] = useState<"grid" | "table">("grid");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [loadingDevices, setLoadingDevices] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // Device Data & Selection
   const [devicesList, setDevicesList] = useState<Device[]>([]);
@@ -85,10 +91,13 @@ export default function DevicesTab() {
     api<Device[]>("get_devices", { companyId: effectiveCompanyId })
       .then((data) => {
         if (data && Array.isArray(data)) setDevicesList(data);
+        setLoadError(null);
       })
       .catch((err) => {
         console.warn("Retorno temporário de IPC para get_devices:", err);
-      });
+        setLoadError(typeof err === "string" ? err : err?.message || "Não foi possível carregar os aparelhos.");
+      })
+      .finally(() => setLoadingDevices(false));
 
     api<DeviceWithActiveUser[]>("get_devices_with_active_user_map", { companyId: effectiveCompanyId })
       .then((data) => {
@@ -230,12 +239,12 @@ export default function DevicesTab() {
   const handleForceWirelessAdb = async (serial: string, deviceNumber: number, sector: string, deviceName: string) => {
     if (linkingSerial) return;
     setLinkingSerial(serial);
-    setLinkingStatus("⚡ Forçando ativação da porta 5555 TCP/IP e extraindo IP...");
+    setLinkingStatus("Ativando Wi-Fi ADB (porta 5555) e obtendo o IP...");
 
     let timedOut = false;
     const timeoutId = setTimeout(() => {
       timedOut = true;
-      setLinkingStatus("⏰ Timeout (25s): dispositivo não respondeu. Se é remoto (VPS), já está conectado via túnel.");
+      setLinkingStatus("Tempo esgotado (25s): o aparelho não respondeu. Se for remoto (VPS), ele já está conectado via túnel.");
       setLinkingSerial(null);
     }, 25000);
 
@@ -261,7 +270,7 @@ export default function DevicesTab() {
       clearTimeout(timeoutId);
       if (!timedOut) {
         const errMsg = typeof err === "string" ? err : err?.message || "Erro ao forçar depuração Wi-Fi.";
-        setLinkingStatus(`❌ Erro: ${errMsg}`);
+        setLinkingStatus(`Erro: ${errMsg}`);
         setTimeout(() => setLinkingSerial(null), 4000);
       }
     }
@@ -270,12 +279,12 @@ export default function DevicesTab() {
   const handleConnectDevice = async (ipAddress: string, portNumber: number, deviceNumber: number, sector: string, deviceName: string) => {
     if (linkingSerial) return;
     setLinkingSerial(ipAddress);
-    setLinkingStatus("🔌 Conectando sem bloquear a interface...");
+    setLinkingStatus("Conectando...");
 
     let timedOut = false;
     const timeoutId = setTimeout(() => {
       timedOut = true;
-      setLinkingStatus("⏰ Timeout (25s): verifique se o IP está acessível na mesma rede.");
+      setLinkingStatus("Tempo esgotado (25s): verifique se o IP está acessível na mesma rede.");
       setLinkingSerial(null);
     }, 25000);
 
@@ -306,7 +315,7 @@ export default function DevicesTab() {
       clearTimeout(timeoutId);
       if (!timedOut) {
         const errMsg = typeof err === "string" ? err : err?.message || "Erro ao conectar por IP.";
-        setLinkingStatus(`❌ Erro: ${errMsg}`);
+        setLinkingStatus(`Erro: ${errMsg}`);
       }
     } finally {
       clearTimeout(timeoutId);
@@ -327,7 +336,7 @@ export default function DevicesTab() {
   ) => {
     if (linkingSerial) return;
     setLinkingSerial(ip);
-    setLinkingStatus("🔑 Enviando código de pareamento para o Android...");
+    setLinkingStatus("Enviando código de pareamento ao Android...");
     try {
       const result = await api<string>("pair_and_connect_adb_device", {
         ip,
@@ -348,7 +357,7 @@ export default function DevicesTab() {
       }, 2000);
     } catch (err: any) {
       const errMsg = typeof err === "string" ? err : err?.message || "Erro no pareamento por código.";
-      setLinkingStatus(`❌ Erro: ${errMsg}`);
+      setLinkingStatus(`Erro: ${errMsg}`);
       setTimeout(() => setLinkingSerial(null), 4000);
     }
   };
@@ -430,6 +439,10 @@ export default function DevicesTab() {
           if (sector !== targetSector) return false;
         }
 
+        if (statusFilter === "online" && !isOnlineStatus(device.status)) return false;
+        if (statusFilter === "offline" && device.status !== "offline") return false;
+        if (statusFilter === "inuse" && !activeUserMap[device.serial]?.activeUserDisplayName) return false;
+
         if (searchQuery) {
           const q = searchQuery.toLowerCase().trim();
           const name = String(device.name || "");
@@ -459,238 +472,231 @@ export default function DevicesTab() {
         const nameB = String(b.name || b.model || b.serial || "");
         return nameA.localeCompare(nameB, undefined, { numeric: true, sensitivity: "base" });
       });
-  }, [devicesList, sectorTab, searchQuery]);
+  }, [devicesList, sectorTab, searchQuery, statusFilter, activeUserMap]);
+
+  const stats = useMemo(() => {
+    const list = devicesList || [];
+    return {
+      total: list.length,
+      online: list.filter((d) => isOnlineStatus(d.status)).length,
+      offline: list.filter((d) => d.status === "offline").length,
+      inUse: list.filter((d) => !!activeUserMap[d.serial]?.activeUserDisplayName).length,
+    };
+  }, [devicesList, activeUserMap]);
 
   const pendingRequests = useMemo(() => {
     return (permissionRequests || []).filter((r) => r.status === "pending");
   }, [permissionRequests]);
 
-  return (
-    <div className="space-y-4 animate-fade-in font-sans text-zinc-100 pb-8">
-      {/* Banner de Solicitações Pendentes para o Gestor */}
-      {pendingRequests.length > 0 && (
-        <div className="p-3.5 rounded-xl bg-gradient-to-r from-amber-950/60 via-amber-900/30 to-slate-900 border border-amber-500/40 shadow-xl space-y-2.5 animate-scale-in">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span className="flex h-2 w-2 relative">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
-              </span>
-              <h3 className="text-xs font-bold text-amber-300 flex items-center gap-1.5 uppercase tracking-wider">
-                <Bell size={14} /> {pendingRequests.length} Solicitação(ões) de Acesso Pendente(s)
-              </h3>
-            </div>
-            <span className="text-[10px] text-amber-400/80 font-mono">
-              Aprovação imediata de celular
-            </span>
-          </div>
+  const hasFilters = !!searchQuery || sectorTab !== "all" || statusFilter !== "all";
+  const clearFilters = () => {
+    setSearchQuery("");
+    setSectorTab("all");
+    setStatusFilter("all");
+  };
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+  const openMirror = (device: Device) => {
+    setSelectedDeviceForMirror(device);
+    setMirrorModalOpen(true);
+  };
+  const openConfig = (device: Device) => {
+    setSelectedDeviceForConfig(device);
+    setConfigModalOpen(true);
+  };
+  const openRegion = (device: Device) => {
+    setSelectedSerialForRegion(device.serial);
+    setRegionModalOpen(true);
+  };
+  const openIdentity = (device: Device) => {
+    setSelectedDeviceForDiagnostic(device);
+    setIdentityModalOpen(true);
+  };
+  const forceWireless = (device: Device) =>
+    handleForceWirelessAdb(device.serial, device.deviceNumber, device.sector, device.name || device.model || device.serial);
+
+  const findPending = (device: Device) =>
+    pendingRequests.find(
+      (r) =>
+        r.status === "pending" &&
+        (r.adbDeviceId === device.serial ||
+          r.adbDeviceId === device.currentAdbAddress ||
+          r.adbDeviceId === device.esferaDeviceId ||
+          (device.currentAdbAddress && r.adbDeviceId.includes(device.currentAdbAddress.split(":")[0])))
+    );
+
+  const itemProps = (device: Device) => ({
+    device,
+    activeUserDisplayName: activeUserMap[device.serial]?.activeUserDisplayName,
+    pendingRequest: findPending(device),
+    onApproveRequest: handleApproveRequest,
+    onRejectRequest: handleRejectRequest,
+    isSelected: selectedSerials.includes(device.serial),
+    onToggleSelect: () => toggleSelectDevice(device.serial),
+    onOpenMirror: () => openMirror(device),
+    onOpenConfig: () => openConfig(device),
+    onOpenRegion: () => openRegion(device),
+    onForceWireless: () => forceWireless(device),
+    onOpenDiagnostic: () => openIdentity(device),
+  });
+
+  const showSkeleton = loadingDevices && devicesList.length === 0;
+  const showError = !!loadError && devicesList.length === 0 && !loadingDevices;
+
+  return (
+    <div className="space-y-6 animate-fade-in pb-8">
+      <PageHeader
+        title="Dispositivos"
+        description="Aparelhos conectados, status e controle remoto."
+        icon={<Smartphone size={18} />}
+        actions={
+          <DeviceHeaderActions
+            devicesList={devicesList}
+            onOpenConnectModal={() => setConnectModalOpen(true)}
+            onOpenDiagnosticModal={() => setDiagnosticModalOpen(true)}
+            onRefreshDevices={refreshDevices}
+            onClearOffline={handleClearAllOfflineDevices}
+          />
+        }
+      />
+
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <StatCard label="Total" value={showSkeleton ? "–" : stats.total} icon={<Smartphone size={14} />} tone="neutral" onClick={() => setStatusFilter("all")} />
+        <StatCard label="Online" value={showSkeleton ? "–" : stats.online} icon={<Wifi size={14} />} tone="success" onClick={() => setStatusFilter("online")} />
+        <StatCard label="Offline" value={showSkeleton ? "–" : stats.offline} icon={<WifiOff size={14} />} tone="danger" onClick={() => setStatusFilter("offline")} />
+        <StatCard label="Em uso" value={showSkeleton ? "–" : stats.inUse} icon={<UserCheck size={14} />} tone="accent" onClick={() => setStatusFilter("inuse")} />
+      </div>
+
+      {pendingRequests.length > 0 && (
+        <section className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
+          <h2 className="flex items-center gap-2 text-sm font-semibold text-primary">
+            <Bell size={14} className="text-amber-500" />
+            {pendingRequests.length === 1 ? "1 solicitação de acesso pendente" : `${pendingRequests.length} solicitações de acesso pendentes`}
+          </h2>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {pendingRequests.map((req) => (
-              <div
-                key={req.requestId}
-                className="p-2.5 rounded-lg bg-black/40 border border-amber-500/30 flex items-center justify-between gap-2.5 text-xs"
-              >
+              <div key={req.requestId} className="flex items-center justify-between gap-3 rounded-lg border border-border bg-card p-3">
                 <div className="min-w-0">
-                  <p className="font-bold text-white truncate">
-                    {req.userDisplayName || req.userName}
-                  </p>
-                  <p className="text-[11px] text-amber-300/90 truncate font-mono">
-                    Aparelho: {req.adbDeviceId}
-                  </p>
-                  {req.requestedReason && (
-                    <p className="text-[10px] text-zinc-400 italic truncate">
-                      "{req.requestedReason}"
-                    </p>
-                  )}
+                  <p className="truncate text-[0.8125rem] font-medium text-primary">{req.userDisplayName || req.userName}</p>
+                  <p className="truncate font-mono text-[0.75rem] text-secondary">{req.adbDeviceId}</p>
+                  {req.requestedReason && <p className="truncate text-[0.75rem] text-tertiary">"{req.requestedReason}"</p>}
                 </div>
-                <div className="flex items-center gap-1 shrink-0">
-                  <Button
-                    size="sm"
-                    variant="primary"
-                    onClick={() => handleApproveRequest(req.requestId)}
-                    className="bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] px-2.5 py-1 font-bold"
-                  >
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <Button size="sm" variant="success" onClick={() => handleApproveRequest(req.requestId)}>
                     Aprovar
                   </Button>
-                  <Button
-                    size="sm"
-                    variant="danger"
-                    onClick={() => handleRejectRequest(req.requestId)}
-                    className="text-[10px] px-2 py-1 font-bold"
-                  >
+                  <Button size="sm" variant="danger" onClick={() => handleRejectRequest(req.requestId)}>
                     Recusar
                   </Button>
                 </div>
               </div>
             ))}
           </div>
-        </div>
+        </section>
       )}
 
-      {/* Reusable Clean Toolbar */}
-      <DeviceToolbar
-        searchQuery={searchQuery}
-        onSearchChange={setSearchQuery}
-        sectorTab={sectorTab}
-        onSectorChange={setSectorTab}
-        viewMode={viewMode}
-        onViewModeChange={setViewMode}
-        devicesList={devicesList}
-        onOpenConnectModal={() => setConnectModalOpen(true)}
-        onOpenDiagnosticModal={() => setDiagnosticModalOpen(true)}
-        onRefreshDevices={refreshDevices}
-        selectedSerials={selectedSerials}
-        onBatchDelete={handleBatchDeleteSelected}
-        onClearOffline={handleClearAllOfflineDevices}
-      />
+      <div className="space-y-4">
+        <DeviceToolbar
+          searchQuery={searchQuery}
+          onSearchChange={setSearchQuery}
+          sectorTab={sectorTab}
+          onSectorChange={setSectorTab}
+          viewMode={viewMode}
+          onViewModeChange={setViewMode}
+          devicesList={devicesList}
+          statusFilter={statusFilter}
+          onStatusFilterChange={setStatusFilter}
+          inUseCount={stats.inUse}
+          filteredCount={filteredDevices.length}
+          selectedSerials={selectedSerials}
+          onClearSelection={() => setSelectedSerials([])}
+          onBatchDelete={handleBatchDeleteSelected}
+        />
 
-      {/* Grid or Table view */}
-      {viewMode === "grid" ? (
-        filteredDevices.length > 0 ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3.5">
-            {filteredDevices.map((device) => {
-              const devPendingReq = pendingRequests.find(
-                (r) =>
-                  r.status === "pending" &&
-                  (r.adbDeviceId === device.serial ||
-                    r.adbDeviceId === device.currentAdbAddress ||
-                    r.adbDeviceId === device.esferaDeviceId ||
-                    (device.currentAdbAddress && r.adbDeviceId.includes(device.currentAdbAddress.split(":")[0])))
-              );
-
-              return (
-                <DeviceCard
-                  key={device.serial}
-                  device={device}
-                  activeUserDisplayName={activeUserMap[device.serial]?.activeUserDisplayName}
-                  pendingRequest={devPendingReq}
-                  onApproveRequest={handleApproveRequest}
-                  onRejectRequest={handleRejectRequest}
-                  isSelected={selectedSerials.includes(device.serial)}
-                  onToggleSelect={() => toggleSelectDevice(device.serial)}
-                  onOpenMirror={() => {
-                    setSelectedDeviceForMirror(device);
-                    setMirrorModalOpen(true);
-                  }}
-                  onOpenConfig={() => {
-                    setSelectedDeviceForConfig(device);
-                    setConfigModalOpen(true);
-                  }}
-                  onOpenRegion={() => {
-                    setSelectedSerialForRegion(device.serial);
-                    setRegionModalOpen(true);
-                  }}
-                  onForceWireless={() => {
-                    handleForceWirelessAdb(
-                      device.serial,
-                      device.deviceNumber,
-                      device.sector,
-                      device.name || device.model || device.serial
-                    );
-                  }}
-                  onOpenDiagnostic={() => {
-                    setSelectedDeviceForDiagnostic(device);
-                    setIdentityModalOpen(true);
-                  }}
-                />
-              );
-            })}
+        {showSkeleton ? (
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+            {Array.from({ length: 8 }).map((_, i) => (
+              <div key={i} className="h-44 animate-pulse rounded-xl border border-border bg-card" />
+            ))}
+          </div>
+        ) : showError ? (
+          <EmptyState
+            icon={<AlertTriangle size={18} />}
+            title="Não foi possível carregar os aparelhos"
+            description={loadError}
+            action={
+              <Button variant="secondary" size="sm" onClick={refreshDevices} icon={<RefreshCw size={13} />}>
+                Tentar novamente
+              </Button>
+            }
+          />
+        ) : filteredDevices.length === 0 ? (
+          devicesList.length === 0 ? (
+            <EmptyState
+              icon={<Smartphone size={18} />}
+              title="Nenhum celular conectado"
+              description="Conecte um aparelho Android por cabo USB, Wi-Fi ou túnel para controlar e usar nos disparos."
+              action={
+                <Button variant="primary" size="sm" onClick={() => setConnectModalOpen(true)} icon={<Plus size={14} />}>
+                  Conectar celular
+                </Button>
+              }
+            />
+          ) : (
+            <EmptyState
+              icon={<SearchX size={18} />}
+              title="Nenhum aparelho encontrado"
+              description="Nenhum aparelho corresponde à busca ou aos filtros atuais."
+              action={
+                hasFilters ? (
+                  <Button variant="secondary" size="sm" onClick={clearFilters}>
+                    Limpar filtros
+                  </Button>
+                ) : undefined
+              }
+            />
+          )
+        ) : viewMode === "grid" ? (
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+            {filteredDevices.map((device) => (
+              <DeviceCard key={device.serial} {...itemProps(device)} />
+            ))}
           </div>
         ) : (
-          /* Empty State */
-          <div className="py-14 text-center bg-[#141418] border border-dashed border-white/[0.08] rounded-xl p-6 space-y-3 shadow-sm">
-            <Smartphone size={36} className="mx-auto text-zinc-600 animate-pulse" />
-            <div>
-              <h3 className="text-sm font-semibold text-zinc-200">Nenhum celular encontrado neste setor</h3>
-              <p className="text-xs text-zinc-500 max-w-sm mx-auto mt-0.5">
-                Conecte um aparelho Android via USB ou Wi-Fi (ADB) para gerenciá-lo em tempo real.
-              </p>
-            </div>
-            <div className="flex justify-center gap-2 pt-1">
-              <Button variant="primary" size="sm" onClick={() => setConnectModalOpen(true)} icon={<Plus size={14} />}>
-                Conectar Celular
-              </Button>
-              <Button variant="secondary" size="sm" onClick={refreshDevices} icon={<RefreshCw size={13} />}>
-                Sincronizar ADB
-              </Button>
-            </div>
-          </div>
-        )
-      ) : (
-        /* Table View */
-        <Card padding="none">
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-white/[0.07] text-[10px] font-semibold text-zinc-400 uppercase tracking-wider bg-white/[0.02]">
-                  <th className="px-3.5 py-3 w-8">
-                    <input
-                      type="checkbox"
-                      checked={selectedSerials.length > 0 && selectedSerials.length === filteredDevices.length}
-                      onChange={() => {
-                        if (selectedSerials.length === filteredDevices.length) setSelectedSerials([]);
-                        else setSelectedSerials(filteredDevices.map((d) => d.serial));
-                      }}
-                      className="w-3.5 h-3.5 rounded border-white/20 bg-zinc-900 text-[#5E6AD2] focus:ring-0 cursor-pointer"
-                    />
-                  </th>
-                  <th className="px-3.5 py-3">Dispositivo</th>
-                  <th className="px-4 py-3 font-mono">IP / Serial</th>
-                  <th className="px-4 py-3">Setor</th>
-                  <th className="px-4 py-3">Status</th>
-                  <th className="px-4 py-3 font-mono">Bateria</th>
-                  <th className="px-4 py-3 text-right">Controle</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-white/[0.05]">
-                {filteredDevices.map((device) => (
-                  <tr key={device.serial} className={`hover:bg-white/[0.02] transition-colors ${selectedSerials.includes(device.serial) ? "bg-[#5E6AD2]/10" : ""}`}>
-                    <td className="px-3.5 py-3">
+          <Card padding="none">
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-left">
+                <thead>
+                  <tr className="border-b border-border bg-secondary/50 text-[0.75rem] font-medium text-secondary">
+                    <th className="w-10 px-4 py-2.5">
                       <input
                         type="checkbox"
-                        checked={selectedSerials.includes(device.serial)}
-                        onChange={() => toggleSelectDevice(device.serial)}
-                        className="w-3.5 h-3.5 rounded border-white/20 bg-zinc-900 text-[#5E6AD2] focus:ring-0 cursor-pointer"
-                      />
-                    </td>
-                    <td className="px-3.5 py-3">
-                      <div className="flex items-center gap-2.5">
-                        <Smartphone size={16} className="text-[#828DF7] shrink-0" />
-                        <div>
-                          <p className="font-semibold text-zinc-100">{device.name || device.model}</p>
-                          <p className="text-[10px] text-zinc-500">{device.model}</p>
-                        </div>
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 font-mono text-zinc-300 text-[11px]">{device.currentAdbAddress || device.serial}</td>
-                    <td className="px-4 py-3 uppercase font-medium text-[10px] text-zinc-400">{device.sector}</td>
-                    <td className="px-4 py-3">
-                      <Badge variant={device.status === "online" ? "success" : (device.status === "connecting" || device.status === "degraded") ? "warning" : "danger"} dot>
-                        {device.status === "degraded" ? "degradado (sem ADB)" : device.status}
-                      </Badge>
-                    </td>
-                    <td className="px-4 py-3 font-mono text-zinc-300">{device.battery}%</td>
-                    <td className="px-4 py-3 text-right">
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        icon={<Eye size={13} />}
-                        onClick={() => {
-                          setSelectedDeviceForMirror(device);
-                          setMirrorModalOpen(true);
+                        aria-label="Selecionar todos"
+                        checked={selectedSerials.length > 0 && selectedSerials.length === filteredDevices.length}
+                        onChange={() => {
+                          if (selectedSerials.length === filteredDevices.length) setSelectedSerials([]);
+                          else setSelectedSerials(filteredDevices.map((d) => d.serial));
                         }}
-                      >
-                        Espelhar
-                      </Button>
-                    </td>
+                        className="h-4 w-4 rounded border-border-strong bg-secondary accent-[var(--color-accent)] cursor-pointer"
+                      />
+                    </th>
+                    <th className="px-3 py-2.5 font-medium">Aparelho</th>
+                    <th className="px-3 py-2.5 font-medium">Status</th>
+                    <th className="px-3 py-2.5 font-medium">Bateria</th>
+                    <th className="px-3 py-2.5 font-medium">Setor</th>
+                    <th className="px-3 py-2.5 font-medium">Endereço</th>
+                    <th className="px-3 py-2.5 text-right font-medium">Ações</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Card>
-      )}
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {filteredDevices.map((device) => (
+                    <DeviceRow key={device.serial} {...itemProps(device)} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        )}
+      </div>
 
       {/* Sub-modais modularizados */}
       {configModalOpen && selectedDeviceForConfig && (
@@ -735,7 +741,7 @@ export default function DevicesTab() {
         onPairAndConnectDevice={handlePairAndConnectDevice}
         linkingSerial={linkingSerial}
         linkingStatus={linkingStatus}
-        nextDeviceNumber={devicesList.length + 1}
+        nextDeviceNumber={devicesList.reduce((max, d) => Math.max(max, d.deviceNumber || 0), 0) + 1}
       />
 
       {mirrorModalOpen && selectedDeviceForMirror && (

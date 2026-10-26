@@ -880,6 +880,10 @@ class EsferaAgentService : Service() {
     /// em ordem, os métodos disponíveis no aparelho (root/su, adb nativo, setprop).
     /// Se nenhum funcionar, o relay vai falhar e o app recebe proxy-error (não trava).
     private fun ensureAdbdTcp(port: Int) {
+        // Nunca reinicia o adbd se a porta já está atendendo: isso derruba o
+        // gadget USB FunctionFS e provoca o som de desconexão/reconexão no Windows.
+        if (isAdbdListening(port)) return
+
         // Desativa o "captive portal check" do Android. Sem isso, o Android marca o
         // WiFi como "sem internet" quando o teste de conectividade falha (proxy/DNS da
         // rede da empresa) e DESCONECTA o WiFi — fazendo o celular sumir da VPS.

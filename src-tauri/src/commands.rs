@@ -706,6 +706,11 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             }
         }
 
+        // Limpeza periódica de chaves expiradas em CONNECTING_SINCE (evita crescimento ilimitado)
+        if let Ok(mut map) = CONNECTING_SINCE.write() {
+            map.retain(|_, t| t.elapsed() <= CONNECTING_TIMEOUT);
+        }
+
         // PONTE VPS -> LOCAL: consulta dispositivos ao vivo da VPS com timeout ultra-rápido (400ms)
         let live_vps: Vec<serde_json::Value> = {
             let rt = tokio::runtime::Handle::try_current();
@@ -1174,7 +1179,7 @@ pub async fn connect_adb_device(
 
                 let final_name = device_name
                     .filter(|n| !n.trim().is_empty())
-                    .unwrap_or_else(|| existing_dev.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| format!("Aparelho {}", device_number)));
+                    .unwrap_or_else(|| existing_dev.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| format!("Celular {}", device_number)));
 
                 let is_active = active_by_target || active_by_eid;
                 let status_str = if is_active { "online".to_string() } else { "degraded".to_string() };
@@ -2367,7 +2372,7 @@ pub async fn force_enable_wireless_adb(
 
                 let final_name = device_name
                     .filter(|n| !n.trim().is_empty())
-                    .unwrap_or_else(|| existing_dev.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| format!("Aparelho {}", device_number)));
+                    .unwrap_or_else(|| existing_dev.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| format!("Celular {}", device_number)));
 
                 let is_active = active_by_serial || active_by_eid;
                 let status_str = if is_active { "online".to_string() } else { "degraded".to_string() };
@@ -2727,6 +2732,18 @@ pub fn retry_failed_campaign_contacts(state: State<'_, AppState>, token: String,
         return Err("Pause a campanha antes de reprocessar falhas.".to_string());
     }
     state.db.retry_failed_contacts(campaign_id)
+}
+
+#[tauri::command]
+pub fn reset_campaign_contacts(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<usize, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let company_id = state.db.get_campaign_company_id(campaign_id)
+        .ok_or_else(|| "Campanha não encontrada.".to_string())?;
+    check_company_access(&session, company_id)?;
+    if state.db.get_campaigns(company_id).iter().any(|c| c.id == campaign_id && c.status == "running") {
+        return Err("Pause a campanha antes de reiniciar a fila de contatos.".to_string());
+    }
+    state.db.reset_campaign_contacts(campaign_id)
 }
 
 #[tauri::command]

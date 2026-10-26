@@ -1,18 +1,15 @@
+// Card e linha de aparelho: nome em destaque, status, bateria, serial discreto,
+// ações primárias visíveis e secundárias em menu.
 import { memo, useState } from "react";
 import type { Device, DevicePermissionRequest } from "../../types";
-import { getConnectionOrigin, CONNECTION_BADGE_CONFIG } from "../../types";
+import { getConnectionOrigin } from "../../types";
 import Button from "../ui/Button";
 import Badge from "../ui/Badge";
-import {
-  Zap,
-  Camera,
-  MoreVertical,
-  BatteryCharging,
-  Info,
-  Bell,
-} from "lucide-react";
+import { Monitor, Camera, Zap, Copy, Check, Info, Settings2, Bell, User } from "lucide-react";
+import { RowMenu } from "./RowMenu";
+import { StatusDot, BatteryMeter, ORIGIN_LABEL, sectorLabel, deviceDisplayName } from "./deviceUi";
 
-interface DeviceCardProps {
+export interface DeviceItemProps {
   device: Device;
   activeUserDisplayName?: string;
   pendingRequest?: DevicePermissionRequest;
@@ -27,235 +24,185 @@ interface DeviceCardProps {
   onOpenDiagnostic: () => void;
 }
 
-export const DeviceCard = memo(function DeviceCard({
-  device,
-  activeUserDisplayName,
-  pendingRequest,
-  onApproveRequest,
-  onRejectRequest,
-  isSelected,
-  onToggleSelect,
-  onOpenMirror,
-  onOpenConfig,
-  onOpenRegion,
-  onForceWireless,
-  onOpenDiagnostic,
-}: DeviceCardProps) {
+const checkboxCls = "h-4 w-4 shrink-0 rounded border-border-strong bg-secondary accent-[var(--color-accent)] cursor-pointer";
 
-  const displayName = device.name && device.name.trim() ? device.name.trim() : (device.model || device.serial);
-  const displayModel = device.model && device.model !== "Smartphone" && device.model !== "Android"
-    ? device.model
-    : (device.brand && device.brand !== "Android" ? `${device.brand} Smartphone` : "Android Smartphone");
-  const isWireless = (device.serial && device.serial.includes(":")) || (device.currentAdbAddress && device.currentAdbAddress.includes(":"));
+function useDeviceInfo(device: Device) {
+  const isWireless =
+    (device.serial && device.serial.includes(":")) || (device.currentAdbAddress && device.currentAdbAddress.includes(":"));
   const isUsbOnly = device.status === "online" && !isWireless && !device.viaTunnel;
   const origin = getConnectionOrigin(device);
-  const originBadge = CONNECTION_BADGE_CONFIG[origin];
+  const displayName = deviceDisplayName(device);
+  const model =
+    device.model && device.model !== "Smartphone" && device.model !== "Android"
+      ? device.model
+      : device.brand && device.brand !== "Android"
+      ? device.brand
+      : "Android";
+  const address = device.currentAdbAddress || device.ip || device.serial;
+  return { isUsbOnly, origin, displayName, model, address };
+}
 
-  const [copiedId, setCopiedId] = useState(false);
+function menuItems(p: DeviceItemProps, isUsbOnly: boolean) {
+  return [
+    { label: "Detalhes e identidade", icon: <Info size={14} />, onClick: p.onOpenDiagnostic },
+    { label: "Configurações", icon: <Settings2 size={14} />, onClick: p.onOpenConfig },
+    { label: "Câmera virtual", icon: <Camera size={14} />, onClick: p.onOpenRegion },
+    { label: "Ativar Wi-Fi ADB", icon: <Zap size={14} />, onClick: p.onForceWireless, hidden: !isUsbOnly },
+  ];
+}
 
-  const handleCopyId = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    const id = device.esferaDeviceId || device.serial;
-    navigator.clipboard.writeText(id);
-    setCopiedId(true);
-    setTimeout(() => setCopiedId(false), 1500);
-  };
+function CopyId({ id }: { id: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      title="Copiar identificador"
+      aria-label="Copiar identificador do aparelho"
+      onClick={(e) => {
+        e.stopPropagation();
+        try {
+          navigator.clipboard.writeText(id);
+        } catch {
+          /* ignore */
+        }
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }}
+      className="inline-flex min-w-0 items-center gap-1 text-tertiary hover:text-primary transition-colors cursor-pointer"
+    >
+      <span className="truncate font-mono text-[0.6875rem]">{id}</span>
+      {copied ? <Check size={11} className="shrink-0 text-emerald-500" /> : <Copy size={11} className="shrink-0" />}
+    </button>
+  );
+}
+
+export const DeviceCard = memo(function DeviceCard(props: DeviceItemProps) {
+  const { device, activeUserDisplayName, pendingRequest, onApproveRequest, onRejectRequest, isSelected, onToggleSelect, onOpenMirror } = props;
+  const { isUsbOnly, origin, displayName, model, address } = useDeviceInfo(device);
+  const idText = device.esferaDeviceId || device.serial;
 
   return (
     <div
-      className={`rounded-lg bg-[#141418] border transition-all duration-150 p-3.5 flex flex-col justify-between space-y-3 relative group ${
-        isSelected
-          ? "border-[#5E6AD2] bg-[#5E6AD2]/[0.04] ring-1 ring-[#5E6AD2]/30"
-          : "border-white/[0.07] hover:border-[#5E6AD2]/40 hover:bg-[#16161b]"
+      className={`flex h-full flex-col gap-3 rounded-xl border bg-card p-4 transition-colors ${
+        isSelected ? "border-[var(--color-accent)] bg-[var(--color-accent-glow)]" : "border-border hover:border-border-strong"
       }`}
     >
-      <div className="flex items-center justify-between gap-2 border-b border-white/[0.06] pb-2.5">
-        <div className="flex items-center gap-2 min-w-0">
-          <input
-            type="checkbox"
-            checked={isSelected}
-            onChange={onToggleSelect}
-            className="w-3.5 h-3.5 rounded border-white/20 bg-zinc-900 text-[#5E6AD2] focus:ring-0 cursor-pointer shrink-0"
-          />
-
-          <span className="relative flex h-2 w-2 shrink-0">
-            {device.status === "online" && (
-              <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75 animate-ping" />
-            )}
-            {(device.status === "connecting" || device.status === "degraded") && (
-              <span className="absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75 animate-pulse" />
-            )}
-            <span
-              className={`relative inline-flex rounded-full h-2 w-2 ${
-                device.status === "online"
-                  ? "bg-emerald-400"
-                  : device.status === "connecting"
-                  ? "bg-amber-400"
-                  : device.status === "degraded"
-                  ? "bg-amber-500"
-                  : device.status === "error"
-                  ? "bg-red-400"
-                  : "bg-zinc-600"
-              }`}
-            />
-          </span>
-
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <span className="font-bold text-sm text-zinc-100 truncate" title={displayName}>
-                {displayName}
-              </span>
-              <span className="px-1.5 py-0.2 rounded bg-[#5E6AD2]/15 text-[#828DF7] text-[9px] font-mono uppercase font-semibold border border-[#5E6AD2]/30">
-                {device.sector.replace("_", " ")}
-              </span>
-            </div>
-            <div className="flex items-center gap-1.5 mt-0.5">
-              <p className="text-[11px] text-zinc-400 font-medium truncate" title={displayModel}>
-                {displayModel}
-              </p>
-              <Badge variant={originBadge.badgeVariant} className="text-[8px] px-1 py-0">
-                {originBadge.icon} {originBadge.label}
-              </Badge>
-            </div>
-          </div>
+      <div className="flex items-start gap-3">
+        <input type="checkbox" checked={isSelected} onChange={onToggleSelect} aria-label={`Selecionar ${displayName}`} className={`${checkboxCls} mt-1`} />
+        <div className="min-w-0 flex-1">
+          <h3 className="truncate text-sm font-semibold text-primary" title={displayName}>
+            {displayName}
+          </h3>
+          <p className="truncate text-[0.75rem] text-secondary" title={model}>
+            {model} · {sectorLabel(device.sector)}
+          </p>
         </div>
+        <RowMenu items={menuItems(props, isUsbOnly)} />
+      </div>
 
-        <div className="flex items-center gap-0.5 shrink-0">
-          <button
-            onClick={onOpenDiagnostic}
-            className="p-1 rounded text-zinc-500 hover:text-[#828DF7] hover:bg-[#5E6AD2]/10 transition-colors cursor-pointer"
-            title="Diagnóstico do dispositivo"
-          >
-            <Info size={14} />
-          </button>
-
-          <button
-            onClick={onOpenConfig}
-            className="p-1 rounded text-zinc-400 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer"
-            title="Configurações, provisionamento e ações do celular"
-          >
-            <MoreVertical size={14} />
-          </button>
-        </div>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <StatusDot status={device.status} />
+        <BatteryMeter level={device.battery} />
+        <Badge variant="neutral">{ORIGIN_LABEL[origin]}</Badge>
       </div>
 
       {activeUserDisplayName && (
-        <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 text-[10px] text-emerald-300">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-          <span>Em uso: <strong>{activeUserDisplayName}</strong></span>
+        <div className="flex items-center gap-1.5 rounded-lg bg-emerald-500/10 px-2.5 py-1.5 text-[0.75rem] text-emerald-600 dark:text-emerald-400">
+          <User size={12} className="shrink-0" />
+          <span className="truncate">Em uso por {activeUserDisplayName}</span>
         </div>
       )}
 
       {pendingRequest && (
-        <div className="p-2.5 rounded-lg bg-amber-500/15 border border-amber-500/40 text-xs flex flex-col gap-1.5 animate-pulse">
-          <div className="flex items-center justify-between text-amber-300 font-bold text-[10px]">
-            <span className="flex items-center gap-1 truncate">
-              <Bell size={12} className="shrink-0 text-amber-400" />
-              <span className="truncate">{pendingRequest.userDisplayName || pendingRequest.userName} solicitou uso</span>
-            </span>
-            <span className="text-[8px] bg-amber-500/20 px-1.5 py-0.5 rounded text-amber-200 uppercase font-semibold shrink-0">
-              Pendente
-            </span>
-          </div>
-          {pendingRequest.requestedReason && (
-            <p className="text-[10px] text-zinc-400 italic truncate">
-              "{pendingRequest.requestedReason}"
-            </p>
-          )}
-          <div className="grid grid-cols-2 gap-1.5 pt-0.5">
-            <Button
-              size="sm"
-              variant="primary"
-              onClick={(e) => {
-                e.stopPropagation();
-                onApproveRequest?.(pendingRequest.requestId);
-              }}
-              className="bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] py-1 font-bold"
-            >
+        <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5">
+          <p className="flex items-center gap-1.5 text-[0.75rem] font-medium text-amber-600 dark:text-amber-400">
+            <Bell size={12} className="shrink-0" />
+            <span className="truncate">{pendingRequest.userDisplayName || pendingRequest.userName} pediu acesso</span>
+          </p>
+          {pendingRequest.requestedReason && <p className="truncate text-[0.75rem] text-secondary">"{pendingRequest.requestedReason}"</p>}
+          <div className="grid grid-cols-2 gap-2">
+            <Button size="sm" variant="success" onClick={() => onApproveRequest?.(pendingRequest.requestId)}>
               Aprovar
             </Button>
-            <Button
-              size="sm"
-              variant="danger"
-              onClick={(e) => {
-                e.stopPropagation();
-                onRejectRequest?.(pendingRequest.requestId);
-              }}
-              className="text-[10px] py-1 font-bold"
-            >
+            <Button size="sm" variant="danger" onClick={() => onRejectRequest?.(pendingRequest.requestId)}>
               Recusar
             </Button>
           </div>
         </div>
       )}
 
-      <div className="flex flex-col gap-1 text-[10px] font-mono bg-white/[0.02] p-2 rounded border border-white/[0.04]">
-        <div className="flex items-center justify-between">
-          <button
-            type="button"
-            onClick={handleCopyId}
-            className="text-zinc-300 font-semibold flex items-center gap-1 min-w-0 hover:text-white transition-colors cursor-pointer group/id"
-            title="Clique para copiar ID de hardware"
-          >
-            <span className="text-[#828DF7] font-bold">ID:</span>
-            <span className="truncate max-w-[125px] text-zinc-200 group-hover/id:text-[#828DF7]" title={device.esferaDeviceId || device.serial}>
-              {device.esferaDeviceId || device.serial}
-            </span>
-            <span className="text-[9px] px-1 py-0.2 rounded bg-white/[0.06] text-zinc-400 shrink-0 font-sans">
-              {copiedId ? "Copiado!" : "copiar"}
-            </span>
-          </button>
-          <div className="flex items-center gap-1 text-zinc-300 shrink-0 ml-2">
-            <BatteryCharging size={11} className={device.battery > 50 ? "text-emerald-400" : device.battery > 20 ? "text-amber-400" : "text-red-400"} />
-            <span className="font-mono">{device.battery}%</span>
-          </div>
-        </div>
-        <div className="flex items-center justify-between text-zinc-500 text-[9px] pt-1 border-t border-white/[0.03]">
-          <span className="truncate max-w-[140px]" title={device.currentAdbAddress || device.ip || device.serial}>
-            {device.currentAdbAddress || device.ip || device.serial}
-          </span>
-          {device.viaTunnel && (
-            <span className="text-emerald-400 font-sans font-medium text-[8px] bg-emerald-500/10 px-1 rounded">
-              Túnel
+      <div className="mt-auto space-y-3">
+        <div className="flex items-center justify-between gap-2 border-t border-border pt-3">
+          <CopyId id={idText} />
+          {address !== idText && (
+            <span className="truncate font-mono text-[0.6875rem] text-tertiary" title={address}>
+              {address}
             </span>
           )}
         </div>
+        {isUsbOnly ? (
+          <Button variant="secondary" size="sm" className="w-full" onClick={props.onForceWireless} icon={<Zap size={14} />}>
+            Ativar Wi-Fi ADB
+          </Button>
+        ) : (
+          <div className="grid grid-cols-2 gap-2">
+            <Button variant="primary" size="sm" onClick={onOpenMirror} icon={<Monitor size={14} />} title="Espelhar a tela em tempo real">
+              Espelhar
+            </Button>
+            <Button variant="secondary" size="sm" onClick={props.onOpenRegion} icon={<Camera size={14} />} title="Câmera virtual para leitura de QR Code">
+              Câmera
+            </Button>
+          </div>
+        )}
       </div>
-
-      {isUsbOnly ? (
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={onForceWireless}
-          className="w-full text-[11px] font-medium bg-amber-500/10 text-amber-300 border-amber-500/20 hover:bg-amber-500/20 gap-1.5 mt-1"
-        >
-          <Zap size={12} className="text-amber-400" />
-          <span>Ativar Wi-Fi ADB</span>
-        </Button>
-      ) : (
-        <div className="grid grid-cols-2 gap-1.5 mt-1">
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={onOpenMirror}
-            className="w-full text-[11px] font-medium gap-1 py-1"
-            title="Espelhar tela do dispositivo em tempo real"
-          >
-            <Zap size={12} />
-            <span>Espelhar</span>
-          </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={onOpenRegion}
-            className="w-full text-[11px] font-medium gap-1 py-1"
-            title="Câmera Virtual para leitura de QR Code"
-          >
-            <Camera size={12} className="text-zinc-400" />
-            <span>Câmera</span>
-          </Button>
-        </div>
-      )}
     </div>
+  );
+});
+
+// Linha para a visão em lista (densa).
+export const DeviceRow = memo(function DeviceRow(props: DeviceItemProps) {
+  const { device, activeUserDisplayName, isSelected, onToggleSelect, onOpenMirror } = props;
+  const { isUsbOnly, origin, displayName, model, address } = useDeviceInfo(device);
+
+  return (
+    <tr className={`transition-colors hover:bg-secondary/60 ${isSelected ? "bg-[var(--color-accent-glow)]" : ""}`}>
+      <td className="w-10 px-4 py-2.5">
+        <input type="checkbox" checked={isSelected} onChange={onToggleSelect} aria-label={`Selecionar ${displayName}`} className={checkboxCls} />
+      </td>
+      <td className="px-3 py-2.5">
+        <p className="max-w-[16rem] truncate text-[0.8125rem] font-medium text-primary" title={displayName}>
+          {displayName}
+        </p>
+        <p className="max-w-[16rem] truncate text-[0.75rem] text-secondary">{model}</p>
+      </td>
+      <td className="px-3 py-2.5">
+        <StatusDot status={device.status} />
+        {activeUserDisplayName && <p className="max-w-[10rem] truncate text-[0.6875rem] text-tertiary">Em uso: {activeUserDisplayName}</p>}
+      </td>
+      <td className="px-3 py-2.5">
+        <BatteryMeter level={device.battery} />
+      </td>
+      <td className="px-3 py-2.5 text-[0.8125rem] text-secondary">{sectorLabel(device.sector)}</td>
+      <td className="px-3 py-2.5">
+        <p className="max-w-[14rem] truncate font-mono text-[0.75rem] text-secondary" title={address}>
+          {address}
+        </p>
+        <p className="text-[0.6875rem] text-tertiary">{ORIGIN_LABEL[origin]}</p>
+      </td>
+      <td className="px-3 py-2.5">
+        <div className="flex items-center justify-end gap-1">
+          {isUsbOnly ? (
+            <Button variant="secondary" size="sm" onClick={props.onForceWireless} icon={<Zap size={13} />}>
+              Wi-Fi ADB
+            </Button>
+          ) : (
+            <Button variant="secondary" size="sm" onClick={onOpenMirror} icon={<Monitor size={13} />}>
+              Espelhar
+            </Button>
+          )}
+          <RowMenu items={menuItems(props, isUsbOnly)} />
+        </div>
+      </td>
+    </tr>
   );
 });

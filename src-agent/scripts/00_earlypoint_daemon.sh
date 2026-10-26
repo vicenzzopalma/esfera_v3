@@ -11,10 +11,12 @@ LOG_TAG="EsferaEarlypoint"
 
 log() { log -t "$LOG_TAG" "$1"; }
 
-# 1. ADB TCP sempre habilitado
-setprop service.adb.tcp.port 5555
-stop adbd 2>/dev/null
-start adbd 2>/dev/null
+# 1. ADB TCP sempre habilitado, sem reiniciar o adbd quando já está em 5555
+if [ "$(getprop service.adb.tcp.port)" != "5555" ] && [ "$(getprop persist.adb.tcp.port)" != "5555" ]; then
+  setprop service.adb.tcp.port 5555
+  stop adbd 2>/dev/null
+  start adbd 2>/dev/null
+fi
 
 # 2. Espera o wlan0 ficar pronto (até 60s)
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do

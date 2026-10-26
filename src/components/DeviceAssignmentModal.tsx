@@ -2,6 +2,10 @@ import React, { useState, useEffect } from "react";
 import { User, DeviceWithActiveUser } from "../types";
 import { UserCheck, UserX, ShieldAlert, Smartphone, CheckCircle, Clock } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import Modal from "./ui/Modal";
+import Button from "./ui/Button";
+import Field, { FormSection } from "./ui/Field";
+import { inputCls } from "./devices/deviceUi";
 
 interface DeviceAssignmentModalProps {
   isOpen: boolean;
@@ -98,128 +102,104 @@ export const DeviceAssignmentModal: React.FC<DeviceAssignmentModalProps> = ({
     }
   };
 
+  const msgBox = message && (
+    <div
+      role={message.type === "error" ? "alert" : "status"}
+      className={`flex items-center gap-2 rounded-lg border p-3 text-[0.8125rem] ${
+        message.type === "success"
+          ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+          : "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400"
+      }`}
+    >
+      {message.type === "success" ? <CheckCircle className="h-4 w-4 shrink-0" /> : <ShieldAlert className="h-4 w-4 shrink-0" />}
+      <span className="min-w-0 break-words">{message.text}</span>
+    </div>
+  );
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg overflow-hidden shadow-2xl animate-in fade-in zoom-in duration-200">
-        {/* Header */}
-        <div className="px-6 py-5 bg-gradient-to-r from-slate-900 via-emerald-950/30 to-slate-900 border-b border-slate-800/80 flex items-center justify-between">
-          <div className="flex items-center space-x-3">
-            <div className="p-2.5 bg-emerald-500/10 border border-emerald-500/20 rounded-xl text-emerald-400">
-              <Smartphone className="w-5 h-5" />
-            </div>
-            <div>
-              <h3 className="text-lg font-semibold text-slate-100">Vínculo de Responsabilidade</h3>
-              <p className="text-xs text-slate-400 font-mono">
-                {device.name || `Celular #${device.deviceNumber}`} ({device.serial})
-              </p>
-            </div>
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title="Responsável pelo celular"
+      size="md"
+      footer={
+        <Button variant="secondary" size="sm" onClick={onClose}>
+          Fechar
+        </Button>
+      }
+    >
+      <div className="space-y-6">
+        <div className="flex items-center gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border bg-secondary text-secondary">
+            <Smartphone size={18} />
           </div>
-          <button
-            onClick={onClose}
-            className="text-slate-400 hover:text-slate-200 p-1.5 rounded-lg hover:bg-slate-800 transition-colors"
-          >
-            ✕
-          </button>
+          <div className="min-w-0">
+            <h3 className="truncate text-sm font-semibold text-primary">{device.name || `Celular #${device.deviceNumber}`}</h3>
+            <p className="truncate font-mono text-[0.75rem] text-tertiary">{device.serial}</p>
+          </div>
         </div>
 
-        {/* Content Body */}
-        <div className="p-6 space-y-6">
-          {message && (
-            <div
-              className={`p-3.5 rounded-xl border text-sm flex items-center space-x-2 ${
-                message.type === "success"
-                  ? "bg-emerald-950/40 border-emerald-500/30 text-emerald-300"
-                  : "bg-rose-950/40 border-rose-500/30 text-rose-300"
-              }`}
-            >
-              {message.type === "success" ? (
-                <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
-              ) : (
-                <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0" />
-              )}
-              <span>{message.text}</span>
-            </div>
-          )}
+        {msgBox}
 
-          {/* Estado Atual do Celular */}
-          <div className="bg-slate-950/60 border border-slate-800/60 rounded-xl p-4 space-y-2">
-            <div className="flex justify-between items-center text-sm">
-              <span className="text-slate-400">Responsável Atual:</span>
-              <span className="font-medium text-emerald-400">
-                {device.assignedUserName || device.responsibleUserName || "Nenhum responsável atribuído"}
-              </span>
-            </div>
-            <div className="flex justify-between items-center text-sm">
-              <span className="text-slate-400">Operador Ativo no Momento:</span>
-              <span className="font-medium text-cyan-400">
-                {device.activeUserDisplayName || device.activeUserName || "Nenhum"}
-              </span>
-            </div>
+        <div className="divide-y divide-border rounded-xl border border-border px-4 text-[0.8125rem]">
+          <div className="flex items-center justify-between gap-4 py-2.5">
+            <span className="text-secondary">Responsável atual</span>
+            <span className="truncate font-medium text-primary">
+              {device.assignedUserName || device.responsibleUserName || "Nenhum"}
+            </span>
           </div>
+          <div className="flex items-center justify-between gap-4 py-2.5">
+            <span className="text-secondary">Em uso agora por</span>
+            <span className="truncate font-medium text-primary">
+              {device.activeUserDisplayName || device.activeUserName || "Ninguém"}
+            </span>
+          </div>
+        </div>
 
-          {/* Seleção de Colaborador Responsável (Gestor) */}
-          <div className="space-y-3">
-            <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider">
-              Atribuir Colaborador Responsável pelo Celular
-            </label>
+        <FormSection title="Atribuir responsável" description="O colaborador escolhido passa a responder por este celular.">
+          <Field label="Colaborador" htmlFor="assign-user">
             <select
+              id="assign-user"
               value={selectedUserId}
               onChange={(e) => setSelectedUserId(e.target.value ? Number(e.target.value) : "")}
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-emerald-500 transition-colors"
+              className={inputCls}
             >
-              <option value="">Selecione um Colaborador...</option>
+              <option value="">Selecione um colaborador</option>
               {users.map((u) => (
                 <option key={u.id} value={u.id}>
                   {u.displayName || u.username} ({u.role})
                 </option>
               ))}
             </select>
-
-            <div className="flex space-x-3 pt-1">
-              <button
-                onClick={handleAssignResponsible}
-                disabled={loading || !selectedUserId}
-                className="flex-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-medium px-4 py-2.5 rounded-xl text-sm transition-all shadow-lg shadow-emerald-950/30 flex items-center justify-center space-x-2"
-              >
-                <UserCheck className="w-4 h-4" />
-                <span>Salvar Responsável</span>
-              </button>
-
-              {device.assignedUserId && (
-                <button
-                  onClick={handleRemoveResponsible}
-                  disabled={loading}
-                  className="bg-slate-800 hover:bg-rose-950/60 hover:text-rose-300 border border-slate-700 hover:border-rose-500/40 text-slate-300 font-medium px-4 py-2.5 rounded-xl text-sm transition-all flex items-center space-x-2"
-                >
-                  <UserX className="w-4 h-4" />
-                  <span>Desvincular</span>
-                </button>
-              )}
-            </div>
+          </Field>
+          <div className="flex gap-2">
+            <Button variant="primary" size="sm" onClick={handleAssignResponsible} disabled={!selectedUserId} loading={loading} icon={<UserCheck className="h-4 w-4" />}>
+              Salvar responsável
+            </Button>
+            {device.assignedUserId && (
+              <Button variant="danger" size="sm" onClick={handleRemoveResponsible} disabled={loading} icon={<UserX className="h-4 w-4" />}>
+                Desvincular
+              </Button>
+            )}
           </div>
+        </FormSection>
 
-          <div className="border-t border-slate-800 pt-5 space-y-3">
-            <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider">
-              Ou Enviar Solicitação de Pedido de Uso ao Gestor
-            </label>
+        <FormSection title="Pedir uso ao gestor" description="Envie uma solicitação de acesso a este celular.">
+          <Field label="Motivo" htmlFor="assign-reason">
             <input
+              id="assign-reason"
               type="text"
-              placeholder="Motivo do pedido (ex: Campanha Vendas SP)..."
+              placeholder="Ex.: Campanha de vendas SP"
               value={reason}
               onChange={(e) => setReason(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-cyan-500 transition-colors"
+              className={inputCls}
             />
-            <button
-              onClick={handleRequestAccess}
-              disabled={loading}
-              className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium px-4 py-2.5 rounded-xl text-sm transition-all border border-slate-700 flex items-center justify-center space-x-2"
-            >
-              <Clock className="w-4 h-4 text-cyan-400" />
-              <span>Enviar Pedido de Uso</span>
-            </button>
-          </div>
-        </div>
+          </Field>
+          <Button variant="secondary" size="sm" onClick={handleRequestAccess} loading={loading} icon={<Clock className="h-4 w-4" />}>
+            Enviar pedido de uso
+          </Button>
+        </FormSection>
       </div>
-    </div>
+    </Modal>
   );
 };

@@ -1,6 +1,6 @@
 // ============================================================
 // Esfera v3 — StatusBar
-// Barra inferior com status de conexão e info da empresa
+// Barra inferior discreta: conexão, empresa, aparelhos online e versão
 // ============================================================
 
 import { useState, useEffect } from "react";
@@ -42,43 +42,32 @@ export default function StatusBar() {
   }, [selectedCompanyId]);
 
   return (
-    <footer style={{ left: "240px" }} className="fixed bottom-0 right-0 h-6 z-30 bg-[#0b0b0e] border-t border-white/[0.07] flex items-center justify-between px-3 text-[10px] text-zinc-400 select-none">
-      <div className="flex items-center gap-3">
-        {/* Status de conexão */}
-        <div className="flex items-center gap-1">
-          {onlineCount > 0 ? (
-            <>
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="text-emerald-400 font-medium">Conectado</span>
-            </>
-          ) : (
-            <>
-              <span className="w-1.5 h-1.5 rounded-full bg-zinc-600" />
-              <span className="text-zinc-500 font-medium">Pronto</span>
-            </>
-          )}
+    <footer
+      style={{ left: "240px" }}
+      className="statusbar-panel fixed bottom-0 right-0 h-7 z-30 bg-sidebar border-t border-border flex items-center justify-between px-4 text-xs text-tertiary select-none"
+    >
+      <div className="flex items-center gap-4 min-w-0">
+        <div className="flex items-center gap-1.5">
+          <span className={`w-1.5 h-1.5 rounded-full ${onlineCount > 0 ? "bg-emerald-500" : "bg-zinc-500"}`} />
+          <span>{onlineCount > 0 ? "Conectado" : "Pronto"}</span>
         </div>
 
-        {/* Empresa atual */}
         {company && (
-          <div className="flex items-center gap-1 text-zinc-400">
-            <Building2 size={11} className="text-zinc-500" />
-            <span className="truncate max-w-[150px]">{company.name}</span>
+          <div className="flex items-center gap-1.5 min-w-0">
+            <Building2 size={12} className="shrink-0" />
+            <span className="truncate max-w-[200px]">{company.name}</span>
           </div>
         )}
       </div>
 
-      <div className="flex items-center gap-3">
-        {/* Dispositivos online */}
+      <div className="flex items-center gap-4">
         {selectedCompanyId && (
-          <div className="flex items-center gap-1 text-zinc-400 font-mono">
-            <Smartphone size={11} className="text-zinc-500" />
+          <div className="flex items-center gap-1.5 tabular-nums">
+            <Smartphone size={12} />
             <span>{onlineCount}/{totalCount} online</span>
           </div>
         )}
-
-        {/* Versão */}
-        <span className="font-mono text-zinc-600">v3.0.0</span>
+        <span className="font-mono">v3.19.0</span>
       </div>
     </footer>
   );

@@ -4,7 +4,7 @@
 // ============================================================
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use serde::{Serialize, Deserialize};
 
@@ -113,5 +113,7 @@ pub fn get_all_sessions() -> Vec<DeviceSession> {
 }
 
 pub fn get_session(uuid: &str) -> Option<DeviceSession> {
+    sweep_stale_sessions();
     SESSIONS.lock().unwrap().get(uuid).cloned()
 }
+

@@ -1,6 +1,6 @@
 // ============================================================
-// Esfera v3 — Componente Toggle
-// Toggle switch animado para booleanos
+// Esfera v3 — Toggle
+// Switch sóbrio: accent sólido quando ativo
 // ============================================================
 
 interface ToggleProps {
@@ -18,37 +18,32 @@ export default function Toggle({
   disabled = false,
   size = "md",
 }: ToggleProps) {
-  const trackSize = size === "sm" ? "w-9 h-5" : "w-11 h-6";
-  const thumbSize = size === "sm" ? "h-3.5 w-3.5" : "h-4 w-4";
-  const thumbTranslate = size === "sm"
-    ? (checked ? "translate-x-4.5" : "translate-x-0.5")
-    : (checked ? "translate-x-5.5" : "translate-x-0.5");
+  const trackSize = size === "sm" ? "w-8 h-[18px]" : "w-10 h-[22px]";
+  const thumbSize = size === "sm" ? "h-3.5 w-3.5" : "h-[18px] w-[18px]";
+  const thumbTranslate =
+    size === "sm"
+      ? checked ? "translate-x-[16px]" : "translate-x-[2px]"
+      : checked ? "translate-x-[20px]" : "translate-x-[2px]";
 
   return (
-    <label className={`inline-flex items-center gap-2.5 ${disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}>
+    <label className={`inline-flex items-center gap-2.5 !mb-0 ${disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}>
       <button
         role="switch"
         type="button"
         aria-checked={checked}
+        aria-label={label}
         disabled={disabled}
         onClick={() => !disabled && onChange(!checked)}
-        className={`relative inline-flex items-center shrink-0 rounded-full
-          transition-colors duration-300 ease-in-out focus:outline-none
+        className={`relative inline-flex items-center shrink-0 rounded-full transition-colors duration-150
+          focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-accent)]
           ${trackSize}
-          ${checked
-            ? "bg-gradient-to-r from-violet-600 to-indigo-600"
-            : "bg-slate-600"
-          }`}
+          ${checked ? "bg-[var(--color-accent)]" : "bg-[var(--color-border-strong)]"}`}
       >
         <span
-          className={`inline-block rounded-full bg-white shadow-lg
-            transform transition-transform duration-300 ease-in-out
-            ${thumbSize} ${thumbTranslate}`}
+          className={`inline-block rounded-full bg-white shadow-sm transform transition-transform duration-150 ${thumbSize} ${thumbTranslate}`}
         />
       </button>
-      {label && (
-        <span className="text-sm text-secondary select-none">{label}</span>
-      )}
+      {label && <span className="text-[0.8125rem] text-secondary select-none">{label}</span>}
     </label>
   );
 }

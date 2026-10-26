@@ -1,13 +1,15 @@
 // ============================================================
-// Esfera v3 — Tela de Login Refatorada
-// Design Glassmorphic Premium com proporções e espaçamentos perfeitos
+// Esfera v3 — Tela de Login
+// Cartão central sóbrio, segue o tema claro/escuro
 // ============================================================
 
 import { useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
-import { User, Lock, Eye, EyeOff, Loader2, Sun, Moon, Sparkles } from "lucide-react";
+import Button from "../components/ui/Button";
+import Field from "../components/ui/Field";
+import { User, Lock, Eye, EyeOff, Sun, Moon, AlertCircle } from "lucide-react";
 
 export default function LoginPage() {
   const { login, error } = useAuth();
@@ -43,125 +45,108 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center relative overflow-hidden bg-[#09090b] p-4 font-sans">
-      {/* Subtle Static Radial Gradient Background */}
-      <div className="absolute inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-[#5E6AD2]/15 via-[#09090b] to-[#09090b]" />
-
-      {/* Theme Toggle Button */}
+    <div className="min-h-screen flex items-center justify-center relative bg-primary text-primary p-4 font-sans">
       <button
+        type="button"
         onClick={toggleTheme}
-        className="absolute top-5 right-5 p-2 rounded-md bg-white/[0.04] border border-white/[0.08] text-zinc-400 hover:text-zinc-100 transition-all z-20 cursor-pointer text-xs"
-        title="Alternar Tema"
+        className="absolute top-4 right-4 h-8 w-8 flex items-center justify-center rounded-lg text-secondary hover:text-primary hover:bg-hover transition-colors cursor-pointer"
+        title={isDark ? "Tema claro" : "Tema escuro"}
+        aria-label={isDark ? "Mudar para tema claro" : "Mudar para tema escuro"}
       >
-        {isDark ? <Sun size={15} /> : <Moon size={15} />}
+        {isDark ? <Sun size={16} /> : <Moon size={16} />}
       </button>
 
-      {/* Login Card Container */}
       <div className={`relative w-full max-w-sm ${shake ? "animate-shake" : "animate-scale-in"}`}>
-        <div className="rounded-xl bg-[#141418] border border-white/[0.08] p-6 sm:p-7 space-y-5 shadow-2xl shadow-black/80">
-          {/* Header */}
+        <div className="rounded-xl bg-card border border-border p-7 space-y-6 shadow-[var(--shadow-pop)]">
           <div className="text-center">
-            <div className="inline-flex items-center justify-center mb-3">
-              <img
-                src="/logo.png"
-                alt="Esfera Logo"
-                className="w-16 h-16 object-contain drop-shadow-[0_0_20px_rgba(94,106,210,0.65)] hover:scale-105 transition-transform"
-              />
-            </div>
-            <h1 className="text-xl font-bold text-zinc-100 tracking-tight">Esfera Hub</h1>
-            <p className="text-xs text-zinc-400 mt-0.5">
-              Gestão ADB & Disparos Inteligentes
-            </p>
+            <img src="/logo.png" alt="Esfera" className="w-12 h-12 object-contain mx-auto mb-3" />
+            <h1 className="text-xl font-semibold text-primary">Entrar na Esfera</h1>
+            <p className="text-[0.8125rem] text-secondary mt-1">Use seu usuário e senha para continuar.</p>
           </div>
 
-          {/* Form */}
-          <form onSubmit={handleSubmit} className="space-y-3.5">
+          <form onSubmit={handleSubmit} className="space-y-4">
             {error && (
-              <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-medium animate-fade-in">
-                <span>⚠️</span>
+              <div
+                role="alert"
+                className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-red-500/10 border border-red-500/25 text-red-600 dark:text-red-400 text-[0.8125rem] animate-fade-in"
+              >
+                <AlertCircle size={15} className="mt-0.5 shrink-0" />
                 <span>{error}</span>
               </div>
             )}
 
-            {/* Input Usuário */}
-            <div>
-              <label htmlFor="login-username" className="text-xs text-zinc-300 font-medium mb-1.5 block">Usuário</label>
+            <Field label="Usuário" htmlFor="login-username">
               <div className="relative flex items-center">
-                <User size={16} className="input-icon-left text-zinc-500" />
+                <User size={15} className="input-icon-left text-tertiary" />
                 <input
                   id="login-username"
                   type="text"
+                  autoComplete="username"
+                  autoFocus={!username}
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="Digite seu usuário"
-                  className="w-full h-10 input-with-icon-left pr-3 text-xs bg-white/[0.03] border border-white/[0.08] rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-[#5E6AD2]"
+                  placeholder="Seu usuário"
+                  className="input-with-icon-left"
                 />
               </div>
-            </div>
+            </Field>
 
-            {/* Input Senha */}
-            <div>
-              <label htmlFor="login-password" className="text-xs text-zinc-300 font-medium mb-1.5 block">Senha</label>
+            <Field label="Senha" htmlFor="login-password">
               <div className="relative flex items-center">
-                <Lock size={16} className="input-icon-left text-zinc-500" />
+                <Lock size={15} className="input-icon-left text-tertiary" />
                 <input
                   id="login-password"
                   type={showPassword ? "text" : "password"}
+                  autoComplete="current-password"
+                  autoFocus={!!username}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Digite sua senha"
-                  className="w-full h-10 input-with-icon-both text-xs bg-white/[0.03] border border-white/[0.08] rounded-md text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-[#5E6AD2]"
+                  placeholder="Sua senha"
+                  className="input-with-icon-both"
                 />
                 <button
                   type="button"
                   onClick={() => setShowPassword(!showPassword)}
-                  className="input-icon-right text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer"
+                  aria-label={showPassword ? "Ocultar senha" : "Mostrar senha"}
+                  className="input-icon-right text-tertiary hover:text-primary transition-colors cursor-pointer"
                 >
-                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
                 </button>
               </div>
-            </div>
+            </Field>
 
-            {/* Submit Button */}
-            <button
+            <Button
               type="submit"
-              disabled={loading || !username || !password}
-              className="w-full h-9 rounded-md text-xs font-semibold text-white bg-[#5E6AD2] hover:bg-[#4C57C6] shadow-sm shadow-[#5E6AD2]/25 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-150 cursor-pointer flex items-center justify-center gap-2 mt-4"
+              size="lg"
+              loading={loading}
+              disabled={!username || !password}
+              className="w-full"
             >
-              {loading ? (
-                <>
-                  <Loader2 size={15} className="animate-spin" />
-                  <span>Entrando...</span>
-                </>
-              ) : (
-                <span>Entrar no Sistema</span>
-              )}
-            </button>
+              {loading ? "Entrando..." : "Entrar"}
+            </Button>
           </form>
 
-          {/* Quick Credentials Widget — APENAS em modo de desenvolvimento */}
+          {/* Atalhos — apenas em modo de desenvolvimento */}
           {import.meta.env.DEV && (
-            <div className="pt-2 border-t border-white/[0.06]">
-              <div className="flex items-center gap-1 text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">
-                <Sparkles size={12} className="text-[#828DF7]" />
-                <span>Atalhos DEV</span>
-              </div>
-
+            <div className="pt-4 border-t border-border">
+              <p className="text-xs text-tertiary mb-2">Atalhos de desenvolvimento</p>
               <div className="grid grid-cols-2 gap-2">
-                <button
+                <Button
                   type="button"
+                  variant="secondary"
+                  size="sm"
                   onClick={() => fillCredentials("vicenzzo.master", "root123")}
-                  className="py-1.5 px-2 rounded-md bg-[#5E6AD2]/10 hover:bg-[#5E6AD2]/20 text-[11px] font-medium text-[#828DF7] border border-[#5E6AD2]/20 transition-colors cursor-pointer text-center truncate"
                 >
                   Master
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
+                  variant="secondary"
+                  size="sm"
                   onClick={() => fillCredentials("vicenzzo.mastronikolis", "Ope@2025")}
-                  className="py-1.5 px-2 rounded-md bg-white/[0.04] hover:bg-white/[0.08] text-[11px] font-medium text-zinc-300 border border-white/[0.08] transition-colors cursor-pointer text-center truncate"
                 >
                   Gestor
-                </button>
+                </Button>
               </div>
             </div>
           )}

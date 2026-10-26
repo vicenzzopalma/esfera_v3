@@ -26,14 +26,11 @@ mod write_queue;
 
 use commands::*;
 use db::Database;
-use crate::protocol::HubMessage;
 use hub_client::HubClient;
 use session::SessionManager;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
-use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
-use tauri::Manager;
 
 fn get_db_path() -> String {
     let base_dir = std::env::var_os("LOCALAPPDATA")
@@ -113,7 +110,7 @@ pub fn run() {
     // o company_id e o token da empresa do próprio usuário (arquitetura
     // multi-tenant VPS central — Opção A do HERMES_CONTEXT). Sem login = sem hub.
 
-    let result = tauri::Builder::default()
+    let _result = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             diag("ETAPA [4] setup iniciado");
@@ -260,6 +257,7 @@ pub fn run() {
             // AI Config
             get_ai_config,
             save_ai_config,
+            get_ai_provider_keys,
             // Permissions
             get_user_permissions,
             update_user_permission,
@@ -270,6 +268,9 @@ pub fn run() {
             // Campaign Dispatch
             send_campaign,
             pause_campaign,
+            stop_campaign,
+            retry_failed_campaign_contacts,
+            reset_campaign_contacts,
             start_campaign,
             rewrite_message_ai,
             // Hub / Master
@@ -294,6 +295,7 @@ pub fn run() {
             get_devices_with_active_user_map,
             configure_device_proxy_and_antiban,
             trigger_manual_intent_bezier_dispatch,
+            clear_device_temporary_contacts,
             check_git_auto_update,
             apply_git_auto_update,
             // Config

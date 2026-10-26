@@ -6,6 +6,9 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import Modal from "../ui/Modal";
 import Button from "../ui/Button";
+import { FormSection } from "../ui/Field";
+import { SegmentedControl } from "../ui/Tabs";
+import { inputCls } from "./deviceUi";
 import type { Device } from "../../types";
 import { api } from "../../tauri";
 import {
@@ -18,11 +21,8 @@ import {
   Sparkles,
   MonitorPlay,
   Video,
-  ScreenShare,
-  EyeOff,
   RotateCcw,
   Send,
-  Keyboard,
   Volume2,
   VolumeX,
   ClipboardPaste,
@@ -123,7 +123,7 @@ export function MirrorModal({
           dpi: 320,
         });
       }
-      setStreamMsg(`${msg}\n(⚡ Janela externa Scrcpy ativa — controle e preview interno sincronizados)`);
+      setStreamMsg(`${msg}\nJanela externa ativa: controle e pré-visualização sincronizados.`);
     } catch (e: any) {
       setErrorMsg(typeof e === "string" ? e : e?.message || "Falha ao iniciar espelhamento.");
     } finally {
@@ -215,305 +215,163 @@ export function MirrorModal({
     }
   };
 
+  const keyBtn =
+    "rounded-lg border border-border px-2.5 py-1 text-[0.75rem] text-secondary hover:text-primary bg-secondary hover:bg-hover transition-colors cursor-pointer";
+
   return (
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      title={`Controle Remoto: ${device.name || device.model} (${device.esferaDeviceId || device.serial})`}
+      title={`Controle remoto: ${device.name || device.model}`}
       size="xl"
       footer={
-        <div className="flex justify-between items-center w-full text-xs gap-2">
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={onOpenRegion}
-            icon={<Camera size={13} className="text-amber-400" />}
-          >
-            Leitura de QR Code (Câmera)
+        <>
+          <Button variant="secondary" size="sm" onClick={onOpenRegion} icon={<Camera size={13} />} className="mr-auto">
+            Câmera virtual (QR Code)
           </Button>
           <Button variant="secondary" size="sm" onClick={onClose}>
             Fechar
           </Button>
-        </div>
+        </>
       }
     >
-      <div className="flex flex-col lg:flex-row gap-5 items-start text-xs">
-        {/* Left: Device Display Screen */}
-        <div className="w-full lg:w-[320px] shrink-0 bg-[#09090b] border border-white/[0.08] rounded-xl p-3 flex flex-col items-center justify-center min-h-[460px] relative overflow-hidden shadow-inner">
+      <div className="flex flex-col items-start gap-6 lg:flex-row">
+        {/* Tela do aparelho */}
+        <div className="relative flex min-h-[26rem] w-full shrink-0 flex-col items-center justify-center rounded-xl border border-border bg-black/90 p-3 lg:w-[20rem]">
           {screenSrc ? (
-            <div className="relative group flex flex-col items-center">
+            <div className="group relative flex flex-col items-center">
               <img
                 ref={imgRef}
                 src={screenSrc}
-                alt="Tela do Celular"
+                alt="Tela do celular"
                 onClick={handleImageClick}
-                className="max-h-[440px] w-auto rounded-lg border border-white/[0.06] shadow-md cursor-crosshair transition-transform hover:scale-[1.005]"
+                className="max-h-[26rem] w-auto cursor-crosshair rounded-lg border border-white/10"
               />
-              <div className="absolute bottom-2 inset-x-2 bg-black/75 backdrop-blur-sm px-2.5 py-1 rounded text-[10px] text-zinc-300 text-center pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity">
-                Clique na tela para enviar toque ADB
+              <div className="pointer-events-none absolute inset-x-2 bottom-2 rounded bg-black/75 px-2.5 py-1 text-center text-[0.75rem] text-zinc-200 opacity-0 transition-opacity group-hover:opacity-100">
+                Clique na tela para enviar um toque
               </div>
             </div>
           ) : (
-            <div className="text-center p-6 text-zinc-500">
+            <div className="p-6 text-center text-[0.8125rem] text-zinc-400">
               {loadingFrame ? (
                 <>
-                  <RefreshCw size={26} className="animate-spin text-[#828DF7] mx-auto mb-2" />
-                  <p className="font-medium text-zinc-400">Capturando tela do Android...</p>
+                  <RefreshCw size={22} className="mx-auto mb-2 animate-spin" />
+                  <p>Capturando a tela...</p>
                 </>
               ) : (
                 <>
-                  <MonitorPlay size={28} className="text-zinc-600 mx-auto mb-2" />
-                  <p>Iniciando stream de tela...</p>
+                  <MonitorPlay size={24} className="mx-auto mb-2" />
+                  <p>{errorMsg ? "Sem imagem do aparelho" : "Iniciando..."}</p>
                 </>
               )}
             </div>
           )}
-
-          {/* Badge de modo ativo */}
           {mode !== "frame" && (
-            <div className="mt-2.5 px-2.5 py-1 rounded bg-[#5E6AD2]/15 border border-[#5E6AD2]/30 text-[10px] text-[#828DF7] font-medium flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              <span>Scrcpy Ativo (Janela Externa)</span>
+            <div className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-white/10 px-2.5 py-1 text-[0.75rem] text-zinc-200">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+              Janela externa ativa
             </div>
           )}
         </div>
 
-        {/* Right: Controls & Interactive Keyboard */}
-        <div className="flex-1 space-y-3.5 w-full min-w-0">
-          {/* Seção 1: Digitar no Celular (ADB Text Input) */}
-          <div className="p-3.5 bg-[#141418] border border-white/[0.07] rounded-xl space-y-2.5">
-            <div className="flex items-center justify-between">
-              <h5 className="font-semibold text-zinc-100 flex items-center gap-1.5 text-xs">
-                <Keyboard size={14} className="text-[#828DF7]" /> Digitar no Celular (Entrada ADB)
-              </h5>
-              <button
-                type="button"
-                onClick={handlePasteClipboard}
-                disabled={sendingText}
-                className="text-[11px] text-zinc-400 hover:text-zinc-200 flex items-center gap-1 px-2 py-0.5 rounded bg-white/[0.04] border border-white/[0.06] transition-colors"
-                title="Colar texto da área de transferência do PC"
-              >
-                <ClipboardPaste size={12} className="text-amber-400" /> Colar do PC
-              </button>
-            </div>
-
+        {/* Controles */}
+        <div className="w-full min-w-0 flex-1 space-y-6">
+          <FormSection title="Digitar no celular" description="O texto é enviado ao campo em foco no aparelho.">
             <div className="flex gap-2">
               <input
                 type="text"
+                aria-label="Texto para enviar ao celular"
                 value={textInput}
                 onChange={(e) => setTextInput(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") handleSendText();
                 }}
-                placeholder="Digite texto e pressione Enter para enviar ao celular..."
+                placeholder="Digite e pressione Enter"
                 disabled={sendingText}
-                className="flex-1 px-3 py-1.5 rounded-md bg-[#09090b] border border-white/[0.08] text-zinc-100 text-xs font-medium focus:outline-none focus:border-[#5E6AD2]"
+                className={inputCls}
               />
-              <Button
-                variant="primary"
-                size="sm"
-                onClick={handleSendText}
-                disabled={sendingText || !textInput.trim()}
-                loading={sendingText}
-                icon={<Send size={12} />}
-              >
+              <Button variant="primary" size="md" onClick={handleSendText} disabled={sendingText || !textInput.trim()} loading={sendingText} icon={<Send size={13} />}>
                 Enviar
               </Button>
-            </div>
-
-            {/* Teclas rápidas de digitação */}
-            <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-              <button
-                type="button"
-                onClick={() => handleKeyevent(66)}
-                className="px-2 py-1 rounded bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 text-[10px] font-mono border border-white/[0.06] transition-colors"
-              >
-                ↵ Enter
-              </button>
-              <button
-                type="button"
-                onClick={() => handleKeyevent(67)}
-                className="px-2 py-1 rounded bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 text-[10px] font-mono border border-white/[0.06] transition-colors"
-              >
-                ⌫ Apagar
-              </button>
-              <button
-                type="button"
-                onClick={() => handleKeyevent(62)}
-                className="px-2 py-1 rounded bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 text-[10px] font-mono border border-white/[0.06] transition-colors"
-              >
-                ␣ Espaço
-              </button>
-              <button
-                type="button"
-                onClick={() => handleKeyevent(61)}
-                className="px-2 py-1 rounded bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 text-[10px] font-mono border border-white/[0.06] transition-colors"
-              >
-                ⇥ Tab
-              </button>
-            </div>
-          </div>
-
-          {/* Seção 2: Modo de Espelhamento */}
-          <div className="p-3.5 bg-[#141418] border border-white/[0.07] rounded-xl space-y-2.5">
-            <h5 className="font-semibold text-zinc-100 flex items-center gap-1.5 text-xs">
-              <ScreenShare size={14} className="text-[#828DF7]" /> Modo de Espelhamento
-            </h5>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              <Button
-                variant={mode === "frame" ? "primary" : "secondary"}
-                size="sm"
-                onClick={() => startMode("frame")}
-                icon={<RefreshCw size={12} />}
-              >
-                Frame Interno
-              </Button>
-              <Button
-                variant={mode === "scrcpy" ? "primary" : "secondary"}
-                size="sm"
-                onClick={() => startMode("scrcpy")}
-                loading={busy && mode !== "scrcpy"}
-                icon={<ScreenShare size={12} />}
-              >
-                Scrcpy 60FPS
-              </Button>
-              <Button
-                variant={mode === "scrcpy_off" ? "primary" : "secondary"}
-                size="sm"
-                onClick={() => startMode("scrcpy_off")}
-                loading={busy && mode !== "scrcpy_off"}
-                icon={<EyeOff size={12} />}
-              >
-                Tela Off
-              </Button>
-              <Button
-                variant={mode === "virtual" ? "primary" : "secondary"}
-                size="sm"
-                onClick={() => startMode("virtual")}
-                loading={busy && mode !== "virtual"}
-                icon={<MonitorPlay size={12} />}
-              >
-                Display #2
+              <Button variant="secondary" size="md" onClick={handlePasteClipboard} disabled={sendingText} icon={<ClipboardPaste size={13} />} title="Colar texto da área de transferência do PC">
+                Colar
               </Button>
             </div>
-          </div>
-
-          {/* Seção 3: Botões Físicos & Navegação Android */}
-          <div className="p-3.5 bg-[#141418] border border-white/[0.07] rounded-xl space-y-2.5">
-            <h5 className="font-semibold text-zinc-100 text-xs">Navegação & Botões Físicos</h5>
-            <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
-              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(4)} icon={<ArrowLeft size={12} />}>
-                Voltar
-              </Button>
-              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(3)} icon={<Home size={12} />}>
-                Início
-              </Button>
-              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(187)} icon={<Layers size={12} />}>
-                Apps
-              </Button>
-              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(24)} icon={<Volume2 size={12} />}>
-                Vol +
-              </Button>
-              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(25)} icon={<VolumeX size={12} />}>
-                Vol -
-              </Button>
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => handleKeyevent(26)}
-                icon={<Power size={12} className="text-red-400" />}
-              >
-                Power
-              </Button>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button type="button" onClick={() => handleKeyevent(66)} className={keyBtn}>Enter</button>
+              <button type="button" onClick={() => handleKeyevent(67)} className={keyBtn}>Apagar</button>
+              <button type="button" onClick={() => handleKeyevent(62)} className={keyBtn}>Espaço</button>
+              <button type="button" onClick={() => handleKeyevent(61)} className={keyBtn}>Tab</button>
             </div>
+          </FormSection>
 
-            <div className="grid grid-cols-2 gap-2 pt-1">
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => handleKeyevent(224)}
-                icon={<SunMedium size={12} className="text-amber-400" />}
-              >
-                Acordar Tela (Wakeup)
-              </Button>
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={fetchScreenFrame}
-                loading={loadingFrame}
-                icon={<RotateCcw size={12} />}
-              >
-                Atualizar Frame
-              </Button>
+          <FormSection title="Modo de espelhamento">
+            <SegmentedControl<MirrorMode>
+              items={[
+                { id: "frame", label: "Pré-visualização" },
+                { id: "scrcpy", label: "Scrcpy" },
+                { id: "scrcpy_off", label: "Tela apagada" },
+                { id: "virtual", label: "Display virtual" },
+              ]}
+              value={mode}
+              onChange={(m) => !busy && startMode(m)}
+            />
+            {busy && (
+              <p className="flex items-center gap-1.5 text-[0.75rem] text-secondary">
+                <RefreshCw size={12} className="animate-spin" /> Iniciando...
+              </p>
+            )}
+          </FormSection>
+
+          <FormSection title="Navegação e botões">
+            <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(4)} icon={<ArrowLeft size={12} />}>Voltar</Button>
+              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(3)} icon={<Home size={12} />}>Início</Button>
+              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(187)} icon={<Layers size={12} />}>Apps</Button>
+              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(24)} icon={<Volume2 size={12} />}>Vol +</Button>
+              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(25)} icon={<VolumeX size={12} />}>Vol -</Button>
+              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(26)} icon={<Power size={12} />}>Ligar</Button>
             </div>
-          </div>
-
-          {/* Seção 4: Câmeras & Injeção Virtual */}
-          <div className="p-3.5 bg-[#141418] border border-white/[0.07] rounded-xl space-y-2.5">
-            <h5 className="font-semibold text-zinc-100 text-xs">Câmera e Injeção Virtual</h5>
             <div className="grid grid-cols-2 gap-2">
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => startCamera("back")}
-                loading={busy}
-                icon={<Camera size={12} className="text-emerald-400" />}
-              >
-                Câmera Traseira
-              </Button>
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => startCamera("front")}
-                loading={busy}
-                icon={<Camera size={12} className="text-sky-400" />}
-              >
-                Câmera Frontal
-              </Button>
+              <Button variant="secondary" size="sm" onClick={() => handleKeyevent(224)} icon={<SunMedium size={12} />}>Acordar tela</Button>
+              <Button variant="secondary" size="sm" onClick={fetchScreenFrame} loading={loadingFrame} icon={<RotateCcw size={12} />}>Atualizar imagem</Button>
             </div>
+          </FormSection>
 
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={stealCamera}
-              loading={busy}
-              icon={<Video size={12} className="text-fuchsia-400" />}
-              className="w-full"
-            >
-              Roubar Câmera (Injetar Tela do PC na Câmera)
+          <FormSection title="Câmera" description="Abra a câmera do aparelho ou envie a tela do PC como câmera.">
+            <div className="grid grid-cols-2 gap-2">
+              <Button variant="secondary" size="sm" onClick={() => startCamera("back")} loading={busy} icon={<Camera size={12} />}>Câmera traseira</Button>
+              <Button variant="secondary" size="sm" onClick={() => startCamera("front")} loading={busy} icon={<Camera size={12} />}>Câmera frontal</Button>
+            </div>
+            <Button variant="secondary" size="sm" onClick={stealCamera} loading={busy} icon={<Video size={12} />} className="w-full">
+              Enviar tela do PC como câmera
             </Button>
-          </div>
+          </FormSection>
 
-          {/* Seção 5: Ação Rápida WhatsApp */}
           <Button
-            variant="primary"
-            size="sm"
+            variant="secondary"
+            size="md"
             onClick={async () => {
               try {
-                await api("send_intent_to_display", {
-                  serial,
-                  url: "https://wa.me/",
-                  displayId: 0,
-                });
+                await api("send_intent_to_display", { serial, url: "https://wa.me/", displayId: 0 });
                 setTimeout(fetchScreenFrame, 600);
               } catch {
                 /* noop */
               }
             }}
             icon={<Sparkles size={13} />}
-            className="w-full py-2 font-semibold shadow-md"
+            className="w-full"
           >
-            Abrir WhatsApp Business
+            Abrir WhatsApp
           </Button>
 
-          {/* Mensagens de feedback */}
           {streamMsg && (
-            <div className="p-2.5 bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 font-mono text-[11px] rounded-lg whitespace-pre-wrap">
+            <div role="status" className="whitespace-pre-wrap rounded-lg border border-border bg-secondary p-3 text-[0.8125rem] text-secondary">
               {streamMsg}
             </div>
           )}
           {errorMsg && (
-            <div className="p-2.5 bg-red-500/10 border border-red-500/20 text-red-300 font-mono text-[11px] rounded-lg whitespace-pre-wrap">
+            <div role="alert" className="whitespace-pre-wrap rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-[0.8125rem] text-red-600 dark:text-red-400">
               {errorMsg}
             </div>
           )}

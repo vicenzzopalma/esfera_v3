@@ -211,13 +211,11 @@ struct AdbConn {
 fn open_shell(mut stream: TcpStream) -> io::Result<AdbConn> {
     let local_id = rand::random::<u32>().max(1);
     write_msg(&mut stream, A_OPEN, local_id, 0, b"shell,v2\0")?;
-    let mut remote_id = 0u32;
-    loop {
+    let remote_id = loop {
         let msg = read_msg(&mut stream)?;
         match msg.cmd {
             A_OKAY => {
-                remote_id = msg.arg1;
-                break;
+                break msg.arg1;
             }
             A_CLSE => {
                 return Err(io::Error::new(
@@ -227,7 +225,7 @@ fn open_shell(mut stream: TcpStream) -> io::Result<AdbConn> {
             }
             _ => {}
         }
-    }
+    };
     Ok(AdbConn { stream, local_id, remote_id })
 }
 
@@ -310,6 +308,7 @@ fn is_tcp_serial(serial: &str) -> bool {
 
 /// Captura o handle do runtime Tokio no setup (necessário para abrir a ponte de
 /// túnel inverso a partir de threads de spawn_blocking).
+#[allow(dead_code)]
 pub fn init() {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         if let Ok(mut slot) = RUNTIME_HANDLE.lock() {

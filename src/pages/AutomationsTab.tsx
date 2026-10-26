@@ -1,6 +1,6 @@
 // ============================================================
-// Esfera v3 — Automations Tab com Triggers & Actions
-// Motor de regras com gatilhos avançados e ações multi-destino
+// Esfera v3 — Automações
+// Regras de gatilho e ação: lista com status e edição em modal
 // ============================================================
 
 import { useState, useEffect } from "react";
@@ -11,6 +11,10 @@ import Badge from "../components/ui/Badge";
 import Button from "../components/ui/Button";
 import Modal from "../components/ui/Modal";
 import Toggle from "../components/ui/Toggle";
+import PageHeader from "../components/ui/PageHeader";
+import StatCard from "../components/ui/StatCard";
+import EmptyState from "../components/ui/EmptyState";
+import Field, { FormSection } from "../components/ui/Field";
 import type { Automation, AutomationTriggerType, AutomationActionType } from "../types";
 import { TRIGGER_LABELS, ACTION_LABELS } from "../types";
 import { api } from "../tauri";
@@ -41,15 +45,6 @@ const TRIGGER_ICONS: Record<AutomationTriggerType, React.ReactNode> = {
   schedule: <Clock size={16} />,
   message_received: <MessageSquare size={16} />,
 };
-
-const TRIGGER_COLORS: Record<AutomationTriggerType, string> = {
-  keyword: "bg-violet-500/20 text-violet-400 border-violet-500/30",
-  ban_detected: "bg-red-500/20 text-red-400 border-red-500/30",
-  device_offline: "bg-amber-500/20 text-amber-400 border-amber-500/30",
-  schedule: "bg-blue-500/20 text-blue-400 border-blue-500/30",
-  message_received: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
-};
-
 const ACTION_ICONS: Record<AutomationActionType, React.ReactNode> = {
   send_response: <MessageSquare size={16} />,
   move_chip: <ArrowRight size={16} />,
@@ -58,16 +53,6 @@ const ACTION_ICONS: Record<AutomationActionType, React.ReactNode> = {
   set_chip_status: <Shield size={16} />,
   send_to_sector: <Users size={16} />,
 };
-
-const ACTION_COLORS: Record<AutomationActionType, string> = {
-  send_response: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
-  move_chip: "bg-blue-500/20 text-blue-400 border-blue-500/30",
-  notify: "bg-amber-500/20 text-amber-400 border-amber-500/30",
-  toggle_campaign: "bg-violet-500/20 text-violet-400 border-violet-500/30",
-  set_chip_status: "bg-red-500/20 text-red-400 border-red-500/30",
-  send_to_sector: "bg-pink-500/20 text-pink-400 border-pink-500/30",
-};
-
 const SECTORS = ["junior", "senior", "pesquisa", "pa_fixa_1", "pa_fixa_2", "comercial"];
 const SECTOR_LABELS: Record<string, string> = {
   junior: "Junior",
@@ -84,6 +69,8 @@ export default function AutomationsTab() {
   const [editModalOpen, setEditModalOpen] = useState(false);
   const [selectedAutomation, setSelectedAutomation] = useState<Automation | null>(null);
   const [automationsList, setAutomationsList] = useState<Automation[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [deleteTarget, setDeleteTarget] = useState<Automation | null>(null);
 
   // Form states
   const [ruleName, setRuleName] = useState("");
@@ -99,10 +86,12 @@ export default function AutomationsTab() {
 
   useEffect(() => {
     let mounted = true;
-    if (!selectedCompanyId) { if (mounted) setAutomationsList([]); return; }
+    if (!selectedCompanyId) { if (mounted) { setAutomationsList([]); setLoading(false); } return; }
+    setLoading(true);
     api<Automation[]>("get_automations", { companyId: selectedCompanyId })
       .then((data) => { if (mounted) setAutomationsList(data); })
-      .catch(() => { if (mounted) setAutomationsList(MOCK_AUTOMATIONS.filter((a) => a.companyId === selectedCompanyId)); });
+      .catch(() => { if (mounted) setAutomationsList(MOCK_AUTOMATIONS.filter((a) => a.companyId === selectedCompanyId)); })
+      .finally(() => { if (mounted) setLoading(false); });
     return () => { mounted = false; };
   }, [selectedCompanyId]);
 
@@ -246,382 +235,303 @@ export default function AutomationsTab() {
     setAutomationsList((prev) => prev.filter((a) => a.id !== id));
   };
 
+
+  const actionSummary = (a: Automation) => {
+    switch (a.actionType) {
+      case "send_response": return a.response || "Enviar resposta automática";
+      case "move_chip": return `Mover chip para ${SECTOR_LABELS[a.sector || "junior"]}`;
+      case "notify": return "Notificar o gestor no sistema";
+      case "toggle_campaign": return "Pausar ou iniciar a campanha vinculada";
+      case "set_chip_status": return "Alterar o status do chip";
+      case "send_to_sector": return `Encaminhar para ${SECTOR_LABELS[a.sector || "junior"]}`;
+      default: return "";
+    }
+  };
+
+  const optionButton = (selected: boolean) =>
+    `flex items-center gap-2 rounded-lg border px-3 py-2 text-[0.8125rem] font-medium transition-colors cursor-pointer text-left ${
+      selected
+        ? "border-[var(--color-accent)] bg-[var(--color-accent-glow)] text-primary"
+        : "border-border text-secondary hover:border-border-strong hover:text-primary"
+    }`;
+
+  const infoBox = "rounded-lg border border-border bg-secondary px-3 py-2 text-xs text-secondary";
+
   return (
     <div className="space-y-6 animate-fade-in">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h2 className="text-xl font-bold text-primary tracking-tight">Automações Avançadas</h2>
-          <p className="text-xs text-tertiary mt-1 leading-snug">
-            Triggers inteligentes com ações automáticas — detections, agendamentos e respostas.
-          </p>
-        </div>
-        <Button icon={<Plus size={16} />} onClick={() => openEditModal()}>
-          Nova Automação
-        </Button>
+      <PageHeader
+        title="Automações"
+        description="Regras que reagem a eventos e executam ações sozinhas."
+        icon={<Bot size={18} />}
+        actions={
+          <Button icon={<Plus size={15} />} onClick={() => openEditModal()}>
+            Nova automação
+          </Button>
+        }
+      />
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatCard label="Regras" value={automationsList.length} icon={<Bot size={14} />} tone="accent" />
+        <StatCard label="Ativas" value={activeRulesCount} icon={<CheckCircle2 size={14} />} tone="success" />
+        <StatCard label="Execuções" value={totalTriggers.toLocaleString("pt-BR")} icon={<Zap size={14} />} tone="warning" />
+        <StatCard
+          label="Detecção de bloqueio"
+          value={automationsList.filter((a) => a.triggerType === "ban_detected").length}
+          icon={<AlertTriangle size={14} />}
+          tone="danger"
+        />
       </div>
 
-      {/* KPI Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <Card padding="md" className="flex items-center gap-4">
-          <div className="p-2.5 rounded-xl bg-[#5E6AD2]/10 border border-[#5E6AD2]/20 text-[#828DF7] shrink-0">
-            <Bot size={20} />
-          </div>
-          <div>
-            <p className="text-2xl font-bold text-primary">{automationsList.length}</p>
-            <p className="text-xs text-tertiary font-medium">Total de Regras</p>
-          </div>
-        </Card>
-
-        <Card padding="md" className="flex items-center gap-4">
-          <div className="p-2.5 rounded-xl bg-emerald-500/15 border border-emerald-500/20 text-emerald-400 shrink-0">
-            <CheckCircle2 size={20} />
-          </div>
-          <div>
-            <p className="text-2xl font-bold text-primary">{activeRulesCount}</p>
-            <p className="text-xs text-tertiary font-medium">Regras Ativas</p>
-          </div>
-        </Card>
-
-        <Card padding="md" className="flex items-center gap-4">
-          <div className="p-2.5 rounded-xl bg-amber-500/15 border border-amber-500/20 text-amber-400 shrink-0">
-            <Zap size={20} />
-          </div>
-          <div>
-            <p className="text-2xl font-bold text-primary">{totalTriggers.toLocaleString()}</p>
-            <p className="text-xs text-tertiary font-medium">Total de Disparos</p>
-          </div>
-        </Card>
-
-        <Card padding="md" className="flex items-center gap-4">
-          <div className="p-2.5 rounded-xl bg-blue-500/15 border border-blue-500/20 text-blue-400 shrink-0">
-            <AlertTriangle size={20} />
-          </div>
-          <div>
-            <p className="text-2xl font-bold text-primary">
-              {automationsList.filter((a) => a.triggerType === "ban_detected").length}
-            </p>
-            <p className="text-xs text-tertiary font-medium">Watchdogs Ban</p>
-          </div>
-        </Card>
-      </div>
-
-      {/* Search */}
       <div className="relative max-w-md flex items-center">
         <Search size={16} className="input-icon-left text-tertiary" />
         <input
           type="text"
-          placeholder="Buscar por regra ou palavra-chave..."
+          aria-label="Buscar automação"
+          placeholder="Buscar por nome ou palavra-chave"
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           className="w-full input-with-icon-left"
         />
       </div>
 
-      {/* Automations List */}
-      <div className="space-y-3">
-        {filteredAutomations.map((automation, idx) => (
-          <Card key={automation.id || idx} padding="none" hover>
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between p-4 gap-4">
-              <div className="flex items-start sm:items-center gap-3.5">
-                <div
-                  className={`flex items-center justify-center w-10 h-10 rounded-2xl border ${
-                    automation.active
-                      ? "bg-violet-600/20 text-violet-400 border-violet-500/30"
-                      : "bg-white/5 text-tertiary border-border"
-                  }`}
-                >
-                  {TRIGGER_ICONS[automation.triggerType || "keyword"]}
-                </div>
-
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 mb-1 flex-wrap">
-                    <h3 className="font-bold text-sm text-primary">{automation.name}</h3>
-                    <Badge variant={automation.active ? "success" : "neutral"} dot>
-                      {automation.active ? "Ativa" : "Inativa"}
-                    </Badge>
-                    <Badge variant="purple" className="text-[10px] gap-1">
-                      {TRIGGER_ICONS[automation.triggerType || "keyword"]}
-                      {TRIGGER_LABELS[automation.triggerType || "keyword"]}
-                    </Badge>
-                    <Badge variant="info" className="text-[10px] gap-1">
-                      {ACTION_ICONS[automation.actionType || "send_response"]}
-                      {ACTION_LABELS[automation.actionType || "send_response"]}
-                    </Badge>
+      {loading ? (
+        <div className="space-y-3">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="h-20 rounded-xl border border-border bg-card skeleton" />
+          ))}
+        </div>
+      ) : filteredAutomations.length === 0 ? (
+        <EmptyState
+          icon={<Bot size={18} />}
+          title={searchQuery ? "Nenhuma automação encontrada" : "Nenhuma automação criada"}
+          description={searchQuery ? "Revise o termo buscado." : "Crie uma regra com gatilho e ação para automatizar respostas e alertas."}
+          action={
+            searchQuery ? (
+              <Button variant="secondary" onClick={() => setSearchQuery("")}>Limpar busca</Button>
+            ) : (
+              <Button icon={<Plus size={15} />} onClick={() => openEditModal()}>Nova automação</Button>
+            )
+          }
+        />
+      ) : (
+        <div className="space-y-3">
+          {filteredAutomations.map((automation, idx) => (
+            <Card key={automation.id || idx} padding="none">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between p-4 gap-4">
+                <div className="flex items-start gap-3 min-w-0">
+                  <div
+                    className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border ${
+                      automation.active
+                        ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-glow)] text-[var(--color-accent-light)]"
+                        : "border-border bg-secondary text-tertiary"
+                    }`}
+                  >
+                    {TRIGGER_ICONS[automation.triggerType || "keyword"]}
                   </div>
 
-                  <div className="flex items-center gap-3 text-xs text-secondary flex-wrap">
-                    {automation.keyword && (
-                      <span className="inline-flex items-center gap-1 font-mono text-violet-400 bg-violet-500/10 px-2 py-0.5 rounded-md border border-violet-500/20">
-                        <Hash size={12} />
-                        "{automation.keyword}"
-                      </span>
-                    )}
-                    <span className="inline-flex items-center gap-1 text-tertiary">
-                      <Zap size={12} className="text-amber-400" />
-                      {automation.triggeredCount || 0} execuções
-                    </span>
-                  </div>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h3 className="text-sm font-semibold text-primary">{automation.name}</h3>
+                      <Badge variant={automation.active ? "success" : "neutral"} dot>
+                        {automation.active ? "Ativa" : "Inativa"}
+                      </Badge>
+                    </div>
 
-                  <p className="text-xs text-tertiary mt-1.5 line-clamp-1 flex items-center gap-1">
-                    <ArrowRight size={12} className="shrink-0 text-secondary" />
-                    <span>
-                      {automation.actionType === "send_response" && automation.response}
-                      {automation.actionType === "move_chip" && `Mover chip → ${SECTOR_LABELS[automation.sector || "junior"]}`}
-                      {automation.actionType === "notify" && "Notificar gestor via sistema"}
-                      {automation.actionType === "toggle_campaign" && "Pausar/iniciar campanha vinculada"}
-                      {automation.actionType === "set_chip_status" && "Alterar status do chip automaticamente"}
-                      {automation.actionType === "send_to_sector" && `Encaminhar → ${SECTOR_LABELS[automation.sector || "junior"]}`}
-                    </span>
-                  </p>
+                    <p className="mt-1 flex items-center gap-1.5 text-xs text-secondary flex-wrap">
+                      <span>{TRIGGER_LABELS[automation.triggerType || "keyword"]}</span>
+                      {automation.keyword && (
+                        <span className="font-mono rounded bg-secondary px-1.5 py-0.5 text-primary">"{automation.keyword}"</span>
+                      )}
+                      <ArrowRight size={12} className="text-tertiary" />
+                      <span>{ACTION_LABELS[automation.actionType || "send_response"]}</span>
+                    </p>
+
+                    <p className="mt-1 text-xs text-tertiary line-clamp-1">{actionSummary(automation)}</p>
+                    <p className="mt-1 text-xs text-tertiary tabular-nums">{automation.triggeredCount || 0} execuções</p>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-end gap-2 border-t sm:border-t-0 border-border pt-3 sm:pt-0 shrink-0">
+                  <Toggle
+                    checked={automation.active}
+                    onChange={() => toggleActive(automation.id, automation.active)}
+                    size="sm"
+                  />
+                  <Button variant="secondary" size="sm" icon={<Pencil size={13} />} onClick={() => openEditModal(automation)}>
+                    Editar
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    icon={<Trash2 size={14} />}
+                    className="text-red-600 dark:text-red-400 hover:text-red-300"
+                    aria-label={`Excluir ${automation.name}`}
+                    onClick={() => setDeleteTarget(automation)}
+                  />
                 </div>
               </div>
-
-              <div className="flex items-center justify-end gap-3 border-t sm:border-t-0 border-border pt-3 sm:pt-0 shrink-0">
-                <Toggle
-                  checked={automation.active}
-                  onChange={() => toggleActive(automation.id, automation.active)}
-                  size="sm"
-                />
-                <Button variant="ghost" size="sm" icon={<Pencil size={14} />} onClick={() => openEditModal(automation)}>
-                  Editar
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  icon={<Trash2 size={14} />}
-                  className="text-red-400 hover:text-red-300"
-                  onClick={() => handleDelete(automation.id)}
-                >
-                  Excluir
-                </Button>
-              </div>
-            </div>
-          </Card>
-        ))}
-      </div>
-
-      {filteredAutomations.length === 0 && (
-        <Card className="flex flex-col items-center justify-center py-16 text-center text-tertiary">
-          <Bot size={40} className="mb-2 opacity-30" />
-          <p className="text-sm font-medium text-secondary">Nenhuma automação encontrada</p>
-          <p className="text-xs">Crie uma nova regra com triggers e ações automáticas.</p>
-        </Card>
+            </Card>
+          ))}
+        </div>
       )}
 
-      {/* Modal Criar/Editar */}
+      {/* Criar / editar */}
       <Modal
         isOpen={editModalOpen}
         onClose={() => setEditModalOpen(false)}
-        title={selectedAutomation ? `Editar: ${selectedAutomation.name}` : "Nova Automação"}
+        title={selectedAutomation ? "Editar automação" : "Nova automação"}
         size="lg"
         footer={
           <>
             <Button variant="secondary" onClick={() => setEditModalOpen(false)}>
               Cancelar
             </Button>
-            <Button onClick={handleSaveAutomation}>Salvar Automação</Button>
+            <Button onClick={handleSaveAutomation} disabled={!ruleName.trim()}>
+              {selectedAutomation ? "Salvar" : "Criar automação"}
+            </Button>
           </>
         }
       >
-        <div className="space-y-5 text-xs">
-          {/* Nome */}
-          <div>
-            <label className="block font-semibold text-secondary mb-1">Nome da Automação</label>
+        <div className="space-y-6">
+          <Field label="Nome" required htmlFor="auto-name">
             <input
+              id="auto-name"
               type="text"
               value={ruleName}
               onChange={(e) => setRuleName(e.target.value)}
-              placeholder="Ex: Auto-resposta Orçamento"
-              className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-border text-primary placeholder:text-tertiary focus:border-violet-500/40 transition-all"
+              placeholder="Ex.: Resposta automática de orçamento"
             />
-          </div>
+          </Field>
 
-          {/* TRIGGER */}
-          <div className="p-4 rounded-xl bg-white/[0.02] border border-border space-y-4">
-            <h4 className="font-bold text-primary flex items-center gap-2">
-              <Zap size={16} className="text-violet-400" />
-              Gatilho (Trigger)
-            </h4>
-
+          <FormSection title="Quando" description="O evento que dispara esta regra.">
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               {(Object.keys(TRIGGER_LABELS) as AutomationTriggerType[]).map((t) => (
-                <button
-                  key={t}
-                  onClick={() => setTriggerType(t)}
-                  className={`flex items-center gap-2 p-2.5 rounded-xl text-xs font-medium transition-all cursor-pointer border ${
-                    triggerType === t
-                      ? `${TRIGGER_COLORS[t]} border-current`
-                      : "bg-white/[0.02] text-secondary border-border hover:bg-white/[0.04]"
-                  }`}
-                >
+                <button key={t} type="button" onClick={() => setTriggerType(t)} aria-pressed={triggerType === t} className={optionButton(triggerType === t)}>
                   {TRIGGER_ICONS[t]}
                   {TRIGGER_LABELS[t]}
                 </button>
               ))}
             </div>
 
-            {/* Trigger-specific config */}
             {triggerType === "keyword" && (
-              <div>
-                <label className="block font-semibold text-secondary mb-1">Palavra-chave</label>
+              <Field label="Palavra-chave" hint="Separe várias palavras por vírgula." htmlFor="auto-keyword">
                 <input
+                  id="auto-keyword"
                   type="text"
                   value={ruleKeyword}
                   onChange={(e) => setRuleKeyword(e.target.value)}
-                  placeholder="Ex: orcamento, preco, valor"
-                  className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-border text-primary font-mono placeholder:text-tertiary focus:border-violet-500/40 transition-all"
+                  placeholder="orcamento, preco, valor"
+                  className="font-mono"
                 />
-              </div>
+              </Field>
             )}
 
             {triggerType === "schedule" && (
               <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block font-semibold text-secondary mb-1">Horário</label>
-                  <input
-                    type="time"
-                    value={scheduleTime}
-                    onChange={(e) => setScheduleTime(e.target.value)}
-                    className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-border text-primary focus:border-violet-500/40 transition-all"
-                  />
-                </div>
-                <div>
-                  <label className="block font-semibold text-secondary mb-1">Dias (1=Seg...7=Dom)</label>
-                  <input
-                    type="text"
-                    value={scheduleDays}
-                    onChange={(e) => setScheduleDays(e.target.value)}
-                    placeholder="1,2,3,4,5"
-                    className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-border text-primary font-mono placeholder:text-tertiary focus:border-violet-500/40 transition-all"
-                  />
-                </div>
+                <Field label="Horário" htmlFor="auto-time">
+                  <input id="auto-time" type="time" value={scheduleTime} onChange={(e) => setScheduleTime(e.target.value)} />
+                </Field>
+                <Field label="Dias da semana" hint="1 = segunda ... 7 = domingo" htmlFor="auto-days">
+                  <input id="auto-days" type="text" value={scheduleDays} onChange={(e) => setScheduleDays(e.target.value)} placeholder="1,2,3,4,5" className="font-mono" />
+                </Field>
               </div>
             )}
 
-            {triggerType === "ban_detected" && (
-              <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-300 text-xs">
-                Esta automação será executada sempre que um chip for marcado como banido pelo WhatsApp.
-              </div>
-            )}
+            {triggerType === "ban_detected" && <div className={infoBox}>Executa sempre que um chip for marcado como bloqueado pelo WhatsApp.</div>}
+            {triggerType === "device_offline" && <div className={infoBox}>Executa quando um aparelho ficar offline por mais de 5 minutos.</div>}
+            {triggerType === "message_received" && <div className={infoBox}>Executa ao receber qualquer mensagem de cliente.</div>}
+          </FormSection>
 
-            {triggerType === "device_offline" && (
-              <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs">
-                Esta automação será executada quando um dispositivo ficar offline por mais de 5 minutos.
-              </div>
-            )}
-
-            {triggerType === "message_received" && (
-              <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs">
-                Esta automação será executada ao receber qualquer mensagem de cliente.
-              </div>
-            )}
-          </div>
-
-          {/* ACTION */}
-          <div className="p-4 rounded-xl bg-white/[0.02] border border-border space-y-4">
-            <h4 className="font-bold text-primary flex items-center gap-2">
-              <ArrowRight size={16} className="text-violet-400" />
-              Ação
-            </h4>
-
+          <FormSection title="Então" description="O que o sistema faz quando o evento acontece.">
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               {(Object.keys(ACTION_LABELS) as AutomationActionType[]).map((a) => (
-                <button
-                  key={a}
-                  onClick={() => setActionType(a)}
-                  className={`flex items-center gap-2 p-2.5 rounded-xl text-xs font-medium transition-all cursor-pointer border ${
-                    actionType === a
-                      ? `${ACTION_COLORS[a]} border-current`
-                      : "bg-white/[0.02] text-secondary border-border hover:bg-white/[0.04]"
-                  }`}
-                >
+                <button key={a} type="button" onClick={() => setActionType(a)} aria-pressed={actionType === a} className={optionButton(actionType === a)}>
                   {ACTION_ICONS[a]}
                   {ACTION_LABELS[a]}
                 </button>
               ))}
             </div>
 
-            {/* Action-specific config */}
             {actionType === "send_response" && (
-              <div>
-                <label className="block font-semibold text-secondary mb-1">Mensagem de Resposta</label>
+              <Field label="Mensagem de resposta" htmlFor="auto-response">
                 <textarea
+                  id="auto-response"
                   value={ruleResponse}
                   onChange={(e) => setRuleResponse(e.target.value)}
-                  placeholder="Digite a resposta automática..."
+                  placeholder="Digite a resposta automática"
                   rows={4}
-                  className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-border text-primary placeholder:text-tertiary focus:border-violet-500/40 transition-all resize-none"
+                  className="resize-none"
                 />
-              </div>
+              </Field>
             )}
 
             {actionType === "move_chip" && (
-              <div>
-                <label className="block font-semibold text-secondary mb-1">Mover para Setor</label>
-                <select
-                  value={ruleSector}
-                  onChange={(e) => setRuleSector(e.target.value)}
-                  className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-border text-primary focus:border-violet-500/40 transition-all"
-                >
+              <Field label="Mover para o setor" htmlFor="auto-sector-move">
+                <select id="auto-sector-move" value={ruleSector} onChange={(e) => setRuleSector(e.target.value)}>
                   {SECTORS.map((s) => (
                     <option key={s} value={s}>{SECTOR_LABELS[s]}</option>
                   ))}
                 </select>
-              </div>
+              </Field>
             )}
 
-            {actionType === "notify" && (
-              <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs">
-                O gestor responsável receberá uma notificação no painel de alertas do sistema.
-              </div>
-            )}
+            {actionType === "notify" && <div className={infoBox}>O gestor responsável receberá um aviso no painel de alertas.</div>}
 
             {actionType === "toggle_campaign" && (
-              <div>
-                <label className="block font-semibold text-secondary mb-1">ID da Campanha</label>
-                <input
-                  type="number"
-                  value={targetCampaignId}
-                  onChange={(e) => setTargetCampaignId(e.target.value)}
-                  placeholder="ID da campanha"
-                  className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-border text-primary font-mono placeholder:text-tertiary focus:border-violet-500/40 transition-all"
-                />
-              </div>
+              <Field label="ID da campanha" htmlFor="auto-campaign">
+                <input id="auto-campaign" type="number" value={targetCampaignId} onChange={(e) => setTargetCampaignId(e.target.value)} placeholder="ID da campanha" className="font-mono" />
+              </Field>
             )}
 
             {actionType === "set_chip_status" && (
-              <div>
-                <label className="block font-semibold text-secondary mb-1">Novo Status do Chip</label>
-                <select
-                  value={chipTargetStatus}
-                  onChange={(e) => setChipTargetStatus(e.target.value)}
-                  className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-border text-primary focus:border-violet-500/40 transition-all"
-                >
+              <Field label="Novo status do chip" htmlFor="auto-chip-status">
+                <select id="auto-chip-status" value={chipTargetStatus} onChange={(e) => setChipTargetStatus(e.target.value)}>
                   <option value="livre">Livre</option>
                   <option value="restrito_24h">Restrito 24h</option>
                   <option value="restrito_7d">Restrito 7d</option>
                   <option value="banido">Banido</option>
                 </select>
-              </div>
+              </Field>
             )}
 
             {actionType === "send_to_sector" && (
-              <div>
-                <label className="block font-semibold text-secondary mb-1">Encaminhar para Setor</label>
-                <select
-                  value={ruleSector}
-                  onChange={(e) => setRuleSector(e.target.value)}
-                  className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-border text-primary focus:border-violet-500/40 transition-all"
-                >
+              <Field label="Encaminhar para o setor" htmlFor="auto-sector-send">
+                <select id="auto-sector-send" value={ruleSector} onChange={(e) => setRuleSector(e.target.value)}>
                   {SECTORS.map((s) => (
                     <option key={s} value={s}>{SECTOR_LABELS[s]}</option>
                   ))}
                 </select>
-              </div>
+              </Field>
             )}
-          </div>
+          </FormSection>
         </div>
+      </Modal>
+
+      {/* Confirmação de exclusão */}
+      <Modal
+        isOpen={!!deleteTarget}
+        onClose={() => setDeleteTarget(null)}
+        title="Excluir automação"
+        size="sm"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setDeleteTarget(null)}>Cancelar</Button>
+            <Button
+              variant="danger"
+              icon={<Trash2 size={14} />}
+              onClick={async () => {
+                if (deleteTarget) await handleDelete(deleteTarget.id);
+                setDeleteTarget(null);
+              }}
+            >
+              Excluir
+            </Button>
+          </>
+        }
+      >
+        <p className="text-[0.8125rem] text-secondary">
+          A automação <span className="font-medium text-primary">{deleteTarget?.name}</span> será removida e deixará de executar.
+        </p>
       </Modal>
     </div>
   );

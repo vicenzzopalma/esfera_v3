@@ -1,8 +1,6 @@
 // ============================================================
-// Esfera v3 — Central de Gestão de Usuários, Permissões e Celulares
-// (Gestor / Master Control Center)
-// Gerencia criação de usuários com papéis (Colaborador, Supervisor, Gestor),
-// vínculo de celulares e concessão de permissões de uso.
+// Esfera v3 — Usuários e permissões
+// Cadastro de usuários por função, vínculo de aparelhos e pedidos de acesso.
 // ============================================================
 
 import { useState, useEffect, useCallback } from "react";
@@ -26,10 +24,17 @@ import {
   Link,
   Unlink,
   Smartphone,
+  Search,
 } from "lucide-react";
 import Button from "../components/ui/Button";
 import Badge from "../components/ui/Badge";
 import Card from "../components/ui/Card";
+import Modal from "../components/ui/Modal";
+import PageHeader from "../components/ui/PageHeader";
+import StatCard from "../components/ui/StatCard";
+import EmptyState from "../components/ui/EmptyState";
+import Field, { FormSection } from "../components/ui/Field";
+import { Tabs } from "../components/ui/Tabs";
 
 export default function PermissionsTab() {
   const { user: currentUser, selectedCompanyId } = useAuth();
@@ -55,6 +60,9 @@ export default function PermissionsTab() {
   const [selectedDeviceForAssign, setSelectedDeviceForAssign] = useState<string>("");
   const [assigning, setAssigning] = useState(false);
   const [unassigning, setUnassigning] = useState<number | null>(null);
+
+  const [userSearch, setUserSearch] = useState("");
+  const [confirmAction, setConfirmAction] = useState<{ title: string; message: string; confirmLabel: string; run: () => void | Promise<void> } | null>(null);
 
   const [feedbackMsg, setFeedbackMsg] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
@@ -100,7 +108,7 @@ export default function PermissionsTab() {
         role: newRole,
         companyId,
       });
-      setFeedbackMsg({ type: "success", text: `Usuário '${newDisplayName}' criado como ${newRole.toUpperCase()} com sucesso!` });
+      setFeedbackMsg({ type: "success", text: `Usuário '${newDisplayName}' criado com sucesso.` });
       setShowCreateModal(false);
       setNewUsername("");
       setNewPassword("");
@@ -179,572 +187,462 @@ export default function PermissionsTab() {
     }
   };
 
+
   const pendingRequests = permissionRequests.filter((r) => r.status === "pending");
+  const approvedRequests = permissionRequests.filter((r) => r.status === "approved");
+
+  const roleLabel = (r: string) =>
+    r === "master" ? "Master" : r === "gestor" ? "Gestor" : r === "supervisor" ? "Supervisor" : "Colaborador";
+  const roleVariant = (r: string): "success" | "purple" | "info" =>
+    r === "gestor" || r === "master" ? "success" : r === "supervisor" ? "purple" : "info";
+  const roleDescription = (r: string) =>
+    r === "colaborador"
+      ? "Solicita o uso dos aparelhos atribuídos."
+      : r === "supervisor"
+      ? "Vê todos os aparelhos e monitora quem opera."
+      : "Acesso total e aprovação de permissões.";
+  const statusLabel = (s: string) => (s === "approved" ? "Aprovada" : s === "pending" ? "Pendente" : s === "rejected" ? "Recusada" : s);
+
+  const normalizedUserSearch = userSearch.trim().toLowerCase();
+  const filteredUsers = usersList.filter(
+    (u) =>
+      !normalizedUserSearch ||
+      u.displayName.toLowerCase().includes(normalizedUserSearch) ||
+      u.username.toLowerCase().includes(normalizedUserSearch) ||
+      u.role.toLowerCase().includes(normalizedUserSearch)
+  );
+
+  const roleOptions: { id: Role; label: string; desc: string; icon: React.ReactNode }[] = [
+    { id: "colaborador", label: "Colaborador", desc: "Pede permissão para usar os aparelhos vinculados.", icon: <Users size={18} /> },
+    { id: "supervisor", label: "Supervisor", desc: "Monitora todos os aparelhos e quem os opera.", icon: <Eye size={18} /> },
+    { id: "gestor", label: "Gestor", desc: "Acesso total e aprova permissões.", icon: <Shield size={18} /> },
+  ];
+
+  const runConfirm = async () => {
+    if (!confirmAction) return;
+    const action = confirmAction.run;
+    setConfirmAction(null);
+    await action();
+  };
 
   return (
-    <div className="space-y-6">
-      {/* Cabeçalho do Painel do Gestor */}
-      <div className="bg-gradient-to-r from-emerald-900/40 via-teal-900/30 to-slate-900 border border-emerald-500/30 rounded-2xl p-6 shadow-xl backdrop-blur-md">
-        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-          <div className="flex items-center gap-4">
-            <div className="p-3 bg-emerald-500/20 border border-emerald-500/40 rounded-xl text-emerald-400">
-              <Shield size={32} />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                  Central do Gestor
-                </span>
-                <span className="text-xs text-slate-400">| Concessão de Acesso & Usuários</span>
-              </div>
-              <h1 className="text-2xl font-bold text-white mt-1">Gestão de Usuários e Permissões</h1>
-              <p className="text-slate-300 text-sm">
-                Cadastre colaboradores, supervisores e gestores, vincule celulares e gerencie solicitações de acesso.
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-3">
-            <Button
-              variant="primary"
-              onClick={() => setShowCreateModal(true)}
-              className="flex items-center gap-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-lg shadow-emerald-900/30 font-semibold"
-            >
-              <UserPlus size={18} />
-              Criar Novo Usuário
+    <div className="space-y-6 animate-fade-in">
+      <PageHeader
+        title="Usuários e permissões"
+        description="Cadastre usuários, vincule aparelhos e aprove pedidos de acesso."
+        icon={<Shield size={18} />}
+        actions={
+          <>
+            <Button variant="secondary" onClick={loadData} disabled={loading} icon={<RefreshCw size={14} className={loading ? "animate-spin" : ""} />}>
+              Atualizar
             </Button>
-
-            <Button
-              variant="ghost"
-              onClick={loadData}
-              disabled={loading}
-              className="p-2.5 text-slate-300 border border-slate-700 hover:text-white"
-            >
-              <RefreshCw size={18} className={loading ? "animate-spin" : ""} />
+            <Button onClick={() => setShowCreateModal(true)} icon={<UserPlus size={15} />}>
+              Novo usuário
             </Button>
-          </div>
-        </div>
+          </>
+        }
+      />
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatCard label="Pedidos pendentes" value={pendingRequests.length} icon={<Clock size={14} />} tone={pendingRequests.length > 0 ? "warning" : "neutral"} />
+        <StatCard label="Acessos liberados" value={approvedRequests.length} icon={<ShieldCheck size={14} />} tone="success" />
+        <StatCard label="Usuários" value={usersList.length} icon={<Users size={14} />} tone="accent" />
+        <StatCard label="Aparelhos vinculados" value={assignmentsList.length} icon={<Smartphone size={14} />} tone="info" />
       </div>
 
       {feedbackMsg && (
         <div
-          className={`p-4 rounded-xl border flex items-center justify-between text-sm font-medium ${
+          role="status"
+          className={`flex items-center justify-between gap-3 rounded-lg border px-4 py-2.5 text-[0.8125rem] ${
             feedbackMsg.type === "success"
-              ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-300"
-              : "bg-red-500/15 border-red-500/30 text-red-300"
+              ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+              : "border-red-500/25 bg-red-500/10 text-red-600 dark:text-red-400"
           }`}
         >
-          <div className="flex items-center gap-3">
-            {feedbackMsg.type === "success" ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}
-            <span>{feedbackMsg.text}</span>
-          </div>
-          <button onClick={() => setFeedbackMsg(null)} className="text-slate-400 hover:text-white">
-            <X size={16} />
+          <span className="flex items-center gap-2 min-w-0">
+            {feedbackMsg.type === "success" ? <CheckCircle2 size={15} className="shrink-0" /> : <AlertCircle size={15} className="shrink-0" />}
+            <span className="break-words">{feedbackMsg.text}</span>
+          </span>
+          <button onClick={() => setFeedbackMsg(null)} aria-label="Fechar aviso" className="shrink-0 cursor-pointer">
+            <X size={15} />
           </button>
         </div>
       )}
 
-      {/* Navegação entre Sub-Abas do Gestor */}
-      <div className="flex items-center gap-2 border-b border-slate-800 pb-2">
-        <button
-          onClick={() => setActiveSubTab("requests")}
-          className={`px-4 py-2.5 rounded-xl font-semibold text-sm flex items-center gap-2 transition-all ${
-            activeSubTab === "requests"
-              ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
-              : "text-slate-400 hover:text-white hover:bg-slate-800/50"
-          }`}
-        >
-          <Zap size={16} />
-          Solicitações de Acesso
-          {pendingRequests.length > 0 && (
-            <span className="px-2 py-0.5 text-xs font-bold rounded-full bg-amber-500 text-slate-950">
-              {pendingRequests.length}
-            </span>
-          )}
-        </button>
+      <Tabs
+        value={activeSubTab}
+        onChange={setActiveSubTab}
+        items={[
+          { id: "requests", label: "Pedidos de acesso", icon: <Zap size={14} />, count: pendingRequests.length },
+          { id: "users", label: "Usuários", icon: <Users size={14} />, count: usersList.length },
+          { id: "assignments", label: "Aparelhos vinculados", icon: <Link size={14} />, count: assignmentsList.length },
+        ]}
+      />
 
-        <button
-          onClick={() => setActiveSubTab("users")}
-          className={`px-4 py-2.5 rounded-xl font-semibold text-sm flex items-center gap-2 transition-all ${
-            activeSubTab === "users"
-              ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
-              : "text-slate-400 hover:text-white hover:bg-slate-800/50"
-          }`}
-        >
-          <Users size={16} />
-          Usuários do Sistema ({usersList.length})
-        </button>
-
-        <button
-          onClick={() => setActiveSubTab("assignments")}
-          className={`px-4 py-2.5 rounded-xl font-semibold text-sm flex items-center gap-2 transition-all ${
-            activeSubTab === "assignments"
-              ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
-              : "text-slate-400 hover:text-white hover:bg-slate-800/50"
-          }`}
-        >
-          <Link size={16} />
-          Vínculo de Celulares
-        </button>
-      </div>
-
-      {/* CONTEÚDO 1: Solicitações de Acesso dos Colaboradores */}
+      {/* Pedidos de acesso */}
       {activeSubTab === "requests" && (
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-bold text-white flex items-center gap-2">
-              <Clock size={20} className="text-emerald-400" />
-              Solicitações de Permissão Enviadas pelos Colaboradores
-            </h2>
-            <span className="text-xs text-slate-400">Total: {permissionRequests.length} solicitações</span>
-          </div>
-
-          {permissionRequests.length === 0 ? (
-            <Card className="p-8 text-center bg-slate-900/60 border border-slate-800">
-              <ShieldCheck size={48} className="mx-auto text-slate-600 mb-3" />
-              <h3 className="text-base font-semibold text-white">Nenhuma solicitação no momento</h3>
-              <p className="text-xs text-slate-400 mt-1">
-                Quando colaboradores pedirem permissão para usar seus celulares vinculados, elas aparecerão aqui em tempo real.
-              </p>
-            </Card>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {permissionRequests.map((req) => {
-                const isPending = req.status === "pending";
-                const isApproved = req.status === "approved";
-
-                return (
-                  <Card
-                    key={req.requestId}
-                    className={`p-5 space-y-4 border transition-all ${
-                      isPending
-                        ? "border-amber-500/50 bg-amber-950/20 shadow-lg shadow-amber-950/30"
-                        : isApproved
-                        ? "border-emerald-500/40 bg-emerald-950/20"
-                        : "border-slate-800 bg-slate-900/60 opacity-80"
-                    }`}
-                  >
-                    <div className="flex items-start justify-between">
-                      <div>
-                        <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-                          Colaborador Pedinte
-                        </span>
-                        <h4 className="text-base font-bold text-white mt-0.5">
-                          {req.userDisplayName || req.userName}
-                        </h4>
-                        <p className="text-xs text-emerald-400 font-mono mt-0.5">
-                          Celular: {req.adbDeviceId}
-                        </p>
-                      </div>
-
-                      <Badge
-                        variant={
-                          isApproved ? "success" : isPending ? "warning" : "danger"
-                        }
-                        className="capitalize"
-                      >
-                        {req.status}
-                      </Badge>
-                    </div>
-
-                    <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800/80 text-xs space-y-1">
-                      <span className="text-slate-400 font-medium block">Motivo Informado:</span>
-                      <p className="text-slate-200 italic">
-                        "{req.requestedReason || "Sem observações adicionais"}"
-                      </p>
-                      <p className="text-[10px] text-slate-500 pt-1">
-                        Solicitado em: {new Date(req.requestedAt).toLocaleString("pt-BR")}
-                      </p>
-                    </div>
-
-                    {/* Botões de Decisão do Gestor */}
-                    <div className="pt-1">
-                      {isPending ? (
-                        <div className="grid grid-cols-2 gap-2">
-                          <Button
-                            variant="primary"
-                            onClick={() => handleApproveRequest(req.requestId)}
-                            className="bg-emerald-600 hover:bg-emerald-500 text-xs py-2 flex items-center justify-center gap-1 font-semibold"
-                          >
-                            <Check size={16} />
-                            Aprovar
-                          </Button>
-
-                          <Button
-                            variant="danger"
-                            onClick={() => handleRejectRequest(req.requestId)}
-                            className="text-xs py-2 flex items-center justify-center gap-1"
-                          >
-                            <X size={16} />
-                            Recusar
-                          </Button>
-                        </div>
-                      ) : isApproved ? (
-                        <div className="space-y-2">
-                          <p className="text-xs text-emerald-400 font-medium text-center">
-                            Aprovado por: {req.approvedByName || "Gestor"}
-                          </p>
-                          <Button
-                            variant="danger"
-                            onClick={() => handleEndSession(req.requestId)}
-                            className="w-full text-xs py-2 flex items-center justify-center gap-1"
-                          >
-                            <Power size={14} />
-                            Revogar / Encerrar Permissão
-                          </Button>
-                        </div>
-                      ) : (
-                        <p className="text-xs text-red-400 text-center font-medium">
-                          Solicitação Recusada
-                        </p>
-                      )}
-                    </div>
-                  </Card>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* CONTEÚDO 2: Lista e Cadastro de Usuários por Role */}
-      {activeSubTab === "users" && (
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-bold text-white flex items-center gap-2">
-              <Users size={20} className="text-emerald-400" />
-              Usuários Cadastrados na Empresa
-            </h2>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {usersList.map((u) => (
-              <Card key={u.id} className="p-5 border border-slate-800 bg-slate-900/80 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <div
-                      className={`p-2.5 rounded-xl border ${
-                        u.role === "gestor" || u.role === "master"
-                          ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-400"
-                          : u.role === "supervisor"
-                          ? "bg-purple-500/20 border-purple-500/40 text-purple-400"
-                          : "bg-blue-500/20 border-blue-500/40 text-blue-400"
-                      }`}
-                    >
-                      {u.role === "gestor" || u.role === "master" ? (
-                        <Shield size={20} />
-                      ) : u.role === "supervisor" ? (
-                        <Eye size={20} />
-                      ) : (
-                        <Users size={20} />
-                      )}
-                    </div>
-                    <div>
-                      <h4 className="text-base font-bold text-white">{u.displayName}</h4>
-                      <p className="text-xs text-slate-400">@{u.username}</p>
-                    </div>
-                  </div>
-
-                  <span
-                    className={`text-xs font-bold uppercase tracking-wider px-2.5 py-1 rounded-lg border ${
-                      u.role === "gestor" || u.role === "master"
-                        ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
-                        : u.role === "supervisor"
-                        ? "bg-purple-500/15 text-purple-300 border-purple-500/30"
-                        : "bg-blue-500/15 text-blue-300 border-blue-500/30"
-                    }`}
-                  >
-                    {u.role}
-                  </span>
-                </div>
-
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800/80 text-xs space-y-1">
-                  <span className="text-slate-400 block font-medium">Permissões de Tela:</span>
-                  <p className="text-slate-300">
-                    {u.role === "colaborador"
-                      ? "Acesso restrito para solicitar uso dos celulares atribuídos."
-                      : u.role === "supervisor"
-                      ? "Visualiza todos os celulares e monitora colaborador ativo."
-                      : "Acesso total ao sistema e central de aprovação do Gestor."}
-                  </p>
-                </div>
-              </Card>
+        loading && permissionRequests.length === 0 ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className="h-40 rounded-xl border border-border bg-card skeleton" />
             ))}
           </div>
+        ) : permissionRequests.length === 0 ? (
+          <EmptyState
+            icon={<ShieldCheck size={18} />}
+            title="Nenhum pedido de acesso"
+            description="Quando um colaborador pedir para usar um aparelho vinculado, o pedido aparece aqui."
+          />
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            {permissionRequests.map((req) => {
+              const isPending = req.status === "pending";
+              const isApproved = req.status === "approved";
+              const who = req.userDisplayName || req.userName;
+
+              return (
+                <Card key={req.requestId} padding="md" className="flex flex-col gap-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <h4 className="text-sm font-semibold text-primary truncate">{who}</h4>
+                      <p className="mt-0.5 text-xs text-tertiary font-mono truncate">Aparelho {req.adbDeviceId}</p>
+                    </div>
+                    <Badge variant={isApproved ? "success" : isPending ? "warning" : "danger"} dot>
+                      {statusLabel(req.status)}
+                    </Badge>
+                  </div>
+
+                  <div className="rounded-lg border border-border bg-secondary p-3 text-xs space-y-1">
+                    <p className="text-primary">{req.requestedReason || "Sem motivo informado."}</p>
+                    <p className="text-tertiary">Pedido em {new Date(req.requestedAt).toLocaleString("pt-BR")}</p>
+                  </div>
+
+                  <div className="mt-auto">
+                    {isPending ? (
+                      <div className="grid grid-cols-2 gap-2">
+                        <Button variant="success" size="sm" icon={<Check size={14} />} onClick={() => handleApproveRequest(req.requestId)}>
+                          Aprovar
+                        </Button>
+                        <Button
+                          variant="danger"
+                          size="sm"
+                          icon={<X size={14} />}
+                          onClick={() =>
+                            setConfirmAction({
+                              title: "Recusar pedido",
+                              message: `O pedido de ${who} para usar o aparelho ${req.adbDeviceId} será recusado.`,
+                              confirmLabel: "Recusar",
+                              run: () => handleRejectRequest(req.requestId),
+                            })
+                          }
+                        >
+                          Recusar
+                        </Button>
+                      </div>
+                    ) : isApproved ? (
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs text-secondary">Aprovado por {req.approvedByName || "Gestor"}</span>
+                        <Button
+                          variant="danger"
+                          size="sm"
+                          icon={<Power size={13} />}
+                          onClick={() =>
+                            setConfirmAction({
+                              title: "Encerrar acesso",
+                              message: `${who} perderá o acesso ao aparelho ${req.adbDeviceId} imediatamente.`,
+                              confirmLabel: "Encerrar acesso",
+                              run: () => handleEndSession(req.requestId),
+                            })
+                          }
+                        >
+                          Encerrar acesso
+                        </Button>
+                      </div>
+                    ) : (
+                      <p className="text-xs text-tertiary">Pedido recusado.</p>
+                    )}
+                  </div>
+                </Card>
+              );
+            })}
+          </div>
+        )
+      )}
+
+      {/* Usuários */}
+      {activeSubTab === "users" && (
+        <div className="space-y-4">
+          <div className="relative max-w-md flex items-center">
+            <Search size={16} className="input-icon-left text-tertiary" />
+            <input
+              type="text"
+              aria-label="Buscar usuário"
+              placeholder="Buscar por nome, login ou função"
+              value={userSearch}
+              onChange={(e) => setUserSearch(e.target.value)}
+              className="w-full input-with-icon-left"
+            />
+          </div>
+
+          {loading && usersList.length === 0 ? (
+            <div className="h-40 rounded-xl border border-border bg-card skeleton" />
+          ) : filteredUsers.length === 0 ? (
+            <EmptyState
+              icon={<Users size={18} />}
+              title={usersList.length === 0 ? "Nenhum usuário cadastrado" : "Nenhum usuário encontrado"}
+              description={usersList.length === 0 ? "Crie o primeiro usuário da empresa." : "Revise o termo buscado."}
+              action={
+                usersList.length === 0 ? (
+                  <Button icon={<UserPlus size={15} />} onClick={() => setShowCreateModal(true)}>Novo usuário</Button>
+                ) : (
+                  <Button variant="secondary" onClick={() => setUserSearch("")}>Limpar busca</Button>
+                )
+              }
+            />
+          ) : (
+            <Card padding="none">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="border-b border-border text-xs text-tertiary">
+                      <th className="px-4 py-2.5 font-medium">Usuário</th>
+                      <th className="px-4 py-2.5 font-medium">Login</th>
+                      <th className="px-4 py-2.5 font-medium">Função</th>
+                      <th className="px-4 py-2.5 font-medium">Permissões</th>
+                      <th className="px-4 py-2.5 font-medium text-right">Aparelhos</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border text-[0.8125rem]">
+                    {filteredUsers.map((u) => (
+                      <tr key={u.id} className="hover:bg-hover transition-colors">
+                        <td className="px-4 py-3 font-medium text-primary">{u.displayName}</td>
+                        <td className="px-4 py-3 font-mono text-xs text-secondary">@{u.username}</td>
+                        <td className="px-4 py-3">
+                          <Badge variant={roleVariant(u.role)}>{roleLabel(u.role)}</Badge>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-secondary">{roleDescription(u.role)}</td>
+                        <td className="px-4 py-3 text-right tabular-nums text-secondary">
+                          {assignmentsList.filter((a) => a.userId === u.id).length}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
         </div>
       )}
 
-      {/* CONTEÚDO 3: Vínculo de Celulares aos Colaboradores */}
+      {/* Vínculo de aparelhos */}
       {activeSubTab === "assignments" && (
         <div className="space-y-6">
-          <Card className="p-6 border border-slate-800 bg-slate-900/80 space-y-4">
-            <h3 className="text-base font-bold text-white flex items-center gap-2">
-              <Link size={18} className="text-emerald-400" />
-              Vincular Celular a um Colaborador Responsável
-            </h3>
-            <p className="text-xs text-slate-400">
-              Selecione o colaborador e o celular para tornar o colaborador responsável por aquele aparelho.
-            </p>
+          <Card padding="md">
+            <FormSection title="Vincular aparelho" description="O usuário escolhido passa a ser responsável pelo aparelho.">
+              <form onSubmit={handleAssignDevice} className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+                <Field label="Usuário" htmlFor="assign-user">
+                  <select
+                    id="assign-user"
+                    value={selectedUserForAssign}
+                    onChange={(e) => setSelectedUserForAssign(e.target.value ? Number(e.target.value) : "")}
+                  >
+                    <option value="">Selecione um usuário</option>
+                    {usersList.map((u) => (
+                      <option key={u.id} value={u.id}>
+                        {u.displayName} ({roleLabel(u.role)})
+                      </option>
+                    ))}
+                  </select>
+                </Field>
 
-            <form onSubmit={handleAssignDevice} className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
-              <div>
-                <label className="text-xs font-semibold text-slate-300 block mb-1.5">
-                  Colaborador:
-                </label>
-                <select
-                  value={selectedUserForAssign}
-                  onChange={(e) => setSelectedUserForAssign(e.target.value ? Number(e.target.value) : "")}
-                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500"
-                >
-                  <option value="">Selecione um usuário...</option>
-                  {usersList.map((u) => (
-                    <option key={u.id} value={u.id}>
-                      {u.displayName} ({u.role})
-                    </option>
-                  ))}
-                </select>
-              </div>
+                <Field label="Aparelho" htmlFor="assign-device">
+                  <select
+                    id="assign-device"
+                    value={selectedDeviceForAssign}
+                    onChange={(e) => setSelectedDeviceForAssign(e.target.value)}
+                  >
+                    <option value="">Selecione o aparelho</option>
+                    {companyDevices.map((d) => (
+                      <option key={d.serial} value={d.serial}>
+                        {d.name || d.model} ({d.serial})
+                      </option>
+                    ))}
+                  </select>
+                </Field>
 
-              <div>
-                <label className="text-xs font-semibold text-slate-300 block mb-1.5">
-                  Celular ADB:
-                </label>
-                <select
-                  value={selectedDeviceForAssign}
-                  onChange={(e) => setSelectedDeviceForAssign(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500"
-                >
-                  <option value="">Selecione o aparelho...</option>
-                  {companyDevices.map((d) => (
-                    <option key={d.serial} value={d.serial}>
-                      {d.name || d.model} ({d.serial})
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="flex items-end">
                 <Button
                   type="submit"
-                  variant="primary"
-                  disabled={assigning || !selectedUserForAssign || !selectedDeviceForAssign}
-                  className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 font-semibold text-xs flex items-center justify-center gap-2"
+                  icon={<Link size={14} />}
+                  loading={assigning}
+                  disabled={!selectedUserForAssign || !selectedDeviceForAssign}
                 >
-                  <Link size={14} />
-                  {assigning ? "Vinculando..." : "Confirmar Vínculo"}
+                  {assigning ? "Vinculando..." : "Vincular"}
                 </Button>
-              </div>
-            </form>
+              </form>
+            </FormSection>
           </Card>
 
-          {/* Lista de Vínculos Existentes */}
           <div className="space-y-3">
-            <h4 className="text-sm font-bold text-white flex items-center gap-2">
-              <Users size={16} className="text-indigo-400" />
-              Colaboradores e Celulares Vinculados Atualmente ({assignmentsList.length})
-            </h4>
+            <h2 className="text-sm font-semibold text-primary">Vínculos atuais ({assignmentsList.length})</h2>
 
             {assignmentsList.length === 0 ? (
-              <Card className="p-6 text-center border border-slate-800 bg-slate-900/60">
-                <p className="text-xs text-slate-400">Nenhum celular vinculado a colaboradores no momento.</p>
-              </Card>
+              <EmptyState
+                icon={<Smartphone size={18} />}
+                title="Nenhum aparelho vinculado"
+                description="Use o formulário acima para atribuir um aparelho a um usuário."
+              />
             ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {assignmentsList.map((a) => (
-                  <Card key={a.assignmentId} className="p-4 border border-slate-800 bg-slate-900/80 space-y-3">
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className="p-2.5 bg-indigo-500/20 border border-indigo-500/40 rounded-xl text-indigo-400">
-                          <Smartphone size={20} />
-                        </div>
-                        <div>
-                          <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-400">
-                            Aparelho #{a.deviceNumber || "?"}
-                          </span>
-                          <h5 className="text-sm font-bold text-white mt-0.5">
-                            {a.deviceName || a.model || a.adbDeviceId}
-                          </h5>
-                          <p className="text-[11px] text-slate-400 font-mono">{a.adbDeviceId}</p>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="p-2.5 bg-slate-950/60 rounded-xl border border-slate-800/80 text-xs flex items-center justify-between">
-                      <div>
-                        <span className="text-[10px] text-slate-500 block uppercase font-semibold">Responsável:</span>
-                        <span className="font-semibold text-slate-200">{a.userDisplayName || a.userName}</span>
-                      </div>
-
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => handleUnassignDevice(a)}
-                        disabled={unassigning === a.assignmentId}
-                        className="text-red-400 hover:text-red-300 hover:bg-red-500/10 text-xs px-2 py-1 flex items-center gap-1 border border-red-500/20"
-                      >
-                        {unassigning === a.assignmentId ? (
-                          <RefreshCw size={12} className="animate-spin" />
-                        ) : (
-                          <Unlink size={12} />
-                        )}
-                        Desvincular
-                      </Button>
-                    </div>
-                  </Card>
-                ))}
-              </div>
+              <Card padding="none">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="border-b border-border text-xs text-tertiary">
+                        <th className="px-4 py-2.5 font-medium">Aparelho</th>
+                        <th className="px-4 py-2.5 font-medium">Serial</th>
+                        <th className="px-4 py-2.5 font-medium">Responsável</th>
+                        <th className="px-4 py-2.5 font-medium text-right">Ação</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-border text-[0.8125rem]">
+                      {assignmentsList.map((a) => {
+                        const deviceLabel = a.deviceName || a.model || a.adbDeviceId;
+                        const owner = a.userDisplayName || a.userName;
+                        return (
+                          <tr key={a.assignmentId} className="hover:bg-hover transition-colors">
+                            <td className="px-4 py-3">
+                              <span className="inline-flex items-center gap-2 font-medium text-primary">
+                                <Smartphone size={14} className="text-tertiary" />
+                                {deviceLabel}
+                                {a.deviceNumber ? <span className="text-xs font-normal text-tertiary">#{a.deviceNumber}</span> : null}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 font-mono text-xs text-secondary">{a.adbDeviceId}</td>
+                            <td className="px-4 py-3 text-secondary">{owner}</td>
+                            <td className="px-4 py-3 text-right">
+                              <Button
+                                variant="danger"
+                                size="sm"
+                                loading={unassigning === a.assignmentId}
+                                icon={<Unlink size={12} />}
+                                onClick={() =>
+                                  setConfirmAction({
+                                    title: "Desvincular aparelho",
+                                    message: `${deviceLabel} deixará de estar vinculado a ${owner}.`,
+                                    confirmLabel: "Desvincular",
+                                    run: () => handleUnassignDevice(a),
+                                  })
+                                }
+                              >
+                                Desvincular
+                              </Button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
             )}
           </div>
         </div>
       )}
 
-      {/* MODAL: Criação de Usuário com Seleção de Tipo (Role Selector) */}
-      {showCreateModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-lg shadow-2xl space-y-6">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-4">
-              <div className="flex items-center gap-3">
-                <div className="p-2.5 bg-emerald-500/20 border border-emerald-500/40 rounded-xl text-emerald-400">
-                  <UserPlus size={24} />
-                </div>
-                <div>
-                  <h3 className="text-lg font-bold text-white">Criar Novo Usuário</h3>
-                  <p className="text-xs text-slate-400">Escolha a função e credenciais do usuário</p>
-                </div>
-              </div>
-              <button
-                onClick={() => setShowCreateModal(false)}
-                className="text-slate-400 hover:text-white p-1"
-              >
-                <X size={20} />
-              </button>
-            </div>
+      {/* Novo usuário */}
+      <Modal
+        isOpen={showCreateModal}
+        onClose={() => setShowCreateModal(false)}
+        title="Novo usuário"
+        footer={
+          <>
+            <Button type="button" variant="secondary" onClick={() => setShowCreateModal(false)}>
+              Cancelar
+            </Button>
+            <Button type="submit" form="create-user-form" loading={creatingUser} icon={<UserPlus size={15} />}>
+              {creatingUser ? "Criando..." : "Criar usuário"}
+            </Button>
+          </>
+        }
+      >
+        <form id="create-user-form" onSubmit={handleCreateUser} className="space-y-4">
+          <Field label="Nome" required htmlFor="new-display">
+            <input
+              id="new-display"
+              type="text"
+              required
+              value={newDisplayName}
+              onChange={(e) => setNewDisplayName(e.target.value)}
+              placeholder="Nome completo"
+            />
+          </Field>
 
-            <form onSubmit={handleCreateUser} className="space-y-4">
-              <div>
-                <label className="text-xs font-semibold text-slate-300 block mb-1">
-                  Nome de Exibição (Ex: João Silva):
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={newDisplayName}
-                  onChange={(e) => setNewDisplayName(e.target.value)}
-                  placeholder="Nome completo do usuário"
-                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-xs font-semibold text-slate-300 block mb-1">
-                    Usuário de Login (Username):
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={newUsername}
-                    onChange={(e) => setNewUsername(e.target.value)}
-                    placeholder="joao.silva"
-                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500"
-                  />
-                </div>
-
-                <div>
-                  <label className="text-xs font-semibold text-slate-300 block mb-1">
-                    Senha:
-                  </label>
-                  <input
-                    type="password"
-                    required
-                    value={newPassword}
-                    onChange={(e) => setNewPassword(e.target.value)}
-                    placeholder="••••••••"
-                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500"
-                  />
-                </div>
-              </div>
-
-              {/* SELETOR VISUAL DO TIPO DE USUÁRIO / ROLE */}
-              <div className="space-y-2 pt-2">
-                <label className="text-xs font-semibold text-slate-300 block">
-                  Selecione o Tipo de Login / Função:
-                </label>
-
-                <div className="grid grid-cols-3 gap-3">
-                  {/* Card Colaborador */}
-                  <div
-                    onClick={() => setNewRole("colaborador")}
-                    className={`p-3 rounded-xl border cursor-pointer transition-all space-y-1 ${
-                      newRole === "colaborador"
-                        ? "bg-blue-500/20 border-blue-500 text-blue-300 shadow-md shadow-blue-950/50"
-                        : "bg-slate-950/60 border-slate-800 text-slate-400 hover:border-slate-700"
-                    }`}
-                  >
-                    <Users size={20} className={newRole === "colaborador" ? "text-blue-400" : "text-slate-500"} />
-                    <h5 className="text-xs font-bold text-white">Colaborador</h5>
-                    <p className="text-[10px] leading-tight text-slate-400">
-                      Pede permissão para celulares vinculados.
-                    </p>
-                  </div>
-
-                  {/* Card Supervisor */}
-                  <div
-                    onClick={() => setNewRole("supervisor")}
-                    className={`p-3 rounded-xl border cursor-pointer transition-all space-y-1 ${
-                      newRole === "supervisor"
-                        ? "bg-purple-500/20 border-purple-500 text-purple-300 shadow-md shadow-purple-950/50"
-                        : "bg-slate-950/60 border-slate-800 text-slate-400 hover:border-slate-700"
-                    }`}
-                  >
-                    <Eye size={20} className={newRole === "supervisor" ? "text-purple-400" : "text-slate-500"} />
-                    <h5 className="text-xs font-bold text-white">Supervisor</h5>
-                    <p className="text-[10px] leading-tight text-slate-400">
-                      Monitora todos os celulares e quem opera.
-                    </p>
-                  </div>
-
-                  {/* Card Gestor */}
-                  <div
-                    onClick={() => setNewRole("gestor")}
-                    className={`p-3 rounded-xl border cursor-pointer transition-all space-y-1 ${
-                      newRole === "gestor"
-                        ? "bg-emerald-500/20 border-emerald-500 text-emerald-300 shadow-md shadow-emerald-950/50"
-                        : "bg-slate-950/60 border-slate-800 text-slate-400 hover:border-slate-700"
-                    }`}
-                  >
-                    <Shield size={20} className={newRole === "gestor" ? "text-emerald-400" : "text-slate-500"} />
-                    <h5 className="text-xs font-bold text-white">Gestor</h5>
-                    <p className="text-[10px] leading-tight text-slate-400">
-                      Acesso total + Aprova permissões.
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3 pt-4 border-t border-slate-800">
-                <Button
-                  type="submit"
-                  variant="primary"
-                  disabled={creatingUser}
-                  className="flex-1 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 font-semibold text-xs flex items-center justify-center gap-2"
-                >
-                  <UserPlus size={16} />
-                  {creatingUser ? "Criando Usuário..." : "Concluir Cadastro"}
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  onClick={() => setShowCreateModal(false)}
-                  className="py-2.5 text-xs text-slate-400"
-                >
-                  Cancelar
-                </Button>
-              </div>
-            </form>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Login" required htmlFor="new-username">
+              <input
+                id="new-username"
+                type="text"
+                required
+                value={newUsername}
+                onChange={(e) => setNewUsername(e.target.value)}
+                placeholder="joao.silva"
+              />
+            </Field>
+            <Field label="Senha" required htmlFor="new-password">
+              <input
+                id="new-password"
+                type="password"
+                required
+                autoComplete="new-password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                placeholder="Senha de acesso"
+              />
+            </Field>
           </div>
-        </div>
-      )}
+
+          <Field label="Função">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2" role="radiogroup" aria-label="Função do usuário">
+              {roleOptions.map((opt) => {
+                const selected = newRole === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={selected}
+                    onClick={() => setNewRole(opt.id)}
+                    className={`rounded-lg border p-3 text-left transition-colors cursor-pointer ${
+                      selected
+                        ? "border-[var(--color-accent)] bg-[var(--color-accent-glow)]"
+                        : "border-border hover:border-border-strong"
+                    }`}
+                  >
+                    <span className={selected ? "text-[var(--color-accent-light)]" : "text-tertiary"}>{opt.icon}</span>
+                    <span className="mt-1.5 block text-[0.8125rem] font-medium text-primary">{opt.label}</span>
+                    <span className="mt-0.5 block text-xs text-tertiary leading-snug">{opt.desc}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </Field>
+        </form>
+      </Modal>
+
+      {/* Confirmação de ações destrutivas */}
+      <Modal
+        isOpen={!!confirmAction}
+        onClose={() => setConfirmAction(null)}
+        title={confirmAction?.title || ""}
+        size="sm"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setConfirmAction(null)}>Cancelar</Button>
+            <Button variant="danger" onClick={runConfirm}>{confirmAction?.confirmLabel}</Button>
+          </>
+        }
+      >
+        <p className="text-[0.8125rem] text-secondary">{confirmAction?.message}</p>
+      </Modal>
     </div>
   );
 }

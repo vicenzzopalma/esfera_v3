@@ -1,6 +1,6 @@
 // ============================================================
-// Esfera v3 — Global Header Component
-// Barra superior com breadcrumb, switcher de empresas, status ADB e perfil
+// Esfera v3 — Header global
+// Contexto (empresa / página), troca de empresa, tema e menu do usuário
 // ============================================================
 
 import { useState, useEffect, useRef } from "react";
@@ -9,27 +9,21 @@ import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
 import { api } from "../tauri";
 import type { Company, Device } from "../types";
-import {
-  Building2,
-  ChevronDown,
-  Sun,
-  Moon,
-  CheckCircle2,
-  Cpu,
-  LogOut,
-  UserCheck,
-} from "lucide-react";
+import { Building2, ChevronDown, ChevronRight, Check, Sun, Moon, LogOut, Settings } from "lucide-react";
 
 const PAGE_TITLES: Record<string, { title: string; subtitle: string }> = {
-  "/companies": { title: "Gestão de Empresas", subtitle: "Gerencie permissões e cotas de clientes" },
-  "/permissions": { title: "Permissões", subtitle: "Controle de acesso por usuário e setor" },
-  "/dashboard": { title: "Dashboard", subtitle: "Indicadores e KPIs em tempo real" },
-  "/devices": { title: "Hub de Dispositivos ADB", subtitle: "Conexões ativas e status em tempo real" },
-  "/campaigns": { title: "Central de Campanhas", subtitle: "Disparos inteligentes e fluxo de contatos" },
-  "/automations": { title: "Regras de Automação", subtitle: "Respostas automáticas por palavras-chave" },
-  "/logs": { title: "Logs do Sistema", subtitle: "Histórico detalhado de eventos e execuções" },
-  "/settings": { title: "Configurações da Empresa", subtitle: "Preferências e conexões de infraestrutura" },
+  "/companies": { title: "Empresas", subtitle: "Empresas, cotas e limites" },
+  "/permissions": { title: "Usuários e permissões", subtitle: "Acessos, solicitações e vínculos de aparelhos" },
+  "/dashboard": { title: "Dashboard", subtitle: "Indicadores de desempenho" },
+  "/devices": { title: "Dispositivos", subtitle: "Conexões, espelhamento e status" },
+  "/campaigns": { title: "Campanhas", subtitle: "Disparos e fluxo de contatos" },
+  "/automations": { title: "Automações", subtitle: "Respostas automáticas por palavra-chave" },
+  "/logs": { title: "Logs", subtitle: "Histórico de eventos e execuções" },
+  "/settings": { title: "Configurações", subtitle: "Preferências e infraestrutura" },
 };
+
+const menuItem =
+  "w-full flex items-center gap-2 px-2.5 h-8 rounded-md text-[0.8125rem] text-secondary hover:text-primary hover:bg-hover transition-colors cursor-pointer";
 
 export default function Header() {
   const { user, selectedCompanyId, enterCompany, leaveCompany, logout } = useAuth();
@@ -44,15 +38,6 @@ export default function Header() {
 
   const companyDropdownRef = useRef<HTMLDivElement>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
-
-  if (!user) return null;
-
-  const currentRoute = PAGE_TITLES[location.pathname] || {
-    title: "Esfera v3",
-    subtitle: "Plataforma de Disparos Inteligentes",
-  };
-
-  const selectedCompany = companies.find((c) => c.id === selectedCompanyId);
 
   useEffect(() => {
     let mounted = true;
@@ -74,7 +59,7 @@ export default function Header() {
     return () => { mounted = false; };
   }, [selectedCompanyId]);
 
-  // Bug 7: Fechar dropdowns ao clicar fora
+  // Fechar menus ao clicar fora ou com Esc
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       if (companyDropdownRef.current && !companyDropdownRef.current.contains(e.target as Node)) {
@@ -84,9 +69,29 @@ export default function Header() {
         setUserMenuOpen(false);
       }
     };
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setCompanyDropdownOpen(false);
+        setUserMenuOpen(false);
+      }
+    };
     document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleEsc);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleEsc);
+    };
   }, []);
+
+  if (!user) return null;
+
+  const currentRoute = PAGE_TITLES[location.pathname] || {
+    title: "Esfera",
+    subtitle: "",
+  };
+
+  const selectedCompany = companies.find((c) => c.id === selectedCompanyId);
+  const canSwitch = user.role === "master";
 
   const handleCompanySelect = (companyId: number) => {
     enterCompany(companyId);
@@ -101,125 +106,144 @@ export default function Header() {
   };
 
   return (
-    <header className="sticky top-0 z-30 h-12 w-full glass-header flex items-center justify-between px-5 gap-4 transition-all bg-[#0b0b0e]/90 border-b border-white/[0.07]">
-      {/* Left: Breadcrumb & Context */}
-      <div className="flex items-center gap-2 min-w-0 text-xs">
-        {selectedCompany ? (
-          <div className="relative" ref={companyDropdownRef}>
-            <button
-              onClick={() => user.role === "master" && setCompanyDropdownOpen(!companyDropdownOpen)}
-              className={`flex items-center gap-1.5 font-medium text-zinc-400 hover:text-zinc-200 transition-colors ${
-                user.role === "master" ? "cursor-pointer" : "cursor-default"
-              }`}
-            >
-              <Building2 size={13} className="text-[#828DF7] shrink-0" />
-              <span className="truncate max-w-[130px] font-semibold text-zinc-200">{selectedCompany.name}</span>
-              {user.role === "master" && <ChevronDown size={12} className="text-zinc-500 shrink-0" />}
-            </button>
+    <header className="sticky top-0 z-30 h-12 w-full glass-header flex items-center justify-between px-6 gap-4">
+      {/* Contexto: empresa / página */}
+      <div className="flex items-center gap-1.5 min-w-0 text-[0.8125rem]">
+        {selectedCompany && (
+          <>
+            <div className="relative" ref={companyDropdownRef}>
+              <button
+                onClick={() => canSwitch && setCompanyDropdownOpen(!companyDropdownOpen)}
+                aria-haspopup={canSwitch ? "menu" : undefined}
+                aria-expanded={canSwitch ? companyDropdownOpen : undefined}
+                className={`flex items-center gap-1.5 h-7 px-2 rounded-md text-secondary transition-colors ${
+                  canSwitch ? "hover:text-primary hover:bg-hover cursor-pointer" : "cursor-default"
+                }`}
+              >
+                <Building2 size={14} className="text-tertiary shrink-0" />
+                <span className="truncate max-w-[160px]">{selectedCompany.name}</span>
+                {canSwitch && <ChevronDown size={12} className="text-tertiary shrink-0" />}
+              </button>
 
-            {companyDropdownOpen && user.role === "master" && (
-              <div className="absolute left-0 mt-1.5 w-52 rounded-lg glass-panel shadow-2xl p-1 z-50 animate-scale-in bg-[#141418] border border-white/[0.08]">
-                <div className="px-2.5 py-1.5 text-[9px] uppercase font-bold text-zinc-500 tracking-wider border-b border-white/[0.06] mb-1">
-                  Trocar Empresa
+              {companyDropdownOpen && canSwitch && (
+                <div className="absolute left-0 mt-1.5 w-60 rounded-xl glass-panel p-1.5 z-50 animate-scale-in" role="menu">
+                  <div className="px-2.5 py-1.5 text-[11px] uppercase font-medium text-tertiary tracking-wider">
+                    Trocar de empresa
+                  </div>
+                  {companies.length === 0 && (
+                    <div className="px-2.5 py-1.5 text-xs text-tertiary">Nenhuma empresa</div>
+                  )}
+                  <div className="max-h-64 overflow-y-auto custom-scrollbar">
+                    {companies.map((c) => (
+                      <button
+                        key={c.id}
+                        role="menuitem"
+                        onClick={() => handleCompanySelect(c.id)}
+                        className={`w-full flex items-center justify-between gap-2 px-2.5 h-8 rounded-md text-[0.8125rem] transition-colors cursor-pointer ${
+                          selectedCompanyId === c.id
+                            ? "bg-[var(--color-accent-glow)] text-primary font-medium"
+                            : "text-secondary hover:text-primary hover:bg-hover"
+                        }`}
+                      >
+                        <span className="truncate">{c.name}</span>
+                        {selectedCompanyId === c.id && <Check size={14} className="text-[var(--color-accent-light)] shrink-0" />}
+                      </button>
+                    ))}
+                  </div>
+                  {selectedCompanyId !== null && (
+                    <button
+                      role="menuitem"
+                      onClick={handleLeaveCompany}
+                      className="w-full text-left px-2.5 h-8 mt-1 border-t border-border text-[0.8125rem] text-secondary hover:text-primary hover:bg-hover rounded-md transition-colors cursor-pointer"
+                    >
+                      Ver todas as empresas
+                    </button>
+                  )}
                 </div>
-                {companies.length === 0 && (
-                  <div className="px-2.5 py-1.5 text-xs text-zinc-500">Nenhuma empresa</div>
-                )}
-                {companies.map((c) => (
-                  <button
-                    key={c.id}
-                    onClick={() => handleCompanySelect(c.id)}
-                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-xs transition-colors cursor-pointer ${
-                      selectedCompanyId === c.id
-                        ? "bg-[#5E6AD2]/20 text-[#828DF7] font-semibold"
-                        : "text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.04]"
-                    }`}
-                  >
-                    <span className="truncate">{c.name}</span>
-                    {selectedCompanyId === c.id && <CheckCircle2 size={12} className="text-[#828DF7]" />}
-                  </button>
-                ))}
-                {selectedCompanyId !== null && (
-                  <button
-                    onClick={handleLeaveCompany}
-                    className="w-full text-left px-2.5 py-1.5 mt-1 border-t border-white/[0.06] text-xs text-red-400 hover:bg-red-500/10 rounded-md transition-colors cursor-pointer"
-                  >
-                    Todas as empresas
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-        ) : (
-          <span className="text-zinc-400 font-medium">Esfera</span>
+              )}
+            </div>
+            <ChevronRight size={14} className="text-tertiary shrink-0" />
+          </>
         )}
-
-        <span className="text-zinc-600 font-mono">/</span>
-        <h1 className="font-semibold text-zinc-100 tracking-tight truncate">
+        <h1 className="font-semibold text-primary truncate" title={currentRoute.subtitle || undefined}>
           {currentRoute.title}
         </h1>
       </div>
 
-      {/* Right: Engine Badge & User Profile */}
-      <div className="flex items-center gap-3">
-        {/* ADB Engine Status Badge */}
-        <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white/[0.03] border border-white/[0.07] text-[11px]">
-          <Cpu size={12} className="text-[#828DF7] shrink-0" />
-          <span className="text-zinc-500">Engine:</span>
-          <span className="font-medium text-emerald-400 flex items-center gap-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-            {onlineDevicesCount > 0 ? `${onlineDevicesCount} Online` : "Pronto"}
-          </span>
-        </div>
+      {/* Ações */}
+      <div className="flex items-center gap-2">
+        {selectedCompanyId !== null && (
+          <div
+            className="hidden sm:flex items-center gap-1.5 h-7 px-2.5 rounded-md border border-border text-xs text-secondary"
+            title="Aparelhos online"
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full shrink-0 ${onlineDevicesCount > 0 ? "bg-emerald-500" : "bg-zinc-500"}`}
+            />
+            <span className="tabular-nums">
+              {onlineDevicesCount > 0 ? `${onlineDevicesCount} online` : "Nenhum online"}
+            </span>
+          </div>
+        )}
 
-        {/* User Profile Menu */}
+        <button
+          onClick={toggleTheme}
+          aria-label={isDark ? "Mudar para tema claro" : "Mudar para tema escuro"}
+          title={isDark ? "Tema claro" : "Tema escuro"}
+          className="flex items-center justify-center h-7 w-7 rounded-md text-secondary hover:text-primary hover:bg-hover transition-colors cursor-pointer"
+        >
+          {isDark ? <Sun size={15} /> : <Moon size={15} />}
+        </button>
+
         <div className="relative" ref={userMenuRef}>
           <button
             onClick={() => setUserMenuOpen(!userMenuOpen)}
-            className="flex items-center gap-1.5 p-1 rounded-md hover:bg-white/[0.05] transition-all cursor-pointer"
+            aria-haspopup="menu"
+            aria-expanded={userMenuOpen}
+            className="flex items-center gap-2 h-8 pl-1 pr-2 rounded-lg hover:bg-hover transition-colors cursor-pointer"
           >
-            <div className="flex items-center justify-center w-6 h-6 rounded bg-[#5E6AD2] text-white font-bold text-[11px] shadow-sm">
+            <div className="flex items-center justify-center w-6 h-6 rounded-full bg-[var(--color-accent-glow)] text-[var(--color-accent-light)] font-semibold text-[11px]">
               {user.displayName.charAt(0).toUpperCase()}
             </div>
-            <ChevronDown size={12} className="text-zinc-500" />
+            <span className="text-[0.8125rem] font-medium text-primary max-w-[110px] truncate hidden md:inline">
+              {user.displayName}
+            </span>
+            <ChevronDown size={12} className="text-tertiary" />
           </button>
 
           {userMenuOpen && (
-            <div className="absolute right-0 mt-1.5 w-48 rounded-lg glass-panel shadow-2xl p-1 z-50 animate-scale-in bg-[#141418] border border-white/[0.08]">
-              <div className="px-2.5 py-1.5 border-b border-white/[0.06] mb-1">
-                <p className="text-xs font-semibold text-zinc-100 truncate">{user.displayName}</p>
-                <p className="text-[10px] text-zinc-500 capitalize">{user.role}</p>
+            <div className="absolute right-0 mt-1.5 w-56 rounded-xl glass-panel p-1.5 z-50 animate-scale-in" role="menu">
+              <div className="px-2.5 py-2 border-b border-border mb-1">
+                <p className="text-[0.8125rem] font-medium text-primary truncate">{user.displayName}</p>
+                <p className="text-xs text-tertiary capitalize">{user.role}</p>
               </div>
-              <button
-                onClick={() => {
-                  toggleTheme();
-                }}
-                className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-xs text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.04] transition-colors cursor-pointer"
-              >
-                <div className="flex items-center gap-2">
-                  {isDark ? <Sun size={13} /> : <Moon size={13} />}
-                  <span>{isDark ? "Modo Claro" : "Modo Escuro"}</span>
-                </div>
+              <button role="menuitem" onClick={() => toggleTheme()} className={menuItem}>
+                {isDark ? <Sun size={14} /> : <Moon size={14} />}
+                <span>{isDark ? "Tema claro" : "Tema escuro"}</span>
               </button>
+              {(user.role === "master" || user.role === "gestor") && (
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setUserMenuOpen(false);
+                    navigate("/settings");
+                  }}
+                  className={menuItem}
+                >
+                  <Settings size={14} />
+                  <span>Configurações</span>
+                </button>
+              )}
               <button
-                onClick={() => {
-                  setUserMenuOpen(false);
-                  navigate("/settings");
-                }}
-                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-xs text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.04] transition-colors cursor-pointer"
-              >
-                <UserCheck size={13} />
-                <span>Perfil & Ajustes</span>
-              </button>
-              <button
+                role="menuitem"
                 onClick={() => {
                   setUserMenuOpen(false);
                   logout();
                   navigate("/login");
                 }}
-                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-xs text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer mt-1 border-t border-white/[0.06]"
+                className="w-full flex items-center gap-2 px-2.5 h-8 mt-1 border-t border-border rounded-md text-[0.8125rem] text-red-500 hover:bg-red-500/10 transition-colors cursor-pointer"
               >
-                <LogOut size={13} />
+                <LogOut size={14} />
                 <span>Sair</span>
               </button>
             </div>

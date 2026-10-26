@@ -1,7 +1,6 @@
 // ============================================================
-// Esfera v3 — Settings Tab (UI/UX Refatorado)
-// Configurações da Empresa, IA, Dispatch, ADB e Segurança
-// Layout com Menu Lateral Interno e Espaçamento Aprimorado
+// Esfera v3 — Configurações
+// Configurações: empresa, notificações, ADB, conexão, IA e segurança
 // ============================================================
 
 import { useState, useEffect, useRef } from "react";
@@ -9,8 +8,11 @@ import { useAuth } from "../context/AuthContext";
 import Card from "../components/ui/Card";
 import Button from "../components/ui/Button";
 import Toggle from "../components/ui/Toggle";
+import PageHeader from "../components/ui/PageHeader";
+import Field, { FormSection } from "../components/ui/Field";
 import { api, setAppMode as setTauriAppMode, reloadConfig } from "../tauri";
-import type { AppConfig } from "../types";
+import type { AppConfig, AiConfig } from "../types";
+import { AI_PROVIDERS, getAiProviderInfo } from "../constants/aiProviders";
 import {
   Save,
   Globe,
@@ -22,6 +24,12 @@ import {
   Wifi,
   Sparkles,
   Cpu,
+  CheckCircle2,
+  AlertCircle,
+  Play,
+  Settings,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 
 type SettingsSection = "geral" | "notificacoes" | "adb" | "hub" | "ia" | "seguranca";
@@ -71,13 +79,16 @@ export default function SettingsTab() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // IA / LLM local
-  const [aiProvider, setAiProvider] = useState("ollama");
-  const [aiModel, setAiModel] = useState("llama3");
+  const [aiProvider, setAiProvider] = useState("openrouter");
+  const [aiModel, setAiModel] = useState("openrouter/free");
   const [aiTemperature, setAiTemperature] = useState("0.7");
   const [aiSystemPrompt, setAiSystemPrompt] = useState("");
   const [aiApiKey, setAiApiKey] = useState("");
-  const [aiEndpoint, setAiEndpoint] = useState("http://localhost:11434/api/generate");
+  const [aiEndpoint, setAiEndpoint] = useState("https://openrouter.ai/api/v1/chat/completions");
+  const [savedProviderKeys, setSavedProviderKeys] = useState<Record<string, { apiKey: string; endpoint: string; model: string }>>({});
   const [aiStatus, setAiStatus] = useState("");
+  const [testingAi, setTestingAi] = useState(false);
+  const [aiTestResult, setAiTestResult] = useState<{ success: boolean; text: string } | null>(null);
 
   // Load app config
   useEffect(() => {
@@ -98,15 +109,23 @@ export default function SettingsTab() {
         console.error("Erro ao carregar app_config:", err);
       });
     if (selectedCompanyId) {
-      api<import("../types").AiConfig | null>("get_ai_config", { company_id: selectedCompanyId })
+      api<AiConfig | null>("get_ai_config", { companyId: selectedCompanyId })
         .then((cfg) => {
           if (!mounted || !cfg) return;
-          setAiProvider(cfg.provider || "ollama");
-          setAiModel(cfg.model || "llama3");
+          setAiProvider(cfg.provider || "openrouter");
+          setAiModel(cfg.model || "openrouter/free");
           setAiTemperature(String(cfg.temperature ?? 0.7));
           setAiSystemPrompt(cfg.systemPrompt || "");
           setAiApiKey(cfg.apiKey || "");
-          setAiEndpoint(cfg.endpoint || "http://localhost:11434/api/generate");
+          setAiEndpoint(cfg.endpoint || "https://openrouter.ai/api/v1/chat/completions");
+        })
+        .catch(() => {});
+
+      api<Record<string, { apiKey: string; endpoint: string; model: string }>>("get_ai_provider_keys", { companyId: selectedCompanyId })
+        .then((keys) => {
+          if (mounted && keys) {
+            setSavedProviderKeys(keys);
+          }
         })
         .catch(() => {});
     }
@@ -118,18 +137,45 @@ export default function SettingsTab() {
     try {
       await api("save_ai_config", {
         config: {
-          company_id: selectedCompanyId,
+          companyId: selectedCompanyId,
           provider: aiProvider,
           model: aiModel,
           temperature: parseFloat(aiTemperature) || 0.7,
-          system_prompt: aiSystemPrompt,
-          api_key: aiApiKey,
+          systemPrompt: aiSystemPrompt,
+          apiKey: aiApiKey,
           endpoint: aiEndpoint,
         },
       });
+      setSavedProviderKeys((prev) => ({
+        ...prev,
+        [aiProvider]: { apiKey: aiApiKey, endpoint: aiEndpoint, model: aiModel },
+      }));
       setAiStatus("Configuração de IA salva com sucesso!");
-    } catch {
-      setAiStatus("Falha ao salvar configuração de IA.");
+    } catch (e) {
+      setAiStatus(`Falha ao salvar configuração de IA: ${String(e)}`);
+    }
+  };
+
+  const handleTestAi = async () => {
+    if (!selectedCompanyId) return;
+    setTestingAi(true);
+    setAiTestResult(null);
+    try {
+      const rewritten = await api<string>("rewrite_message_ai", {
+        message: "Olá {nome}! Notamos uma pendência em aberto de R$ 150,00. Pague pelo PIX financeiro@empresa.com ou acesse https://empresa.com/fatura",
+        contactName: "Lucas Silva",
+        companyId: selectedCompanyId,
+        provider: aiProvider,
+        model: aiModel,
+        prompt: aiSystemPrompt,
+        apiKey: aiApiKey,
+        endpoint: aiEndpoint,
+      });
+      setAiTestResult({ success: true, text: rewritten });
+    } catch (err) {
+      setAiTestResult({ success: false, text: String(err) });
+    } finally {
+      setTestingAi(false);
     }
   };
 
@@ -178,335 +224,380 @@ export default function SettingsTab() {
     }
   };
 
-  const menuItems = [
-    { id: "geral", label: "Informações Gerais", icon: <Globe size={18} /> },
-    { id: "notificacoes", label: "Notificações", icon: <Bell size={18} /> },
-    { id: "adb", label: "Rede & ADB", icon: <Smartphone size={18} /> },
-    { id: "hub", label: "Conexão Hub Nuvem", icon: <Wifi size={18} /> },
-    { id: "ia", label: "IA & Spintax Local", icon: <Sparkles size={18} /> },
-    { id: "seguranca", label: "Segurança", icon: <Shield size={18} /> },
-  ] as const;
+
+  const menuItems: { id: SettingsSection; label: string; icon: React.ReactNode }[] = [
+    { id: "geral", label: "Geral", icon: <Globe size={16} /> },
+    { id: "notificacoes", label: "Notificações", icon: <Bell size={16} /> },
+    { id: "adb", label: "Aparelhos e ADB", icon: <Smartphone size={16} /> },
+    { id: "hub", label: "Conexão e servidores", icon: <Wifi size={16} /> },
+    { id: "ia", label: "Inteligência artificial", icon: <Sparkles size={16} /> },
+    { id: "seguranca", label: "Segurança e backup", icon: <Shield size={16} /> },
+  ];
+
+  const hubStatusIsError = hubStatus.startsWith("Erro");
+  const aiStatusIsError = aiStatus.startsWith("Falha");
+  const providerInfo = getAiProviderInfo(aiProvider);
 
   return (
-    <div className="flex flex-col h-full space-y-6 animate-fade-in max-w-6xl mx-auto">
-      {/* Header Superior */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h2 className="text-2xl font-bold text-primary tracking-tight">Configurações do Sistema</h2>
-          <p className="text-sm text-tertiary mt-1">
-            Personalize preferências, parâmetros de envio, IA e segurança.
-          </p>
-        </div>
-        <Button icon={<Save size={18} />} onClick={handleSaveAll} className="px-6 py-2.5">
-          Salvar Alterações
-        </Button>
-      </div>
+    <div className="space-y-6 animate-fade-in max-w-6xl mx-auto">
+      <PageHeader
+        title="Configurações"
+        description="Preferências da empresa, conexão, IA e segurança."
+        icon={<Settings size={18} />}
+        actions={
+          <Button icon={<Save size={15} />} onClick={handleSaveAll}>
+            Salvar alterações
+          </Button>
+        }
+      />
 
-      <div className="flex flex-col md:flex-row gap-8 items-start">
-        {/* Menu Lateral Esquerdo */}
-        <aside className="w-full md:w-64 shrink-0 glass-panel p-4 rounded-2xl flex flex-col gap-1">
-          {menuItems.map((item) => (
-            <button
-              key={item.id}
-              onClick={() => setActiveSection(item.id as SettingsSection)}
-              className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium transition-all ${
-                activeSection === item.id
-                  ? "bg-violet-600/20 text-violet-400 border border-violet-500/30"
-                  : "text-tertiary hover:bg-white/5 hover:text-primary"
-              }`}
-            >
-              {item.icon}
-              {item.label}
-            </button>
-          ))}
-        </aside>
+      {hubStatus && <StatusBanner error={hubStatusIsError} message={hubStatus} onClose={() => setHubStatus("")} />}
 
-        {/* Área de Conteúdo (Direita) */}
-        <main className="flex-1 w-full">
-          <Card className="p-8">
+      <div className="flex flex-col md:flex-row gap-6 items-start">
+        <nav aria-label="Seções de configurações" className="w-full md:w-56 shrink-0 flex md:flex-col gap-1 overflow-x-auto">
+          {menuItems.map((item) => {
+            const active = activeSection === item.id;
+            return (
+              <button
+                key={item.id}
+                onClick={() => setActiveSection(item.id)}
+                aria-current={active ? "page" : undefined}
+                className={`flex items-center gap-2.5 whitespace-nowrap rounded-lg px-3 py-2 text-[0.8125rem] font-medium transition-colors cursor-pointer text-left ${
+                  active ? "bg-secondary text-primary" : "text-secondary hover:bg-secondary hover:text-primary"
+                }`}
+              >
+                <span className={active ? "text-[var(--color-accent-light)]" : "text-tertiary"}>{item.icon}</span>
+                {item.label}
+              </button>
+            );
+          })}
+        </nav>
+
+        <main className="flex-1 w-full min-w-0">
+          <Card padding="lg">
             {activeSection === "geral" && (
-              <div className="space-y-8 animate-fade-in">
-                <SectionHeader icon={<Globe size={24} />} color="violet" title="Informações Gerais" subtitle="Identificação da empresa e fuso horário" />
-                <div className="space-y-6 text-sm max-w-2xl">
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">Nome da Empresa</label>
-                    <input type="text" value={companyName} onChange={(e) => setCompanyName(e.target.value)} className="w-full input-setting" />
-                  </div>
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">Fuso Horário</label>
-                    <select value={timezone} onChange={(e) => setTimezone(e.target.value)} className="w-full input-setting">
+              <FormSection title="Geral" description="Identificação da empresa e fuso horário.">
+                <div className="space-y-4 max-w-xl">
+                  <Field label="Nome da empresa" htmlFor="set-company">
+                    <input id="set-company" type="text" value={companyName} onChange={(e) => setCompanyName(e.target.value)} />
+                  </Field>
+                  <Field label="Fuso horário" htmlFor="set-tz">
+                    <select id="set-tz" value={timezone} onChange={(e) => setTimezone(e.target.value)}>
                       <option value="America/Sao_Paulo">América/São Paulo (GMT-3)</option>
                       <option value="America/Manaus">América/Manaus (GMT-4)</option>
                       <option value="America/Fortaleza">América/Fortaleza (GMT-3)</option>
                     </select>
-                  </div>
+                  </Field>
                 </div>
-              </div>
+              </FormSection>
             )}
 
             {activeSection === "notificacoes" && (
-              <div className="space-y-8 animate-fade-in">
-                <SectionHeader icon={<Bell size={24} />} color="blue" title="Notificações & Alertas" subtitle="Alertas visuais e sonoros do sistema" />
-                <div className="space-y-6 max-w-2xl">
-                  <ToggleRow label="Alertas do Sistema" desc="Receber avisos quando dispositivos desconectarem ou apresentarem falhas" checked={notifications} onChange={setNotifications} />
-                  <ToggleRow label="Alerta de Bateria Baixa" desc="Notificar visualmente caso a bateria do celular fique abaixo de 20%" checked={batteryAlert} onChange={setBatteryAlert} />
-                  <ToggleRow label="Alerta de Ban Detectado" desc="Sinalizar imediatamente quando a operadora banir o chip" checked={banAlert} onChange={setBanAlert} />
-                  <ToggleRow label="Alerta de Conclusão de Disparo" desc="Avisar assim que a fila de envios de uma campanha for zerada" checked={dispatchAlert} onChange={setDispatchAlert} />
+              <FormSection title="Notificações" description="Escolha quais avisos o sistema deve exibir.">
+                <div className="max-w-xl divide-y divide-border">
+                  <ToggleRow label="Alertas do sistema" desc="Avisar quando aparelhos desconectarem ou apresentarem falhas." checked={notifications} onChange={setNotifications} />
+                  <ToggleRow label="Bateria baixa" desc="Avisar quando a bateria de um aparelho ficar abaixo de 20%." checked={batteryAlert} onChange={setBatteryAlert} />
+                  <ToggleRow label="Bloqueio de chip" desc="Avisar assim que um chip for bloqueado pela operadora." checked={banAlert} onChange={setBanAlert} />
+                  <ToggleRow label="Disparo concluído" desc="Avisar quando a fila de envios de uma campanha terminar." checked={dispatchAlert} onChange={setDispatchAlert} />
                 </div>
-              </div>
+              </FormSection>
             )}
 
             {activeSection === "adb" && (
-              <div className="space-y-8 animate-fade-in">
-                <SectionHeader icon={<Smartphone size={24} />} color="emerald" title="Conexão ADB & Redes" subtitle="Parâmetros de comunicação wireless com celulares" />
-                <div className="space-y-6 text-sm max-w-2xl">
-                  <ToggleRow label="Reconexão Automática" desc="O servidor tentará reconectar aparelhos caídos em segundo plano" checked={autoReconnect} onChange={setAutoReconnect} />
-                  
-                  <div className="flex gap-8">
-                    <div className="w-40">
-                      <label className="block font-semibold text-secondary mb-2 text-sm">Intervalo Ping (s)</label>
-                      <input type="number" value={pingInterval} onChange={(e) => setPingInterval(parseInt(e.target.value) || 30)} min={5} max={300} className="w-full input-setting font-mono text-lg text-center" />
-                    </div>
-                    <div className="w-40">
-                      <label className="block font-semibold text-secondary mb-2 text-sm">Max Tentativas</label>
-                      <input type="number" value={maxRetries} onChange={(e) => setMaxRetries(parseInt(e.target.value) || 3)} min={1} max={10} className="w-full input-setting font-mono text-lg text-center" />
-                    </div>
+              <FormSection title="Aparelhos e ADB" description="Como o sistema se comunica com os celulares.">
+                <div className="space-y-5 max-w-xl">
+                  <ToggleRow label="Reconectar automaticamente" desc="Tenta reconectar aparelhos desconectados em segundo plano." checked={autoReconnect} onChange={setAutoReconnect} />
+                  <div className="grid grid-cols-2 gap-4">
+                    <Field label="Intervalo de verificação (s)" hint="Entre 5 e 300." htmlFor="set-ping">
+                      <input id="set-ping" type="number" value={pingInterval} onChange={(e) => setPingInterval(parseInt(e.target.value) || 30)} min={5} max={300} className="font-mono" />
+                    </Field>
+                    <Field label="Máximo de tentativas" hint="Entre 1 e 10." htmlFor="set-retries">
+                      <input id="set-retries" type="number" value={maxRetries} onChange={(e) => setMaxRetries(parseInt(e.target.value) || 3)} min={1} max={10} className="font-mono" />
+                    </Field>
                   </div>
-
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">PIN de Desbloqueio (opcional)</label>
-                    <input type="password" value={unlockPin} onChange={(e) => setUnlockPin(e.target.value)} placeholder="Ex: 1234" className="w-48 input-setting font-mono text-lg tracking-widest" />
-                  </div>
+                  <Field label="PIN de desbloqueio" hint="Opcional. Usado para desbloquear a tela dos aparelhos." htmlFor="set-pin">
+                    <SecretInput id="set-pin" value={unlockPin} onChange={setUnlockPin} placeholder="Ex.: 1234" />
+                  </Field>
                 </div>
-              </div>
+              </FormSection>
             )}
 
-
-
             {activeSection === "hub" && (
-              <div className="space-y-8 animate-fade-in">
-                <SectionHeader icon={<Wifi size={24} />} color="blue" title="Conexão Hub Nuvem" subtitle="Topologia de rede local e remota" />
-                <div className="space-y-6 text-sm max-w-2xl">
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">Modo de Operação</label>
-                    <select value={appMode} onChange={(e) => setAppMode(e.target.value as "local" | "empresa" | "master")} className="w-full input-setting">
-                      <option value="empresa">Modo Empresa (Conecta ao Hub Nuvem VPS)</option>
-                      <option value="local">Modo Standalone (Offline / Local apenas)</option>
-                      <option value="master">Modo Master (Controle Administrativo Remoto)</option>
-                    </select>
+              <div className="space-y-8">
+                <FormSection title="Modo de operação" description="Define onde os dados e aparelhos são gerenciados.">
+                  <div className="max-w-xl">
+                    <Field label="Modo" htmlFor="set-mode">
+                      <select id="set-mode" value={appMode} onChange={(e) => setAppMode(e.target.value as "local" | "empresa" | "master")}>
+                        <option value="empresa">Empresa (conecta ao hub na nuvem)</option>
+                        <option value="local">Local (somente esta máquina)</option>
+                        <option value="master">Master (administração remota)</option>
+                      </select>
+                    </Field>
                   </div>
+                </FormSection>
 
-                  {(appMode === "empresa" || appMode === "master" || isMasterUser) && (
-                    <div className="space-y-6 pt-4 border-t border-border">
-                      <div>
-                        <label className="block font-semibold text-secondary mb-2 text-sm">Servidor Hub / P2P Local</label>
+                {(appMode === "empresa" || appMode === "master" || isMasterUser) && (
+                  <FormSection title="Hub" description="Endereço e credenciais do servidor central.">
+                    <div className="space-y-4 max-w-xl">
+                      <Field label="Endereço do hub" htmlFor="set-hub-addr">
                         {!customIpOverride ? (
-                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 bg-emerald-950/40 border border-emerald-500/30 rounded-xl">
-                            <div className="flex items-center gap-2.5 text-emerald-300 font-mono text-sm font-bold">
-                              <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                              {hubAddress || "127.0.0.1:8555"} (Padrão Local / VPN)
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => setCustomIpOverride(true)}
-                              className="text-xs bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 px-3 py-1.5 rounded-lg transition-all font-medium cursor-pointer"
-                            >
-                              ⚙️ Alterar Endereço
-                            </button>
+                          <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary px-3 py-2">
+                            <span className="flex items-center gap-2 font-mono text-[0.8125rem] text-primary">
+                              <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                              {hubAddress || "127.0.0.1:8555"}
+                              <span className="font-sans text-xs text-tertiary">(padrão local)</span>
+                            </span>
+                            <Button variant="ghost" size="sm" type="button" onClick={() => setCustomIpOverride(true)}>
+                              Alterar
+                            </Button>
                           </div>
                         ) : (
-                          <div className="space-y-2">
-                            <div className="flex items-center gap-2">
-                              <input
-                                type="text"
-                                value={hubAddress}
-                                onChange={(e) => setHubAddress(e.target.value)}
-                                placeholder="127.0.0.1:8555"
-                                className="flex-1 input-setting font-mono text-sm"
-                              />
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setHubAddress("127.0.0.1:8555");
-                                  setCustomIpOverride(false);
-                                }}
-                                className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-2.5 rounded-lg border border-slate-700 font-bold"
-                              >
-                                Restaurar Padrão Local
-                              </button>
+                          <div className="flex items-center gap-2">
+                            <input
+                              id="set-hub-addr"
+                              type="text"
+                              value={hubAddress}
+                              onChange={(e) => setHubAddress(e.target.value)}
+                              placeholder="127.0.0.1:8555"
+                              className="flex-1 font-mono"
+                            />
+                            <Button
+                              variant="secondary"
+                              type="button"
+                              onClick={() => {
+                                setHubAddress("127.0.0.1:8555");
+                                setCustomIpOverride(false);
+                              }}
+                            >
+                              Restaurar padrão
+                            </Button>
+                          </div>
+                        )}
+                      </Field>
+
+                      <ToggleRow label="Conexão contínua" desc="Mantém sinal de vida em tempo real com o servidor central." checked={hubEnabled} onChange={setHubEnabled} />
+
+                      {(appMode === "master" || appMode === "empresa") && (
+                        <>
+                          <Field
+                            label={appMode === "master" ? "Token do hub (master)" : "Token da empresa"}
+                            hint={
+                              appMode === "master"
+                                ? "Deve ser o mesmo token mestre configurado no servidor."
+                                : "Sem o token, os celulares remotos não aparecem."
+                            }
+                            htmlFor="set-hub-token"
+                          >
+                            <SecretInput id="set-hub-token" value={hubToken} onChange={setHubToken} placeholder="Cole o token" />
+                          </Field>
+
+                          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-border p-3">
+                            <div className="min-w-0 flex-1">
+                              <p className="text-[0.8125rem] font-medium text-primary">Atualizar servidor</p>
+                              <p className="text-xs text-tertiary">Envie o executável do hub para atualizar o servidor remoto.</p>
+                              {updateVpsMsg && (
+                                <p className="mt-1 text-xs text-secondary break-words">{updateVpsMsg}</p>
+                              )}
                             </div>
-                            <p className="text-[11px] text-amber-400 font-medium">
-                              ℹ️ Endereço do túnel ou IP de rede para sincronização de instâncias.
-                            </p>
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              type="button"
+                              icon={<Cpu size={13} />}
+                              loading={updatingVps}
+                              onClick={handleUpdateVpsClick}
+                              title="Selecione o esfera-hub-standalone.exe para atualizar o servidor remotamente"
+                            >
+                              {updatingVps ? "Atualizando..." : "Escolher arquivo"}
+                            </Button>
+                            <input ref={fileInputRef} type="file" accept=".exe" className="hidden" onChange={handleVpsFile} />
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </FormSection>
+                )}
+
+                <FormSection title="Servidores locais" description="Acesso pela rede interna e conexão de aparelhos remotos.">
+                  <div className="max-w-xl divide-y divide-border">
+                    {appMode === "empresa" && (
+                      <div className="pb-3">
+                        <ToggleRow label="Servidor na rede local" desc="Permite que colaboradores na mesma rede acessem o painel pelo navegador." checked={empresaServerEnabled} onChange={setEmpresaServerEnabled} />
+                        {empresaServerEnabled && (
+                          <div className="mt-2 w-40">
+                            <Field label="Porta" htmlFor="set-lan-port">
+                              <input id="set-lan-port" type="number" value={empresaServerPort} onChange={(e) => setEmpresaServerPort(parseInt(e.target.value) || 7777)} min={1024} max={65535} className="font-mono" />
+                            </Field>
                           </div>
                         )}
                       </div>
-                      <ToggleRow label="Habilitar Conexão Contínua" desc="Manter heartbeat em tempo real com o servidor central" checked={hubEnabled} onChange={setHubEnabled} />
-
-                      {(appMode === "master" || appMode === "empresa") && (
-                        <div className="space-y-2 pt-4 border-t border-border">
-                          <label className="block font-semibold text-secondary mb-2 text-sm">
-                            {appMode === "master" ? "Token do Hub (Master)" : "Token da Empresa (REALESS)"}
-                          </label>
-                          <input
-                            type="password"
-                            value={hubToken}
-                            onChange={(e) => setHubToken(e.target.value)}
-                            placeholder={appMode === "master" ? "root123" : "Ope@2025"}
-                            className="w-full input-setting font-mono text-sm"
-                          />
-                          <p className="text-[11px] text-amber-400 font-medium">
-                            {appMode === "master"
-                              ? "Alinhe com HUB_MASTER_TOKEN da VPS (padrão: root123)."
-                              : "Token da empresa REALESS (Ope@2025). Sem ele, os celulares remotos não aparecem."}
-                          </p>
-                          <div className="flex items-center gap-3 pt-2">
-                            <button
-                              type="button"
-                              onClick={handleUpdateVpsClick}
-                              disabled={updatingVps}
-                              className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#5E6AD2]/15 border border-[#5E6AD2]/30 text-[12px] text-[#828DF7] hover:bg-[#5E6AD2]/25 transition-colors cursor-pointer disabled:opacity-50"
-                              title="Selecione o esfera-hub-standalone.exe para atualizar o VPS remotamente"
-                            >
-                              <Cpu size={13} className="shrink-0" />
-                              {updatingVps ? "Atualizando..." : "Atualizar VPS"}
-                            </button>
-                            <input
-                              ref={fileInputRef}
-                              type="file"
-                              accept=".exe"
-                              className="hidden"
-                              onChange={handleVpsFile}
-                            />
-                            {updateVpsMsg && (
-                              <span className="text-[11px] text-zinc-400 max-w-[220px] truncate" title={updateVpsMsg}>{updateVpsMsg}</span>
-                            )}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {appMode === "empresa" && (
-                    <div className="space-y-6 pt-4 border-t border-border">
-                      <ToggleRow label="Ativar Servidor LAN Interno" desc="Permite que colaboradores na rede Wi-Fi local acessem o painel via navegador web" checked={empresaServerEnabled} onChange={setEmpresaServerEnabled} />
-                      {empresaServerEnabled && (
-                        <div className="pl-6 ml-4 border-l-2 border-blue-500/30">
-                          <label className="block font-semibold text-secondary mb-2 text-sm">Porta de Acesso (Servidor Web)</label>
-                          <input type="number" value={empresaServerPort} onChange={(e) => setEmpresaServerPort(parseInt(e.target.value) || 7777)} min={1024} max={65535} className="w-32 input-setting font-mono text-center" />
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  <div className="space-y-6 pt-4 border-t border-border">
-                    <ToggleRow label="Túnel Inverso de Dispositivos" desc="Recebe daemons dos celulares (aparelhos atrás de NAT/4G) para mantê-los sempre acessíveis via ADB" checked={tunnelServerEnabled} onChange={setTunnelServerEnabled} />
-                    {tunnelServerEnabled && (
-                      <div className="pl-6 ml-4 border-l-2 border-violet-500/30">
-                        <label className="block font-semibold text-secondary mb-2 text-sm">Porta do Túnel (daemons Android)</label>
-                        <input type="number" value={tunnelServerPort} onChange={(e) => setTunnelServerPort(parseInt(e.target.value) || 8888)} min={1024} max={65535} className="w-32 input-setting font-mono text-center" />
-                        <p className="text-[11px] text-violet-400 font-medium mt-1">
-                          Os aparelhos devem apontar para IP:porta desta máquina no instalador do daemon (Instalar Daemon).
-                        </p>
-                      </div>
                     )}
-                  </div>
-
-                  {hubStatus && (
-                    <div className="p-4 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl text-sm font-medium mt-6">
-                      {hubStatus}
+                    <div className={appMode === "empresa" ? "pt-3" : ""}>
+                      <ToggleRow label="Túnel reverso de aparelhos" desc="Recebe os aparelhos atrás de NAT ou 4G para mantê-los acessíveis via ADB." checked={tunnelServerEnabled} onChange={setTunnelServerEnabled} />
+                      {tunnelServerEnabled && (
+                        <div className="mt-2 w-40">
+                          <Field label="Porta do túnel" hint="Aponte os aparelhos para IP:porta desta máquina ao instalar o agente." htmlFor="set-tunnel-port">
+                            <input id="set-tunnel-port" type="number" value={tunnelServerPort} onChange={(e) => setTunnelServerPort(parseInt(e.target.value) || 8888)} min={1024} max={65535} className="font-mono" />
+                          </Field>
+                        </div>
+                      )}
                     </div>
-                  )}
-                </div>
+                  </div>
+                </FormSection>
               </div>
             )}
 
             {activeSection === "ia" && (
-              <div className="space-y-8 animate-fade-in">
-                <SectionHeader icon={<Sparkles size={24} />} color="violet" title="IA & Spintax Local" subtitle="Modelos LLM locais (Ollama / Llama.cpp) e personalização de mensagens" />
-                <div className="space-y-6 text-sm max-w-2xl">
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">Provedor</label>
-                    <select value={aiProvider} onChange={(e) => setAiProvider(e.target.value)} className="w-full input-setting">
-                      <option value="ollama">Ollama (Local — recomendado, zero custo)</option>
-                      <option value="openai">OpenAI (API paga)</option>
-                      <option value="anthropic">Anthropic (API paga)</option>
-                      <option value="custom">Custom (OpenAI-compatible)</option>
+              <FormSection title="Inteligência artificial" description="Provedor usado para reescrever mensagens e variar o texto dos disparos.">
+                <div className="space-y-4 max-w-xl">
+                  <Field label="Provedor" htmlFor="set-ai-provider">
+                    <select
+                      id="set-ai-provider"
+                      value={aiProvider}
+                      onChange={(e) => {
+                        const next = e.target.value;
+                        setAiProvider(next);
+                        const pInfo = getAiProviderInfo(next);
+                        if (savedProviderKeys[next]) {
+                          setAiEndpoint(savedProviderKeys[next].endpoint || pInfo?.defaultEndpoint || "");
+                          setAiModel(savedProviderKeys[next].model || pInfo?.defaultModel || "");
+                          setAiApiKey(savedProviderKeys[next].apiKey || "");
+                        } else if (pInfo) {
+                          setAiEndpoint(pInfo.defaultEndpoint);
+                          setAiModel(pInfo.defaultModel);
+                          setAiApiKey("");
+                        }
+                      }}
+                    >
+                      <optgroup label="Nuvem gratuita">
+                        {AI_PROVIDERS.filter((p) => p.category === "cloud_free").map((p) => (
+                          <option key={p.id} value={p.id}>{p.name}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Local (offline)">
+                        {AI_PROVIDERS.filter((p) => p.category === "local_free").map((p) => (
+                          <option key={p.id} value={p.id}>{p.name}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Pagos e personalizados">
+                        {AI_PROVIDERS.filter((p) => p.category === "paid_custom").map((p) => (
+                          <option key={p.id} value={p.id}>{p.name}</option>
+                        ))}
+                      </optgroup>
                     </select>
+                  </Field>
+
+                  <Field label="Modelo" htmlFor="set-ai-model">
+                    <input
+                      id="set-ai-model"
+                      type="text"
+                      value={aiModel}
+                      onChange={(e) => setAiModel(e.target.value)}
+                      placeholder="openrouter/free ou llama-3.3-70b-versatile"
+                      className="font-mono"
+                    />
+                    {providerInfo && providerInfo.suggestedModels.length > 0 && (
+                      <div className="flex flex-wrap gap-1.5 pt-1">
+                        {providerInfo.suggestedModels.map((m) => (
+                          <button
+                            key={m.id}
+                            type="button"
+                            onClick={() => setAiModel(m.id)}
+                            className={`rounded-md border px-2 py-1 text-xs transition-colors cursor-pointer ${
+                              aiModel === m.id
+                                ? "border-[var(--color-accent)] bg-[var(--color-accent-glow)] text-primary"
+                                : "border-border text-secondary hover:border-border-strong hover:text-primary"
+                            }`}
+                          >
+                            {m.name} <span className="text-tertiary">({m.tag})</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </Field>
+
+                  <Field label="Endereço da API" htmlFor="set-ai-endpoint">
+                    <input id="set-ai-endpoint" type="text" value={aiEndpoint} onChange={(e) => setAiEndpoint(e.target.value)} placeholder="https://openrouter.ai/api/v1/chat/completions" className="font-mono" />
+                  </Field>
+
+                  {aiProvider !== "ollama" && aiProvider !== "lmstudio" && (
+                    <Field label="Chave de API" hint={providerInfo?.keyHint} htmlFor="set-ai-key">
+                      <SecretInput id="set-ai-key" value={aiApiKey} onChange={setAiApiKey} placeholder={providerInfo?.keyPlaceholder || "sk-..."} />
+                    </Field>
+                  )}
+
+                  <div className="w-40">
+                    <Field label="Criatividade" hint="De 0 (preciso) a 1 (criativo)." htmlFor="set-ai-temp">
+                      <input id="set-ai-temp" type="number" step="0.05" min="0" max="1" value={aiTemperature} onChange={(e) => setAiTemperature(e.target.value)} className="font-mono" />
+                    </Field>
                   </div>
 
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">Modelo</label>
-                    <input type="text" value={aiModel} onChange={(e) => setAiModel(e.target.value)} placeholder="llama3 / qwen2.5:1.5b / llama3.2:3b (Q4_K_M)" className="w-full input-setting font-mono" />
-                    <p className="text-[11px] text-tertiary mt-1">Para inferência local, use um GGUF quantizado (ex.: Q4_K_M). Modelos sugeridos: Qwen2.5-1.5B-Instruct, Llama-3.2-3B-Instruct.</p>
+                  <Field label="Instruções para a IA" hint="Regras de redação aplicadas a todas as mensagens." htmlFor="set-ai-prompt">
+                    <textarea id="set-ai-prompt" value={aiSystemPrompt} onChange={(e) => setAiSystemPrompt(e.target.value)} rows={4} placeholder="Você é um assistente especialista em redação de mensagens para WhatsApp. Seja natural, humano e nunca invente informações." className="resize-none" />
+                  </Field>
+
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <Button icon={<Save size={15} />} onClick={handleSaveAi}>
+                      Salvar IA
+                    </Button>
+                    <Button variant="secondary" icon={<Play size={14} />} loading={testingAi} onClick={handleTestAi}>
+                      {testingAi ? "Testando..." : "Testar conexão"}
+                    </Button>
                   </div>
 
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">Endpoint</label>
-                    <input type="text" value={aiEndpoint} onChange={(e) => setAiEndpoint(e.target.value)} placeholder="http://localhost:11434/api/generate" className="w-full input-setting font-mono" />
-                  </div>
-
-                  <div className="w-48">
-                    <label className="block font-semibold text-secondary mb-2 text-sm">Temperatura</label>
-                    <input type="number" step="0.1" min="0" max="2" value={aiTemperature} onChange={(e) => setAiTemperature(e.target.value)} className="w-full input-setting font-mono text-center" />
-                  </div>
-
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">System Prompt (opcional)</label>
-                    <textarea value={aiSystemPrompt} onChange={(e) => setAiSystemPrompt(e.target.value)} rows={3} placeholder="Você é um assistente especialista em redação de mensagens para WhatsApp." className="w-full input-setting resize-none" />
-                  </div>
-
-                  <div>
-                    <label className="block font-semibold text-secondary mb-2 text-sm">API Key (somente para OpenAI/Anthropic)</label>
-                    <input type="password" value={aiApiKey} onChange={(e) => setAiApiKey(e.target.value)} placeholder="sk-..." className="w-full input-setting font-mono" />
-                  </div>
-
-                  <div className="pt-2">
-                    <Button icon={<Sparkles size={18} />} onClick={handleSaveAi} className="px-6 py-2.5">Salvar Configuração de IA</Button>
-                  </div>
-
-                  {aiStatus && (
-                    <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 rounded-xl text-sm font-medium mt-2">
-                      {aiStatus}
+                  {aiTestResult && (
+                    <div
+                      className={`rounded-lg border p-3 text-[0.8125rem] space-y-1 ${
+                        aiTestResult.success
+                          ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                          : "border-red-500/25 bg-red-500/10 text-red-600 dark:text-red-400"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 font-medium">
+                        {aiTestResult.success ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
+                        {aiTestResult.success ? "Teste concluído" : "Falha no teste"}
+                      </div>
+                      <p className="whitespace-pre-wrap text-xs text-secondary">{aiTestResult.text}</p>
                     </div>
                   )}
-                  <p className="text-[11px] text-tertiary">O Spintax é resolvido automaticamente no criador de campanhas (aba Campanhas → Simular Spintax). Combine Spintax + Ollama local para zero custo de API e conformidade LGPD.</p>
+
+                  {aiStatus && <StatusBanner error={aiStatusIsError} message={aiStatus} onClose={() => setAiStatus("")} />}
+
+                  <p className="text-xs text-tertiary">
+                    O Spintax é resolvido no criador de campanhas. Combine Spintax com um modelo gratuito ou local para variar as mensagens sem custo.
+                  </p>
                 </div>
-              </div>
+              </FormSection>
             )}
 
             {activeSection === "seguranca" && (
-              <div className="space-y-8 animate-fade-in">
-                <SectionHeader icon={<Shield size={24} />} color="emerald" title="Segurança & Backup" subtitle="Proteção de dados e retenção de registros" />
-                <div className="space-y-6 text-sm max-w-2xl">
-                  <ToggleRow label="Backup Automático Diário" desc="Salvar cópia de segurança (snapshot) local do banco de dados todo fim de dia" checked={autoBackup} onChange={setAutoBackup} />
-                  
-                  <div className="flex gap-8">
-                    <div className="w-48">
-                      <label className="block font-semibold text-secondary mb-2 text-sm">Retenção de Logs (Dias)</label>
-                      <select value={logRetention} onChange={(e) => setLogRetention(e.target.value)} className="w-full input-setting">
-                        <option value="7">7 dias (Mais Leve)</option>
+              <FormSection title="Segurança e backup" description="Proteção de dados e retenção de registros.">
+                <div className="space-y-5 max-w-xl">
+                  <ToggleRow label="Backup diário automático" desc="Salva uma cópia local do banco de dados ao fim de cada dia." checked={autoBackup} onChange={setAutoBackup} />
+                  <div className="grid grid-cols-2 gap-4">
+                    <Field label="Retenção de logs" htmlFor="set-retention">
+                      <select id="set-retention" value={logRetention} onChange={(e) => setLogRetention(e.target.value)}>
+                        <option value="7">7 dias</option>
                         <option value="15">15 dias</option>
-                        <option value="30">30 dias (Padrão)</option>
+                        <option value="30">30 dias (padrão)</option>
                         <option value="90">90 dias</option>
                       </select>
-                    </div>
-                    <div className="w-48">
-                      <label className="block font-semibold text-secondary mb-2 text-sm">Timeout de Sessão (min)</label>
-                      <input type="number" value={sessionTimeout} onChange={(e) => setSessionTimeout(e.target.value)} min={15} max={480} className="w-full input-setting text-center font-mono" />
-                    </div>
+                    </Field>
+                    <Field label="Expiração da sessão (min)" hint="Entre 15 e 480." htmlFor="set-session">
+                      <input id="set-session" type="number" value={sessionTimeout} onChange={(e) => setSessionTimeout(e.target.value)} min={15} max={480} className="font-mono" />
+                    </Field>
                   </div>
 
-                  <div className="flex items-center gap-4 pt-6 mt-4 border-t border-border">
-                    <Button variant="secondary" size="md" icon={<Database size={16} />}>
-                      Exportar Backup Agora
+                  <div className="flex flex-wrap items-center gap-2 border-t border-border pt-4">
+                    <Button variant="secondary" icon={<Database size={15} />}>
+                      Exportar backup
                     </Button>
-                    <Button variant="danger" size="md" icon={<RefreshCw size={16} />}>
-                      Restaurar de Padrão
+                    <Button variant="danger" icon={<RefreshCw size={15} />}>
+                      Restaurar padrões
                     </Button>
                   </div>
                 </div>
-              </div>
+              </FormSection>
             )}
           </Card>
         </main>
@@ -515,34 +606,58 @@ export default function SettingsTab() {
   );
 }
 
-// ---- Reusable Components ----
-function SectionHeader({
-  icon,
-  color,
-  title,
-  subtitle,
-}: {
-  icon: React.ReactNode;
-  color: string;
-  title: string;
-  subtitle: string;
-}) {
-  const colorMap: Record<string, string> = {
-    violet: "bg-violet-600/20 border-violet-500/30 text-violet-400",
-    blue: "bg-blue-600/20 border-blue-500/30 text-blue-400",
-    emerald: "bg-emerald-600/20 border-emerald-500/30 text-emerald-400",
-    amber: "bg-amber-600/20 border-amber-500/30 text-amber-400",
-    red: "bg-red-600/20 border-red-500/30 text-red-400",
-  };
+// ---- Componentes locais ----
+function StatusBanner({ error, message, onClose }: { error: boolean; message: string; onClose: () => void }) {
   return (
-    <div className="flex items-center gap-4 mb-2 pb-4">
-      <div className={`flex items-center justify-center w-12 h-12 rounded-xl border ${colorMap[color] || colorMap.violet}`}>
-        {icon}
-      </div>
-      <div>
-        <h3 className="text-xl font-bold text-primary">{title}</h3>
-        <p className="text-sm text-tertiary mt-0.5">{subtitle}</p>
-      </div>
+    <div
+      role="status"
+      className={`flex items-center justify-between gap-3 rounded-lg border px-4 py-2.5 text-[0.8125rem] ${
+        error ? "border-red-500/25 bg-red-500/10 text-red-600 dark:text-red-400" : "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+      }`}
+    >
+      <span className="flex items-center gap-2 min-w-0">
+        {error ? <AlertCircle size={15} className="shrink-0" /> : <CheckCircle2 size={15} className="shrink-0" />}
+        <span className="break-words">{message}</span>
+      </span>
+      <button type="button" onClick={onClose} aria-label="Fechar aviso" className="shrink-0 text-xs underline cursor-pointer">
+        Fechar
+      </button>
+    </div>
+  );
+}
+
+// Campo de segredo: mascarado por padrão, com botão para mostrar/ocultar.
+function SecretInput({
+  id,
+  value,
+  onChange,
+  placeholder,
+}: {
+  id: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div className="relative flex items-center">
+      <input
+        id={id}
+        type={visible ? "text" : "password"}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        autoComplete="off"
+        className="w-full font-mono pr-10"
+      />
+      <button
+        type="button"
+        onClick={() => setVisible((v) => !v)}
+        aria-label={visible ? "Ocultar valor" : "Mostrar valor"}
+        className="absolute right-2 flex h-7 w-7 items-center justify-center rounded-md text-tertiary hover:text-primary cursor-pointer"
+      >
+        {visible ? <EyeOff size={15} /> : <Eye size={15} />}
+      </button>
     </div>
   );
 }
@@ -559,13 +674,13 @@ function ToggleRow({
   onChange: (v: boolean) => void;
 }) {
   return (
-    <div className="flex items-center justify-between py-2 border-b border-white/5 last:border-0 hover:bg-white/[0.02] -mx-4 px-4 rounded-xl transition-colors">
-      <div className="pr-6">
-        <p className="text-base font-semibold text-primary mb-1">{label}</p>
-        <p className="text-sm text-tertiary leading-snug">{desc}</p>
+    <div className="flex items-center justify-between gap-6 py-3">
+      <div className="min-w-0">
+        <p className="text-[0.8125rem] font-medium text-primary">{label}</p>
+        <p className="mt-0.5 text-xs text-tertiary leading-snug">{desc}</p>
       </div>
-      <div className="shrink-0 scale-110">
-        <Toggle checked={checked} onChange={onChange} />
+      <div className="shrink-0">
+        <Toggle checked={checked} onChange={onChange} size="sm" />
       </div>
     </div>
   );

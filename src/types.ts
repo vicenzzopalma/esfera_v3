@@ -111,11 +111,13 @@ export interface Campaign {
   contactsCount: number;
   sentCount: number;
   failedCount: number;
-  deviceIds?: number[];
+  deviceIds?: string[];
   companyId: number;
   useSpintax: boolean;
-  useAI: boolean;
+  useAi?: boolean;
+  useAI?: boolean;
   aiModel?: string;
+  aiProvider?: string;
   aiTemperature?: number;
   aiPrompt?: string;
   createdAt?: string;

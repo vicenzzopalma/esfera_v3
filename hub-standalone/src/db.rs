@@ -852,6 +852,16 @@ impl Database {
         // Garante que a empresa #1 seja REALESS e que nenhuma informação seja perdida
         let _ = self.conn().execute("UPDATE ESF_Company SET CompanyName='REALESS' WHERE CompanyId=1 AND (CompanyName='Empresa Principal' OR CompanyName='');", []);
 
+        // Atualização automática de modelos de IA descontinuados/obsoletos do OpenRouter
+        let _ = self.conn().execute(
+            "UPDATE ESF_Campaign SET AiModel = 'openrouter/free' WHERE AiModel IN ('qwen/qwen-2.5-72b-instruct:free', 'qwen/qwen-2.5-72b-instruct', 'meta-llama/llama-3.3-70b-instruct:free') OR AiModel LIKE '%qwen%72b%';",
+            [],
+        );
+        let _ = self.conn().execute(
+            "UPDATE ESF_AiConfig SET Model = 'openrouter/free' WHERE Model IN ('qwen/qwen-2.5-72b-instruct:free', 'qwen/qwen-2.5-72b-instruct', 'meta-llama/llama-3.3-70b-instruct:free') OR Model LIKE '%qwen%72b%';",
+            [],
+        );
+
         Ok(())
     }
 
