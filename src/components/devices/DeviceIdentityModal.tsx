@@ -1,24 +1,16 @@
 // ============================================================
-// Esfera v3 — Sub-componente DeviceIdentityModal (Linear SaaS Style)
-// Modal de diagnóstico de identidade e estado de cada dispositivo
+// Esfera v3 — Detalhes e identidade do aparelho (somente leitura)
 // ============================================================
 
-import Modal from "../ui/Modal";
-import Badge from "../ui/Badge";
-import Button from "../ui/Button";
-import type { Device } from "../../types";
-import { getConnectionOrigin, CONNECTION_BADGE_CONFIG } from "../../types";
-import {
-  Smartphone,
-  BatteryCharging,
-  BatteryLow,
-  BatteryFull,
-  BatteryWarning,
-  Clock,
-  Copy,
-  Check,
-} from "lucide-react";
 import { useState } from "react";
+import Modal from "../ui/Modal";
+import Button from "../ui/Button";
+import Badge from "../ui/Badge";
+import { FormSection } from "../ui/Field";
+import type { Device } from "../../types";
+import { getConnectionOrigin } from "../../types";
+import { Smartphone, Copy, Check } from "lucide-react";
+import { StatusDot, BatteryMeter, ORIGIN_LABEL, sectorLabel } from "./deviceUi";
 
 interface DeviceIdentityModalProps {
   isOpen: boolean;
@@ -26,41 +18,38 @@ interface DeviceIdentityModalProps {
   device: Device | null;
 }
 
-function BatteryIcon({ level }: { level: number }) {
-  if (level >= 75) return <BatteryFull size={14} className="text-emerald-400" />;
-  if (level >= 40) return <BatteryCharging size={14} className="text-amber-400" />;
-  if (level >= 15) return <BatteryWarning size={14} className="text-orange-400" />;
-  return <BatteryLow size={14} className="text-red-400" />;
-}
-
-function FieldRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+function Row({ label, value, mono = false, copy = false }: { label: string; value: React.ReactNode; mono?: boolean; copy?: boolean }) {
   const [copied, setCopied] = useState(false);
+  const text = typeof value === "string" ? value : "";
 
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(value);
+      await navigator.clipboard.writeText(text);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch {}
+    } catch {
+      /* ignore */
+    }
   };
 
   return (
-    <div className="flex items-center justify-between py-2 border-b border-white/[0.04] last:border-0">
-      <span className="text-[11px] text-zinc-500 shrink-0">{label}</span>
-      <div className="flex items-center gap-1.5 min-w-0 ml-4">
-        <span
-          className={`text-[11px] text-zinc-200 truncate ${mono ? "font-mono" : ""}`}
-          title={value}
-        >
+    <div className="flex items-center justify-between gap-4 border-b border-border py-2.5 last:border-0">
+      <span className="shrink-0 text-[0.8125rem] text-secondary">{label}</span>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className={`truncate text-[0.8125rem] text-primary ${mono ? "font-mono text-[0.75rem]" : ""}`} title={text}>
           {value}
         </span>
-        <button
-          onClick={handleCopy}
-          className="p-0.5 rounded text-zinc-600 hover:text-zinc-300 hover:bg-white/[0.06] transition-colors shrink-0 cursor-pointer"
-          title="Copiar"
-        >
-          {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
-        </button>
+        {copy && text && (
+          <button
+            type="button"
+            onClick={handleCopy}
+            aria-label={`Copiar ${label}`}
+            title="Copiar"
+            className="shrink-0 rounded p-1 text-tertiary hover:bg-secondary hover:text-primary cursor-pointer"
+          >
+            {copied ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -70,104 +59,58 @@ export function DeviceIdentityModal({ isOpen, onClose, device }: DeviceIdentityM
   if (!device) return null;
 
   const origin = getConnectionOrigin(device);
-  const badge = CONNECTION_BADGE_CONFIG[origin];
   const displayName = device.name || device.model || device.serial;
-
-  const statusConfig = {
-    online: { label: "Online", dot: "bg-emerald-400", text: "text-emerald-400" },
-    connecting: { label: "Conectando", dot: "bg-amber-400", text: "text-amber-400" },
-    offline: { label: "Offline", dot: "bg-zinc-600", text: "text-zinc-400" },
-    error: { label: "Erro", dot: "bg-red-400", text: "text-red-400" },
-    online_agent: { label: "Online (Agente)", dot: "bg-emerald-400", text: "text-emerald-400" },
-    degraded: { label: "Degradado (sem ADB)", dot: "bg-amber-500", text: "text-amber-400" },
-  };
-
-  const status = statusConfig[device.status] || statusConfig.offline;
 
   return (
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      title="Diagnóstico de Dispositivo"
+      title="Detalhes do aparelho"
       size="md"
       footer={
-        <Button variant="primary" size="sm" onClick={onClose}>
+        <Button variant="secondary" size="sm" onClick={onClose}>
           Fechar
         </Button>
       }
     >
-      <div className="space-y-4">
-        {/* Device Header */}
-        <div className="flex items-center gap-3 p-3 rounded-lg bg-[#09090b] border border-white/[0.06]">
-          <div className="p-2.5 rounded-lg bg-[#5E6AD2]/10 border border-[#5E6AD2]/20">
-            <Smartphone size={20} className="text-[#828DF7]" />
+      <div className="space-y-6">
+        <div className="flex items-center gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border bg-secondary text-secondary">
+            <Smartphone size={18} />
           </div>
           <div className="min-w-0 flex-1">
-            <h3 className="text-sm font-semibold text-zinc-100 truncate">{displayName}</h3>
-            <p className="text-[10px] text-zinc-500 font-mono">{device.model}</p>
+            <h3 className="truncate text-sm font-semibold text-primary">{displayName}</h3>
+            <p className="truncate text-[0.75rem] text-secondary">{device.model}</p>
           </div>
-          <div className="flex items-center gap-1.5 shrink-0">
-            <span className={`w-2 h-2 rounded-full ${status.dot} ${device.status === "online" ? "animate-pulse" : ""}`} />
-            <span className={`text-[11px] font-medium ${status.text}`}>{status.label}</span>
-          </div>
+          <StatusDot status={device.status} />
         </div>
 
-        {/* Connection Badge */}
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] uppercase font-semibold text-zinc-500 tracking-wider">Origem:</span>
-          <Badge variant={badge.badgeVariant} dot pulse={device.status === "online"}>
-            <span>{badge.icon} {badge.label}</span>
-          </Badge>
-          {device.viaTunnel && (
-            <Badge variant="purple">
-              <span>Túnel Reverso</span>
-            </Badge>
-          )}
-        </div>
+        <FormSection title="Identificação" description="O nome só muda por edição manual nas configurações do aparelho.">
+          <div className="rounded-xl border border-border px-4">
+            <Row label="Serial ADB" value={device.serial} mono copy />
+            <Row label="ID do Esfera" value={device.esferaDeviceId || "Não provisionado"} mono copy={!!device.esferaDeviceId} />
+            <Row label="Endereço" value={device.currentAdbAddress || device.ip || "Não informado"} mono copy={!!(device.currentAdbAddress || device.ip)} />
+            <Row label="Empresa (ID)" value={String(device.companyId)} mono />
+          </div>
+        </FormSection>
 
-        {/* Diagnostic Fields */}
-        <div className="rounded-lg bg-[#09090b] border border-white/[0.06] p-3 space-y-0">
-          <FieldRow label="Serial ADB Local" value={device.serial} mono />
-          <FieldRow
-            label="EsferaDeviceId (VPS)"
-            value={device.esferaDeviceId || "Não provisionado"}
-            mono
-          />
-          <FieldRow
-            label="IP / Porta ADB"
-            value={device.currentAdbAddress || device.ip || "N/A"}
-            mono
-          />
-          <FieldRow label="Company ID" value={String(device.companyId)} mono />
-          <div className="flex items-center justify-between py-2 border-b border-white/[0.04]">
-            <span className="text-[11px] text-zinc-500">Bateria</span>
-            <div className="flex items-center gap-1.5">
-              <BatteryIcon level={device.battery} />
-              <span className="text-[11px] text-zinc-200 font-mono">{device.battery}%</span>
-            </div>
+        <FormSection title="Estado">
+          <div className="rounded-xl border border-border px-4">
+            <Row label="Bateria" value={<BatteryMeter level={device.battery} />} />
+            <Row
+              label="Conexão"
+              value={
+                <span className="inline-flex items-center gap-2">
+                  {ORIGIN_LABEL[origin]}
+                  {device.viaTunnel && <Badge variant="neutral">Túnel reverso</Badge>}
+                </span>
+              }
+            />
+            <Row label="Setor" value={sectorLabel(device.sector)} />
+            <Row label="Número" value={`#${device.deviceNumber}`} mono />
+            <Row label="Último sinal (UTC)" value={device.lastSeenUtc || device.lastSeen || "Sem registro"} mono />
           </div>
-          <div className="flex items-center justify-between py-2">
-            <span className="text-[11px] text-zinc-500 flex items-center gap-1">
-              <Clock size={11} />
-              Último Sinal (UTC)
-            </span>
-            <span className="text-[11px] text-zinc-200 font-mono truncate ml-4" title={device.lastSeenUtc || device.lastSeen || "N/A"}>
-              {device.lastSeenUtc || device.lastSeen || "N/A"}
-            </span>
-          </div>
-        </div>
-
-        {/* Setor & Número */}
-        <div className="grid grid-cols-2 gap-2">
-          <div className="p-2.5 rounded-lg bg-[#09090b] border border-white/[0.06] flex items-center justify-between">
-            <span className="text-[10px] text-zinc-500">Setor</span>
-            <span className="text-[11px] text-zinc-200 uppercase font-medium">{device.sector}</span>
-          </div>
-          <div className="p-2.5 rounded-lg bg-[#09090b] border border-white/[0.06] flex items-center justify-between">
-            <span className="text-[10px] text-zinc-500">Nº Dispositivo</span>
-            <span className="text-[11px] text-zinc-200 font-mono">#{device.deviceNumber}</span>
-          </div>
-        </div>
+        </FormSection>
       </div>
     </Modal>
   );

@@ -173,7 +173,7 @@ async fn handle_connection(
                 // Auth por TOKEN de empresa (sem credencial global em código).
                 // Master => CompanyId 0; Empresa => CompanyId N (isolada).
                 let validated = db.validate_token(&token);
-                let (company_id, role_out) = match validated {
+                let (company_id, _role_out) = match validated {
                     Some((cid, r)) => (cid, r),
                     None => {
                         let resp = HubMessage::AuthResponse {

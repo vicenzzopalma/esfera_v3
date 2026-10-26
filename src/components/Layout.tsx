@@ -1,6 +1,6 @@
 // ============================================================
 // Esfera v3 — Layout Principal
-// Sidebar Fixa + Inline Style Padding 256px + Header + Viewport + StatusBar
+// Sidebar fixa (240px) + Header + conteúdo + StatusBar
 // ============================================================
 
 import { Outlet } from "react-router-dom";
@@ -10,24 +10,20 @@ import StatusBar from "./StatusBar";
 
 export default function Layout() {
   return (
-    <div className="min-h-screen bg-primary text-primary relative font-sans">
-      {/* Sidebar Fixa (Largura: 240px) */}
+    <div className="min-h-screen bg-primary text-primary relative font-sans overflow-x-hidden">
       <Sidebar />
 
-      {/* Container Principal Deslocado Exatamente 240px para a direita via inline style */}
-      <div style={{ paddingLeft: "240px" }} className="min-h-screen flex flex-col min-w-0">
-        {/* Header Global */}
+      {/* Offset de 240px definido também em .layout-main-wrapper (index.css) */}
+      <div style={{ paddingLeft: "240px" }} className="layout-main-wrapper min-h-screen flex flex-col min-w-0">
         <Header />
 
-        {/* Viewport de Conteúdo das Abas */}
-        <main className="flex-1 p-6 pb-14 overflow-y-auto min-w-0">
-          <div className="max-w-[1440px] mx-auto w-full space-y-6">
+        <main className="flex-1 px-6 py-6 pb-14 overflow-x-hidden min-w-0">
+          <div className="max-w-[1440px] mx-auto w-full space-y-6 min-w-0">
             <Outlet />
           </div>
         </main>
       </div>
 
-      {/* Barra de Status no Rodapé */}
       <StatusBar />
     </div>
   );

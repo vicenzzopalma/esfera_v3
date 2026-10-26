@@ -10,13 +10,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::spawn_blocking;
-use tokio::time::{sleep, Duration};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::{sleep, timeout, Duration};
 
 static CAMPAIGN_DEVICE_INDEX: std::sync::LazyLock<Mutex<HashMap<i32, usize>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static KEEPALIVE_LAST_ATTEMPT: std::sync::LazyLock<Mutex<HashMap<String, (i64, bool)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+#[allow(dead_code)]
+static SEND_DEVICE_PREPARED: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static DEVICE_SEND_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const KEEPALIVE_COOLDOWN_SECS: i64 = 90;
@@ -47,8 +53,9 @@ impl Dispatcher {
     /// Mantém fluidez por: polling menor, lote limitado e backpressure artificial.
     pub fn start_worker(db_arc: Arc<Database>, app_handle: Option<AppHandle>) {
         tauri::async_runtime::spawn(async move {
+            let mut poll_delay = Duration::ZERO;
             loop {
-                sleep(Duration::from_secs(2)).await;
+                sleep(poll_delay).await;
 
                 let db = db_arc.clone();
                 let active_campaigns = match spawn_blocking(move || db.get_running_campaigns()).await {
@@ -57,31 +64,72 @@ impl Dispatcher {
                 };
 
                 if active_campaigns.is_empty() {
+                    poll_delay = Duration::from_secs(2);
                     continue;
                 }
+                poll_delay = Duration::from_millis(250);
 
-                // Processa no máximo 1 contato por tick por campanha para reduzir spawns.
+                // Cada campanha mantém sua própria cadência. Campanhas diferentes
+                // podem avançar juntas sem somar os intervalos HCP umas às outras.
+                let mut tasks = Vec::new();
                 for campaign in active_campaigns {
+                    let db_arc = db_arc.clone();
+                    let app_handle = app_handle.clone();
+                    tasks.push(tauri::async_runtime::spawn(async move {
+                    let lookup_started = Instant::now();
                     let db1 = db_arc.clone();
-                    let next_contact = match spawn_blocking(move || db1.get_next_pending_contact(campaign.id)).await {
-                        Ok(Some(c)) => c,
-                        _ => continue,
+                    let next_contact = match spawn_blocking(move || db1.try_get_next_pending_contact(campaign.id)).await {
+                        Ok(Ok(Some(c))) => c,
+                        Ok(Ok(None)) => {
+                            let db_done = db_arc.clone();
+                            let campaign_id = campaign.id;
+                            let _ = spawn_blocking(move || db_done.set_campaign_status(campaign_id, "completed")).await;
+                            if let Some(ref handle) = app_handle {
+                                let _ = handle.emit("campaign-progress", CampaignProgressEvent {
+                                    campaign_id: campaign.id,
+                                    campaign_name: campaign.name.clone(),
+                                    sent_count: campaign.sent_count,
+                                    total_contacts: campaign.contacts_count,
+                                    last_contact_phone: String::new(),
+                                    delay_used_ms: 0,
+                                    status: "completed".to_string(),
+                                });
+                            }
+                            return;
+                        }
+                        Ok(Err(error)) => {
+                            eprintln!("[DISPATCHER DB] Falha ao buscar contato da campanha {}: {}", campaign.id, error);
+                            return;
+                        }
+                        Err(error) => {
+                            eprintln!("[DISPATCHER DB] Falha na tarefa de busca da campanha {}: {}", campaign.id, error);
+                            return;
+                        }
                     };
 
                     let phone = next_contact.phone.clone();
                     let phone_check = phone.clone();
                     let db_check = db_arc.clone();
-                    let already_sent = match spawn_blocking(move || db_check.was_already_sent(&phone_check, campaign.id)).await {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                    let already_sent = match spawn_blocking(move || db_check.try_was_already_sent(&phone_check, campaign.id)).await {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(error)) => {
+                            eprintln!("[DISPATCHER DB] Falha na deduplicação da campanha {}: {}", campaign.id, error);
+                            return;
+                        }
+                        Err(error) => {
+                            eprintln!("[DISPATCHER DB] Falha na tarefa de deduplicação da campanha {}: {}", campaign.id, error);
+                            return;
+                        }
                     };
 
                     if already_sent {
                         let db2 = db_arc.clone();
                         let cid = next_contact.id;
                         let _ = spawn_blocking(move || db2.update_contact_status(cid, "already_sent")).await;
-                        continue;
+                        return;
                     }
+                    let lookup_ms = lookup_started.elapsed().as_millis();
+                    let preparation_started = Instant::now();
 
                     // Monta o texto base: saudação + corpo + despedida, com Spintax resolvido
                     let campaign_text = {
@@ -96,6 +144,8 @@ impl Dispatcher {
                             full.push_str(&campaign.closing);
                         }
                         if campaign.use_spintax {
+                            // Troca {nome} antes do spintax: sem isso o motor trata "{nome}" como bloco de 1 variante e envia "nome".
+                            let full = AiEngine::replace_contact_name(&full, &next_contact.contact_name);
                             crate::spintax::resolve_spintax(&full)
                         } else {
                             full
@@ -105,25 +155,84 @@ impl Dispatcher {
                     let message_to_send = if campaign.use_ai {
                         let db2 = db_arc.clone();
                         match spawn_blocking(move || db2.get_ai_config(campaign.company_id)).await {
-                            Ok(Some(config)) => {
-                                match AiEngine::generate_message(&config, &campaign_text, &next_contact.contact_name).await {
+                            Ok(global_config) => {
+                                let mut config = if let Some(config) = global_config {
+                                    config
+                                } else {
+                                    crate::db::AiConfig {
+                                        company_id: campaign.company_id,
+                                        provider: if !campaign.ai_provider.is_empty() { campaign.ai_provider.clone() } else { "groq".to_string() },
+                                        model: if !campaign.ai_model.is_empty() { campaign.ai_model.clone() } else { "llama-3.3-70b-versatile".to_string() },
+                                        temperature: 0.7,
+                                        system_prompt: String::new(),
+                                        api_key: String::new(),
+                                        endpoint: String::new(),
+                                    }
+                                };
+
+                                // Se a campanha tiver provedor específico, prioriza o da campanha
+                                if !campaign.ai_provider.is_empty() {
+                                    if campaign.ai_provider != config.provider {
+                                        config.provider = campaign.ai_provider.clone();
+                                        config.endpoint = String::new();
+                                        if let Some((saved_key, saved_ep, saved_model)) = db_arc.get_ai_provider_key(campaign.company_id, &campaign.ai_provider) {
+                                            config.api_key = saved_key;
+                                            if !saved_ep.is_empty() { config.endpoint = saved_ep; }
+                                            if !saved_model.is_empty() && campaign.ai_model.trim().is_empty() { config.model = saved_model; }
+                                        } else {
+                                            config.api_key = String::new();
+                                        }
+                                    }
+                                }
+                                if !campaign.ai_model.trim().is_empty() {
+                                    config.model = campaign.ai_model.clone();
+                                }
+                                if !campaign.ai_prompt.trim().is_empty() {
+                                    config.system_prompt = campaign.ai_prompt.clone();
+                                }
+
+                                let ai_result = timeout(Duration::from_secs(15), AiEngine::generate_message(&config, &campaign_text, &next_contact.contact_name))
+                                    .await
+                                    .unwrap_or_else(|_| Err("Tempo limite total de 15s na geração de IA".to_string()));
+                                match ai_result {
                                     Ok(custom_msg) => custom_msg,
-                                    Err(_) => campaign_text.replace("{nome}", &next_contact.contact_name),
+                                    Err(error) => {
+                                        // Fallback resiliente: não quebra a campanha de 100 celulares. Usa a mensagem base com substituição de nome.
+                                        eprintln!("[DISPATCHER IA] Falha na IA: {}. Aplicando fallback de mensagem original.", error);
+                                        if let Some(ref handle) = app_handle {
+                                            let _ = handle.emit("campaign-progress", CampaignProgressEvent {
+                                                campaign_id: campaign.id,
+                                                campaign_name: campaign.name.clone(),
+                                                sent_count: campaign.sent_count,
+                                                total_contacts: campaign.contacts_count,
+                                                last_contact_phone: next_contact.phone.clone(),
+                                                delay_used_ms: 0,
+                                                status: format!("IA aviso (fallback ativo): {}", error),
+                                            });
+                                        }
+                                        AiEngine::replace_contact_name(&campaign_text, &next_contact.contact_name)
+                                    }
                                 }
                             }
-                            _ => campaign_text.replace("{nome}", &next_contact.contact_name),
+                            _ => AiEngine::replace_contact_name(&campaign_text, &next_contact.contact_name),
                         }
                     } else {
-                        campaign_text.replace("{nome}", &next_contact.contact_name)
+                        AiEngine::replace_contact_name(&campaign_text, &next_contact.contact_name)
                     };
 
                     let db2 = db_arc.clone();
                     let active_devices = match spawn_blocking(move || db2.get_devices(campaign.company_id)).await {
                         Ok(v) => v,
-                        Err(_) => continue,
+                        Err(_) => return,
                     };
-                    let online_devices: Vec<_> = active_devices.into_iter().filter(|d| d.status == "online").collect();
+                    let online_devices: Vec<_> = active_devices.into_iter().filter(|d| {
+                        d.status == "online" && campaign.device_ids.iter().any(|id| {
+                            d.esfera_device_id.as_deref() == Some(id.as_str()) || d.serial == *id
+                        })
+                    }).collect();
 
+                    let preparation_ms = preparation_started.elapsed().as_millis();
+                    let send_started = Instant::now();
                     let outcome = if online_devices.is_empty() {
                         SendOutcome::NoOnlineDevice
                     } else {
@@ -132,21 +241,50 @@ impl Dispatcher {
                             let idx = idx_map.entry(campaign.id).or_insert(0);
                             let target_dev = &online_devices[*idx % online_devices.len()];
                             *idx = (*idx + 1) % online_devices.len();
-                            target_dev.serial.clone()
+                            target_dev.current_adb_address.as_ref()
+                                .filter(|a| !a.trim().is_empty())
+                                .cloned()
+                                .unwrap_or_else(|| target_dev.serial.clone())
                         };
 
                         let msg = message_to_send.clone();
                         let phone2 = phone.clone();
+                        let contact_name = next_contact.contact_name.clone();
+                        let device_lock = {
+                            let mut locks = DEVICE_SEND_LOCKS.lock().unwrap();
+                            locks.entry(serial.clone())
+                                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                                .clone()
+                        };
+                        let _device_guard = device_lock.lock().await;
                         let send_res = spawn_blocking(move || {
-                            let _ = AdbManager::configure_device_socks_proxy_and_revoke_bssid(&serial, None);
-                            AdbManager::send_whatsapp_intent_and_bezier_tap(&serial, &phone2, &msg)
+                            let name_ref = if contact_name.trim().is_empty() { None } else { Some(contact_name.as_str()) };
+                            println!("[DISPATCHER] Disparando contato '{}' ({}) via navegacao nativa WhatsApp no aparelho {}", contact_name, phone2, serial);
+                            AdbManager::send_whatsapp_with_contact(&serial, &phone2, &msg, name_ref, Some("com.whatsapp"))
                         }).await;
 
                         match send_res {
-                            Ok(Ok(_)) => SendOutcome::Sent,
-                            _ => SendOutcome::SendFailed("send_failed".to_string()),
+                            Ok(Ok(_)) => {
+                                println!("[DISPATCHER] Mensagem enviada com sucesso para {} via navegacao nativa!", phone);
+                                SendOutcome::Sent
+                            }
+                            Ok(Err(e)) => {
+                                eprintln!("[DISPATCHER] Erro no envio para {}: {}", phone, e);
+                                SendOutcome::SendFailed(e)
+                            }
+                            Err(e) => {
+                                eprintln!("[DISPATCHER] Falha de execucao no worker para {}: {}", phone, e);
+                                SendOutcome::SendFailed(e.to_string())
+                            }
                         }
                     };
+                    let send_ms = send_started.elapsed().as_millis();
+                    if lookup_ms > 500 || preparation_ms > 3000 || send_ms > 8000 {
+                        eprintln!(
+                            "[DISPATCHER PERF] campanha={} busca={}ms preparo={}ms envio={}ms",
+                            campaign.id, lookup_ms, preparation_ms, send_ms
+                        );
+                    }
 
                     let delay_min_ms = campaign.delay_min * 1000;
                     let delay_max_ms = campaign.delay_max * 1000;
@@ -164,7 +302,13 @@ impl Dispatcher {
                                 .await
                                 .unwrap_or_default();
                         }
-                        SendOutcome::SkippedDuplicate | SendOutcome::NoOnlineDevice | SendOutcome::SendFailed(_) => {
+                        SendOutcome::SendFailed(_) => {
+                            let db_failure = db_arc.clone();
+                            let campaign_id = campaign.id;
+                            let contact_id = next_contact.id;
+                            let _ = spawn_blocking(move || db_failure.record_contact_send_failure(campaign_id, contact_id)).await;
+                        }
+                        SendOutcome::SkippedDuplicate | SendOutcome::NoOnlineDevice => {
                             // não contabiliza como enviado; mantém contato pendente para próxima rodada
                         }
                     }
@@ -188,6 +332,12 @@ impl Dispatcher {
                             },
                         };
                         let _ = handle.emit("campaign-progress", progress);
+                    }
+                    }));
+                }
+                for task in tasks {
+                    if let Err(error) = task.await {
+                        eprintln!("[DISPATCHER] Falha na tarefa de campanha: {}", error);
                     }
                 }
             }

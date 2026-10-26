@@ -1,6 +1,6 @@
 // ============================================================
-// Esfera v3 — Componente Card (Refatorado)
-// Container com glassmorphism, suporte a hover glow e transições
+// Esfera v3 — Card
+// Container limpo: borda 1px, raio xl, sem sombra pesada
 // ============================================================
 
 import type { ReactNode, HTMLAttributes } from "react";
@@ -14,8 +14,8 @@ interface CardProps extends HTMLAttributes<HTMLDivElement> {
 
 const paddingClasses: Record<string, string> = {
   none: "",
-  xs: "p-2.5",
-  sm: "p-3.5",
+  xs: "p-3",
+  sm: "p-4",
   md: "p-4 sm:p-5",
   lg: "p-5 sm:p-6",
 };
@@ -30,11 +30,9 @@ export default function Card({
 }: CardProps) {
   return (
     <div
-      className={`rounded-xl bg-[#141418] border border-white/[0.07] relative overflow-hidden transition-all duration-150 ${
-        hover
-          ? "hover:border-white/[0.15] hover:bg-[#18181d] cursor-pointer"
-          : ""
-      } ${glow ? "border-[#5E6AD2]/40 shadow-md shadow-[#5E6AD2]/10" : ""} ${
+      className={`rounded-xl bg-card border relative transition-colors duration-150 ${
+        glow ? "border-accent" : "border-border"
+      } ${hover ? "hover:border-border-strong hover:bg-[var(--color-bg-card-hover)] cursor-pointer" : ""} ${
         paddingClasses[padding]
       } ${className}`}
       {...props}

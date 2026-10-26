@@ -44,6 +44,7 @@ const PROXY_ACK_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct AgentHandshake {
     #[serde(rename = "type")]
     msg_type: Option<String>,

@@ -19,12 +19,14 @@ import {
   RefreshCw,
   CheckCircle2,
   AlertCircle,
-  Activity,
   Monitor,
 } from "lucide-react";
 import Button from "./ui/Button";
 import Card from "./ui/Card";
-import Badge from "./ui/Badge";
+import PageHeader from "./ui/PageHeader";
+import EmptyState from "./ui/EmptyState";
+import Field from "./ui/Field";
+import { inputCls, StatusDot, BatteryMeter } from "./devices/deviceUi";
 
 export default function CollaboratorView() {
   const { user, selectedCompanyId } = useAuth();
@@ -35,6 +37,7 @@ export default function CollaboratorView() {
   const [reasonInput, setReasonInput] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [launchingScrcpy, setLaunchingScrcpy] = useState<Record<string, boolean>>({});
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   const companyId = selectedCompanyId || user?.companyId || 1;
@@ -51,14 +54,14 @@ export default function CollaboratorView() {
       });
       setMessage({
         type: "success",
-        text: `Scrcpy aberto com sucesso para ${dev.name || dev.model || dev.serial}! (${res})`,
+        text: `Espelhamento aberto para ${dev.name || dev.model || dev.serial}. (${res})`,
       });
     } catch (err: any) {
       console.error("Erro ao iniciar Scrcpy para o colaborador:", err);
       const errMsg = typeof err === "string" ? err : err?.message || JSON.stringify(err);
       setMessage({
         type: "error",
-        text: `Falha ao abrir Scrcpy: ${errMsg}`,
+        text: `Falha ao abrir o espelhamento: ${errMsg}`,
       });
     } finally {
       setLaunchingScrcpy((prev) => ({ ...prev, [devKey]: false }));
@@ -80,8 +83,10 @@ export default function CollaboratorView() {
       ]);
       setAssignedDevices(devices || []);
       setPermissionRequests(requests || []);
-    } catch (err) {
+      setLoadError(null);
+    } catch (err: any) {
       console.error("Erro ao carregar dados do colaborador:", err);
+      setLoadError(typeof err === "string" ? err : err?.message || "Falha ao buscar os dados.");
     } finally {
       setLoading(false);
     }
@@ -136,69 +141,57 @@ export default function CollaboratorView() {
   };
 
   return (
-    <div className="space-y-6">
-      {/* Cabeçalho da Tela do Colaborador */}
-      <div className="bg-gradient-to-r from-blue-900/40 via-purple-900/30 to-slate-900 border border-blue-500/30 rounded-2xl p-6 shadow-xl backdrop-blur-md">
-        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-          <div className="flex items-center gap-4">
-            <div className="p-3 bg-blue-500/20 border border-blue-500/40 rounded-xl text-blue-400">
-              <Smartphone size={32} />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-500/30">
-                  Painel de Uso Exclusivo
-                </span>
-                <span className="text-xs text-slate-400">| Colaborador: {user?.displayName}</span>
-              </div>
-              <h1 className="text-2xl font-bold text-white mt-1">Meus Celulares Responsáveis</h1>
-              <p className="text-slate-300 text-sm">
-                Solicite permissão para utilizar o celular pelo qual você é responsável. O acesso será liberado pelo seu Gestor.
-              </p>
-            </div>
-          </div>
-
-          <Button
-            variant="ghost"
-            onClick={loadData}
-            disabled={loading}
-            className="flex items-center gap-2 text-slate-300 hover:text-white border border-slate-700"
-          >
-            <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
-            Atualizar Status
+    <div className="space-y-6 animate-fade-in pb-8">
+      <PageHeader
+        title="Meus celulares"
+        description="Peça permissão ao gestor para usar o celular pelo qual você é responsável."
+        icon={<Smartphone size={18} />}
+        actions={
+          <Button variant="secondary" onClick={loadData} loading={loading} icon={<RefreshCw size={14} />}>
+            Atualizar
           </Button>
-        </div>
-      </div>
+        }
+      />
 
       {message && (
         <div
-          className={`p-4 rounded-xl border flex items-center gap-3 text-sm font-medium ${
+          role={message.type === "error" ? "alert" : "status"}
+          className={`flex items-center gap-2.5 rounded-lg border p-3 text-[0.8125rem] ${
             message.type === "success"
-              ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-300"
-              : "bg-red-500/15 border-red-500/30 text-red-300"
+              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+              : "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400"
           }`}
         >
-          {message.type === "success" ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}
-          <span>{message.text}</span>
+          {message.type === "success" ? <CheckCircle2 size={16} className="shrink-0" /> : <AlertCircle size={16} className="shrink-0" />}
+          <span className="min-w-0 break-words">{message.text}</span>
         </div>
       )}
 
-      {/* Lista de Celulares Atribuídos ao Colaborador */}
       {loading && assignedDevices.length === 0 ? (
-        <div className="flex flex-col items-center justify-center p-12 text-slate-400">
-          <RefreshCw size={32} className="animate-spin text-blue-400 mb-3" />
-          <p>Buscando seus celulares atribuídos...</p>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <div key={i} className="h-56 animate-pulse rounded-xl border border-border bg-card" />
+          ))}
         </div>
+      ) : loadError && assignedDevices.length === 0 ? (
+        <EmptyState
+          icon={<AlertCircle size={18} />}
+          title="Não foi possível carregar seus celulares"
+          description={loadError}
+          action={
+            <Button variant="secondary" size="sm" onClick={loadData} icon={<RefreshCw size={13} />}>
+              Tentar novamente
+            </Button>
+          }
+        />
       ) : assignedDevices.length === 0 ? (
-        <Card className="p-8 text-center border border-slate-800 bg-slate-900/60">
-          <Smartphone size={48} className="mx-auto text-slate-600 mb-4" />
-          <h3 className="text-lg font-semibold text-white">Nenhum celular vinculado no momento</h3>
-          <p className="text-slate-400 text-sm mt-1 max-w-md mx-auto">
-            Você ainda não possui aparelhos atribuídos ao seu usuário. Solicite ao seu Gestor para vincular um celular à sua conta.
-          </p>
-        </Card>
+        <EmptyState
+          icon={<Smartphone size={18} />}
+          title="Nenhum celular vinculado"
+          description="Você ainda não tem aparelhos atribuídos. Peça ao gestor para vincular um celular à sua conta."
+        />
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
           {assignedDevices.map((dev) => {
             const req = getDeviceRequestStatus(dev);
             const isApproved = req && req.status === "approved";
@@ -208,177 +201,111 @@ export default function CollaboratorView() {
             return (
               <Card
                 key={dev.serial}
-                className={`relative overflow-hidden transition-all duration-300 border ${
-                  isApproved
-                    ? "border-emerald-500/50 bg-emerald-950/20 shadow-lg shadow-emerald-950/40"
-                    : isPending
-                    ? "border-amber-500/50 bg-amber-950/20"
-                    : "border-slate-800 bg-slate-900/80 hover:border-slate-700"
-                }`}
+                className={isApproved ? "!border-emerald-500/50" : isPending ? "!border-amber-500/50" : ""}
               >
-                <div className="p-5 space-y-4">
-                  {/* Cabeçalho do Card */}
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <span className="text-xs font-medium text-slate-400 uppercase tracking-wider">
-                        Aparelho #{dev.deviceNumber || 1}
-                      </span>
-                      <h3 className="text-lg font-bold text-white mt-0.5">{dev.name || dev.model}</h3>
-                      <p className="text-xs text-slate-400">{dev.brand} {dev.model} • {dev.serial}</p>
+                <div className="space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <h3 className="truncate text-sm font-semibold text-primary">{dev.name || dev.model}</h3>
+                      <p className="truncate text-[0.75rem] text-secondary">
+                        #{dev.deviceNumber || 1} · {dev.brand} {dev.model}
+                      </p>
+                      <p className="truncate font-mono text-[0.6875rem] text-tertiary">{dev.serial}</p>
                     </div>
-
-                    <div className="flex flex-col items-end gap-1">
-                      <Badge
-                        variant={dev.status === "online" ? "success" : "neutral"}
-                        className="capitalize"
-                      >
-                        {dev.status}
-                      </Badge>
-                      <span className="text-xs text-slate-400 flex items-center gap-1">
-                        <Activity size={12} /> Bateria: {dev.battery}%
-                      </span>
+                    <div className="flex shrink-0 flex-col items-end gap-1">
+                      <StatusDot status={dev.status} />
+                      <BatteryMeter level={dev.battery} />
                     </div>
                   </div>
 
-                  {/* Status da Permissão de Uso */}
-                  <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800/80 space-y-2">
-                    <span className="text-xs font-semibold text-slate-400 block uppercase">
-                      Status da Permissão:
-                    </span>
-
+                  <div className="space-y-1 rounded-lg bg-secondary/60 p-3">
+                    <p className="text-[0.75rem] text-secondary">Permissão de uso</p>
                     {isApproved ? (
-                      <div className="flex items-center gap-2 text-emerald-400 font-medium text-sm">
-                        <ShieldCheck size={18} className="text-emerald-400 animate-pulse" />
-                        <span>Permissão Concedida pelo Gestor</span>
-                      </div>
+                      <p className="flex items-center gap-2 text-[0.8125rem] font-medium text-emerald-600 dark:text-emerald-400">
+                        <ShieldCheck size={16} /> Concedida pelo gestor
+                      </p>
                     ) : isPending ? (
-                      <div className="flex items-center gap-2 text-amber-400 font-medium text-sm">
-                        <Clock size={18} className="text-amber-400 animate-spin" />
-                        <span>Aguardando Aprovação do Gestor...</span>
-                      </div>
+                      <p className="flex items-center gap-2 text-[0.8125rem] font-medium text-amber-600 dark:text-amber-400">
+                        <Clock size={16} /> Aguardando aprovação
+                      </p>
                     ) : isRejected ? (
-                      <div className="flex items-center gap-2 text-red-400 font-medium text-sm">
-                        <ShieldAlert size={18} className="text-red-400" />
-                        <span>Solicitação Recusada pelo Gestor</span>
-                      </div>
+                      <p className="flex items-center gap-2 text-[0.8125rem] font-medium text-red-600 dark:text-red-400">
+                        <ShieldAlert size={16} /> Recusada pelo gestor
+                      </p>
                     ) : (
-                      <div className="flex items-center gap-2 text-slate-400 text-sm">
-                        <ShieldAlert size={18} className="text-slate-500" />
-                        <span>Acesso Não Solicitado</span>
-                      </div>
-                    )}
-
-                    {req?.requestedAt && (
-                      <p className="text-[11px] text-slate-500">
-                        Última solicitação: {new Date(req.requestedAt).toLocaleString("pt-BR")}
+                      <p className="flex items-center gap-2 text-[0.8125rem] text-secondary">
+                        <ShieldAlert size={16} /> Não solicitada
                       </p>
                     )}
+                    {req?.requestedAt && (
+                      <p className="text-[0.75rem] text-tertiary">Última solicitação: {new Date(req.requestedAt).toLocaleString("pt-BR")}</p>
+                    )}
                   </div>
 
-                  {/* Ações do Colaborador */}
-                  <div className="pt-2">
-                    {isApproved ? (
-                      <div className="space-y-2">
-                        <div className="p-3 bg-emerald-500/15 rounded-xl border border-emerald-500/30 text-emerald-300 text-xs flex flex-col gap-1">
-                          <div className="flex items-center justify-between font-semibold">
-                            <span className="flex items-center gap-1.5">
-                              <Zap size={14} /> Celular Autorizado pelo Gestor!
-                            </span>
-                            <span className="text-[10px] bg-emerald-500/20 px-2 py-0.5 rounded-md">Ativo</span>
-                          </div>
-                          <p className="text-[11px] text-slate-400">
-                            🔒 Permissão Restrita: Apenas visualização de tela habilitada. Câmeras e processamento em segundo plano desativados.
-                          </p>
-                        </div>
-
-                        {/* Botões do Scrcpy para o Colaborador */}
-                        <div className="space-y-1.5">
-                          <Button
-                            variant="primary"
-                            disabled={launchingScrcpy[dev.serial]}
-                            onClick={() => handleLaunchScrcpy(dev, false)}
-                            className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 font-bold py-2.5 shadow-lg shadow-blue-950/40"
-                          >
-                            {launchingScrcpy[dev.serial] ? (
-                              <>
-                                <RefreshCw size={16} className="animate-spin" />
-                                <span>Iniciando Scrcpy...</span>
-                              </>
-                            ) : (
-                              <>
-                                <Monitor size={18} />
-                                <span>Abrir Scrcpy (Espelhar Tela)</span>
-                              </>
-                            )}
-                          </Button>
-
-                          <Button
-                            variant="secondary"
-                            disabled={launchingScrcpy[dev.serial]}
-                            onClick={() => handleLaunchScrcpy(dev, true)}
-                            className="w-full flex items-center justify-center gap-2 text-xs py-1.5 bg-slate-900/80 hover:bg-slate-800 text-slate-300 border border-slate-700"
-                            title="Abre o Scrcpy no computador mantendo a tela física do celular desligada"
-                          >
-                            <Smartphone size={14} />
-                            <span>Abrir com Tela do Celular Apagada</span>
-                          </Button>
-                        </div>
-
-                        <Button
-                          variant="danger"
-                          onClick={() => handleEndSession(req.requestId)}
-                          className="w-full flex items-center justify-center gap-2 text-xs py-2"
-                        >
-                          <Power size={14} />
-                          Encerrar Uso do Celular
-                        </Button>
-                      </div>
-                    ) : requestingSerial === dev.serial ? (
-                      <div className="space-y-3 p-3 bg-slate-800/80 rounded-xl border border-blue-500/40">
-                        <label className="text-xs font-semibold text-slate-300 block">
-                          Motivo / Observação do Pedido:
-                        </label>
+                  {isApproved ? (
+                    <div className="space-y-2">
+                      <p className="text-[0.75rem] text-secondary">Acesso restrito: apenas visualização da tela. Câmeras e processamento em segundo plano ficam desativados.</p>
+                      <Button
+                        variant="primary"
+                        size="md"
+                        loading={!!launchingScrcpy[dev.serial]}
+                        onClick={() => handleLaunchScrcpy(dev, false)}
+                        icon={<Monitor size={14} />}
+                        className="w-full"
+                      >
+                        {launchingScrcpy[dev.serial] ? "Abrindo..." : "Espelhar tela"}
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={launchingScrcpy[dev.serial]}
+                        onClick={() => handleLaunchScrcpy(dev, true)}
+                        icon={<Smartphone size={13} />}
+                        className="w-full"
+                        title="Abre o espelhamento no computador com a tela física do celular apagada"
+                      >
+                        Espelhar com a tela do celular apagada
+                      </Button>
+                      <Button variant="danger" size="sm" onClick={() => handleEndSession(req.requestId)} icon={<Power size={13} />} className="w-full">
+                        Encerrar uso do celular
+                      </Button>
+                    </div>
+                  ) : requestingSerial === dev.serial ? (
+                    <div className="space-y-3">
+                      <Field label="Motivo do pedido" htmlFor={`reason-${dev.serial}`}>
                         <input
+                          id={`reason-${dev.serial}`}
                           type="text"
                           value={reasonInput}
                           onChange={(e) => setReasonInput(e.target.value)}
-                          placeholder="Ex: Realizar testes de campanha WhatsApp..."
-                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-blue-500"
+                          placeholder="Ex.: Testes de campanha no WhatsApp"
+                          className={inputCls}
                         />
-                        <div className="flex items-center gap-2">
-                          <Button
-                            variant="primary"
-                            onClick={() => handleRequestAccess(dev.serial)}
-                            disabled={submitting}
-                            className="flex-1 text-xs py-2 flex items-center justify-center gap-1.5"
-                          >
-                            <Send size={14} />
-                            {submitting ? "Enviando..." : "Enviar Pedido"}
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            onClick={() => setRequestingSerial(null)}
-                            className="text-xs py-2 text-slate-400"
-                          >
-                            Cancelar
-                          </Button>
-                        </div>
+                      </Field>
+                      <div className="flex items-center gap-2">
+                        <Button variant="primary" size="sm" onClick={() => handleRequestAccess(dev.serial)} loading={submitting} icon={<Send size={13} />} className="flex-1">
+                          {submitting ? "Enviando..." : "Enviar pedido"}
+                        </Button>
+                        <Button variant="ghost" size="sm" onClick={() => setRequestingSerial(null)}>
+                          Cancelar
+                        </Button>
                       </div>
-                    ) : (
-                      <Button
-                        variant="primary"
-                        onClick={() => {
-                          setRequestingSerial(dev.serial);
-                          setReasonInput("");
-                        }}
-                        disabled={!!isPending}
-                        className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 font-semibold shadow-lg shadow-blue-900/30"
-                      >
-                        <Zap size={16} />
-                        {isPending ? "Aguardando Gestor..." : "Pedir Permissão para Usar Celular"}
-                      </Button>
-                    )}
-                  </div>
+                    </div>
+                  ) : (
+                    <Button
+                      variant="primary"
+                      size="md"
+                      onClick={() => {
+                        setRequestingSerial(dev.serial);
+                        setReasonInput("");
+                      }}
+                      disabled={!!isPending}
+                      icon={<Zap size={14} />}
+                      className="w-full"
+                    >
+                      {isPending ? "Aguardando gestor" : "Pedir permissão de uso"}
+                    </Button>
+                  )}
                 </div>
               </Card>
             );

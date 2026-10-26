@@ -8,6 +8,7 @@ import Modal from "../ui/Modal";
 import Button from "../ui/Button";
 import { api } from "../../tauri";
 import { Camera, RefreshCw } from "lucide-react";
+import EmptyState from "../ui/EmptyState";
 
 interface ScreenRegionModalProps {
   isOpen: boolean;
@@ -42,10 +43,10 @@ export function ScreenRegionModal({
         videoRef.current.srcObject = stream;
         videoRef.current.play();
         setStreamActive(true);
-        setStatusMsg("✅ Monitor capturado! Arraste o quadrado para enquadrar o QR Code.");
+        setStatusMsg("Tela capturada. Arraste o quadrado para enquadrar o QR Code.");
       }
     } catch {
-      setStatusMsg("❌ Erro ao acessar monitor.");
+      setStatusMsg("Não foi possível acessar a tela.");
     }
   };
 
@@ -71,7 +72,7 @@ export function ScreenRegionModal({
       const msg = await api<string>("inject_base64_frame", { serial, frameData: base64Data });
       setStatusMsg(msg);
     } catch (err: any) {
-      setStatusMsg(`❌ Erro: ${typeof err === "string" ? err : err?.message || "Falha na injeção"}`);
+      setStatusMsg(`Erro: ${typeof err === "string" ? err : err?.message || "Falha na injeção"}`);
     }
   }, [serial, posX, posY, width, height, streamActive]);
 
@@ -138,6 +139,7 @@ export function ScreenRegionModal({
     };
   };
 
+  const isError = statusMsg.startsWith("Erro") || statusMsg.startsWith("Não foi");
   return (
     <Modal
       isOpen={isOpen}
@@ -149,60 +151,59 @@ export function ScreenRegionModal({
         }
         onClose();
       }}
-      title="Selecionar Área de Enquadramento (Câmera Virtual)"
+      title="Câmera virtual"
       size="xl"
     >
-      <div className="space-y-3 text-xs flex flex-col items-center">
-        {!streamActive ? (
-          <div className="w-full p-6 border border-dashed border-white/[0.1] rounded-lg bg-[#141418] flex flex-col items-center justify-center text-center space-y-3">
-            <Camera size={36} className="text-[#828DF7]" />
-            <div>
-              <h3 className="text-sm font-semibold text-zinc-100 mb-1">Captura de Tela para Câmera Virtual</h3>
-              <p className="text-xs text-zinc-400 max-w-sm">
-                Selecione o monitor para enquadrar o QR Code do WhatsApp Web em tempo real.
-              </p>
-            </div>
-            <Button variant="primary" size="sm" onClick={startScreenShare}>
-              Selecionar Tela / Monitor
-            </Button>
-          </div>
-        ) : (
-          <div className="w-full relative rounded-lg overflow-hidden border border-white/[0.08] bg-black flex justify-center items-center max-h-[50vh]">
-            <video ref={videoRef} className="max-w-full max-h-full" muted playsInline />
-
-            <div
-              className={`absolute border-2 ${isStreaming ? "border-red-500" : "border-[#5E6AD2] border-dashed"} bg-[#5E6AD2]/10 cursor-move`}
-              style={getOverlayStyle()}
-              onPointerDown={handlePointerDown}
-              onPointerMove={handlePointerMove}
-              onPointerUp={handlePointerUp}
-              onPointerCancel={handlePointerUp}
-            >
-              <div className="absolute -top-5 left-0 bg-[#5E6AD2] text-white font-mono text-[9px] px-1.5 py-0.5 rounded-t font-semibold whitespace-nowrap">
-                Pos: ({posX}, {posY}) - {width}x{height}
-              </div>
-            </div>
-          </div>
+      <div className="space-y-4">
+        {!streamActive && (
+          <EmptyState
+            icon={<Camera size={18} />}
+            title="Capture a tela para usar como câmera"
+            description="Escolha o monitor e enquadre o QR Code do WhatsApp Web. A imagem é enviada ao celular em tempo real."
+            action={
+              <Button variant="primary" size="sm" onClick={startScreenShare}>
+                Selecionar tela
+              </Button>
+            }
+          />
         )}
+        <div className={streamActive ? "relative flex max-h-[50vh] items-center justify-center overflow-hidden rounded-xl border border-border bg-black" : "hidden"}>
+          <video ref={videoRef} className="max-h-full max-w-full" muted playsInline />
+          <div
+            className={`absolute cursor-move border-2 bg-[var(--color-accent-glow)] ${isStreaming ? "border-red-500" : "border-dashed border-[var(--color-accent)]"}`}
+            style={getOverlayStyle()}
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+            onPointerCancel={handlePointerUp}
+          >
+            <div className="absolute -top-5 left-0 whitespace-nowrap rounded-t bg-[var(--color-accent)] px-1.5 py-0.5 font-mono text-[0.6875rem] text-white">
+              {posX}, {posY} · {width}x{height}
+            </div>
+          </div>
+        </div>
 
         {streamActive && (
-          <div className="w-full flex items-center justify-between gap-3 pt-2">
-            <Button
-              variant={isStreaming ? "danger" : "primary"}
-              size="sm"
-              onClick={() => setIsStreaming(!isStreaming)}
-              icon={<RefreshCw size={13} className={isStreaming ? "animate-spin" : ""} />}
-              className="w-full"
-            >
-              {isStreaming ? "Parar Transmissão" : "Iniciar Câmera Virtual"}
-            </Button>
-          </div>
+          <Button
+            variant={isStreaming ? "danger" : "primary"}
+            size="md"
+            onClick={() => setIsStreaming(!isStreaming)}
+            icon={<RefreshCw size={13} className={isStreaming ? "animate-spin" : ""} />}
+            className="w-full"
+          >
+            {isStreaming ? "Parar transmissão" : "Iniciar câmera virtual"}
+          </Button>
         )}
 
         {statusMsg && (
-          <div className="w-full p-2.5 bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 font-mono text-[11px] rounded text-center">
+          <p
+            role="status"
+            className={`rounded-lg border px-3 py-2 text-[0.8125rem] ${
+              isError ? "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400" : "border-border bg-secondary text-secondary"
+            }`}
+          >
             {statusMsg}
-          </div>
+          </p>
         )}
 
         <canvas ref={canvasRef} className="hidden" />

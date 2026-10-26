@@ -1,25 +1,31 @@
 // ============================================================
-// Esfera v3 — Sub-componente DeviceToolbar (Linear SaaS Style)
-// Toolbar unificada e limpa para filtros, busca e ações
+// Esfera v3 — Toolbar de Dispositivos
+// Busca, filtros, alternância grade/lista, barra de seleção e
+// ações do cabeçalho (conectar, sincronizar, menu de sistema).
 // ============================================================
 
-import { useState, useRef, useEffect } from "react";
+import { useState } from "react";
 import Button from "../ui/Button";
+import { SegmentedControl } from "../ui/Tabs";
 import { api } from "../../tauri";
 import type { Device } from "../../types";
+import { RowMenu } from "./RowMenu";
+import { SECTOR_OPTIONS, normSector } from "./deviceUi";
 import {
   Search,
   Plus,
-  MoreHorizontal,
   RefreshCw,
   Zap,
   Shield,
-  AlertTriangle,
-  Grid,
-  Table,
+  Stethoscope,
+  LayoutGrid,
+  List,
   Trash2,
-  XCircle,
+  X,
+  PlugZap,
 } from "lucide-react";
+
+export type StatusFilter = "all" | "online" | "offline" | "inuse";
 
 interface DeviceToolbarProps {
   searchQuery: string;
@@ -29,12 +35,13 @@ interface DeviceToolbarProps {
   viewMode: "grid" | "table";
   onViewModeChange: (m: "grid" | "table") => void;
   devicesList: Device[];
-  onOpenConnectModal: () => void;
-  onOpenDiagnosticModal: () => void;
-  onRefreshDevices: () => void;
+  statusFilter: StatusFilter;
+  onStatusFilterChange: (s: StatusFilter) => void;
+  inUseCount: number;
+  filteredCount: number;
   selectedSerials: string[];
+  onClearSelection: () => void;
   onBatchDelete: () => void;
-  onClearOffline: () => void;
 }
 
 export function DeviceToolbar({
@@ -45,252 +52,180 @@ export function DeviceToolbar({
   viewMode,
   onViewModeChange,
   devicesList,
-  onOpenConnectModal,
-  onOpenDiagnosticModal,
-  onRefreshDevices,
+  statusFilter,
+  onStatusFilterChange,
+  inUseCount,
+  filteredCount,
   selectedSerials,
+  onClearSelection,
   onBatchDelete,
-  onClearOffline,
 }: DeviceToolbarProps) {
-  const [moreActionsOpen, setMoreActionsOpen] = useState(false);
-  const dropdownRef = useRef<HTMLDivElement>(null);
-
+  const onlineCount = devicesList.filter((d) => d.status === "online" || d.status === "online_agent").length;
   const offlineCount = devicesList.filter((d) => d.status === "offline").length;
 
-  useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setMoreActionsOpen(false);
-      }
-    };
-    if (moreActionsOpen) document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [moreActionsOpen]);
+  const sectorItems = [
+    { id: "all", label: "Todos os setores", count: devicesList.length },
+    ...SECTOR_OPTIONS.map((s) => ({
+      id: s.id,
+      label: s.label,
+      count: devicesList.filter((d) => normSector(d.sector) === normSector(s.id)).length,
+    })),
+  ];
 
   return (
     <div className="space-y-3">
-      {/* Top Main Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-3 bg-[#141418] border border-white/[0.07] p-3 rounded-xl">
-        {/* Left: Sector Pills */}
-        <div className="flex items-center gap-1.5 overflow-x-auto custom-scrollbar py-0.5">
-          {[
-            { id: "junior", label: "Junior" },
-            { id: "senior", label: "Senior" },
-            { id: "pa_fixa", label: "PA FIXA" },
-            { id: "pesquisa", label: "Pesquisa" },
-            { id: "juridico", label: "Juridico" },
-            { id: "comercial", label: "Comercial" },
-            { id: "all", label: "Todos" },
-          ].map((tab) => {
-            const count =
-              tab.id === "all"
-                ? devicesList.length
-                : devicesList.filter(
-                    (d) =>
-                      String(d.sector || "junior")
-                        .toLowerCase()
-                        .replace(/[- _.]/g, "") === tab.id.replace(/[- _.]/g, "")
-                  ).length;
-
-            const isActive = sectorTab === tab.id;
-
-            return (
-              <button
-                key={tab.id}
-                onClick={() => onSectorChange(tab.id)}
-                className={`px-4 py-1.5 rounded-full text-xs font-semibold transition-all duration-150 cursor-pointer flex items-center gap-1.5 shrink-0 ${
-                  isActive
-                    ? "bg-[#5057D9] text-white shadow-md shadow-[#5057D9]/30 border border-[#636bf6]"
-                    : "bg-white/[0.04] text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.08] border border-white/[0.06]"
-                }`}
-              >
-                <span>{tab.label}</span>
-                {tab.id === "all" && (
-                  <span className={`px-1.5 py-0.2 rounded-full text-[10px] font-mono ${isActive ? "bg-white/20 text-white" : "bg-white/[0.08] text-zinc-400"}`}>
-                    {count}
-                  </span>
-                )}
-              </button>
-            );
-          })}
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="relative min-w-[14rem] flex-1 sm:max-w-sm">
+          <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-tertiary" />
+          <input
+            type="text"
+            aria-label="Buscar aparelhos"
+            placeholder="Buscar por nome, número, serial ou IP"
+            value={searchQuery}
+            onChange={(e) => onSearchChange(e.target.value)}
+            style={{ paddingLeft: "2.25rem" }}
+            className="h-9 w-full rounded-lg border border-border bg-primary pr-8 text-[0.8125rem] text-primary placeholder:text-tertiary focus:border-[var(--color-accent)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent-glow)]"
+          />
+          {searchQuery && (
+            <button
+              type="button"
+              aria-label="Limpar busca"
+              onClick={() => onSearchChange("")}
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-tertiary hover:text-primary cursor-pointer"
+            >
+              <X size={14} />
+            </button>
+          )}
         </div>
 
-        {/* Right: Search, Conectar, Dropdown Menu */}
-        <div className="flex items-center gap-2">
-          {/* Search bar */}
-          <div className="relative min-w-[220px] sm:min-w-[280px] flex items-center">
-            <Search size={14} className="input-icon-left text-cyan-400/80" />
-            <input
-              type="text"
-              placeholder="Pesquisar por nome ou final do número..."
-              value={searchQuery}
-              onChange={(e) => onSearchChange(e.target.value)}
-              className="w-full h-8 bg-[#09090b] border border-white/[0.1] text-zinc-100 rounded-full input-with-icon-left pr-3 text-xs placeholder:text-zinc-500 focus:outline-none focus:border-[#5057D9] focus:ring-1 focus:ring-[#5057D9]/40 transition-all"
-            />
-          </div>
+        <SegmentedControl<StatusFilter>
+          items={[
+            { id: "all", label: "Todos", count: devicesList.length },
+            { id: "online", label: "Online", count: onlineCount },
+            { id: "offline", label: "Offline", count: offlineCount },
+            { id: "inuse", label: "Em uso", count: inUseCount },
+          ]}
+          value={statusFilter}
+          onChange={onStatusFilterChange}
+        />
 
-          {/* Primary Action Button */}
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={onOpenConnectModal}
-            icon={<Plus size={14} />}
-          >
-            Conectar Celular
-          </Button>
-
-          {/* View Mode Switcher */}
-          <div className="flex items-center bg-[#09090b] border border-white/[0.08] rounded-md p-0.5">
-            <button
-              onClick={() => onViewModeChange("grid")}
-              className={`p-1 rounded transition-colors cursor-pointer ${
-                viewMode === "grid" ? "bg-white/[0.1] text-white" : "text-zinc-500 hover:text-zinc-300"
-              }`}
-              title="Grade"
-            >
-              <Grid size={14} />
-            </button>
-            <button
-              onClick={() => onViewModeChange("table")}
-              className={`p-1 rounded transition-colors cursor-pointer ${
-                viewMode === "table" ? "bg-white/[0.1] text-white" : "text-zinc-500 hover:text-zinc-300"
-              }`}
-              title="Tabela"
-            >
-              <Table size={14} />
-            </button>
-          </div>
-
-          {/* Secondary Actions Dropdown (...) */}
-          <div className="relative" ref={dropdownRef}>
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => setMoreActionsOpen(!moreActionsOpen)}
-              icon={<MoreHorizontal size={14} />}
-              title="Mais ações do sistema"
-            />
-
-            {moreActionsOpen && (
-              <div className="absolute right-0 mt-1.5 w-60 rounded-lg bg-[#19191e] border border-white/[0.08] shadow-2xl p-1 z-50 animate-scale-in text-xs">
-                <div className="px-2.5 py-1 text-[9px] uppercase font-bold text-zinc-500 tracking-wider border-b border-white/[0.06] mb-1">
-                  Ações ADB & Automação
-                </div>
-
-                <button
-                  onClick={async () => {
-                    setMoreActionsOpen(false);
-                    const unprovisioned = devicesList.filter((d) => !d.esferaDeviceId);
-                    if (unprovisioned.length === 0) {
-                      alert("Todos os dispositivos já estão provisionados.");
-                      return;
-                    }
-                    if (!confirm(`Provisionar ${unprovisioned.length} dispositivo(s)?`)) return;
-                    for (const d of unprovisioned) {
-                      try {
-                        const targetSerial = d.status === "online" && d.currentAdbAddress ? d.currentAdbAddress : d.serial;
-                        await api<string>("provision_device", { serial: targetSerial, server_url: null });
-                      } catch (e: any) {
-                        console.warn(`Erro ao provisionar ${d.serial}:`, e);
-                      }
-                    }
-                    onRefreshDevices();
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-zinc-300 hover:text-white hover:bg-white/[0.06] transition-colors"
-                >
-                  <Shield size={13} className="text-emerald-400" />
-                  <span>Provisionar Todos</span>
-                </button>
-
-                <button
-                  onClick={async () => {
-                    setMoreActionsOpen(false);
-                    try {
-                      const msg = await api<string>("inject_all_devices_immunity", {});
-                      alert(msg);
-                      onRefreshDevices();
-                    } catch (e: any) {
-                      alert(typeof e === "string" ? e : e?.message || "Erro ao injetar imunidade.");
-                    }
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-zinc-300 hover:text-white hover:bg-white/[0.06] transition-colors"
-                >
-                  <Shield size={13} className="text-cyan-400" />
-                  <span>Injetar Imunidade & MAC Físico</span>
-                </button>
-
-                <button
-                  onClick={async () => {
-                    setMoreActionsOpen(false);
-                    try {
-                      await api<string>("force_reconnect_all_adb", {});
-                      onRefreshDevices();
-                    } catch (e: any) {
-                      console.error("Erro ao forçar reconexão:", e);
-                    }
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-zinc-300 hover:text-white hover:bg-white/[0.06] transition-colors"
-                >
-                  <Zap size={13} className="text-amber-400" />
-                  <span>Forçar Reconexão Wi-Fi</span>
-                </button>
-
-                <button
-                  onClick={() => {
-                    setMoreActionsOpen(false);
-                    onRefreshDevices();
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-zinc-300 hover:text-white hover:bg-white/[0.06] transition-colors"
-                >
-                  <RefreshCw size={13} className="text-emerald-400" />
-                  <span>Sincronizar ADB</span>
-                </button>
-
-                <button
-                  onClick={() => {
-                    setMoreActionsOpen(false);
-                    onOpenDiagnosticModal();
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-zinc-300 hover:text-white hover:bg-white/[0.06] transition-colors"
-                >
-                  <AlertTriangle size={13} className="text-amber-400" />
-                  <span>Diagnóstico ADB</span>
-                </button>
-
-                <div className="border-t border-white/[0.06] my-1" />
-
-                <button
-                  onClick={() => {
-                    setMoreActionsOpen(false);
-                    onClearOffline();
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-amber-400 hover:bg-amber-500/10 transition-colors"
-                >
-                  <XCircle size={13} />
-                  <span>Limpar Celulares Offline ({offlineCount})</span>
-                </button>
-              </div>
-            )}
-          </div>
+        <div className="ml-auto flex items-center gap-3">
+          <span className="hidden text-[0.75rem] text-tertiary sm:inline tabular-nums">
+            {filteredCount} de {devicesList.length}
+          </span>
+          <SegmentedControl<"grid" | "table">
+            items={[
+              { id: "grid", label: "", icon: <LayoutGrid size={14} /> },
+              { id: "table", label: "", icon: <List size={14} /> },
+            ]}
+            value={viewMode}
+            onChange={onViewModeChange}
+          />
         </div>
       </div>
 
-      {/* Batch Selection Banner (If any selected) */}
+      <div className="overflow-x-auto pb-1 custom-scrollbar">
+        <SegmentedControl items={sectorItems} value={sectorTab} onChange={onSectorChange} />
+      </div>
+
       {selectedSerials.length > 0 && (
-        <div className="flex items-center justify-between px-3 py-2 bg-[#5E6AD2]/10 border border-[#5E6AD2]/20 rounded-lg text-xs animate-fade-in">
-          <span className="text-[#828DF7] font-medium font-mono">
-            {selectedSerials.length} celular(es) selecionado(s)
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-[var(--color-accent)] bg-[var(--color-accent-glow)] px-3 py-2 animate-fade-in">
+          <span className="text-[0.8125rem] font-medium text-primary">
+            {selectedSerials.length} {selectedSerials.length === 1 ? "aparelho selecionado" : "aparelhos selecionados"}
           </span>
-          <Button
-            variant="danger"
-            size="sm"
-            onClick={onBatchDelete}
-            icon={<Trash2 size={13} />}
-          >
-            Apagar Selecionados
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={onClearSelection}>
+              Limpar seleção
+            </Button>
+            <Button variant="danger" size="sm" onClick={onBatchDelete} icon={<Trash2 size={13} />}>
+              Apagar selecionados
+            </Button>
+          </div>
         </div>
       )}
     </div>
+  );
+}
+
+interface HeaderActionsProps {
+  devicesList: Device[];
+  loading?: boolean;
+  onOpenConnectModal: () => void;
+  onOpenDiagnosticModal: () => void;
+  onRefreshDevices: () => void;
+  onClearOffline: () => void;
+}
+
+// Ações do cabeçalho: uma primária (Conectar), sincronizar e menu com ações de sistema.
+export function DeviceHeaderActions({
+  devicesList,
+  loading,
+  onOpenConnectModal,
+  onOpenDiagnosticModal,
+  onRefreshDevices,
+  onClearOffline,
+}: HeaderActionsProps) {
+  const [busy, setBusy] = useState(false);
+  const offlineCount = devicesList.filter((d) => d.status === "offline").length;
+
+  const provisionAll = async () => {
+    const unprovisioned = devicesList.filter((d) => !d.esferaDeviceId);
+    if (unprovisioned.length === 0) {
+      alert("Todos os dispositivos já estão provisionados.");
+      return;
+    }
+    if (!confirm(`Provisionar ${unprovisioned.length} dispositivo(s)?`)) return;
+    setBusy(true);
+    for (const d of unprovisioned) {
+      try {
+        const targetSerial = d.status === "online" && d.currentAdbAddress ? d.currentAdbAddress : d.serial;
+        await api<string>("provision_device", { serial: targetSerial, server_url: null });
+      } catch (e: any) {
+        console.warn(`Erro ao provisionar ${d.serial}:`, e);
+      }
+    }
+    setBusy(false);
+    onRefreshDevices();
+  };
+
+  const injectImmunity = async () => {
+    try {
+      const msg = await api<string>("inject_all_devices_immunity", {});
+      alert(msg);
+      onRefreshDevices();
+    } catch (e: any) {
+      alert(typeof e === "string" ? e : e?.message || "Erro ao injetar imunidade.");
+    }
+  };
+
+  const reconnectAll = async () => {
+    try {
+      await api<string>("force_reconnect_all_adb", {});
+      onRefreshDevices();
+    } catch (e: any) {
+      console.error("Erro ao forçar reconexão:", e);
+    }
+  };
+
+  return (
+    <>
+      <Button variant="secondary" size="md" onClick={onRefreshDevices} loading={loading || busy} icon={<RefreshCw size={14} />}>
+        Sincronizar
+      </Button>
+      <RowMenu
+        label="Mais ações"
+        items={[
+          { label: "Provisionar todos", icon: <Shield size={14} />, onClick: provisionAll },
+          { label: "Aplicar imunidade e MAC físico", icon: <Shield size={14} />, onClick: injectImmunity },
+          { label: "Forçar reconexão Wi-Fi", icon: <Zap size={14} />, onClick: reconnectAll },
+          { label: "Diagnóstico ADB", icon: <Stethoscope size={14} />, onClick: onOpenDiagnosticModal },
+          "sep",
+          { label: `Remover offline (${offlineCount})`, icon: <PlugZap size={14} />, onClick: onClearOffline, danger: true },
+        ]}
+      />
+      <Button variant="primary" size="md" onClick={onOpenConnectModal} icon={<Plus size={14} />}>
+        Conectar celular
+      </Button>
+    </>
   );
 }

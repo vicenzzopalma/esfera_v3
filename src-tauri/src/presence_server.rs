@@ -12,7 +12,7 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::net::SocketAddr;
 use tauri::{AppHandle, Emitter};
 

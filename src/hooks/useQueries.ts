@@ -257,7 +257,7 @@ export function useImportContacts() {
 export function useSaveAiConfig() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (args: AiConfig) => api("save_ai_config", args as unknown as Record<string, unknown>),
+    mutationFn: (args: AiConfig) => api("save_ai_config", { config: args, ...args }),
     onSuccess: (_, vars) => {
       qc.invalidateQueries({ queryKey: keys.aiConfig(vars.companyId) });
     },

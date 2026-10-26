@@ -8,12 +8,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 /// Script shell embutido (fallback quando APK não está disponível)
 const AGENT_SCRIPT_CONTENT: &str = include_str!("../../src-agent/esfera_agent.sh");
@@ -481,30 +480,17 @@ pub fn run_cmd_timeout(
 ) -> Result<std::process::Output, String> {
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Falha ao iniciar comando: {}", e))?;
     let pid = child.id();
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let status = child.wait();
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        if let Some(mut out) = child.stdout.take() {
-            use std::io::Read;
-            let _ = out.read_to_end(&mut stdout);
-        }
-        if let Some(mut err) = child.stderr.take() {
-            use std::io::Read;
-            let _ = err.read_to_end(&mut stderr);
-        }
-        let _ = tx.send(match status {
-            Ok(s) => Ok(std::process::Output {
-                status: s,
-                stdout,
-                stderr,
-            }),
+        // wait_with_output drena stdout/stderr enquanto espera. Esperar o processo
+        // primeiro pode bloquear quando o buffer de saída do ADB fica cheio.
+        let _ = tx.send(match child.wait_with_output() {
+            Ok(output) => Ok(output),
             Err(e) => Err(format!("Erro no processo: {}", e)),
         });
     });
@@ -614,6 +600,7 @@ pub struct EsferaAdbDiagnosticResult {
     pub diagnostic_msg: String,
 }
 
+#[allow(dead_code, improper_ctypes)]
 extern "C" {
     pub fn esfera_hpc_detect_hardware(caps: *mut EsferaHardwareCaps);
     pub fn esfera_hpc_run_adb_diagnostic(diag: *mut EsferaAdbDiagnostic);
@@ -659,10 +646,21 @@ static DEVICE_INFO_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (String, St
 
 static BATTERY_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (i32, Instant)>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+static SHELL_TARGET_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (String, Instant)>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+#[allow(dead_code)]
+static CONTACT_PREPARED: std::sync::LazyLock<RwLock<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub struct AdbManager;
 
 impl AdbManager {
+    pub const DEFAULT_WHATSAPP_PACKAGE: &'static str = "com.whatsapp";
+    #[allow(dead_code)]
+    pub const ESFERA_TEMP_CONTACT_ACCOUNT_NAME: &'static str = "esfera_temp";
+    #[allow(dead_code)]
+    pub const ESFERA_TEMP_CONTACT_ACCOUNT_TYPE: &'static str = "com.esfera";
+
     /// Detecta capacidades da CPU via Engine C++ HPC nativa
     pub fn get_hardware_capabilities() -> EsferaHardwareCaps {
         let mut caps = EsferaHardwareCaps {
@@ -692,6 +690,7 @@ impl AdbManager {
     }
 
     /// Processa buffer com o caminho SIMD/C++ escolhido no boot.
+    #[allow(dead_code)]
     pub fn process_buffer(input: &[u8]) -> Vec<u8> {
         if input.is_empty() {
             return Vec::new();
@@ -719,6 +718,7 @@ impl AdbManager {
 
     /// Expõe para UI/debug qual caminho o runtime SIMD escolheu,
     /// inferido diretamente das capacidades de hardware (fonte oficial).
+    #[allow(dead_code)]
     pub fn active_processor_label(caps: EsferaHardwareCaps) -> &'static str {
         if caps.supports_avx512 {
             "avx512"
@@ -733,7 +733,6 @@ impl AdbManager {
     pub fn scan_subnet(subnet_prefix: &str) -> Vec<String> {
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio::sync::Semaphore;
 
         let prefix = if subnet_prefix.is_empty() {
             "192.168.1"
@@ -743,7 +742,7 @@ impl AdbManager {
         .to_string();
 
         let num_workers = 16;
-        let max_concurrency = 48;
+        let _max_concurrency = 48;
         let active_ips = Arc::new(std::sync::Mutex::new(Vec::new()));
         let scan_timeout = Duration::from_millis(25);
         std::thread::scope(|s| {
@@ -1085,6 +1084,7 @@ impl AdbManager {
     }
 
     /// Variante que aceita o alvo já formatado como "IP:Porta"
+    #[allow(dead_code)]
     pub fn connect_target_flushed(target: &str) -> Result<String, String> {
         let parts: Vec<&str> = target.split(':').collect();
         if parts.is_empty() || parts[0].is_empty() {
@@ -1339,29 +1339,29 @@ impl AdbManager {
         Self::type_text_human_hpc(serial, text)
     }
 
-    /// Digitação humana com delays Gaussianos — batch único ADB shell
+    /// Digitação humana com delays Gaussianos otimizados — batch único ADB shell por palavras
     pub fn type_text_human_hpc(serial: &str, text: &str) -> Result<(), String> {
         let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
-        let mut shell_cmds = Vec::new();
-        for ch in text.chars() {
-            let delay_ms = Self::calculate_gaussian_delay(45, 160);
-            let escaped = match ch {
-                ' ' => "%s".to_string(),
-                '"' => "\\\"".to_string(),
-                '\\' => "\\\\".to_string(),
-                '&' => "\\&".to_string(),
-                '<' => "\\<".to_string(),
-                '>' => "\\>".to_string(),
-                '|' => "\\|".to_string(),
-                c => c.to_string(),
-            };
-            shell_cmds.push(format!(
-                "input text {}; sleep {}",
-                escaped,
-                delay_ms as f64 / 1000.0
-            ));
+        if text.trim().is_empty() {
+            return Ok(());
         }
-        let full_cmd = shell_cmds.join(" ");
+
+        // Se o texto for longo ou contiver quebras de linha, usa o despacho ultrarrápido em lote
+        if text.len() > 60 || text.contains('\n') {
+            return Self::type_message_native_fast(serial, text);
+        }
+
+        let words: Vec<&str> = text.split(' ').collect();
+        let mut shell_cmds = Vec::new();
+        for (idx, word) in words.iter().enumerate() {
+            let escaped = word.replace('\'', "\\'").replace('"', "\\\"").replace('&', "\\&");
+            let delay_ms = Self::calculate_gaussian_delay(20, 50);
+            shell_cmds.push(format!("input text '{}'", escaped));
+            if idx + 1 < words.len() {
+                shell_cmds.push(format!("input text '%s'; sleep {}", delay_ms as f64 / 1000.0));
+            }
+        }
+        let full_cmd = shell_cmds.join(" && ");
 
         // Wi-Fi: protocolo ADB nativo em vez de adb.exe
         if Self::use_native_adb(&target_serial) {
@@ -1602,11 +1602,15 @@ impl AdbManager {
         display_id: u32,
     ) -> Result<String, String> {
         let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
+        let is_whatsapp = url.contains("whatsapp") || url.contains("wa.me");
+        let pkg_flag = if is_whatsapp { "-p com.whatsapp " } else { "" };
+
         // Wi-Fi: protocolo ADB nativo em vez de adb.exe
         if Self::use_native_adb(&target_serial) {
             let intent_cmd = format!(
-                "am start --display {} -a android.intent.action.VIEW -d '{}'",
+                "am start --display {} -a android.intent.action.VIEW {}-d '{}'",
                 display_id,
+                pkg_flag,
                 Self::shell_quote(url)
             );
             match crate::adb_tcp::exec_shell_bytes(&target_serial, &intent_cmd) {
@@ -1631,20 +1635,24 @@ impl AdbManager {
             }
         }
 
-        let output = create_cmd("adb")
-            .args([
-                "-s",
-                &target_serial,
-                "shell",
-                "am",
-                "start",
-                "--display",
-                &display_id.to_string(),
-                "-a",
-                "android.intent.action.VIEW",
-                "-d",
-                url,
-            ])
+        let mut cmd = create_cmd("adb");
+        cmd.args([
+            "-s",
+            &target_serial,
+            "shell",
+            "am",
+            "start",
+            "--display",
+            &display_id.to_string(),
+            "-a",
+            "android.intent.action.VIEW",
+        ]);
+        if is_whatsapp {
+            cmd.args(["-p", "com.whatsapp"]);
+        }
+        cmd.args(["-d", url]);
+
+        let output = cmd
             .output()
             .map_err(|e| format!("Falha ao executar intent em display secundário: {}", e))?;
 
@@ -2710,7 +2718,6 @@ impl AdbManager {
              settings put global tcp_keepalive_interval 15; \
              device_config put activity_manager max_phantom_processes 2147483647; \
              dumpsys deviceidle disable; \
-             dumpsys deviceidle whitelist +com.mouldybread.adbautoenable; \
              dumpsys deviceidle whitelist +com.android.shell; \
              dumpsys deviceidle whitelist +com.google.android.gms; \
              dumpsys deviceidle whitelist +com.esfera.agent; \
@@ -2718,8 +2725,7 @@ impl AdbManager {
              cmd appops set com.esfera.agent RUN_ANY_IN_BACKGROUND allow; \
              cmd appops set com.esfera.agent REQUEST_IGNORE_BATTERY_OPTIMIZATIONS allow; \
              am set-standby-bucket com.esfera.agent active; \
-             am start-foreground-service com.esfera.agent/.EsferaAgentService; \
-             am startservice com.esfera.agent/.EsferaAgentService",
+             am start-foreground-service -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am startservice -n com.esfera.agent/.EsferaAgentService 2>/dev/null",
             id_cmd
         );
 
@@ -2849,24 +2855,54 @@ impl AdbManager {
 
     /// Executa o pipeline completo de Auto-Cura, Provisionamento e Imunidade Total (Zero-Touch)
     pub fn auto_heal_and_immunize_device(serial: &str, company_id: i32, server_url: &str) -> Result<(), String> {
-        // 1. Se for conexão USB inicial, ativa porta TCP/IP 5555 e conecta automaticamente no IP Wi-Fi
+        // 1. Se for conexão USB inicial, ativa porta TCP/IP 5555 apenas se service.adb.tcp.port ainda não for 5555.
+        // IMPORTANTE: Rodar `adb tcpip 5555` quando já está em 5555 reinicia o gadget USB FunctionFS do adbd,
+        // causando som de desconexão/reconexão USB no Windows!
         if !serial.contains(':') && !serial.contains('.') {
-            let mut tcp_cmd = create_cmd("adb");
-            tcp_cmd.args(["-s", serial, "tcpip", "5555"]);
-            let _ = run_cmd_timeout(tcp_cmd, Duration::from_secs(4));
+            let mut tcp_port_cmd = create_cmd("adb");
+            tcp_port_cmd.args(["-s", serial, "shell", "getprop service.adb.tcp.port; getprop persist.adb.tcp.port"]);
+            let port_stdout = run_cmd_timeout(tcp_port_cmd, Duration::from_secs(3))
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            let port_already_5555 = port_stdout.lines().any(|l| l.trim() == "5555");
 
             let mut ip_cmd = create_cmd("adb");
             ip_cmd.args(["-s", serial, "shell", "ip route || ip addr show wlan0"]);
+            let mut detected_ip: Option<String> = None;
             if let Ok(out) = run_cmd_timeout(ip_cmd, Duration::from_secs(3)) {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 for word in stdout.split_whitespace() {
                     if (word.starts_with("192.168.") || word.starts_with("10.")) && !word.ends_with(".255") {
                         let clean_ip = word.split('/').next().unwrap_or(word);
                         if clean_ip.contains('.') && clean_ip.split('.').count() == 4 {
-                            let _ = Self::connect_device_flushed(clean_ip, 5555);
+                            detected_ip = Some(clean_ip.to_string());
                             break;
                         }
                     }
+                }
+            }
+
+            let tcp_already_open = port_already_5555
+                || detected_ip
+                    .as_ref()
+                    .and_then(|ip| format!("{}:5555", ip).parse::<std::net::SocketAddr>().ok())
+                    .map(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok())
+                    .unwrap_or(false);
+
+            if !tcp_already_open {
+                let mut tcp_cmd = create_cmd("adb");
+                tcp_cmd.args(["-s", serial, "tcpip", "5555"]);
+                let _ = run_cmd_timeout(tcp_cmd, Duration::from_secs(4));
+            }
+
+            if let Some(clean_ip) = detected_ip {
+                let target_endpoint = format!("{}:5555", clean_ip);
+                let already_connected = Self::list_devices()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|d| d.serial == target_endpoint && d.state == "device");
+                if !already_connected {
+                    let _ = Self::connect_device(&clean_ip, 5555);
                 }
             }
         }
@@ -2891,11 +2927,28 @@ impl AdbManager {
             }
         }
 
-        // 4. Verifica se o APK do agente está instalado; caso ausente, instala imediatamente
+        // 4. Remove pacotes legados (com.tpn.adbautoenable / com.mouldybread.adbautoenable) que abrem tela no celular
+        // e verifica se o APK do agente oficial (com.esfera.agent) está instalado
         let pkg_check = create_cmd("adb")
-            .args(["-s", serial, "shell", "pm", "list", "packages", "com.esfera.agent"])
+            .args(["-s", serial, "shell", "pm", "list", "packages"])
             .output();
-        let is_installed = pkg_check.map(|o| String::from_utf8_lossy(&o.stdout).contains("com.esfera.agent")).unwrap_or(false);
+        let pkg_stdout = pkg_check
+            .as_ref()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+
+        if pkg_stdout.contains("com.tpn.adbautoenable") {
+            let mut u_cmd = create_cmd("adb");
+            u_cmd.args(["-s", serial, "uninstall", "com.tpn.adbautoenable"]);
+            let _ = run_cmd_timeout(u_cmd, Duration::from_secs(5));
+        }
+        if pkg_stdout.contains("com.mouldybread.adbautoenable") {
+            let mut u_cmd = create_cmd("adb");
+            u_cmd.args(["-s", serial, "uninstall", "com.mouldybread.adbautoenable"]);
+            let _ = run_cmd_timeout(u_cmd, Duration::from_secs(5));
+        }
+
+        let is_installed = pkg_stdout.contains("com.esfera.agent");
         if !is_installed {
             let _ = Self::install_agent_apk(serial);
         }
@@ -2904,7 +2957,7 @@ impl AdbManager {
         let pid = Self::get_persistent_device_id(serial);
         let _ = Self::inject_device_immunity(serial, pid.as_deref());
 
-        // 6. Inicia o serviço em primeiro plano
+        // 6. Inicia o serviço em primeiro plano (silencioso, sem abrir Activity)
         let _ = Self::start_agent_service(serial);
 
         Ok(())
@@ -2969,9 +3022,8 @@ impl AdbManager {
             .to_string()
     }
 
-    /// Inicia o serviço do Agent Android via ADB
+    /// Inicia o serviço do Agent Android via ADB (100% em background, NUNCA abre MainActivity na tela)
     pub fn start_agent_service(serial: &str) -> Result<String, String> {
-        // Tenta iniciar o novo agente (v4), fallback para o antigo (mouldybread/tpn)
         let result = (|| -> Result<String, String> {
             // 0. Semeia a chave ADB do PC no celular (/data/misc/adb/adb_keys)
             // para que conexões ADB-over-TCP sejam autorizadas SEM popup e de forma
@@ -2992,52 +3044,22 @@ impl AdbManager {
                 }
             }
 
-            // 1. Inicia o servico com.esfera.agent silenciosamente em background
+            // 1. Inicia o servico com.esfera.agent silenciosamente em background (NUNCA inicia MainActivity)
             let mut cmd = create_cmd("adb");
             cmd.args([
                 "-s",
                 serial,
                 "shell",
-                "am start-foreground-service -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am startservice -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am broadcast -a com.esfera.agent.KEEP_ALIVE 2>/dev/null",
+                "am start-foreground-service -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am startservice -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am broadcast -a com.esfera.agent.KEEP_ALIVE -n com.esfera.agent/.BootReceiver 2>/dev/null",
             ]);
             if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 if stdout.contains("Starting") || stdout.contains("Broadcast") || out.status.success() {
-                    return Ok("Agente Esfera v4 iniciado".to_string());
+                    return Ok("Agente Esfera v4 iniciado em segundo plano".to_string());
                 }
             }
 
-            // 2. Tenta agente tpn (com.tpn.adbautoenable)
-            let mut cmd_tpn = create_cmd("adb");
-            cmd_tpn.args([
-                "-s",
-                serial,
-                "shell",
-                "am",
-                "start",
-                "-n",
-                "com.tpn.adbautoenable/.MainActivity",
-            ]);
-            if let Ok(out) = run_cmd_timeout(cmd_tpn, Duration::from_secs(3)) {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                if stdout.contains("Starting") || out.status.success() {
-                    return Ok("Agente TPN ADB Auto Enable iniciado".to_string());
-                }
-            }
-
-            // 3. Fallback: agente mouldybread (com.mouldybread.adbautoenable)
-            let mut cmd_mb = create_cmd("adb");
-            cmd_mb.args([
-                "-s",
-                serial,
-                "shell",
-                "am",
-                "start",
-                "-n",
-                "com.mouldybread.adbautoenable/.MainActivity",
-            ]);
-            run_cmd_timeout(cmd_mb, Duration::from_secs(3))
-                .map(|_| "Agente ADB Auto Enable iniciado (fallback)".to_string())
+            Err("Serviço com.esfera.agent não pôde ser iniciado em segundo plano".to_string())
         })();
 
         match result {
@@ -3120,7 +3142,7 @@ impl AdbManager {
         // Se o frontend passou o serial USB antigo gravado no DB, consulta o IP Wi-Fi atual (CurrentAdbAddress) e conecta
         let db_path = crate::get_db_path();
         if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-            let mut stmt = conn.prepare(
+            let stmt = conn.prepare(
                 "SELECT CurrentAdbAddress, DeviceIp FROM ESF_Device WHERE AdbDeviceId = ?1 OR EsferaDeviceId = ?1 OR UPPER(EsferaDeviceId) = UPPER(?1) LIMIT 1"
             );
             if let Ok(mut stmt) = stmt {
@@ -3749,66 +3771,626 @@ impl AdbManager {
         encoded
     }
 
-    /// Envia mensagem no WhatsApp via Deep Link Intent + Toque Físico
-    /// Para mensagens longas (>1500 chars), usa fallback: Intent só com telefone + digitação via ADB
-    pub fn send_whatsapp_intent_and_bezier_tap(serial: &str, phone: &str, message: &str) -> Result<(), String> {
-        if message.len() > 1500 {
-            return Self::send_long_message_typing(serial, phone, message);
-        }
-
-        let encoded_msg = Self::url_encode(message);
-        let intent_url = format!("https://api.whatsapp.com/send?phone={}&text={}", phone, encoded_msg);
-
-        // 1. Dispara Intent do WhatsApp (protocolo ADB nativo para Wi-Fi/túnel)
-        if Self::use_native_adb(serial) {
-            let intent_cmd = format!(
-                "am start -a android.intent.action.VIEW -d '{}'",
-                Self::shell_quote(&intent_url)
-            );
-            match crate::adb_tcp::exec_shell_bytes(serial, &intent_cmd) {
-                Ok((_, _, true)) => {}
-                Ok((_, _, false)) => {
-                    return Err("Falha ao disparar Intent do WhatsApp (nativo)".to_string())
+    /// Executa comando shell no dispositivo (suporta protocolo ADB nativo TCP e adb.exe USB)
+    pub fn execute_shell(serial: &str, shell_cmd: &str, timeout_secs: u64) -> Result<String, String> {
+        let cached = SHELL_TARGET_CACHE.read().ok().and_then(|cache| {
+            cache.get(serial).and_then(|(target, at)| {
+                (at.elapsed() < Duration::from_secs(10)).then(|| target.clone())
+            })
+        });
+        let target_serial = cached.unwrap_or_else(|| match Self::resolve_target_serial(serial) {
+            Ok(target) => {
+                if let Ok(mut cache) = SHELL_TARGET_CACHE.write() {
+                    cache.insert(serial.to_string(), (target.clone(), Instant::now()));
                 }
-                Err(e) => {
-                    return Err(format!(
-                        "Falha ao disparar Intent do WhatsApp via túnel: {}",
-                        e
-                    ))
-                }
+                target
             }
+            Err(_) => serial.to_string(),
+        });
+        if Self::use_native_adb(&target_serial) {
+            crate::adb_tcp::exec_shell(&target_serial, shell_cmd)
         } else {
-            let mut intent_adb = create_cmd("adb");
-            intent_adb
-                .arg("-s")
-                .arg(serial)
-                .arg("shell")
-                .arg("am")
-                .arg("start")
-                .arg("-a")
-                .arg("android.intent.action.VIEW")
-                .arg("-d")
-                .arg(&intent_url);
-            let intent_cmd = run_cmd_timeout(intent_adb, Duration::from_secs(8));
+            let mut cmd = create_cmd("adb");
+            cmd.args(["-s", &target_serial, "shell", shell_cmd]);
+            let output = run_cmd_timeout(cmd, Duration::from_secs(timeout_secs))?;
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            } else {
+                let err = String::from_utf8_lossy(&output.stderr);
+                Err(format!("Erro ao executar shell ADB: {}", err.trim()))
+            }
+        }
+    }
 
-            if let Err(e) = intent_cmd {
-                return Err(format!("Falha ao disparar Intent do WhatsApp: {}", e));
+    /// Faz o parse do ID numérico de um contato a partir do retorno de `content query`
+    /// Retorna o maior ID numérico para garantir a seleção da linha recém-inserida
+    #[allow(dead_code)]
+    pub fn parse_contact_id_from_query(output: &str) -> Option<i64> {
+        let mut max_id: Option<i64> = None;
+        for line in output.lines() {
+            let line = line.trim();
+            if let Some(idx) = line.find("_id=") {
+                let rest = &line[idx + 4..];
+                let id_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(id) = id_str.parse::<i64>() {
+                    max_id = Some(max_id.map_or(id, |curr| curr.max(id)));
+                }
+            }
+        }
+        max_id
+    }
+
+    /// Faz o parse do ID numérico de um contato a partir do retorno direto de `content insert`
+    /// Exemplos: "Row inserted: content://com.android.contacts/raw_contacts/1234"
+    #[allow(dead_code)]
+    pub fn parse_inserted_raw_contact_id(output: &str) -> Option<i64> {
+        for line in output.lines() {
+            let line = line.trim();
+            if let Some(idx) = line.find("raw_contacts/") {
+                let rest = &line[idx + "raw_contacts/".len()..];
+                let id_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(id) = id_str.parse::<i64>() {
+                    return Some(id);
+                }
+            }
+        }
+        None
+    }
+
+    /// Sanitiza o número de telefone extraindo apenas os dígitos
+    pub fn extract_phone_digits(phone: &str) -> String {
+        phone.chars().filter(|c| c.is_ascii_digit()).collect()
+    }
+
+    /// Normaliza número de telefone garantindo prefixo DDI (55 para Brasil quando ausente)
+    #[allow(dead_code)]
+    pub fn normalize_target_phone(raw_phone: &str) -> String {
+        let trimmed = raw_phone.trim();
+        let starts_with_plus = trimmed.starts_with('+');
+        let mut digits = Self::extract_phone_digits(trimmed);
+
+        // Remove zeros à esquerda (ex: 011987654321 -> 11987654321)
+        while digits.starts_with('0') {
+            digits.remove(0);
+        }
+
+        if digits.is_empty() {
+            return String::new();
+        }
+
+        // Se não possui prefixo '+' internacional explícito e é número brasileiro padrão (10 ou 11 dígitos com DDD)
+        if !starts_with_plus && (digits.len() == 10 || digits.len() == 11) && !digits.starts_with("55") {
+            digits = format!("55{}", digits);
+        }
+
+        digits
+    }
+
+    /// Assegura permissões essenciais de contatos para o pacote WhatsApp
+    #[allow(dead_code)]
+    pub fn grant_whatsapp_contact_permissions(serial: &str, package: &str) {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
+        if Self::use_native_adb(&target_serial) {
+            let cmd = format!(
+                "pm grant {} android.permission.READ_CONTACTS 2>/dev/null && pm grant {} android.permission.WRITE_CONTACTS 2>/dev/null",
+                package, package
+            );
+            let _ = crate::adb_tcp::exec_shell_bytes(&target_serial, &cmd);
+        } else {
+            let _ = create_cmd("adb")
+                .args(["-s", &target_serial, "shell", "pm", "grant", package, "android.permission.READ_CONTACTS"])
+                .output();
+            let _ = create_cmd("adb")
+                .args(["-s", &target_serial, "shell", "pm", "grant", package, "android.permission.WRITE_CONTACTS"])
+                .output();
+        }
+    }
+
+    /// Insere um contato provisório na agenda do Android (via content provider nativo)
+    /// Retorna o raw_contact_id para rastreamento e exclusão
+    #[allow(dead_code)]
+    pub fn insert_temporary_contact(
+        serial: &str,
+        contact_name: &str,
+        phone: &str,
+    ) -> Result<Option<i64>, String> {
+        let normalized = Self::normalize_target_phone(phone);
+        let digits = if normalized.is_empty() {
+            Self::extract_phone_digits(phone)
+        } else {
+            normalized
+        };
+        if digits.is_empty() {
+            return Err("Número de telefone não contém dígitos válidos".to_string());
+        }
+
+        let clean_name = contact_name.trim();
+        let display_name = if clean_name.is_empty() {
+            "Contato Esfera"
+        } else {
+            clean_name
+        };
+
+        // Formato internacional E.164 no contato para correspondência imediata no WhatsApp
+        let phone_e164 = format!("+{}", digits);
+
+        // 1. Cria container raw_contact vinculado à conta isolada esfera_temp
+        let insert_raw_cmd = format!(
+            "content insert --uri content://com.android.contacts/raw_contacts --bind account_name:s:{} --bind account_type:s:{}",
+            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME,
+            Self::ESFERA_TEMP_CONTACT_ACCOUNT_TYPE
+        );
+        let raw_out = Self::execute_shell(serial, &insert_raw_cmd, 6).unwrap_or_default();
+
+        // 2. Tenta extrair o ID diretamente da saída do insert (0ms de latência)
+        let mut contact_id = Self::parse_inserted_raw_contact_id(&raw_out);
+
+        // Fallback de consulta caso o stdout do content insert seja omitido pelo SO
+        if contact_id.is_none() {
+            let query_cmd = format!(
+                "content query --uri content://com.android.contacts/raw_contacts --projection _id --where \"account_name='{}' AND (deleted IS NULL OR deleted=0)\" --sort \"_id DESC\"",
+                Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME
+            );
+            if let Ok(out) = Self::execute_shell(serial, &query_cmd, 6) {
+                contact_id = Self::parse_contact_id_from_query(&out);
             }
         }
 
-        // 2. Aguarda delay Gaussiano
+        // Segundo fallback sem cláusula AND deleted=0 para compatibilidade com versões antigas
+        if contact_id.is_none() {
+            let query_legacy = format!(
+                "content query --uri content://com.android.contacts/raw_contacts --projection _id --where \"account_name='{}'\" --sort \"_id DESC\"",
+                Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME
+            );
+            if let Ok(out) = Self::execute_shell(serial, &query_legacy, 6) {
+                contact_id = Self::parse_contact_id_from_query(&out);
+            }
+        }
+
+        // 3. Se encontrou o ID, associa Nome (data1 e data2) e Telefone (data1, data2 e data4 normalizado) na tabela `data`
+        if let Some(id) = contact_id {
+            let insert_name_cmd = format!(
+                "content insert --uri content://com.android.contacts/data --bind raw_contact_id:i:{} --bind mimetype:s:vnd.android.cursor.item/name --bind data1:s:'{}' --bind data2:s:'{}'",
+                id,
+                Self::shell_quote(display_name),
+                Self::shell_quote(display_name)
+            );
+            let insert_phone_cmd = format!(
+                "content insert --uri content://com.android.contacts/data --bind raw_contact_id:i:{} --bind mimetype:s:vnd.android.cursor.item/phone_v2 --bind data1:s:'{}' --bind data2:i:2 --bind data4:s:'{}'",
+                id,
+                Self::shell_quote(&phone_e164),
+                Self::shell_quote(&phone_e164)
+            );
+            let insert_data_batch = format!("{}; {}", insert_name_cmd, insert_phone_cmd);
+            let _ = Self::execute_shell(serial, &insert_data_batch, 6);
+
+            // Intervalo biológico para o ContentProvider propagar a gravação no Android SQLite
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
+        Ok(contact_id)
+    }
+
+    /// Exclui um contato temporário específico por raw_contact_id
+    #[allow(dead_code)]
+    pub fn delete_temporary_contact(serial: &str, contact_id: Option<i64>) -> Result<(), String> {
+        if let Some(id) = contact_id {
+            // 1. Purgamento definitivo via caller_is_syncadapter para expurgar fisicamente da tabela SQLite
+            let del_sync_cmd = format!(
+                "content delete --uri \"content://com.android.contacts/raw_contacts?caller_is_syncadapter=true\" --where _id={}",
+                id
+            );
+            // 2. Limpeza explícita dos dados do contato na tabela data
+            let del_data_cmd = format!(
+                "content delete --uri content://com.android.contacts/data --where raw_contact_id={}",
+                id
+            );
+            // 3. Fallback delete padrão sem parâmetros extras
+            let del_cmd = format!(
+                "content delete --uri content://com.android.contacts/raw_contacts --where _id={}",
+                id
+            );
+            let batch = format!("{}; {}; {}", del_sync_cmd, del_data_cmd, del_cmd);
+            let _ = Self::execute_shell(serial, &batch, 6);
+        }
+        Ok(())
+    }
+
+    /// Exclui TODOS os contatos temporários criados pelo Esfera (account_name='esfera_temp')
+    /// Não afeta nenhum contato pessoal ou corporativo do operador (Google/SIM/Telefone)
+    pub fn cleanup_all_temporary_contacts(serial: &str) -> Result<(), String> {
+        // 1. Purgamento em lote definitivo com caller_is_syncadapter
+        let del_sync_cmd = format!(
+            "content delete --uri \"content://com.android.contacts/raw_contacts?caller_is_syncadapter=true\" --where \"account_name='{}'\"",
+            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME
+        );
+        // 2. Fallback delete padrão em lote
+        let del_cmd = format!(
+            "content delete --uri content://com.android.contacts/raw_contacts --where \"account_name='{}'\"",
+            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME
+        );
+        let batch = format!("{}; {}", del_sync_cmd, del_cmd);
+        let _ = Self::execute_shell(serial, &batch, 6);
+        Ok(())
+    }
+
+    /// Digitação humana fluida e rápida via HCI com cadência natural:
+    /// Processa palavras com micro-delays Gaussianos (20-45ms) e quebras de linha com ENTER (keycode 66).
+    /// Escapa com precisão todos os metacaracteres shell POSIX sem quebras de aspas.
+    pub fn type_text_fluid_hci(serial: &str, text: &str) -> Result<(), String> {
+        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+
+        let lines: Vec<&str> = text.split('\n').collect();
+        let total_lines = lines.len();
+
+        for (l_idx, line) in lines.into_iter().enumerate() {
+            let mut shell_cmds = Vec::new();
+            let words: Vec<&str> = line.split(' ').collect();
+            let total_words = words.len();
+
+            for (w_idx, word) in words.into_iter().enumerate() {
+                if !word.is_empty() {
+                    let mut escaped_word = String::with_capacity(word.len() * 2);
+                    for ch in word.chars() {
+                        match ch {
+                            ' ' => escaped_word.push_str("%s"),
+                            '"' => escaped_word.push_str("\\\""),
+                            '\'' => escaped_word.push_str("\\'"),
+                            '\\' => escaped_word.push_str("\\\\"),
+                            '&' => escaped_word.push_str("\\&"),
+                            '<' => escaped_word.push_str("\\<"),
+                            '>' => escaped_word.push_str("\\>"),
+                            '|' => escaped_word.push_str("\\|"),
+                            ';' => escaped_word.push_str("\\;"),
+                            '$' => escaped_word.push_str("\\$"),
+                            '(' => escaped_word.push_str("\\("),
+                            ')' => escaped_word.push_str("\\)"),
+                            '*' => escaped_word.push_str("\\*"),
+                            '?' => escaped_word.push_str("\\?"),
+                            '#' => escaped_word.push_str("\\#"),
+                            '%' => escaped_word.push_str("\\%"),
+                            '~' => escaped_word.push_str("\\~"),
+                            '`' => escaped_word.push_str("\\`"),
+                            '!' => escaped_word.push_str("\\!"),
+                            c => escaped_word.push(c),
+                        }
+                    }
+                    let delay_ms = Self::calculate_gaussian_delay(20, 45);
+                    shell_cmds.push(format!("input text {}; sleep {:.3}", escaped_word, delay_ms as f64 / 1000.0));
+                }
+
+                // Espaçador entre palavras
+                if w_idx + 1 < total_words {
+                    let space_delay = Self::calculate_gaussian_delay(15, 30);
+                    shell_cmds.push(format!("input text %s; sleep {:.3}", space_delay as f64 / 1000.0));
+                }
+            }
+
+            // Executa os comandos da linha em batch único para alta performance
+            if !shell_cmds.is_empty() {
+                let batch = shell_cmds.join(" && ");
+                let _ = Self::execute_shell(&target_serial, &batch, 8);
+            }
+
+            // Se houver próxima linha, envia ENTER humano
+            if l_idx + 1 < total_lines {
+                let _ = Self::send_keyevent(&target_serial, 66);
+                let line_pause = Self::calculate_gaussian_delay(120, 220);
+                std::thread::sleep(Duration::from_millis(line_pause as u64));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Alias para compatibilidade com type_text_fluid_hci
+    pub fn type_message_native_fast(serial: &str, text: &str) -> Result<(), String> {
+        Self::type_text_fluid_hci(serial, text)
+    }
+
+    /// Envia mensagem no WhatsApp via NAVEGAÇÃO 100% NATIVA interna in-app (sem sair do app).
+    /// Mantém a sessão do WhatsApp aberta e desbloqueada sem jamais disparar intents externos
+    /// que acionariam a tela de senha/biometria (AppAuthenticationActivity).
+    /// Se já estiver na conversa do contato, apenas digita/cola e envia.
+    /// Se estiver na lista de conversas, clica na busca, digita o número, seleciona o contato,
+    /// digita e clica em enviar via toque Bézier.
+    pub fn send_whatsapp_native_navigation(
+        serial: &str,
+        phone: &str,
+        message: &str,
+        _contact_name: Option<&str>,
+        package: Option<&str>,
+    ) -> Result<(), String> {
+        let pkg = package.unwrap_or(Self::DEFAULT_WHATSAPP_PACKAGE);
+        let digits = Self::extract_phone_digits(phone);
+        if digits.len() < 8 {
+            return Err("Número de telefone não contém dígitos válidos".to_string());
+        }
+        let tail = digits[digits.len() - 8..].to_string();
+
+        let (screen_w, screen_h) = {
+            let (w, h) = Self::get_device_screen_size(serial);
+            if w > 0 && h > 0 { (w, h) } else { (720, 1600) }
+        };
+
+        // 1. Coloca o WhatsApp alvo em primeiro plano, numa tela neutra (lista de conversas).
+        let focus_raw = Self::wa_focus(serial);
+        if !focus_raw.contains(pkg) {
+            let bring_fg = format!("monkey -p {} -c android.intent.category.LAUNCHER 1", pkg);
+            let _ = Self::execute_shell(serial, &bring_fg, 3);
+            let d = Self::calculate_gaussian_delay(500, 800);
+            std::thread::sleep(Duration::from_millis(d as u64));
+        } else if !focus_raw.contains("HomeActivity") {
+            // Conversa de outro contato, busca aberta ou diálogo: volta UMA vez (sem sair do WhatsApp)
+            let _ = Self::send_keyevent(serial, 4);
+            let d = Self::calculate_gaussian_delay(300, 450);
+            std::thread::sleep(Duration::from_millis(d as u64));
+        }
+
+        // 2. Abre a conversa. Busca interna só quando dá para conferir o número na linha do
+        //    resultado e o texto é digitável por `input text` (sem acento/emoji). Senão, deep link
+        //    travado no pacote alvo (nunca abre outro WhatsApp).
+        let typable = message.chars().all(|c| c.is_ascii()) && message.len() <= 1500;
+        let mut opened_via_search = false;
+        if typable {
+            opened_via_search = Self::wa_open_chat_via_search(serial, pkg, &digits, &tail, screen_w, screen_h)?;
+        }
+        let prefilled = !opened_via_search && message.len() <= 1500;
+        if !opened_via_search {
+            let text_param = if prefilled { format!("&text={}", Self::url_encode(message)) } else { String::new() };
+            let url = format!("https://api.whatsapp.com/send?phone={}{}", digits, text_param);
+            let cmd = format!(
+                "am start -a android.intent.action.VIEW -p {} -d '{}'",
+                pkg,
+                Self::shell_quote(&url)
+            );
+            Self::execute_shell(serial, &cmd, 8).map_err(|e| format!("Falha ao abrir conversa por deep link: {}", e))?;
+            let d = Self::calculate_gaussian_delay(2200, 3200);
+            std::thread::sleep(Duration::from_millis(d as u64));
+        }
+
+        // 3. Confere que a conversa abriu (campo de mensagem presente).
+        let mut entry = None;
+        for _ in 0..4 {
+            let nodes = Self::ui_nodes(&Self::ui_dump(serial));
+            entry = nodes.into_iter().find(|n| n.rid == format!("{}:id/entry", pkg));
+            if entry.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(900));
+        }
+        let entry = match entry {
+            Some(e) => e,
+            None => {
+                let focus = Self::wa_focus(serial);
+                let _ = Self::send_keyevent(serial, 4); // fecha diálogo/aviso sem sair do WhatsApp
+                if focus.contains("AppAuthentication") {
+                    return Err("WhatsApp bloqueado por senha/biometria: a conversa não abriu".to_string());
+                }
+                return Err(format!("A conversa com {} não abriu (o número pode não ter WhatsApp)", phone));
+            }
+        };
+
+        // 4. Garante o texto no campo (digitando quando não veio pré-preenchido).
+        if !Self::same_text(&entry.text, message) {
+            if prefilled && !entry.text.trim().is_empty() {
+                return Err("O texto pré-preenchido não confere com a mensagem; envio cancelado".to_string());
+            }
+            Self::bezier_tap_screen(serial, entry.cx, entry.cy, entry.cx, entry.cy)?;
+            let d = Self::calculate_gaussian_delay(200, 350);
+            std::thread::sleep(Duration::from_millis(d as u64));
+            Self::type_text_fluid_hci(serial, message)?;
+            let d = Self::calculate_gaussian_delay(300, 500);
+            std::thread::sleep(Duration::from_millis(d as u64));
+            let typed = Self::ui_nodes(&Self::ui_dump(serial))
+                .into_iter()
+                .find(|n| n.rid == format!("{}:id/entry", pkg))
+                .map(|n| n.text)
+                .unwrap_or_default();
+            if !Self::same_text(&typed, message) {
+                return Err("A mensagem não foi digitada corretamente no campo; envio cancelado".to_string());
+            }
+        }
+
+        // 5. Toca em Enviar pela posição real do botão (fallback: posição relativa padrão).
+        let send_btn = Self::ui_nodes(&Self::ui_dump(serial))
+            .into_iter()
+            .find(|n| n.rid == format!("{}:id/send", pkg));
+        let (sx, sy) = match send_btn {
+            Some(b) => (b.cx, b.cy),
+            None => {
+                let mut x: i32 = 0;
+                let mut y: i32 = 0;
+                unsafe { esfera_hpc_calculate_tap_coordinates(screen_w, screen_h, 91.0, 91.5, &mut x, &mut y); }
+                (x, y)
+            }
+        };
+        Self::bezier_tap_screen(serial, sx, sy, sx, sy)?;
+        let d = Self::calculate_gaussian_delay(900, 1300);
+        std::thread::sleep(Duration::from_millis(d as u64));
+
+        // 6. Confirma que saiu: o campo precisa ter esvaziado.
+        let after = Self::ui_nodes(&Self::ui_dump(serial))
+            .into_iter()
+            .find(|n| n.rid == format!("{}:id/entry", pkg))
+            .map(|n| n.text);
+        if let Some(t) = after {
+            if Self::same_text(&t, message) {
+                return Err("O botão Enviar não respondeu: a mensagem continua no campo".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Abre a conversa pela busca interna do WhatsApp. Só toca num resultado cuja linha
+    /// mostre o próprio número (nunca abre conversa de outra pessoa). Retorna false se não achou.
+    fn wa_open_chat_via_search(
+        serial: &str,
+        pkg: &str,
+        digits: &str,
+        tail: &str,
+        screen_w: i32,
+        screen_h: i32,
+    ) -> Result<bool, String> {
+        let nodes = Self::ui_nodes(&Self::ui_dump(serial));
+        let bar = nodes.iter().find(|n| {
+            n.rid == format!("{}:id/search_text", pkg) || n.rid == format!("{}:id/my_search_bar", pkg)
+        });
+        let (bx, by) = match bar {
+            Some(b) => (b.cx, b.cy),
+            None => {
+                let mut x: i32 = 0;
+                let mut y: i32 = 0;
+                unsafe { esfera_hpc_calculate_tap_coordinates(screen_w, screen_h, 50.0, 14.5, &mut x, &mut y); }
+                (x, y)
+            }
+        };
+        Self::bezier_tap_screen(serial, bx, by, bx, by)?;
+        let d = Self::calculate_gaussian_delay(400, 600);
+        std::thread::sleep(Duration::from_millis(d as u64));
+        Self::type_text_fluid_hci(serial, digits)?;
+        let d = Self::calculate_gaussian_delay(1000, 1400);
+        std::thread::sleep(Duration::from_millis(d as u64));
+
+        let results = Self::ui_nodes(&Self::ui_dump(serial));
+        let hit = results.iter().find(|n| {
+            n.rid.contains("contact_name") && Self::extract_phone_digits(&n.text).ends_with(tail)
+        });
+        match hit {
+            Some(row) => {
+                Self::bezier_tap_screen(serial, row.cx, row.cy, row.cx, row.cy)?;
+                let d = Self::calculate_gaussian_delay(1100, 1600);
+                std::thread::sleep(Duration::from_millis(d as u64));
+                Ok(true)
+            }
+            None => {
+                // Fecha teclado e busca, voltando à lista de conversas
+                let _ = Self::send_keyevent(serial, 4);
+                std::thread::sleep(Duration::from_millis(250));
+                if !Self::wa_focus(serial).contains("HomeActivity") || Self::ui_dump(serial).contains(&format!("{}:id/search_input", pkg)) {
+                    let _ = Self::send_keyevent(serial, 4);
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    fn wa_focus(serial: &str) -> String {
+        Self::execute_shell(serial, "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'", 3).unwrap_or_default()
+    }
+
+    /// Lê a árvore de UI da tela atual (uiautomator).
+    fn ui_dump(serial: &str) -> String {
+        Self::execute_shell(
+            serial,
+            "uiautomator dump /sdcard/esf_ui.xml >/dev/null 2>&1; cat /sdcard/esf_ui.xml",
+            12,
+        )
+        .unwrap_or_default()
+    }
+
+    fn ui_nodes(xml: &str) -> Vec<UiNode> {
+        fn attr(seg: &str, name: &str) -> String {
+            let key = format!(" {}=\"", name);
+            match seg.find(&key) {
+                Some(i) => {
+                    let rest = &seg[i + key.len()..];
+                    let raw = &rest[..rest.find('"').unwrap_or(rest.len())];
+                    raw.replace("&quot;", "\"").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&#10;", "\n").replace("&amp;", "&")
+                }
+                None => String::new(),
+            }
+        }
+        xml.split("<node ")
+            .skip(1)
+            .filter_map(|seg| {
+                let b = attr(seg, "bounds");
+                let nums: Vec<i32> = b
+                    .split(|c: char| !c.is_ascii_digit() && c != '-')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                if nums.len() != 4 {
+                    return None;
+                }
+                Some(UiNode {
+                    rid: attr(seg, "resource-id"),
+                    text: attr(seg, "text"),
+                    cx: (nums[0] + nums[2]) / 2,
+                    cy: (nums[1] + nums[3]) / 2,
+                })
+            })
+            .collect()
+    }
+
+    /// Compara textos ignorando diferenças de espaço/quebra de linha.
+    fn same_text(a: &str, b: &str) -> bool {
+        let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        !b.trim().is_empty() && norm(a) == norm(b)
+    }
+
+    /// Envia mensagem no WhatsApp com navegação nativa fluida dentro do WhatsApp
+    /// (busca interna, sem salvar contato na agenda, sem acionar deep link externo nem bloquear por senha)
+    pub fn send_whatsapp_with_contact(
+        serial: &str,
+        phone: &str,
+        message: &str,
+        contact_name: Option<&str>,
+        package: Option<&str>,
+    ) -> Result<(), String> {
+        Self::send_whatsapp_native_navigation(serial, phone, message, contact_name, package)
+    }
+
+    /// Envia mensagem no WhatsApp via navegação nativa e toque Bézier
+    pub fn send_whatsapp_intent_and_bezier_tap(serial: &str, phone: &str, message: &str) -> Result<(), String> {
+        Self::send_whatsapp_native_navigation(serial, phone, message, None, Some(Self::DEFAULT_WHATSAPP_PACKAGE))
+    }
+
+    /// Envia mensagem no WhatsApp com pacote alvo explícito (`com.whatsapp` ou `com.whatsapp.w4b`)
+    #[allow(dead_code)]
+    pub fn send_whatsapp_intent_and_bezier_tap_pkg(
+        serial: &str,
+        phone: &str,
+        message: &str,
+        target_pkg: Option<&str>,
+    ) -> Result<(), String> {
+        Self::send_whatsapp_native_navigation(serial, phone, message, None, target_pkg)
+    }
+
+    /// Método legado via Intent URL mantido para diagnósticos pontuais
+    #[allow(dead_code)]
+    pub fn send_whatsapp_via_intent_legacy(
+        serial: &str,
+        phone: &str,
+        message: &str,
+        package: Option<&str>,
+    ) -> Result<(), String> {
+        let pkg = package.unwrap_or(Self::DEFAULT_WHATSAPP_PACKAGE);
+        let digits = Self::extract_phone_digits(phone);
+        let target_phone = if digits.is_empty() { phone.to_string() } else { digits };
+        let encoded_msg = Self::url_encode(message);
+        let intent_url = format!("https://api.whatsapp.com/send?phone={}&text={}", target_phone, encoded_msg);
+
+        let intent_cmd = format!(
+            "am start -a android.intent.action.VIEW -p {} -d '{}'",
+            pkg,
+            Self::shell_quote(&intent_url)
+        );
+        let _ = Self::execute_shell(serial, &intent_cmd, 6);
+
         let delay_ms = unsafe { esfera_hpc_calculate_gaussian_delay(2200, 3500) };
         std::thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
 
-        // 3. Calcula coordenadas e toca no botão Enviar
         let (screen_w, screen_h) = Self::get_device_screen_size(serial);
         let mut tap_x: i32 = 0;
         let mut tap_y: i32 = 0;
         unsafe {
             esfera_hpc_calculate_tap_coordinates(screen_w, screen_h, 92.5, 96.0, &mut tap_x, &mut tap_y);
         }
-
-        // 3. Toque físico com trajetória Bézier (curva quadrática nativa HPC ±40px, 180-450ms)
         Self::bezier_tap_screen(serial, tap_x, tap_y, tap_x, tap_y)
     }
 
@@ -3859,8 +4441,9 @@ impl AdbManager {
         for i in 1..pts {
             sequence.push_str(&format!(" && input motionevent MOVE {} {}", xs[i], ys[i]));
         }
+        // Dwell time biológico humano: simula a permanência do polegar na tela (~80ms)
         sequence.push_str(&format!(
-            " && input motionevent UP {} {}",
+            " && sleep 0.08 && input motionevent UP {} {}",
             xs[pts - 1], ys[pts - 1]
         ));
 
@@ -3902,58 +4485,25 @@ impl AdbManager {
     }
 
     /// Fallback para mensagens longas: abre o chat via Intent só com telefone e digita o texto
+    #[allow(dead_code)]
     fn send_long_message_typing(serial: &str, phone: &str, message: &str) -> Result<(), String> {
-        let intent_url = format!("https://api.whatsapp.com/send?phone={}", phone);
+        Self::send_long_message_typing_pkg(serial, phone, message, Some("com.whatsapp"))
+    }
 
-        // Abre o chat via Intent (protocolo ADB nativo para Wi-Fi/túnel)
-        if Self::use_native_adb(serial) {
-            let intent_cmd = format!(
-                "am start -a android.intent.action.VIEW -d '{}'",
-                Self::shell_quote(&intent_url)
-            );
-            match crate::adb_tcp::exec_shell_bytes(serial, &intent_cmd) {
-                Ok((_, _, true)) => {}
-                Ok((_, _, false)) => return Err("Falha ao abrir chat WhatsApp (nativo)".to_string()),
-                Err(e) => {
-                    return Err(format!("Falha ao abrir chat WhatsApp via túnel: {}", e))
-                }
-            }
-        } else {
-            let mut intent_adb = create_cmd("adb");
-            intent_adb
-                .arg("-s")
-                .arg(serial)
-                .arg("shell")
-                .arg("am")
-                .arg("start")
-                .arg("-a")
-                .arg("android.intent.action.VIEW")
-                .arg("-d")
-                .arg(&intent_url);
-            let intent_cmd = run_cmd_timeout(intent_adb, Duration::from_secs(8));
+    /// Fallback para mensagens longas com pacote alvo explícito
+    /// Fallback para mensagens longas com pacote alvo explícito: utiliza navegação nativa fluida
+    fn send_long_message_typing_pkg(
+        serial: &str,
+        phone: &str,
+        message: &str,
+        target_pkg: Option<&str>,
+    ) -> Result<(), String> {
+        Self::send_whatsapp_native_navigation(serial, phone, message, None, target_pkg)
+    }
 
-            if let Err(e) = intent_cmd {
-                return Err(format!("Falha ao abrir chat WhatsApp: {}", e));
-            }
-        }
-
-        // Aguarda a tela do chat abrir
-        let delay_ms = unsafe { esfera_hpc_calculate_gaussian_delay(2500, 4000) };
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
-
-        // Digita a mensagem caractere por caractere com delay humano
-        Self::type_text_human_hpc(serial, message)?;
-
-        // Pressiona ENTER para enviar
-        let mut enter_adb = create_cmd("adb");
-        enter_adb
-            .args(["-s", serial, "shell", "input", "keyevent", "66"]);
-        let enter_cmd = run_cmd_timeout(enter_adb, Duration::from_secs(6));
-        match enter_cmd {
-            Ok(out) if out.status.success() => Ok(()),
-            Ok(_) => Err("Falha ao pressionar ENTER no WhatsApp".to_string()),
-            Err(e) => Err(e.to_string()),
-        }
+    /// Limpa em lote TODOS os contatos temporários gerados pelo Esfera v3 ('esfera_temp')
+    pub fn clear_all_temporary_contacts(serial: &str) -> Result<(), String> {
+        Self::cleanup_all_temporary_contacts(serial)
     }
 
     /// Configura Proxy SOCKS5/HTTP por aparelho via ADB e revoga permissões BSSID Wi-Fi (Anti-Ban)
@@ -4013,6 +4563,8 @@ impl AdbManager {
                     batch.push_str(&format!("pm revoke {} {}", pkg, perm));
                 }
             }
+            // Garante permissões de leitura/escrita de contatos para o WhatsApp padrão
+            batch.push_str(" && pm grant com.whatsapp android.permission.READ_CONTACTS 2>/dev/null && pm grant com.whatsapp android.permission.WRITE_CONTACTS 2>/dev/null");
             let _ = crate::adb_tcp::exec_shell_bytes(serial, &batch);
         } else {
             for pkg in &packages {
@@ -4028,6 +4580,24 @@ impl AdbManager {
                         .output();
                 }
             }
+            let _ = create_cmd("adb")
+                .arg("-s")
+                .arg(serial)
+                .arg("shell")
+                .arg("pm")
+                .arg("grant")
+                .arg("com.whatsapp")
+                .arg("android.permission.READ_CONTACTS")
+                .output();
+            let _ = create_cmd("adb")
+                .arg("-s")
+                .arg(serial)
+                .arg("shell")
+                .arg("pm")
+                .arg("grant")
+                .arg("com.whatsapp")
+                .arg("android.permission.WRITE_CONTACTS")
+                .output();
         }
 
         Ok(())
@@ -4163,7 +4733,137 @@ impl AdbManager {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn test_whatsapp_package_defaults() {
+        assert_eq!(AdbManager::DEFAULT_WHATSAPP_PACKAGE, "com.whatsapp");
+    }
 
+    #[test]
+    fn test_esfera_temp_account_constants() {
+        assert_eq!(AdbManager::ESFERA_TEMP_CONTACT_ACCOUNT_NAME, "esfera_temp");
+        assert_eq!(AdbManager::ESFERA_TEMP_CONTACT_ACCOUNT_TYPE, "com.esfera");
+    }
 
+    #[test]
+    fn test_parse_contact_id_from_standard_query() {
+        let output = "Row: 0 _id=1234\n";
+        assert_eq!(AdbManager::parse_contact_id_from_query(output), Some(1234));
+    }
 
+    #[test]
+    fn test_parse_contact_id_with_multiple_rows_and_columns() {
+        let output = "Row: 0 _id=987, account_name=esfera_temp, account_type=com.esfera\nRow: 1 _id=654, account_name=esfera_temp\n";
+        assert_eq!(AdbManager::parse_contact_id_from_query(output), Some(987));
+    }
+
+    #[test]
+    fn test_parse_contact_id_no_results() {
+        assert_eq!(AdbManager::parse_contact_id_from_query("No result found.\n"), None);
+        assert_eq!(AdbManager::parse_contact_id_from_query(""), None);
+        assert_eq!(AdbManager::parse_contact_id_from_query("Error: unknown provider\n"), None);
+    }
+
+    #[test]
+    fn test_extract_phone_digits() {
+        assert_eq!(AdbManager::extract_phone_digits("+55 (11) 98765-4321"), "5511987654321");
+        assert_eq!(AdbManager::extract_phone_digits("5511999998888"), "5511999998888");
+        assert_eq!(AdbManager::extract_phone_digits("+1-800-555-0199"), "18005550199");
+        assert_eq!(AdbManager::extract_phone_digits("invalid-no-numbers!"), "");
+    }
+
+    #[test]
+    fn test_url_encode() {
+        let msg = "Olá, tudo bem? Mensagem de teste & confirmação!";
+        let encoded = AdbManager::url_encode(msg);
+        assert!(!encoded.contains(' '));
+        assert!(encoded.contains("%20"));
+        assert!(encoded.contains("%26")); // &
+    }
+
+    #[test]
+    fn test_shell_quote() {
+        let raw = "João d'Ávila";
+        let quoted = AdbManager::shell_quote(raw);
+        assert_eq!(quoted, "João d'\"'\"'Ávila");
+    }
+
+    #[test]
+    fn test_parse_contact_id_from_reversed_query() {
+        // Garante que mesmo quando retornado em ordem não decrescente, o maior ID (mais novo) é sempre selecionado
+        let output = "Row: 0 _id=102, account_name=esfera_temp\nRow: 1 _id=405, account_name=esfera_temp\nRow: 2 _id=203, account_name=esfera_temp\n";
+        assert_eq!(AdbManager::parse_contact_id_from_query(output), Some(405));
+    }
+
+    #[test]
+    fn test_parse_inserted_raw_contact_id() {
+        let out_aosp = "Row inserted: content://com.android.contacts/raw_contacts/4321\n";
+        assert_eq!(AdbManager::parse_inserted_raw_contact_id(out_aosp), Some(4321));
+
+        let out_plain = "content://com.android.contacts/raw_contacts/987\n";
+        assert_eq!(AdbManager::parse_inserted_raw_contact_id(out_plain), Some(987));
+
+        let out_err = "Error: unable to insert into table\n";
+        assert_eq!(AdbManager::parse_inserted_raw_contact_id(out_err), None);
+    }
+
+    #[test]
+    fn test_normalize_target_phone() {
+        // Celular Brasil com DDD sem 55 -> adiciona 55
+        assert_eq!(AdbManager::normalize_target_phone("(11) 98765-4321"), "5511987654321");
+        assert_eq!(AdbManager::normalize_target_phone("11987654321"), "5511987654321");
+        assert_eq!(AdbManager::normalize_target_phone("011987654321"), "5511987654321");
+
+        // Fixo Brasil 10 dígitos -> adiciona 55
+        assert_eq!(AdbManager::normalize_target_phone("1133334444"), "551133334444");
+
+        // Já possui 55
+        assert_eq!(AdbManager::normalize_target_phone("5511999998888"), "5511999998888");
+        assert_eq!(AdbManager::normalize_target_phone("+55 (11) 98765-4321"), "5511987654321");
+
+        // Internacional explícito com '+' preserva código original
+        assert_eq!(AdbManager::normalize_target_phone("+1-800-555-0199"), "18005550199");
+        assert_eq!(AdbManager::normalize_target_phone("+351 912 345 678"), "351912345678");
+
+        // Inválido
+        assert_eq!(AdbManager::normalize_target_phone(""), "");
+        assert_eq!(AdbManager::normalize_target_phone("abc"), "");
+    }
+
+    #[test]
+    fn test_type_text_fluid_hci_empty() {
+        // Texto vazio não deve disparar comandos shell nem falhar
+        let res = AdbManager::type_text_fluid_hci("invalid_serial", "");
+        assert!(res.is_ok());
+        let res_whitespace = AdbManager::type_text_fluid_hci("invalid_serial", "   ");
+        assert!(res_whitespace.is_ok());
+    }
+
+    #[test]
+    fn test_native_navigation_empty_phone() {
+        // Telefone vazio ou inválido deve retornar erro imediato sem alterar a tela
+        let res = AdbManager::send_whatsapp_native_navigation("invalid_serial", "", "msg", None, None);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("não contém dígitos"));
+
+        let res_alpha = AdbManager::send_whatsapp_native_navigation("invalid_serial", "abc", "msg", None, None);
+        assert!(res_alpha.is_err());
+    }
+
+    #[test]
+    fn test_type_message_native_fast_empty() {
+        assert!(AdbManager::type_message_native_fast("invalid_serial", "").is_ok());
+        assert!(AdbManager::type_message_native_fast("invalid_serial", "   ").is_ok());
+    }
+}
+
+/// Nó da árvore de UI (uiautomator) usado para conferir telas do WhatsApp.
+struct UiNode {
+    rid: String,
+    text: String,
+    cx: i32,
+    cy: i32,
+}

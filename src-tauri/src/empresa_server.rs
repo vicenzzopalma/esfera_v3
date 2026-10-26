@@ -66,7 +66,6 @@ async fn handle_lan_client(
                     }
                 }
             }
-            Err(_) => break,
         }
     }
 

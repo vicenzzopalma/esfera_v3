@@ -54,10 +54,12 @@ setprop persist.esfera.hub "$SERVER"
 # 5. SELinux: libera o daemon
 magiskpolicy --live "allow untrusted_app * * *" 2>/dev/null || true
 
-# 6. ADB Wi-Fi imortal
-setprop service.adb.tcp.port 5555
-stop adbd 2>/dev/null
-start adbd 2>/dev/null
+# 6. ADB Wi-Fi imortal, sem reiniciar o adbd quando já está em 5555
+if [ "$(getprop service.adb.tcp.port)" != "5555" ] && [ "$(getprop persist.adb.tcp.port)" != "5555" ]; then
+  setprop service.adb.tcp.port 5555
+  stop adbd 2>/dev/null
+  start adbd 2>/dev/null
+fi
 
 # 7. Imunidade a sono/suspensão (root)
 dumpsys deviceidle whitelist +com.esfera.agent 2>/dev/null || true
