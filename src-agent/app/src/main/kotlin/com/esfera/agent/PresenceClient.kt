@@ -85,17 +85,20 @@ class PresenceClient(
     fun start() {
         job?.cancel()
         job = scope.launch {
+            // Um PresenceClient por host (desktop via adb reverse E host/VPS), todos
+            // simultâneos: a presença é ancorada no ID, não no transporte.
+            val currentHost = serverHost
             // BACKOFF EXPONENCIAL INDESTRUTÍVEL: 2s -> 4s -> 8s -> ... -> máx 30s.
             // Reset para 2s assim que a conexão WebSocket voltar a subir.
             var backoffMs = 2_000L
             while (isActive) {
                 try {
                     val scheme = if (useTls) "wss" else "ws"
-                    val url = "$scheme://$serverHost:$wsPort/ws/presence"
+                    val url = "$scheme://$currentHost:$wsPort/ws/presence"
                     Log.d("PresenceClient", "Conectando ao Presence WS: $url")
 
                     client.webSocket(urlString = url) {
-                        Log.i("PresenceClient", "WebSocket de Presença CONECTADO!")
+                        Log.i("PresenceClient", "WebSocket de Presença CONECTADO em $currentHost!")
                         backoffMs = 2_000L
 
                         while (isActive) {
@@ -131,7 +134,7 @@ class PresenceClient(
                         }
                     }
                 } catch (e: Exception) {
-                    Log.w("PresenceClient", "Erro/Queda no WebSocket de Presença: ${e.message}")
+                    Log.w("PresenceClient", "Erro/Queda no WebSocket de Presença ($currentHost): ${e.message}")
                 }
 
                 Log.w("PresenceClient", "Reconectando em ${backoffMs}ms")

@@ -18,21 +18,36 @@ impl AiEngine {
         contact_name: &str,
     ) -> Result<String, String> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(25))
             .build()
             .map_err(|e| format!("Falha ao criar cliente HTTP IA: {}", e))?;
 
-        let default_system = "Você é um assistente humano brasileiro redigindo mensagens diretas no WhatsApp.\n\
-            REGRAS OBRIGATÓRIAS:\n\
-            1. Retorne APENAS o texto da mensagem final pronto para envio. NUNCA adicione introduções (como 'Aqui está', 'Segue a mensagem:'), explicações ou aspas.\n\
-            2. Mantenha intactos todos os links (http/https), números de telefone, chaves PIX, datas e valores (R$).\n\
-            3. Use tom natural, coloquial, amigável e direto. Evite parecer robô ou telemarketing formal.\n\
-            4. Use no máximo 1 ou 2 emojis.\n\
-            5. Preserve a variável {nome} ou o nome do contato.";
+        // Regras fixas: valem para toda campanha e não podem ser desligadas pelo prompt da empresa.
+        // Base: CDC arts. 42, 42-A, 71 e 54-C IV (Lei 14.181/2021); LGPD arts. 6º e 7º, X.
+        let default_system = "Você reescreve mensagens de WhatsApp de uma empresa brasileira, inclusive mensagens de cobrança. \
+            Seu trabalho é só mudar a redação, mantendo o mesmo conteúdo.\n\
+            FORMATO:\n\
+            1. Retorne APENAS o texto final pronto para envio, sem introduções ('Aqui está', 'Segue'), explicações ou aspas.\n\
+            2. Mantenha exatamente iguais: links, telefones, datas, prazos, protocolos, nome da empresa, CNPJ do credor e instruções de descadastro (ex.: 'responda SAIR').\n\
+            PROIBIDO FALAR DE VALORES: nunca escreva quantias em dinheiro (R$, reais, centavos, números como 350,00), saldo, parcelas, juros, multas ou descontos. Se o texto original tiver valores, retire-os e convide o cliente a consultar as condições pelo canal de negociação.\n\
+            3. Preserve o nome do contato ou a variável {nome}. Tom natural, educado e direto; no máximo 1 emoji.\n\
+            UMA MENSAGEM: o texto recebido é UMA mensagem do WhatsApp (só a saudação, só o corpo ou só a finalização). Reescreva só ela, num único parágrafo curto, sem acrescentar saudação ou despedida que não estejam nela.\n\
+            ANTI-BLOQUEIO: cada envio precisa ser diferente. Reescreva de verdade: troque a saudação, use sinônimos, mude a ordem e a estrutura das frases e o tamanho do texto. Nunca devolva o texto original quase igual. O significado e os itens da regra 2 não mudam.\n\
+            REGRAS LEGAIS DE COBRANÇA (CDC arts. 42 e 71) — OBRIGATÓRIAS:\n\
+            4. Nunca use ameaça, coação, intimidação, humilhação, deboche, culpa ou linguagem agressiva.\n\
+            5. Nunca invente nem exagere consequências (negativação, protesto, processo, corte, visita, perda de bens). Só mencione uma consequência se ela já estiver no texto original, com as mesmas palavras e sem aumentar a gravidade.\n\
+            6. Nunca crie urgência falsa ('última chance', 'só hoje', 'urgente') nem prazos ou condições que não estejam no original.\n\
+            7. Nunca diga ou insinue que outras pessoas (família, trabalho, vizinhos, empregador) saberão da dívida.\n\
+            8. Não pressione nem explore pessoas vulneráveis (idosos, doentes, desempregados) (CDC art. 54-C, IV).\n\
+            9. Se o original identificar o credor (nome, CNPJ, endereço), mantenha essa identificação (CDC art. 42-A).\n\
+            REGRAS DE DADOS PESSOAIS (LGPD arts. 6º e 7º, X):\n\
+            10. Use só os dados que já estão no texto. Nunca acrescente CPF, endereço, dados bancários, detalhes da dívida ou qualquer informação pessoal.\n\
+            11. Escreva sempre para o próprio titular. Nunca peça para repassar a mensagem a terceiros nem fale da dívida como se fosse para outra pessoa.\n\
+            12. Se o texto original oferecer um canal para negociar, contestar ou parar de receber mensagens, mantenha esse canal.";
 
         let prompt = if !config.system_prompt.is_empty() {
             format!(
-                "{}\n\n{}\n\nReescreva a mensagem para o contato '{}':\n{}",
+                "{}\n\nInstruções adicionais da empresa (as regras legais acima sempre prevalecem):\n{}\n\nReescreva a mensagem para o contato '{}':\n{}",
                 default_system, config.system_prompt, contact_name, base_message
             )
         } else {
@@ -68,7 +83,145 @@ impl AiEngine {
         };
 
         let sanitized = Self::sanitize_ai_response(&raw_response, contact_name);
+        Self::validate_rewrite(base_message, &sanitized)?;
         Ok(sanitized)
+    }
+
+    /// Reescreve saudação, corpo e finalização SEPARADAMENTE (blocos separados por linha em
+    /// branco) e devolve os blocos na mesma ordem, para serem enviados como mensagens próprias.
+    pub async fn generate_parts_chain(
+        chain: &[AiConfig],
+        base_message: &str,
+        contact_name: &str,
+    ) -> Result<String, String> {
+        let parts: Vec<&str> = base_message
+            .split("\n\n")
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.len() <= 1 {
+            return Self::generate_message_chain(chain, base_message, contact_name).await;
+        }
+        // Saudação, corpo e finalização em paralelo: o tempo total é o da parte mais lenta.
+        let results = futures_util::future::join_all(
+            parts.iter().map(|part| Self::generate_message_chain(chain, part, contact_name)),
+        )
+        .await;
+        let mut out = Vec::with_capacity(results.len());
+        for r in results {
+            let text = r?;
+            out.push(text.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+        Ok(out.join("\n\n"))
+    }
+
+    /// Tenta cada provedor em ordem (cada um com no máximo 20s) até um devolver texto válido.
+    pub async fn generate_message_chain(
+        chain: &[AiConfig],
+        base_message: &str,
+        contact_name: &str,
+    ) -> Result<String, String> {
+        let mut errors = Vec::new();
+        for cfg in chain {
+            let attempt = tokio::time::timeout(
+                Duration::from_secs(20),
+                Self::generate_message(cfg, base_message, contact_name),
+            )
+            .await
+            .unwrap_or_else(|_| Err("tempo limite de 20s".to_string()));
+            match attempt {
+                Ok(text) => return Ok(text),
+                Err(e) => {
+                    eprintln!("[IA CADEIA] {} / {} falhou: {}", cfg.provider, cfg.model, e);
+                    errors.push(format!("{}: {}", cfg.provider, e));
+                }
+            }
+        }
+        Err(if errors.is_empty() { "Nenhum provedor de IA configurado".to_string() } else { errors.join(" | ") })
+    }
+
+    /// Recusa respostas que não podem ir ao cliente: recusa/explicação da IA, texto vazio ou
+    /// perda de dados obrigatórios do original (links, valores, datas, documentos, opção SAIR).
+    pub fn validate_rewrite(original: &str, output: &str) -> Result<(), String> {
+        let out = output.trim();
+        if out.is_empty() {
+            return Err("IA devolveu texto vazio".to_string());
+        }
+        let lower = out.to_lowercase();
+        const META: [&str; 16] = [
+            "i'm sorry", "i’m sorry", "i can't", "i can’t", "i cannot", "as an ai",
+            "não posso", "não é possível", "nao e possivel", "não consigo", "desculpe, mas",
+            "conforme solicitado", "versão reescrita", "aqui está", "segue a mensagem", "reescrevi",
+        ];
+        let orig_lower = original.to_lowercase();
+        if let Some(m) = META.iter().find(|m| lower.contains(*m) && !orig_lower.contains(*m)) {
+            return Err(format!("IA respondeu com recusa/explicação ('{}')", m));
+        }
+        if out.chars().count() > original.chars().count() * 3 + 200 {
+            return Err("IA devolveu texto longo demais".to_string());
+        }
+        let trim_punct = |w: &str| w.trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '"' | '\'')).to_string();
+        for raw in original.split_whitespace() {
+            let w = trim_punct(raw);
+            let digits = w.chars().filter(|c| c.is_ascii_digit()).count();
+            let is_url = w.starts_with("http://") || w.starts_with("https://");
+            let is_number = digits >= 4 && w.chars().all(|c| c.is_ascii_digit() || "./-:,".contains(c));
+            // Valores em dinheiro não precisam ser mantidos: a regra é retirá-los.
+            if (is_url || (is_number && !Self::has_money(&w))) && !out.contains(&w) {
+                return Err(format!("IA alterou ou removeu '{}'", w));
+            }
+        }
+        if original.contains("SAIR") && !out.contains("SAIR") {
+            return Err("IA removeu a opção de descadastro (SAIR)".to_string());
+        }
+        if Self::has_money(out) {
+            return Err("IA citou valores (proibido falar de valores)".to_string());
+        }
+        Ok(())
+    }
+
+    /// Detecta menção a valores em dinheiro: R$, "reais", "centavos" ou quantia com centavos (350,00).
+    pub fn has_money(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        if lower.contains("r$") || lower.contains("rs$") || lower.contains("brl") {
+            return true;
+        }
+        let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric() && c != '%').filter(|w| !w.is_empty()).collect();
+        if words.iter().any(|w| *w == "reais" || *w == "centavos") {
+            return true;
+        }
+        // Percentual (desconto/juros) também é valor.
+        if words.iter().any(|w| w.ends_with('%') && w.chars().any(|c| c.is_ascii_digit())) {
+            return true;
+        }
+        // "10 %" (com espaço) e "10 por cento" também são percentual.
+        let chars: Vec<char> = lower.chars().collect();
+        if chars.iter().enumerate().any(|(i, &c)| {
+            c == '%' && chars[..i].iter().rev().find(|ch| !ch.is_whitespace()).map_or(false, |ch| ch.is_ascii_digit())
+        }) {
+            return true;
+        }
+        if words.windows(2).any(|w| w[0] == "por" && w[1] == "cento") || words.contains(&"porcento") {
+            return true;
+        }
+        // "R 350" e palavras de valor seguidas de número em até 3 palavras ("valor de 350", "saldo 120").
+        const KEYS: [&str; 22] = [
+            "r", "valor", "valores", "saldo", "parcela", "parcelas", "divida", "dívida", "debito", "débito",
+            "total", "quantia", "montante", "preco", "preço", "desconto", "juros", "multa", "pague", "pagar",
+            "pagamento", "custa",
+        ];
+        for (i, w) in words.iter().enumerate() {
+            if KEYS.contains(w) && words.iter().skip(i + 1).take(3).any(|n| n.chars().next().map_or(false, |c| c.is_ascii_digit())) {
+                return true;
+            }
+        }
+        // Quantia com centavos: "350,00" ou "350.00" (não confunde com data "10.10.2026").
+        let b = text.as_bytes();
+        (1..b.len().saturating_sub(2)).any(|i| {
+            (b[i] == b',' || b[i] == b'.')
+                && b[i - 1].is_ascii_digit() && b[i + 1].is_ascii_digit() && b[i + 2].is_ascii_digit()
+                && (i + 3 >= b.len() || !(b[i + 3].is_ascii_digit() || b[i + 3] == b'.' || b[i + 3] == b'/'))
+        })
     }
 
     /// Requisição para GroqCloud (API Free Tier ultrarrápida compatível com OpenAI)
@@ -77,8 +230,10 @@ impl AiEngine {
         if groq_cfg.endpoint.is_empty() || !groq_cfg.endpoint.contains("groq.com") {
             groq_cfg.endpoint = "https://api.groq.com/openai/v1/chat/completions".to_string();
         }
-        if groq_cfg.model.is_empty() {
-            groq_cfg.model = "llama-3.3-70b-versatile".to_string();
+        // Llama/Mixtral saíram do Groq; modelos ativos em 27/10/2026: gpt-oss-120b/20b e qwen3.8-27b
+        let old = groq_cfg.model.trim().to_lowercase();
+        if old.is_empty() || old.starts_with("llama-3") || old.starts_with("mixtral") {
+            groq_cfg.model = "openai/gpt-oss-120b".to_string();
         }
         if groq_cfg.api_key.trim().is_empty() {
             return Err("Chave de API do Groq não configurada. Obtenha grátis em https://console.groq.com/keys e configure em Parâmetros de IA.".to_string());
@@ -86,11 +241,11 @@ impl AiEngine {
         match Self::call_openai(client, &groq_cfg, prompt).await {
             Ok(content) => Ok(content),
             Err(first_err) => {
-                let is_recoverable = first_err.contains("404") || first_err.contains("429") || first_err.contains("503") || first_err.contains("decommissioned");
-                if is_recoverable && groq_cfg.model != "llama-3.1-8b-instant" {
-                    eprintln!("[GROQ RESILIÊNCIA] Modelo '{}' falhou. Tentando fallback para 'llama-3.1-8b-instant'...", groq_cfg.model);
+                let is_recoverable = first_err.contains("400") || first_err.contains("404") || first_err.contains("429") || first_err.contains("503") || first_err.contains("decommissioned");
+                if is_recoverable && groq_cfg.model != "openai/gpt-oss-20b" {
+                    eprintln!("[GROQ RESILIÊNCIA] Modelo '{}' falhou. Tentando fallback para 'openai/gpt-oss-20b'...", groq_cfg.model);
                     let mut fallback_cfg = groq_cfg.clone();
-                    fallback_cfg.model = "llama-3.1-8b-instant".to_string();
+                    fallback_cfg.model = "openai/gpt-oss-20b".to_string();
                     if let Ok(content) = Self::call_openai(client, &fallback_cfg, prompt).await {
                         return Ok(content);
                     }
@@ -143,12 +298,12 @@ impl AiEngine {
                     return Err(initial_err);
                 }
 
+                // Ordem pela latência medida em 27/10/2026 (modelos gratuitos ativos no OpenRouter)
                 let fallbacks = [
-                    "openrouter/free",
-                    "minimax/minimax-m3.1-flash:free",
                     "nvidia/nemotron-3.5-lightning:free",
+                    "xingchen-agi/xing4.0-29b-a4b:free",
+                    "openrouter/free",
                     "liquid/lfm-2.5-2.6b:free",
-                    "google/gemma-4-26b-a4b-it:free",
                 ];
 
                 for fb_model in fallbacks {
@@ -188,6 +343,10 @@ impl AiEngine {
             || lower.contains("qwen-2.5-72b")
         {
             return "openrouter/free".to_string();
+        }
+        // Variante gratuita aposentada pelo OpenRouter em 22/10/2026 (responde 404)
+        if lower == "minimax/minimax-m3.1-flash:free" {
+            return "nvidia/nemotron-3.5-lightning:free".to_string();
         }
         clean.to_string()
     }
@@ -358,9 +517,65 @@ impl AiEngine {
         Self::call_openai(client, config, prompt).await
     }
 
+    /// Apelidos do nome do contato aceitos no texto, além de {nome}: o nome da coluna da planilha
+    /// ({NOME DEVEDOR}, {Razão Social}, {cliente}...). Comparação sem acento, caixa, espaço ou "_".
+    const NAME_ALIASES: &'static [&'static str] = &[
+        "nome", "name", "nomedevedor", "nomedodevedor", "devedor", "razaosocial", "razao", "nomefantasia",
+        "cliente", "nomecliente", "nomedocliente", "contato", "nomecontato", "nomedocontato", "nomecompleto", "destinatario",
+    ];
+
+    fn name_alias_key(inner: &str) -> String {
+        inner
+            .to_lowercase()
+            .chars()
+            .map(|c| match c {
+                'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+                'é' | 'è' | 'ê' | 'ë' => 'e',
+                'í' | 'ì' | 'î' | 'ï' => 'i',
+                'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+                'ú' | 'ù' | 'û' | 'ü' => 'u',
+                'ç' => 'c',
+                other => other,
+            })
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect()
+    }
+
+    /// Troca os apelidos do nome ({NOME DEVEDOR}, {Razão Social}...) por {nome}. Blocos com "|"
+    /// são spintax e ficam como estão; outros {X} também (a tela avisa da variável desconhecida).
+    pub fn normalize_name_variables(template: &str) -> String {
+        let mut out = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(open) = rest.find('{') {
+            out.push_str(&rest[..open]);
+            let after = &rest[open + 1..];
+            match after.find(|c: char| c == '{' || c == '}') {
+                Some(end) if after[end..].starts_with('}') => {
+                    let inner = &after[..end];
+                    if !inner.contains('|') && Self::NAME_ALIASES.contains(&Self::name_alias_key(inner).as_str()) {
+                        out.push_str("{nome}");
+                    } else {
+                        out.push('{');
+                        out.push_str(inner);
+                        out.push('}');
+                    }
+                    rest = &after[end + 1..];
+                }
+                _ => {
+                    out.push('{');
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
     /// Substitui variáveis de contato ({nome}, {Nome}, etc.) de forma resiliente.
     /// Se o nome for vazio, limpa pontuação residual como espaços antes de vírgula.
     pub fn replace_contact_name(template: &str, contact_name: &str) -> String {
+        let normalized = Self::normalize_name_variables(template);
+        let template = normalized.as_str();
         let clean_name = contact_name.trim();
         if clean_name.is_empty() {
             template
@@ -906,10 +1121,45 @@ mod tests {
             AiEngine::normalize_openrouter_model("   "),
             "openrouter/free"
         );
+        // Variante gratuita aposentada pelo OpenRouter em 22/10/2026 (responde 404)
         assert_eq!(
             AiEngine::normalize_openrouter_model("minimax/minimax-m3.1-flash:free"),
-            "minimax/minimax-m3.1-flash:free"
+            "nvidia/nemotron-3.5-lightning:free"
         );
     }
 }
 
+
+#[cfg(test)]
+mod has_money_tests {
+    use super::AiEngine;
+    #[test]
+    fn detecta_valores() {
+        for t in ["pague 350", "valor: 350", "R$ 350,00", "R 350", "valor de 350", "saldo 120", "350.00 em aberto", "350,00", "50% de desconto", "parcela 2 de 5", "pague 100 reais"] {
+            assert!(AiEngine::has_money(t), "deveria bloquear: {}", t);
+        }
+    }
+    #[test]
+    fn nao_bloqueia_texto_normal() {
+        for t in ["Oi Teste, tudo bem?", "Referente ao contrato 4471, vencido em 10/10/2026.", "Prazo até 10.10.2026", "Acesse https://realess.com.br/negociar e responda SAIR", "Atenciosamente, Equipe REALESS", "Ligue (75) 3333-4444"] {
+            assert!(!AiEngine::has_money(t), "não deveria bloquear: {}", t);
+        }
+    }
+
+    #[test]
+    fn apelidos_do_nome_viram_nome() {
+        assert_eq!(
+            AiEngine::normalize_name_variables("Olá {NOME DEVEDOR}, {Razão Social} {Oi|Olá} {PROCESSO} {nome_cliente} {Olá {nome devedor}|Oi}"),
+            "Olá {nome}, {nome} {Oi|Olá} {PROCESSO} {nome} {Olá {nome}|Oi}"
+        );
+        assert_eq!(AiEngine::replace_contact_name("Olá {NOME DEVEDOR}!", "PRIME ACABAMENTOS"), "Olá PRIME ACABAMENTOS!");
+        assert_eq!(AiEngine::normalize_name_variables("sem chave { aberta"), "sem chave { aberta");
+    }
+
+    #[test]
+    fn percentual_com_espaco_ou_por_extenso_e_valor() {
+        assert!(AiEngine::has_money("condição especial de 10 % hoje"));
+        assert!(AiEngine::has_money("abatimento de 30 por cento"));
+        assert!(!AiEngine::has_money("Olá, tudo bem? Para deixar de receber mensagens, responda SAIR."));
+    }
+}

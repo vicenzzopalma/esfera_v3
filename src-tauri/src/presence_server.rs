@@ -28,6 +28,11 @@ pub struct HeartbeatPayload {
     // (que cruza por AdbDeviceId) funda USB (sem IP) e WiFi no mesmo cartão.
     #[serde(default)]
     pub adb_serial: String,
+    // Endereço ADB local REAL do celular ("ip:5555"). Quando a presença chega
+    // via `adb reverse`, o IP do socket é 127.0.0.1 — inútil para reconectar o
+    // ADB. Este campo carrega o IP de LAN real reportado pelo próprio agente.
+    #[serde(default)]
+    pub current_adb_address: String,
     #[serde(default)]
     pub accessibility_enabled: bool,
 }
@@ -120,11 +125,28 @@ async fn handle_socket(socket: WebSocket, client_ip: String, app_handle: Option<
                     Message::Text(text) => {
                         if let Ok(hb) = serde_json::from_str::<HeartbeatPayload>(&text) {
                             current_uuid = Some(hb.uuid.clone());
-                            
+
+                            // IP REAL do celular: prefere o reportado pelo agente
+                            // (current_adb_address). Via `adb reverse`, client_ip é
+                            // 127.0.0.1 e não serve para reconectar o ADB.
+                            let phone_ip = {
+                                let reported = hb
+                                    .current_adb_address
+                                    .split(':')
+                                    .next()
+                                    .unwrap_or("")
+                                    .trim();
+                                if !reported.is_empty() && reported != "0.0.0.0" {
+                                    reported.to_string()
+                                } else {
+                                    client_ip.clone()
+                                }
+                            };
+
                             // Atualiza estado no SessionManager (pelo Hardware ID / ESF-)
                             crate::session_manager::update_presence(
                                 &hb.uuid,
-                                &client_ip,
+                                &phone_ip,
                                 hb.battery_level,
                                 hb.is_charging,
                                 hb.is_screen_on,
@@ -136,7 +158,7 @@ async fn handle_socket(socket: WebSocket, client_ip: String, app_handle: Option<
                             if !hb.adb_serial.is_empty() {
                                 crate::session_manager::update_presence(
                                     &hb.adb_serial,
-                                    &client_ip,
+                                    &phone_ip,
                                     hb.battery_level,
                                     hb.is_charging,
                                     hb.is_screen_on,
@@ -155,7 +177,7 @@ async fn handle_socket(socket: WebSocket, client_ip: String, app_handle: Option<
                             // O Hardware ID (uuid) é a ÚNICA FONTE DA VERDADE. O IP é volátil.
                             // Conecta o ADB no IP novo e atualiza o banco de dados em background imediatamente:
                             let uuid_clone = hb.uuid.clone();
-                            let ip_clone = client_ip.clone();
+                            let ip_clone = phone_ip.clone();
                             let app_clone = app_handle.clone();
                             std::thread::spawn(move || {
                                 let _ = crate::adb_manager::AdbManager::connect_device(&ip_clone, 5555);

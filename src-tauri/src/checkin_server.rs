@@ -30,10 +30,13 @@ pub async fn start(db: Arc<Database>, port: u16, app_handle: Option<AppHandle>) 
     // Inicia o listener UDP Broadcast na porta 7778 (Handshake nativo por Hardware ID)
     start_udp_broadcast_listener(db.clone(), app_handle.clone());
 
+    let optout_router = crate::optout_api::router(db.clone());
     let state = (db, app_handle);
     let app = Router::new()
         .route("/api/devices/check-in", post(handle_checkin))
-        .with_state(state);
+        .with_state(state)
+        // Descadastro central (VEXOR -> Esfera): POST /api/optout/events, GET /api/optout/status
+        .merge(optout_router);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = match tokio::net::TcpListener::bind(addr).await {

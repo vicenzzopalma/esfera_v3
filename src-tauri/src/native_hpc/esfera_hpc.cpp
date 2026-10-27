@@ -230,6 +230,90 @@ esfera_int32_t esfera_hpc_calculate_gaussian_delay(esfera_int32_t min_ms, esfera
     return static_cast<esfera_int32_t>(val);
 }
 
+// ============================================================================
+// Modelo psicomotor de digitação tecla a tecla (ver README, seção 5)
+// ============================================================================
+namespace {
+    inline bool kb_is_upper(esfera_int32_t cp) {
+        if (cp >= 'A' && cp <= 'Z') return true;
+        // Latin-1 maiúsculas acentuadas (À..Þ, exceto ×)
+        return cp >= 0xC0 && cp <= 0xDE && cp != 0xD7;
+    }
+    inline bool kb_is_lower(esfera_int32_t cp) {
+        if (cp >= 'a' && cp <= 'z') return true;
+        return cp >= 0xDF && cp <= 0xFF && cp != 0xF7;
+    }
+    inline bool kb_is_digit(esfera_int32_t cp) { return cp >= '0' && cp <= '9'; }
+    inline bool kb_is_sentence_end(esfera_int32_t cp) {
+        return cp == '.' || cp == '?' || cp == '!' || cp == '\n';
+    }
+    inline bool kb_is_emoji(esfera_int32_t cp) {
+        return (cp >= 0x1F000) || (cp >= 0x2600 && cp <= 0x27BF) || cp == 0x200D || cp == 0xFE0F
+            || (cp >= 0x1F1E6 && cp <= 0x1F1FF);
+    }
+    inline bool kb_is_accented_letter(esfera_int32_t cp) {
+        return (cp >= 0xC0 && cp <= 0xFF && cp != 0xD7 && cp != 0xF7);
+    }
+    inline bool kb_is_symbol(esfera_int32_t cp) {
+        if (cp < 0x80) {
+            return !(kb_is_upper(cp) || kb_is_lower(cp) || kb_is_digit(cp) || cp == ' ' || cp == '\n');
+        }
+        return !kb_is_accented_letter(cp) && !kb_is_emoji(cp);
+    }
+}
+
+esfera_int32_t esfera_hpc_keystroke_delay_ms(esfera_int32_t prev_cp, esfera_int32_t cur_cp) {
+    thread_local std::random_device rd;
+    thread_local std::mt19937 gen(rd());
+
+    // Base: normal truncada mu=110, sigma=35, [45, 250]
+    std::normal_distribution<double> base(110.0, 35.0);
+    double ms = base(gen);
+    if (ms < 45.0) ms = 45.0;
+    if (ms > 250.0) ms = 250.0;
+
+    std::uniform_real_distribution<double> penalty(80.0, 180.0);
+
+    if (cur_cp == ' ' || cur_cp == '\n') {
+        // Pausa reflexiva inter-palavra: log-normal. Após fim de frase, mediana maior.
+        const bool after_sentence = kb_is_sentence_end(prev_cp);
+        const double median = after_sentence ? 420.0 : 160.0;
+        const double sigma = after_sentence ? 0.55 : 0.45;
+        std::lognormal_distribution<double> pause(std::log(median), sigma);
+        double p = pause(gen);
+        const double lo = after_sentence ? 150.0 : 60.0;
+        const double hi = after_sentence ? 1500.0 : 700.0;
+        if (p < lo) p = lo;
+        if (p > hi) p = hi;
+        return static_cast<esfera_int32_t>(ms + p);
+    }
+
+    // Shift: transição minúscula/nenhuma -> maiúscula
+    if (kb_is_upper(cur_cp) && !kb_is_upper(prev_cp)) ms += penalty(gen);
+    // Números e símbolos (troca de camada do teclado)
+    if (kb_is_digit(cur_cp) && !kb_is_digit(prev_cp)) ms += penalty(gen);
+    if (kb_is_symbol(cur_cp)) ms += penalty(gen);
+    // Acento/ç: pressão longa na tecla base
+    if (kb_is_accented_letter(cur_cp)) ms += penalty(gen);
+    // Emoji: abrir painel e localizar
+    if (kb_is_emoji(cur_cp)) {
+        if (!kb_is_emoji(prev_cp)) {
+            std::uniform_real_distribution<double> emoji(400.0, 900.0);
+            ms += emoji(gen);
+        } else if (cur_cp == 0x200D || cur_cp == 0xFE0F || (cur_cp >= 0x1F3FB && cur_cp <= 0x1F3FF)
+                   || (cur_cp >= 0xE0020 && cur_cp <= 0xE007F) || prev_cp == 0x200D) {
+            ms = 0.0; // modificador/ZWJ sai junto com o emoji base
+        } else {
+            std::uniform_real_distribution<double> next_emoji(180.0, 450.0);
+            ms = next_emoji(gen); // outro emoji: novo toque no painel já aberto
+        }
+    }
+    // Primeira tecla da mensagem: tempo de posicionar o dedo
+    if (prev_cp == 0) ms += penalty(gen);
+
+    return static_cast<esfera_int32_t>(ms);
+}
+
 void esfera_hpc_generate_hardware_uuid(char* out_uuid_buf, esfera_size_t max_len) {
     if (!out_uuid_buf || max_len < 32) return;
 

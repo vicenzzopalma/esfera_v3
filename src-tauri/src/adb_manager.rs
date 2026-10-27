@@ -14,6 +14,13 @@ use std::sync::mpsc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+/// Aparelhos em que a leitura de tela pelo agente falhou recentemente (usa uiautomator).
+static UI_DUMP_AGENT_DOWN: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Sequência das digitações pedidas ao agente (compõe o id de cada pedido).
+static TYPING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Script shell embutido (fallback quando APK não está disponível)
 const AGENT_SCRIPT_CONTENT: &str = include_str!("../../src-agent/esfera_agent.sh");
 
@@ -32,8 +39,16 @@ fn tools_dir_candidates() -> Vec<PathBuf> {
     if let Some(dir) = exe_dir() {
         candidates.push(dir.join("resources").join("binaries"));
         candidates.push(dir.join("binaries"));
-        candidates.push(dir);
+        candidates.push(dir.clone());
+        // Build de desenvolvimento: exe em <repo>/src-tauri/target/<profile>/.
+        // Sobe até src-tauri/binaries sem depender do cwd de lançamento.
+        if let Some(src_tauri) = dir.parent().and_then(|p| p.parent()) {
+            candidates.push(src_tauri.join("binaries"));
+        }
     }
+    // Caminho absoluto de src-tauri gravado em compile-time (CARGO_MANIFEST_DIR).
+    // Robusto para builds locais; inexistente (e ignorado) em máquinas de produção.
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries"));
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("distributable").join("binaries"));
         candidates.push(cwd.join("src-tauri").join("binaries"));
@@ -42,11 +57,23 @@ fn tools_dir_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+/// Um `adb.exe` só é utilizável no Windows com AdbWinApi.dll ao lado (platform-tools
+/// sempre embarca). Um adb.exe avulso sem as DLLs morre com STATUS_DLL_NOT_FOUND
+/// (0xC0000135), e aí TODO comando adb falha silenciosamente e a lista de
+/// dispositivos fica vazia/offline. Por isso o candidato precisa ser completo.
+fn has_usable_adb(dir: &std::path::Path) -> bool {
+    if dir.join("adb.exe").exists() {
+        if cfg!(target_os = "windows") {
+            return dir.join("AdbWinApi.dll").exists();
+        }
+        return true;
+    }
+    dir.join("adb").exists()
+}
+
 /// Retorna o diretório onde estão as ferramentas embutidas (adb, scrcpy, jar, apk).
 pub fn bundled_tools_dir() -> Option<PathBuf> {
-    tools_dir_candidates()
-        .into_iter()
-        .find(|p| p.join("adb.exe").exists() || p.join("adb").exists())
+    tools_dir_candidates().into_iter().find(|p| has_usable_adb(p))
 }
 
 /// Caminho completo de um binário embutido (ex.: "adb.exe", "scrcpy.exe"),
@@ -612,6 +639,7 @@ extern "C" {
         out_written: *mut usize,
     ) -> i32;
     pub fn esfera_hpc_calculate_gaussian_delay(min_ms: i32, max_ms: i32) -> i32;
+    pub fn esfera_hpc_keystroke_delay_ms(prev_cp: i32, cur_cp: i32) -> i32;
     pub fn esfera_hpc_generate_hardware_uuid(out_uuid_buf: *mut u8, max_len: usize);
     pub fn esfera_hpc_generate_bezier_points(
         start_x: i32,
@@ -1334,53 +1362,221 @@ impl AdbManager {
         }
     }
 
-    /// Digitação direta de texto no celular via ADB
+    /// Digitação direta de texto no celular (tecla a tecla, modelo psicomotor humano)
     pub fn input_text(serial: &str, text: &str) -> Result<(), String> {
         Self::type_text_human_hpc(serial, text)
     }
 
-    /// Digitação humana com delays Gaussianos otimizados — batch único ADB shell por palavras
+    /// Intervalo humano entre a tecla anterior e a atual (modelo psicomotor do motor C++,
+    /// README seção 5: normal truncada 110±35 ms, penalidades de Shift/número/símbolo/acento,
+    /// pausa reflexiva log-normal entre palavras).
+    pub fn keystroke_delay_ms(prev: Option<char>, cur: char) -> u32 {
+        let d = unsafe { esfera_hpc_keystroke_delay_ms(prev.map(|c| c as i32).unwrap_or(0), cur as i32) };
+        d.max(0) as u32
+    }
+
+    /// Cronograma tecla a tecla: um intervalo em ms por code point de `text`, na ordem.
+    pub fn keystroke_schedule(text: &str) -> Vec<u32> {
+        let mut prev: Option<char> = None;
+        text.chars()
+            .map(|c| {
+                let d = Self::keystroke_delay_ms(prev, c);
+                prev = Some(c);
+                d
+            })
+            .collect()
+    }
+
+    const TYPE_TEXT_ACTION: &'static str = "com.esfera.agent.TYPE_TEXT";
+    const TYPE_TEXT_RECEIVER: &'static str = "com.esfera.agent/.TypeTextReceiver";
+    const AGENT_ACCESSIBILITY_COMPONENT: &'static str =
+        "com.esfera.agent/com.esfera.agent.accessibility.EsferaAccessibilityService";
+
+    /// Pede ao agente (serviço de acessibilidade do Esfera Agent) que digite `text` no campo
+    /// focado, tecla a tecla, respeitando `delays`. O agente responde na hora pelo código de
+    /// resultado do broadcast: 1 aceito, 2 acessibilidade inativa, 3 sem campo de texto,
+    /// 4 argumentos inválidos, 5 ocupado. Ok(false) = agente indisponível (usar fallback).
+    fn agent_type_text_request(serial: &str, id: &str, text: &str, delays: &[u32], clear: bool) -> Result<bool, String> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        let csv = delays.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
+        let cmd = format!(
+            "am broadcast -a {} -n {} --es id {} --es b64 {} --es delays {} --ez clear {}",
+            Self::TYPE_TEXT_ACTION,
+            Self::TYPE_TEXT_RECEIVER,
+            id,
+            b64,
+            csv,
+            clear
+        );
+        let out = match Self::execute_shell(serial, &cmd, 15) {
+            Ok(o) => o,
+            Err(e) => {
+                println!("[DIGITACAO] Broadcast ao agente falhou em {}: {}", serial, e.trim());
+                return Ok(false);
+            }
+        };
+        let code = out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Broadcast completed: result="))
+            .and_then(|r| r.trim().split(|c: char| !c.is_ascii_digit() && c != '-').next()?.parse::<i32>().ok())
+            .unwrap_or(-1);
+        match code {
+            1 => Ok(true),
+            2 => {
+                println!("[DIGITACAO] Serviço de acessibilidade do agente inativo em {}", serial);
+                Ok(false)
+            }
+            3 => Err("Nenhum campo de texto focado na tela para digitar".to_string()),
+            4 => Err("O agente recusou os argumentos da digitação".to_string()),
+            5 => Err("O agente ainda está digitando outra mensagem neste aparelho".to_string()),
+            _ => {
+                println!(
+                    "[DIGITACAO] Agente sem receptor de digitação em {} (APK antigo?): {}",
+                    serial,
+                    out.lines().last().unwrap_or("").trim()
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Liga o serviço de acessibilidade do agente pelas configurações seguras (o shell ADB pode).
+    fn ensure_agent_accessibility(serial: &str) {
+        let cur = Self::execute_shell(serial, "settings get secure enabled_accessibility_services", 6)
+            .unwrap_or_default();
+        let cur = cur.trim();
+        if !cur.contains("EsferaAccessibilityService") {
+            let new_val = if cur.is_empty() || cur == "null" {
+                Self::AGENT_ACCESSIBILITY_COMPONENT.to_string()
+            } else {
+                format!("{}:{}", cur, Self::AGENT_ACCESSIBILITY_COMPONENT)
+            };
+            let _ = Self::execute_shell(
+                serial,
+                &format!("settings put secure enabled_accessibility_services {}", new_val),
+                6,
+            );
+        }
+        let _ = Self::execute_shell(serial, "settings put secure accessibility_enabled 1", 6);
+        let _ = Self::execute_shell(
+            serial,
+            "am start-foreground-service -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am startservice -n com.esfera.agent/.EsferaAgentService 2>/dev/null",
+            6,
+        );
+        std::thread::sleep(Duration::from_millis(1800));
+    }
+
+    /// Espera o agente terminar a digitação `id` (ele registra `TYPED <id> OK|FAIL ...` no logcat).
+    fn wait_agent_typing(serial: &str, id: &str, total_ms: u64) -> Result<(), String> {
+        std::thread::sleep(Duration::from_millis(total_ms + 400));
+        let ok_marker = format!("TYPED {} OK", id);
+        let fail_marker = format!("TYPED {} FAIL", id);
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            let out = Self::execute_shell(serial, "logcat -d -b main -v raw -s EsferaTyping:I", 8).unwrap_or_default();
+            for line in out.lines() {
+                let line = line.trim();
+                if line.starts_with(&ok_marker) {
+                    return Ok(());
+                }
+                if let Some(rest) = line.strip_prefix(&fail_marker) {
+                    return Err(format!("O agente não concluiu a digitação: {}", rest.trim()));
+                }
+            }
+            if Instant::now() >= deadline {
+                // Nada foi enviado (o Enviar nem foi tocado): falha comum, o contato volta para a fila.
+                return Err("O agente não confirmou o fim da digitação a tempo; nada foi enviado".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(600));
+        }
+    }
+
+    /// Fallback sem agente: `input text` do ADB, uma tecla por comando, com o mesmo cronograma.
+    /// Só serve para ASCII (o `input text` do Android não digita acento, ç nem emoji).
+    fn adb_type_ascii_per_key(serial: &str, text: &str, delays: &[u32]) -> Result<(), String> {
+        let mut chunk: Vec<String> = Vec::new();
+        let mut chunk_ms: u64 = 0;
+        let flush = |chunk: &mut Vec<String>, chunk_ms: &mut u64| -> Result<(), String> {
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            let batch = chunk.join("; ");
+            Self::execute_shell(serial, &batch, *chunk_ms / 1000 + 15).map_err(|e| format!("Falha ao digitar texto: {}", e))?;
+            chunk.clear();
+            *chunk_ms = 0;
+            Ok(())
+        };
+        for (ch, d) in text.chars().zip(delays.iter()) {
+            let key = match ch {
+                ' ' => "input text %s".to_string(),
+                '\n' => "input keyevent 66".to_string(),
+                '\'' => "input text \"'\"".to_string(),
+                c => format!("input text '{}'", c),
+            };
+            chunk.push(format!("sleep {:.3}; {}", *d as f64 / 1000.0, key));
+            chunk_ms += *d as u64;
+            // Lotes curtos: o shell nativo por Wi-Fi tem leitura com timeout de 5 s.
+            if chunk_ms >= 3000 {
+                flush(&mut chunk, &mut chunk_ms)?;
+            }
+        }
+        flush(&mut chunk, &mut chunk_ms)
+    }
+
+    /// Digitação humana tecla a tecla (modelo psicomotor C++). Caminho principal: serviço de
+    /// acessibilidade do Esfera Agent (aceita acento, ç e emoji). Sem agente, cai para o
+    /// `input text` do ADB tecla a tecla, só para texto ASCII. Nunca cola o texto inteiro.
     pub fn type_text_human_hpc(serial: &str, text: &str) -> Result<(), String> {
-        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
+        Self::type_text_human_hpc_opts(serial, text, false, true)
+    }
+
+    /// Igual a `type_text_human_hpc`. `clear`: o agente esvazia o campo antes de digitar (o campo
+    /// termina com exatamente `text`). `field_empty`: o campo já está vazio, então o fallback por
+    /// ADB (que não sabe limpar) pode ser usado se o agente estiver indisponível.
+    pub fn type_text_human_hpc_opts(serial: &str, text: &str, clear: bool, field_empty: bool) -> Result<(), String> {
         if text.trim().is_empty() {
             return Ok(());
         }
+        let delays = Self::keystroke_schedule(text);
+        let total_ms: u64 = delays.iter().map(|d| *d as u64).sum();
+        let seq = TYPING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let id = format!("t{:x}{:x}", nanos & 0xffff_ffff_ffff, seq);
 
-        // Se o texto for longo ou contiver quebras de linha, usa o despacho ultrarrápido em lote
-        if text.len() > 60 || text.contains('\n') {
-            return Self::type_message_native_fast(serial, text);
+        let mut accepted = Self::agent_type_text_request(serial, &id, text, &delays, clear)?;
+        if !accepted {
+            Self::ensure_agent_accessibility(serial);
+            accepted = Self::agent_type_text_request(serial, &id, text, &delays, clear)?;
+        }
+        if accepted {
+            println!(
+                "[DIGITACAO] {} teclas em ~{:.1} s via agente de acessibilidade ({})",
+                delays.len(),
+                total_ms as f64 / 1000.0,
+                serial
+            );
+            return Self::wait_agent_typing(serial, &id, total_ms);
         }
 
-        let words: Vec<&str> = text.split(' ').collect();
-        let mut shell_cmds = Vec::new();
-        for (idx, word) in words.iter().enumerate() {
-            let escaped = word.replace('\'', "\\'").replace('"', "\\\"").replace('&', "\\&");
-            let delay_ms = Self::calculate_gaussian_delay(20, 50);
-            shell_cmds.push(format!("input text '{}'", escaped));
-            if idx + 1 < words.len() {
-                shell_cmds.push(format!("input text '%s'; sleep {}", delay_ms as f64 / 1000.0));
-            }
+        if !field_empty {
+            return Err("Há rascunho no campo e o agente de acessibilidade está indisponível para limpá-lo".to_string());
         }
-        let full_cmd = shell_cmds.join(" && ");
-
-        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
-        if Self::use_native_adb(&target_serial) {
-            if let Ok((_, _, _)) = crate::adb_tcp::exec_shell_bytes(&target_serial, &full_cmd) {
-                return Ok(());
-            }
+        if !text.is_ascii() {
+            return Err(
+                "Agente de acessibilidade indisponível e o texto tem acento/emoji, que o ADB não digita; ative o Esfera Agent no aparelho".to_string(),
+            );
         }
-
-        let output = create_cmd("adb")
-            .args(["-s", &target_serial, "shell", &full_cmd])
-            .output()
-            .map_err(|e| format!("Falha ao digitar texto: {}", e))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!("Falha ao digitar texto: {}", stderr.trim()))
-        }
+        println!(
+            "[DIGITACAO] Agente indisponível em {}: digitando {} teclas em ~{:.1} s via ADB (fallback ASCII)",
+            serial,
+            delays.len(),
+            total_ms as f64 / 1000.0
+        );
+        Self::adb_type_ascii_per_key(serial, text, &delays)
     }
 
     /// Consulta marca+modelo do celular em shell único com cache TTL de 30s
@@ -1498,7 +1694,7 @@ impl AdbManager {
             bitrate,
             "--video-codec",
             "h264",
-            "--tunnel-forward",
+            "--force-adb-forward",
             "--no-audio",
             "--stay-awake",
             "--window-title",
@@ -1544,55 +1740,12 @@ impl AdbManager {
     /// Lança uma segunda Área de Trabalho Virtual independente (Display #1) via Scrcpy.
     /// O bot opera na Área #1 enquanto o supervisor usa livremente a tela física principal (Display #0).
     pub fn launch_scrcpy_virtual_display(
-        serial: &str,
-        width: u32,
-        height: u32,
-        dpi: u32,
+        _serial: &str,
+        _width: u32,
+        _height: u32,
+        _dpi: u32,
     ) -> Result<String, String> {
-        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
-        let display_spec = format!("{}x{}/{}", width, height, dpi);
-        let title = format!("Esfera v3 — Área #2 [Disparos Isolados] ({})", target_serial);
-
-        let mut cmd = create_cmd("scrcpy");
-        cmd.args([
-            "-s",
-            &target_serial,
-            &format!("--new-display={}", display_spec),
-            "--max-fps",
-            "60",
-            "--video-bit-rate",
-            "4M",
-            "--tunnel-forward",
-            "--no-audio",
-            "--window-title",
-            &title,
-            "--stay-awake",
-        ]);
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => return Err(format!(
-                "Falha ao iniciar Display Virtual Secundário ({}). Certifique-se de que o Scrcpy v2.2+ esteja instalado.",
-                e
-            )),
-        };
-
-        std::thread::sleep(Duration::from_millis(500));
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                Err(format!(
-                    "Falha ao abrir Área Virtual #2 para {}: processo encerrou prematuramente ({})",
-                    target_serial, status
-                ))
-            }
-            Ok(None) => {
-                Ok(format!(
-                    "🖥️ Área de Trabalho #2 (Display Virtual {}px) inicializada para o celular {}! O supervisor pode usar a tela física livremente.",
-                    display_spec, target_serial
-                ))
-            }
-            Err(e) => Err(format!("Erro ao verificar processo do Scrcpy: {}", e)),
-        }
+        Err("Display virtual indisponível: o Scrcpy 2.4 empacotado não oferece esse recurso. É necessário atualizar e validar o Scrcpy e seu servidor antes de habilitá-lo.".to_string())
     }
 
     /// Executa um Intent do WhatsApp apontando para um Display específico (ex: Display ID 1)
@@ -1674,15 +1827,18 @@ impl AdbManager {
     /// Lança o fluxo de vídeo da Câmera (Traseira ou Frontal) do celular Android via Scrcpy
     pub fn launch_scrcpy_camera(serial: &str, facing: &str) -> Result<String, String> {
         let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
-        let camera_arg = if facing == "front" { "front" } else { "back" };
+        let camera_arg = match facing {
+            "front" => "front",
+            "back" => "back",
+            _ => return Err("Câmera inválida: selecione frontal ou traseira.".to_string()),
+        };
         let title = format!(
             "Esfera v3 — Câmera Ao Vivo ({}) [{}]",
             target_serial,
             camera_arg.to_uppercase()
         );
 
-        // 1. Tenta obter o SDK level do Android (Android 12+ / SDK 31+ suporta --video-source=camera nativo no scrcpy)
-        let mut sdk_level = 0;
+        // Captura direta da câmera pelo scrcpy exige Android 12 ou superior.
         let sdk_native = if Self::use_native_adb(&target_serial) {
             crate::adb_tcp::exec_shell(&target_serial, "getprop ro.build.version.sdk")
         } else {
@@ -1692,43 +1848,23 @@ impl AdbManager {
                 String::from_utf8_lossy(&o.stdout).trim().to_string()
             })
         };
-        if let Ok(sdk_str) = sdk_native {
-            sdk_level = sdk_str.trim().parse::<i32>().unwrap_or(0);
+        let sdk_level = sdk_native.ok().and_then(|s| s.trim().parse::<i32>().ok())
+            .ok_or_else(|| format!("Não foi possível verificar a versão Android de {}.", target_serial))?;
+        if sdk_level < 31 {
+            return Err(format!("A captura direta de câmera exige Android 12 ou superior (SDK do aparelho: {}).", sdk_level));
         }
 
-        // Se o dispositivo for Android < 12 (SDK < 31), abre o app de Câmera nativo via ADB Intent e abre o espelhamento Scrcpy
-        if sdk_level > 0 && sdk_level < 31 {
-            let mut cam_intent = create_cmd("adb");
-            cam_intent.args([
-                "-s",
-                &target_serial,
-                "shell",
-                "am",
-                "start",
-                "-a",
-                "android.media.action.STILL_IMAGE_CAMERA",
-            ]);
-            let _ = run_cmd_timeout(cam_intent, Duration::from_secs(3));
-            std::thread::sleep(Duration::from_millis(500));
-
-            let result = create_cmd("scrcpy")
-                .args(["-s", &target_serial, "--stay-awake", "--window-title", &title])
-                .spawn();
-
-            return match result {
-                Ok(_) => Ok(format!("Câmera nativa iniciada para {} (Android SDK {}) com espelhamento!", target_serial, sdk_level)),
-                Err(e) => Err(format!("Falha ao iniciar espelhamento de câmera: {}", e)),
-            };
-        }
-
-        // Para Android 12+ (SDK >= 31), tenta a captura nativa de câmera pelo Scrcpy v2 com fallback inteligente
-        let result = create_cmd("scrcpy")
+        // O modo câmera desativa o controle: --stay-awake exige controle e faz o scrcpy falhar.
+        // Não selecionamos áudio: o modo câmera usaria o microfone por padrão.
+        let mut child = create_cmd("scrcpy")
             .args([
                 "-s",
                 &target_serial,
                 "--video-source=camera",
                 &format!("--camera-facing={}", camera_arg),
-                "--stay-awake",
+                "--no-audio",
+                "--max-size",
+                "1280",
                 "--max-fps",
                 "30",
                 "--video-bit-rate",
@@ -1736,48 +1872,14 @@ impl AdbManager {
                 "--window-title",
                 &title,
             ])
-            .spawn();
+            .spawn()
+            .map_err(|e| format!("Falha ao iniciar transmissão direta de câmera: {}", e))?;
 
-        match result {
-            Ok(mut child) => {
-                std::thread::sleep(Duration::from_millis(1200));
-                match child.try_wait() {
-                    Ok(Some(status)) if !status.success() => {
-                        let mut cam_intent = create_cmd("adb");
-                        cam_intent.args([
-                            "-s",
-                            &target_serial,
-                            "shell",
-                            "am",
-                            "start",
-                            "-a",
-                            "android.media.action.STILL_IMAGE_CAMERA",
-                        ]);
-                        let _ = run_cmd_timeout(cam_intent, Duration::from_secs(3));
-
-                        let fallback = create_cmd("scrcpy")
-                            .args(["-s", &target_serial, "--stay-awake", "--window-title", &title])
-                            .spawn();
-                        match fallback {
-                            Ok(_) => Ok(format!("Câmera aberta e espelhamento ativado para {}!", target_serial)),
-                            Err(_) => Err("Falha ao iniciar scrcpy fallback.".to_string()),
-                        }
-                    }
-                    _ => Ok(format!(
-                        "Transmissão de Câmera ({}) iniciada com sucesso para {}!",
-                        camera_arg, target_serial
-                    )),
-                }
-            }
-            Err(e) => {
-                let fallback = create_cmd("scrcpy")
-                    .args(["-s", &target_serial, "--window-title", &title])
-                    .spawn();
-                match fallback {
-                    Ok(_) => Ok(format!("Espelhamento de tela ativado para {}!", target_serial)),
-                    Err(_) => Err(format!("Falha ao iniciar transmissão de câmera: {}", e)),
-                }
-            }
+        std::thread::sleep(Duration::from_millis(2000));
+        match child.try_wait() {
+            Ok(Some(status)) => Err(format!("A transmissão direta da câmera {} encerrou prematuramente em {} ({}). Verifique a conexão ADB e a disponibilidade da câmera.", camera_arg, target_serial, status)),
+            Ok(None) => Ok(format!("Transmissão direta da câmera {} iniciada em janela externa para {}.", camera_arg, target_serial)),
+            Err(e) => Err(format!("Erro ao verificar a transmissão de câmera: {}", e)),
         }
     }
 
@@ -2753,9 +2855,14 @@ impl AdbManager {
         device_id: &str,
         company_id: i32,
     ) -> Result<String, String> {
+        // Primário = programa desktop atual (127.0.0.1 via adb reverse); VPS/host
+        // recebido vira fallback. tunnelPort alinhado ao túnel do desktop.
+        let cfg = crate::config::load_config();
+        let primary_url = format!("http://127.0.0.1:{}", cfg.checkin_server_port);
+        let tunnel_port = cfg.tunnel_server_port;
         let config_json = format!(
-            "{{\\\"serverUrl\\\":\\\"{}\\\",\\\"deviceId\\\":\\\"{}\\\",\\\"companyId\\\":{},\\\"heartbeatIntervalSec\\\":30}}",
-            server_url, device_id, company_id
+            "{{\\\"serverUrl\\\":\\\"{}\\\",\\\"fallbackServerUrl\\\":\\\"{}\\\",\\\"deviceId\\\":\\\"{}\\\",\\\"companyId\\\":{},\\\"tunnelPort\\\":{},\\\"heartbeatIntervalSec\\\":30}}",
+            primary_url, server_url, device_id, company_id, tunnel_port
         );
         let batch_cmd = format!(
             "setprop persist.esfera.server_address {}; setprop persist.esfera.hub {}; setprop persist.esfera.company {}; echo '{}' > /sdcard/esfera_config.json",
@@ -2827,10 +2934,18 @@ impl AdbManager {
         };
         let device_id = format!("ESF-{}", prefix8);
 
+        // PROGRAMA DESKTOP ATUAL É O PRIMÁRIO: o agente aponta para 127.0.0.1
+        // (presença 7779 e túnel via `adb reverse`) e usa a VPS/host recebido
+        // apenas como fallback. O IP do PC/celular deixa de importar.
+        let cfg = crate::config::load_config();
+        let primary_url = format!("http://127.0.0.1:{}", cfg.checkin_server_port);
+        let fallback_url = server_url;
+        let tunnel_port = cfg.tunnel_server_port;
+
         // JSON com aspas simples no shell (evita escape de aspas duplas).
         let json = format!(
-            "{{\"deviceId\":\"{}\",\"companyId\":{},\"serverUrl\":\"{}\"}}",
-            device_id, company_id, server_url
+            "{{\"deviceId\":\"{}\",\"companyId\":{},\"serverUrl\":\"{}\",\"fallbackServerUrl\":\"{}\",\"tunnelPort\":{}}}",
+            device_id, company_id, primary_url, fallback_url, tunnel_port
         );
 
         let mut cmd = create_cmd("adb");
@@ -2910,6 +3025,16 @@ impl AdbManager {
         // 2. Grava a identidade no /sdcard/esfera_config.json
         let _ = Self::write_identity_config(serial, company_id, server_url);
 
+        // 2.5. Encaminha as portas do programa desktop ATUAL (presença/túnel/check-in)
+        // para dentro do aparelho via `adb reverse`. Assim o agente reporta ao
+        // desktop ligado agora (127.0.0.1), sem depender de IP. Reaplicado em cada
+        // auto-cura e, como o cache de cura é limpo quando o aparelho sai do ADB,
+        // em cada reconexão. Vale para USB e Wi-Fi (reverse segue o transporte ADB).
+        {
+            let cfg_reverse = crate::config::load_config();
+            Self::setup_reverse_ports(serial, &cfg_reverse);
+        }
+
         // 3. Semeia as chaves ADB do Windows para autorização perpétua
         if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
             let key_path = std::path::Path::new(&home).join(".android").join("adbkey.pub");
@@ -2956,6 +3081,14 @@ impl AdbManager {
         // 5. Aplica a imunidade de bateria, prevencao de sono e wake lock
         let pid = Self::get_persistent_device_id(serial);
         let _ = Self::inject_device_immunity(serial, pid.as_deref());
+
+        // 5b. Captura do "SAIR": libera o ouvinte de notificações do agente e o acesso ao arquivo
+        //     /sdcard/esfera_optout.jsonl. Sem isso o pedido de descadastro não é registrado.
+        let _ = Self::execute_shell(
+            serial,
+            "cmd notification allow_listener com.esfera.agent/com.esfera.agent.EsferaOptOutNotificationListener; appops set --uid com.esfera.agent MANAGE_EXTERNAL_STORAGE allow",
+            8,
+        );
 
         // 6. Inicia o serviço em primeiro plano (silencioso, sem abrir Activity)
         let _ = Self::start_agent_service(serial);
@@ -3394,6 +3527,29 @@ impl AdbManager {
             Ok(format!("Reverse tcp:{} ok", port))
         } else {
             Err(format!("Reverse tcp:{} falhou", port))
+        }
+    }
+
+    /// Porta do servidor de Presença WebSocket (presence_server.rs). Fixa, igual
+    /// à hardcoded em lib.rs. O agente conecta em ws://127.0.0.1:7779 e o `adb
+    /// reverse` encaminha ao programa desktop atual, independente de IP.
+    pub const PRESENCE_WS_PORT: u16 = 7779;
+
+    /// Encaminha, via `adb reverse`, as portas do PROGRAMA DESKTOP ATUAL para
+    /// dentro do aparelho (loopback 127.0.0.1): Presença (7779), Túnel reverso
+    /// (config.tunnel_server_port) e, se habilitado, Check-in (checkin_server_port).
+    ///
+    /// Com isso o agente sempre alcança o desktop que está rodando AGORA, sem
+    /// depender do IP do PC nem do celular — o IP é volátil, o `adb reverse`
+    /// segue o transporte ADB (USB ou Wi-Fi). Reaplicado a cada auto-cura e a
+    /// cada reconexão do aparelho. A VPS continua como fallback (no agente).
+    pub fn setup_reverse_ports(serial: &str, config: &crate::config::AppConfig) {
+        let _ = Self::reverse_port(serial, Self::PRESENCE_WS_PORT);
+        if config.tunnel_server_enabled {
+            let _ = Self::reverse_port(serial, config.tunnel_server_port);
+        }
+        if config.checkin_server_enabled {
+            let _ = Self::reverse_port(serial, config.checkin_server_port);
         }
     }
 
@@ -4014,81 +4170,17 @@ impl AdbManager {
         Ok(())
     }
 
-    /// Digitação humana fluida e rápida via HCI com cadência natural:
-    /// Processa palavras com micro-delays Gaussianos (20-45ms) e quebras de linha com ENTER (keycode 66).
-    /// Escapa com precisão todos os metacaracteres shell POSIX sem quebras de aspas.
+    /// Alias histórico: digitação tecla a tecla (modelo psicomotor). Antes injetava palavras
+    /// inteiras com `input text`, o que parecia colagem; agora delega à digitação humana.
+    #[allow(dead_code)]
     pub fn type_text_fluid_hci(serial: &str, text: &str) -> Result<(), String> {
-        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
-        if text.trim().is_empty() {
-            return Ok(());
-        }
-
-        let lines: Vec<&str> = text.split('\n').collect();
-        let total_lines = lines.len();
-
-        for (l_idx, line) in lines.into_iter().enumerate() {
-            let mut shell_cmds = Vec::new();
-            let words: Vec<&str> = line.split(' ').collect();
-            let total_words = words.len();
-
-            for (w_idx, word) in words.into_iter().enumerate() {
-                if !word.is_empty() {
-                    let mut escaped_word = String::with_capacity(word.len() * 2);
-                    for ch in word.chars() {
-                        match ch {
-                            ' ' => escaped_word.push_str("%s"),
-                            '"' => escaped_word.push_str("\\\""),
-                            '\'' => escaped_word.push_str("\\'"),
-                            '\\' => escaped_word.push_str("\\\\"),
-                            '&' => escaped_word.push_str("\\&"),
-                            '<' => escaped_word.push_str("\\<"),
-                            '>' => escaped_word.push_str("\\>"),
-                            '|' => escaped_word.push_str("\\|"),
-                            ';' => escaped_word.push_str("\\;"),
-                            '$' => escaped_word.push_str("\\$"),
-                            '(' => escaped_word.push_str("\\("),
-                            ')' => escaped_word.push_str("\\)"),
-                            '*' => escaped_word.push_str("\\*"),
-                            '?' => escaped_word.push_str("\\?"),
-                            '#' => escaped_word.push_str("\\#"),
-                            '%' => escaped_word.push_str("\\%"),
-                            '~' => escaped_word.push_str("\\~"),
-                            '`' => escaped_word.push_str("\\`"),
-                            '!' => escaped_word.push_str("\\!"),
-                            c => escaped_word.push(c),
-                        }
-                    }
-                    let delay_ms = Self::calculate_gaussian_delay(20, 45);
-                    shell_cmds.push(format!("input text {}; sleep {:.3}", escaped_word, delay_ms as f64 / 1000.0));
-                }
-
-                // Espaçador entre palavras
-                if w_idx + 1 < total_words {
-                    let space_delay = Self::calculate_gaussian_delay(15, 30);
-                    shell_cmds.push(format!("input text %s; sleep {:.3}", space_delay as f64 / 1000.0));
-                }
-            }
-
-            // Executa os comandos da linha em batch único para alta performance
-            if !shell_cmds.is_empty() {
-                let batch = shell_cmds.join(" && ");
-                let _ = Self::execute_shell(&target_serial, &batch, 8);
-            }
-
-            // Se houver próxima linha, envia ENTER humano
-            if l_idx + 1 < total_lines {
-                let _ = Self::send_keyevent(&target_serial, 66);
-                let line_pause = Self::calculate_gaussian_delay(120, 220);
-                std::thread::sleep(Duration::from_millis(line_pause as u64));
-            }
-        }
-
-        Ok(())
+        Self::type_text_human_hpc(serial, text)
     }
 
     /// Alias para compatibilidade com type_text_fluid_hci
+    #[allow(dead_code)]
     pub fn type_message_native_fast(serial: &str, text: &str) -> Result<(), String> {
-        Self::type_text_fluid_hci(serial, text)
+        Self::type_text_human_hpc(serial, text)
     }
 
     /// Envia mensagem no WhatsApp via NAVEGAÇÃO 100% NATIVA interna in-app (sem sair do app).
@@ -4097,6 +4189,23 @@ impl AdbManager {
     /// Se já estiver na conversa do contato, apenas digita/cola e envia.
     /// Se estiver na lista de conversas, clica na busca, digita o número, seleciona o contato,
     /// digita e clica em enviar via toque Bézier.
+    /// Toque curto e firme (sem arrasto), com leve variação de posição e de tempo de pressão.
+    /// O toque "em curva" é lido como rolagem em listas (a conversa não abria pela busca).
+    fn soft_tap(serial: &str, x: i32, y: i32) -> Result<(), String> {
+        let jx = Self::calculate_gaussian_delay(0, 4) - 2;
+        let jy = Self::calculate_gaussian_delay(0, 4) - 2;
+        let dwell = Self::calculate_gaussian_delay(60, 110) as f64 / 1000.0;
+        let (tx, ty) = (x + jx, y + jy);
+        let seq = format!(
+            "input motionevent DOWN {} {} && sleep {:.3} && input motionevent UP {} {}",
+            tx, ty, dwell, tx, ty
+        );
+        if Self::execute_shell(serial, &seq, 6).is_ok() {
+            return Ok(());
+        }
+        Self::execute_shell(serial, &format!("input tap {} {}", tx, ty), 6).map(|_| ())
+    }
+
     pub fn send_whatsapp_native_navigation(
         serial: &str,
         phone: &str,
@@ -4104,10 +4213,102 @@ impl AdbManager {
         _contact_name: Option<&str>,
         package: Option<&str>,
     ) -> Result<(), String> {
+        let parts = Self::split_human_parts(message);
+        Self::send_whatsapp_parts(serial, phone, &parts, package, &|| true)
+    }
+
+    /// Divide o texto em mensagens separadas (blocos separados por linha em branco), como uma
+    /// pessoa mandaria no WhatsApp: saudação / assunto / despedida. Quebras simples viram espaço.
+    pub fn split_human_parts(message: &str) -> Vec<String> {
+        let parts: Vec<String> = message
+            .replace("\r\n", "\n")
+            .split("\n\n")
+            .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|p| !p.is_empty())
+            .collect();
+        match parts.len() {
+            0 => vec![message.trim().to_string()],
+            // Veio num bloco só (a IA nem sempre separa): divide aqui, sem depender dela.
+            1 => Self::split_single_block(&parts[0]),
+            _ => parts,
+        }
+    }
+
+    /// Divide um bloco único em saudação / assunto / despedida, como uma pessoa digitaria.
+    fn split_single_block(text: &str) -> Vec<String> {
+        // Frases: termina em . ? ! — tokens só de emoji/símbolo logo depois ficam na mesma frase.
+        let mut sentences: Vec<String> = Vec::new();
+        let mut cur: Vec<&str> = Vec::new();
+        for w in text.split_whitespace() {
+            let symbol_only = !w.chars().any(|c| c.is_alphanumeric());
+            let prev_closed = cur
+                .last()
+                .map(|p| p.ends_with('.') || p.ends_with('?') || p.ends_with('!') || !p.chars().any(|c| c.is_alphanumeric()))
+                .unwrap_or(false);
+            if prev_closed && !symbol_only && !cur.is_empty() {
+                sentences.push(cur.join(" "));
+                cur.clear();
+            }
+            cur.push(w);
+        }
+        if !cur.is_empty() {
+            sentences.push(cur.join(" "));
+        }
+        if sentences.len() < 3 {
+            return vec![text.to_string()];
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        // Saudação: primeira frase curta ("Olá Teste, tudo bem? 😊")
+        let first_is_greeting = sentences[0].chars().count() <= 70;
+        let start = if first_is_greeting {
+            parts.push(sentences[0].clone());
+            1
+        } else {
+            0
+        };
+        // Despedida: últimas frases que começam com palavras de encerramento
+        const SIGN_OFF: [&str; 9] = ["abraço", "abs", "atenciosamente", "att", "equipe", "obrigad", "até ", "cordialmente", "um abraço"];
+        let mut end = sentences.len();
+        while end > start + 1 {
+            let l = sentences[end - 1].to_lowercase();
+            if SIGN_OFF.iter().any(|s| l.starts_with(s)) && sentences[end - 1].chars().count() <= 80 {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        let middle = &sentences[start..end];
+        let middle_text = middle.join(" ");
+        if middle_text.chars().count() > 280 && middle.len() >= 2 {
+            let half = middle.len() / 2;
+            parts.push(middle[..half].join(" "));
+            parts.push(middle[half..].join(" "));
+        } else if !middle_text.is_empty() {
+            parts.push(middle_text);
+        }
+        if end < sentences.len() {
+            parts.push(sentences[end..].join(" "));
+        }
+        parts
+    }
+
+    /// Abre a conversa uma única vez e envia cada parte como mensagem própria, com pausa humana
+    /// entre elas. Cada parte é conferida na tela (texto no campo e campo vazio após Enviar).
+    pub fn send_whatsapp_parts(
+        serial: &str,
+        phone: &str,
+        parts: &[String],
+        package: Option<&str>,
+        should_continue: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
         let pkg = package.unwrap_or(Self::DEFAULT_WHATSAPP_PACKAGE);
         let digits = Self::extract_phone_digits(phone);
         if digits.len() < 8 {
             return Err("Número de telefone não contém dígitos válidos".to_string());
+        }
+        if parts.is_empty() {
+            return Err("Mensagem vazia".to_string());
         }
         let tail = digits[digits.len() - 8..].to_string();
 
@@ -4116,53 +4317,111 @@ impl AdbManager {
             if w > 0 && h > 0 { (w, h) } else { (720, 1600) }
         };
 
-        // 1. Coloca o WhatsApp alvo em primeiro plano, numa tela neutra (lista de conversas).
-        let focus_raw = Self::wa_focus(serial);
-        if !focus_raw.contains(pkg) {
-            let bring_fg = format!("monkey -p {} -c android.intent.category.LAUNCHER 1", pkg);
-            let _ = Self::execute_shell(serial, &bring_fg, 3);
-            let d = Self::calculate_gaussian_delay(500, 800);
-            std::thread::sleep(Duration::from_millis(d as u64));
-        } else if !focus_raw.contains("HomeActivity") {
-            // Conversa de outro contato, busca aberta ou diálogo: volta UMA vez (sem sair do WhatsApp)
-            let _ = Self::send_keyevent(serial, 4);
-            let d = Self::calculate_gaussian_delay(300, 450);
-            std::thread::sleep(Duration::from_millis(d as u64));
-        }
-
-        // 2. Abre a conversa. Busca interna só quando dá para conferir o número na linha do
-        //    resultado e o texto é digitável por `input text` (sem acento/emoji). Senão, deep link
-        //    travado no pacote alvo (nunca abre outro WhatsApp).
-        let typable = message.chars().all(|c| c.is_ascii()) && message.len() <= 1500;
-        let mut opened_via_search = false;
-        if typable {
-            opened_via_search = Self::wa_open_chat_via_search(serial, pkg, &digits, &tail, screen_w, screen_h)?;
-        }
-        let prefilled = !opened_via_search && message.len() <= 1500;
-        if !opened_via_search {
-            let text_param = if prefilled { format!("&text={}", Self::url_encode(message)) } else { String::new() };
-            let url = format!("https://api.whatsapp.com/send?phone={}{}", digits, text_param);
-            let cmd = format!(
-                "am start -a android.intent.action.VIEW -p {} -d '{}'",
-                pkg,
-                Self::shell_quote(&url)
-            );
-            Self::execute_shell(serial, &cmd, 8).map_err(|e| format!("Falha ao abrir conversa por deep link: {}", e))?;
-            let d = Self::calculate_gaussian_delay(2200, 3200);
-            std::thread::sleep(Duration::from_millis(d as u64));
-        }
-
-        // 3. Confere que a conversa abriu (campo de mensagem presente).
-        let mut entry = None;
+        // 1. Coloca o WhatsApp alvo em primeiro plano, na lista de conversas. Volta até confirmar a
+        //    lista (o 1º "voltar" às vezes só fecha o teclado); nunca sai do WhatsApp.
         for _ in 0..4 {
-            let nodes = Self::ui_nodes(&Self::ui_dump(serial));
-            entry = nodes.into_iter().find(|n| n.rid == format!("{}:id/entry", pkg));
-            if entry.is_some() {
+            let focus_raw = Self::wa_focus(serial);
+            if focus_raw.contains(pkg) && focus_raw.contains("HomeActivity") {
                 break;
+            }
+            if !focus_raw.contains(pkg) {
+                let bring_fg = format!("monkey -p {} -c android.intent.category.LAUNCHER 1", pkg);
+                let _ = Self::execute_shell(serial, &bring_fg, 3);
+                let d = Self::calculate_gaussian_delay(500, 800);
+                std::thread::sleep(Duration::from_millis(d as u64));
+            } else {
+                let _ = Self::send_keyevent(serial, 4);
+                let d = Self::calculate_gaussian_delay(350, 500);
+                std::thread::sleep(Duration::from_millis(d as u64));
+            }
+        }
+
+        // 2. Abre a conversa pela busca: acha o contato salvo pela campanha (conta esfera_temp,
+        //    nome "Esfera <número>") e só toca na linha que mostra o próprio número.
+        //    Se a busca não achar, abre pelo link travado no mesmo pacote (nunca outro WhatsApp).
+        let opened_via_search = Self::wa_open_chat_via_search(serial, pkg, &digits, &tail, screen_w, screen_h)?;
+        if !opened_via_search {
+            // Abre a conversa vazia: o texto é sempre digitado, nunca pré-preenchido pelo link.
+            Self::wa_open_link(serial, pkg, &digits, None)?;
+        }
+
+        // 3. Envia cada parte como uma mensagem. Antes de cada parte confere de novo se pode seguir
+        //    (descadastro, campanha parada). Erro depois da 1ª parte vira "PARCIAL:" para o dispatcher
+        //    não reenviar tudo (duplicaria as mensagens já entregues).
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                // Pausa de quem lê o que mandou e começa a próxima mensagem
+                let d = Self::calculate_gaussian_delay(1800, 4200);
+                std::thread::sleep(Duration::from_millis(d as u64));
+            }
+            if !should_continue() {
+                return Err(if i == 0 {
+                    "CANCELADO: descadastro ou campanha parada antes do envio".to_string()
+                } else {
+                    format!("PARCIAL: {}/{} partes enviadas; interrompido (descadastro ou campanha parada)", i, parts.len())
+                });
+            }
+            if let Err(e) = Self::wa_fill_and_send(serial, pkg, &digits, phone, part, screen_w, screen_h) {
+                let _ = Self::send_keyevent(serial, 111);
+                return Err(if i > 0 && !e.starts_with("INCERTO:") {
+                    format!("PARCIAL: {}/{} partes enviadas; parte {} falhou: {}", i, parts.len(), i + 1, e)
+                } else if i > 0 {
+                    format!("PARCIAL: {}/{} partes enviadas; {}", i, parts.len(), e)
+                } else {
+                    e
+                });
+            }
+        }
+        // Fecha o teclado como uma pessoa faria (ESC esconde o teclado sem sair da conversa).
+        let _ = Self::send_keyevent(serial, 111);
+        Ok(())
+    }
+
+    /// Abre a conversa do número pelo link oficial, travado no pacote alvo (-p), com texto opcional.
+    fn wa_open_link(serial: &str, pkg: &str, digits: &str, text: Option<&str>) -> Result<(), String> {
+        let text_param = match text {
+            Some(t) if t.len() <= 1500 => format!("&text={}", Self::url_encode(t)),
+            _ => String::new(),
+        };
+        let url = format!("https://api.whatsapp.com/send?phone={}{}", digits, text_param);
+        let cmd = format!(
+            "am start -a android.intent.action.VIEW -p {} -d '{}'",
+            pkg,
+            Self::shell_quote(&url)
+        );
+        Self::execute_shell(serial, &cmd, 8).map_err(|e| format!("Falha ao abrir conversa por link: {}", e))?;
+        let d = Self::calculate_gaussian_delay(2200, 3200);
+        std::thread::sleep(Duration::from_millis(d as u64));
+        Ok(())
+    }
+
+    /// Lê o campo de mensagem da conversa aberta (aguarda até ~4s).
+    fn wa_entry(serial: &str, pkg: &str) -> Option<UiNode> {
+        for attempt in 0..4 {
+            let xml = if attempt == 3 { Self::ui_dump_uiautomator(serial) } else { Self::ui_dump(serial) };
+            if let Some(n) = Self::ui_nodes(&xml)
+                .into_iter()
+                .find(|n| n.rid == format!("{}:id/entry", pkg))
+            {
+                return Some(n);
             }
             std::thread::sleep(Duration::from_millis(900));
         }
-        let entry = match entry {
+        None
+    }
+
+    /// Coloca `text` no campo da conversa aberta e envia, conferindo antes e depois.
+    fn wa_fill_and_send(
+        serial: &str,
+        pkg: &str,
+        digits: &str,
+        phone: &str,
+        text: &str,
+        screen_w: i32,
+        screen_h: i32,
+    ) -> Result<(), String> {
+        let _ = digits;
+        let entry = match Self::wa_entry(serial, pkg) {
             Some(e) => e,
             None => {
                 let focus = Self::wa_focus(serial);
@@ -4174,31 +4433,32 @@ impl AdbManager {
             }
         };
 
-        // 4. Garante o texto no campo (digitando quando não veio pré-preenchido).
-        if !Self::same_text(&entry.text, message) {
-            if prefilled && !entry.text.trim().is_empty() {
-                return Err("O texto pré-preenchido não confere com a mensagem; envio cancelado".to_string());
+        if !Self::same_text(&entry.text, text) {
+            // Campo vazio mostra a dica "Mensagem"; qualquer outro texto é rascunho antigo.
+            let empty = entry.text.trim().is_empty() || entry.text.trim().eq_ignore_ascii_case("mensagem");
+            if text.chars().count() > 1500 {
+                return Err("Mensagem acima de 1500 caracteres; divida em partes menores".to_string());
             }
-            Self::bezier_tap_screen(serial, entry.cx, entry.cy, entry.cx, entry.cy)?;
+            Self::soft_tap(serial, entry.cx, entry.cy)?;
             let d = Self::calculate_gaussian_delay(200, 350);
             std::thread::sleep(Duration::from_millis(d as u64));
-            Self::type_text_fluid_hci(serial, message)?;
+            // Digita tecla a tecla (acento/emoji inclusos, via agente). O agente esvazia o campo
+            // antes (dica ou rascunho). Nunca cola o texto pelo link `&text=`.
+            Self::type_text_human_hpc_opts(serial, text, true, empty)?;
             let d = Self::calculate_gaussian_delay(300, 500);
             std::thread::sleep(Duration::from_millis(d as u64));
-            let typed = Self::ui_nodes(&Self::ui_dump(serial))
-                .into_iter()
-                .find(|n| n.rid == format!("{}:id/entry", pkg))
-                .map(|n| n.text)
-                .unwrap_or_default();
-            if !Self::same_text(&typed, message) {
-                return Err("A mensagem não foi digitada corretamente no campo; envio cancelado".to_string());
+            let now = Self::wa_entry(serial, pkg).map(|n| n.text).unwrap_or_default();
+            if !Self::same_text(&now, text) {
+                return Err("O texto no campo não confere com a mensagem; envio cancelado".to_string());
             }
         }
 
-        // 5. Toca em Enviar pela posição real do botão (fallback: posição relativa padrão).
+        // Toca em Enviar pela posição real do botão (fallback: posição relativa padrão).
+        let send_id = format!("{}:id/send", pkg);
         let send_btn = Self::ui_nodes(&Self::ui_dump(serial))
             .into_iter()
-            .find(|n| n.rid == format!("{}:id/send", pkg));
+            .find(|n| n.rid == send_id)
+            .or_else(|| Self::ui_nodes(&Self::ui_dump_uiautomator(serial)).into_iter().find(|n| n.rid == send_id));
         let (sx, sy) = match send_btn {
             Some(b) => (b.cx, b.cy),
             None => {
@@ -4208,21 +4468,19 @@ impl AdbManager {
                 (x, y)
             }
         };
-        Self::bezier_tap_screen(serial, sx, sy, sx, sy)?;
+        Self::soft_tap(serial, sx, sy)?;
         let d = Self::calculate_gaussian_delay(900, 1300);
         std::thread::sleep(Duration::from_millis(d as u64));
 
-        // 6. Confirma que saiu: o campo precisa ter esvaziado.
-        let after = Self::ui_nodes(&Self::ui_dump(serial))
-            .into_iter()
-            .find(|n| n.rid == format!("{}:id/entry", pkg))
-            .map(|n| n.text);
-        if let Some(t) = after {
-            if Self::same_text(&t, message) {
-                return Err("O botão Enviar não respondeu: a mensagem continua no campo".to_string());
+        // Confirma que saiu: o campo precisa ter esvaziado. Sem leitura da tela, o estado é
+        // incerto (pode ter saído): "INCERTO:" faz o dispatcher não reenviar automaticamente.
+        match Self::wa_entry(serial, pkg).map(|n| n.text) {
+            Some(t) if Self::same_text(&t, text) => {
+                Err("O botão Enviar não respondeu: a mensagem continua no campo".to_string())
             }
+            Some(_) => Ok(()),
+            None => Err("INCERTO: não foi possível confirmar o envio na tela".to_string()),
         }
-        Ok(())
     }
 
     /// Abre a conversa pela busca interna do WhatsApp. Só toca num resultado cuja linha
@@ -4235,33 +4493,54 @@ impl AdbManager {
         screen_w: i32,
         screen_h: i32,
     ) -> Result<bool, String> {
-        let nodes = Self::ui_nodes(&Self::ui_dump(serial));
-        let bar = nodes.iter().find(|n| {
-            n.rid == format!("{}:id/search_text", pkg) || n.rid == format!("{}:id/my_search_bar", pkg)
-        });
+        let is_bar = |n: &UiNode| n.rid == format!("{}:id/search_text", pkg) || n.rid == format!("{}:id/my_search_bar", pkg);
+        let mut nodes = Self::ui_nodes(&Self::ui_dump(serial));
+        if !nodes.iter().any(|n| is_bar(n)) {
+            nodes = Self::ui_nodes(&Self::ui_dump_uiautomator(serial));
+        }
+        let bar = nodes.iter().find(|n| is_bar(n));
+        // Sem a barra de busca na tela (não está na lista de conversas): não toca nem digita às cegas.
         let (bx, by) = match bar {
             Some(b) => (b.cx, b.cy),
-            None => {
-                let mut x: i32 = 0;
-                let mut y: i32 = 0;
-                unsafe { esfera_hpc_calculate_tap_coordinates(screen_w, screen_h, 50.0, 14.5, &mut x, &mut y); }
-                (x, y)
-            }
+            None => return Ok(false),
         };
-        Self::bezier_tap_screen(serial, bx, by, bx, by)?;
+        let _ = (screen_w, screen_h);
+        Self::soft_tap(serial, bx, by)?;
         let d = Self::calculate_gaussian_delay(400, 600);
         std::thread::sleep(Duration::from_millis(d as u64));
-        Self::type_text_fluid_hci(serial, digits)?;
+        // Só digita se o campo de busca abriu de fato.
+        let search_id = format!("{}:id/search_input", pkg);
+        if !Self::ui_dump(serial).contains(&search_id) && !Self::ui_dump_uiautomator(serial).contains(&search_id) {
+            let _ = Self::send_keyevent(serial, 4);
+            return Ok(false);
+        }
+        // Campo de busca recém-aberto: o agente esvazia antes (a dica "Pesquisar" pode vir como texto).
+        Self::type_text_human_hpc_opts(serial, digits, true, true)?;
         let d = Self::calculate_gaussian_delay(1000, 1400);
         std::thread::sleep(Duration::from_millis(d as u64));
 
         let results = Self::ui_nodes(&Self::ui_dump(serial));
+        // Confere DDD + 8 dígitos (sem DDI e sem o 9º), não só o final: "(11) 8805-2539" e
+        // "(75) 8805-2539" são pessoas diferentes. Linha sem DDD visível não é aceita.
+        let want = crate::db::Database::opt_out_key(digits);
         let hit = results.iter().find(|n| {
-            n.rid.contains("contact_name") && Self::extract_phone_digits(&n.text).ends_with(tail)
+            if !n.rid.contains("contact_name") {
+                return false;
+            }
+            // Só aceita linha cujo texto É o número (sem contato salvo) ou o contato temporário
+            // "Esfera <número>": um nome qualquer que só contenha os dígitos não serve.
+            let t = n.text.trim();
+            let is_number_only = t.chars().all(|c| c.is_ascii_digit() || " +-()".contains(c));
+            let is_temp_contact = t.strip_prefix("Esfera ").map(|r| r.chars().all(|c| c.is_ascii_digit())).unwrap_or(false);
+            let row = Self::extract_phone_digits(t);
+            (is_number_only || is_temp_contact)
+                && row.len() >= 10
+                && row.ends_with(tail)
+                && crate::db::Database::opt_out_key(&row) == want
         });
         match hit {
             Some(row) => {
-                Self::bezier_tap_screen(serial, row.cx, row.cy, row.cx, row.cy)?;
+                Self::soft_tap(serial, row.cx, row.cy)?;
                 let d = Self::calculate_gaussian_delay(1100, 1600);
                 std::thread::sleep(Duration::from_millis(d as u64));
                 Ok(true)
@@ -4283,14 +4562,56 @@ impl AdbManager {
         Self::execute_shell(serial, "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'", 3).unwrap_or_default()
     }
 
-    /// Lê a árvore de UI da tela atual (uiautomator).
+    /// Lê a árvore de UI da tela atual. Caminho rápido: serviço de acessibilidade do agente
+    /// (mesmo XML do uiautomator, em fração de segundo). Reserva: `uiautomator dump`, que leva
+    /// ~5 s em aparelhos fracos. Se o agente falhar, fica 60 s sem tentá-lo naquele aparelho.
     fn ui_dump(serial: &str) -> String {
+        let skip_agent = UI_DUMP_AGENT_DOWN
+            .lock()
+            .ok()
+            .and_then(|m| m.get(serial).map(|t| t.elapsed() < Duration::from_secs(60)))
+            .unwrap_or(false);
+        if !skip_agent {
+            match Self::agent_ui_dump(serial) {
+                Some(xml) => return xml,
+                None => {
+                    if let Ok(mut m) = UI_DUMP_AGENT_DOWN.lock() {
+                        m.insert(serial.to_string(), Instant::now());
+                    }
+                    println!("[TELA] Leitura pelo agente indisponível em {}; usando uiautomator por 60 s", serial);
+                }
+            }
+        }
+        Self::ui_dump_uiautomator(serial)
+    }
+
+    /// Leitura completa e lenta (~5 s): confirma quando a leitura do agente não achou o elemento.
+    fn ui_dump_uiautomator(serial: &str) -> String {
         Self::execute_shell(
             serial,
-            "uiautomator dump /sdcard/esf_ui.xml >/dev/null 2>&1; cat /sdcard/esf_ui.xml",
+            // Apaga o XML anterior: se o dump falhar, não devolve a tela velha.
+            "rm -f /sdcard/esf_ui.xml; uiautomator dump /sdcard/esf_ui.xml >/dev/null 2>&1; cat /sdcard/esf_ui.xml 2>/dev/null",
             12,
         )
         .unwrap_or_default()
+    }
+
+    /// Pede ao agente a árvore da janela ativa (`DUMP_UI`), devolvida em Base64 no resultData.
+    fn agent_ui_dump(serial: &str) -> Option<String> {
+        use base64::Engine as _;
+        let out = Self::execute_shell(
+            serial,
+            "am broadcast -a com.esfera.agent.DUMP_UI -n com.esfera.agent/.TypeTextReceiver",
+            8,
+        )
+        .ok()?;
+        let line = out.lines().find(|l| l.contains("Broadcast completed: result=1"))?;
+        let start = line.find("data=\"")? + 6;
+        let rest = &line[start..];
+        let b64 = &rest[..rest.find('"')?];
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()?;
+        let xml = String::from_utf8(bytes).ok()?;
+        xml.contains("<node ").then_some(xml)
     }
 
     fn ui_nodes(xml: &str) -> Vec<UiNode> {
@@ -4329,12 +4650,71 @@ impl AdbManager {
 
     /// Compara textos ignorando diferenças de espaço/quebra de linha.
     fn same_text(a: &str, b: &str) -> bool {
-        let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-        !b.trim().is_empty() && norm(a) == norm(b)
+        // Compara só letras e números: o uiautomator devolve emoji/espaços codificados de
+        // formas diferentes (ex.: "&#55357;&#56842;"), o que não muda o conteúdo da mensagem.
+        let norm = |s: &str| Self::decode_xml_numeric(s).chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+        let nb = norm(b);
+        !nb.is_empty() && norm(a) == nb
+    }
+
+    /// Decodifica entidades numéricas do XML do uiautomator (&#NNN; e &#xHH;, inclusive pares surrogate).
+    fn decode_xml_numeric(s: &str) -> String {
+        let mut out = String::new();
+        let mut units: Vec<u16> = Vec::new();
+        let mut rest = s;
+        macro_rules! flush {
+            () => {
+                if !units.is_empty() {
+                    out.push_str(&String::from_utf16_lossy(&units));
+                    units.clear();
+                }
+            };
+        }
+        loop {
+            match rest.find("&#") {
+                Some(0) => {
+                    let after = &rest[2..];
+                    if let Some(end) = after.find(';') {
+                        let code = &after[..end];
+                        let val = match code.strip_prefix('x').or_else(|| code.strip_prefix('X')) {
+                            Some(h) => u32::from_str_radix(h, 16).ok(),
+                            None => code.parse::<u32>().ok(),
+                        };
+                        if let Some(v) = val {
+                            if v <= 0xFFFF {
+                                units.push(v as u16);
+                            } else {
+                                flush!();
+                                if let Some(c) = char::from_u32(v) {
+                                    out.push(c);
+                                }
+                            }
+                            rest = &after[end + 1..];
+                            continue;
+                        }
+                    }
+                    flush!();
+                    out.push_str("&#");
+                    rest = after;
+                }
+                Some(i) => {
+                    flush!();
+                    out.push_str(&rest[..i]);
+                    rest = &rest[i..];
+                }
+                None => {
+                    flush!();
+                    out.push_str(rest);
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Envia mensagem no WhatsApp com navegação nativa fluida dentro do WhatsApp
     /// (busca interna, sem salvar contato na agenda, sem acionar deep link externo nem bloquear por senha)
+    #[allow(dead_code)]
     pub fn send_whatsapp_with_contact(
         serial: &str,
         phone: &str,
@@ -4858,6 +5238,33 @@ mod tests {
         assert!(AdbManager::type_message_native_fast("invalid_serial", "").is_ok());
         assert!(AdbManager::type_message_native_fast("invalid_serial", "   ").is_ok());
     }
+
+    #[test]
+    fn test_keystroke_schedule_model() {
+        let text = "Olá João, tudo bem? Segue 2 opções! 😊";
+        let d = AdbManager::keystroke_schedule(text);
+        assert_eq!(d.len(), text.chars().count());
+        assert!(d.iter().all(|ms| *ms <= 2500));
+        // Letra comum: normal truncada em [45, 250]
+        for _ in 0..200 {
+            let plain = AdbManager::keystroke_delay_ms(Some('a'), 'b');
+            assert!((45..=250).contains(&plain), "tecla comum fora da faixa: {}", plain);
+        }
+        // Espaço após fim de frase: base + pausa reflexiva (>= 150)
+        let after = AdbManager::keystroke_delay_ms(Some('?'), ' ');
+        assert!(after >= 195, "pausa após frase curta demais: {}", after);
+        // Shift: maiúscula depois de minúscula ganha penalidade de 80..180
+        let shift = AdbManager::keystroke_delay_ms(Some('a'), 'B');
+        assert!((125..=430).contains(&shift), "shift fora da faixa: {}", shift);
+        // Acento: penalidade também
+        let accent = AdbManager::keystroke_delay_ms(Some('a'), 'ç');
+        assert!(accent >= 125, "acento sem penalidade: {}", accent);
+        // Média de teclas comuns próxima de 110 ms
+        let n = 4000u64;
+        let sum: u64 = (0..n).map(|_| AdbManager::keystroke_delay_ms(Some('a'), 'b') as u64).sum();
+        let mean = sum as f64 / n as f64;
+        assert!((98.0..=122.0).contains(&mean), "media fora do modelo: {}", mean);
+    }
 }
 
 /// Nó da árvore de UI (uiautomator) usado para conferir telas do WhatsApp.
@@ -4866,4 +5273,35 @@ struct UiNode {
     text: String,
     cx: i32,
     cy: i32,
+}
+
+#[cfg(test)]
+mod split_parts_tests {
+    use super::AdbManager;
+    #[test]
+    fn divide_bloco_unico() {
+        let t = "Olá Teste, tudo bem? 😊 A REALESS preparou uma condição especial para regularizar sua pendência. Basta responder a este WhatsApp para iniciar a negociação. Caso queira parar de receber nossos contatos, responda SAIR. Abraço, Equipe REALESS";
+        let p = AdbManager::split_human_parts(t);
+        assert_eq!(p[0], "Olá Teste, tudo bem? 😊");
+        assert_eq!(p.last().unwrap(), "Abraço, Equipe REALESS");
+        assert_eq!(p.len(), 3);
+        assert_eq!(p.join(" "), t);
+    }
+    #[test]
+    fn respeita_linhas_em_branco() {
+        let p = AdbManager::split_human_parts("Oi\n\nTexto aqui.\n\nAtt");
+        assert_eq!(p, vec!["Oi", "Texto aqui.", "Att"]);
+    }
+}
+
+#[cfg(test)]
+mod search_match_tests {
+    use crate::db::Database;
+    #[test]
+    fn ddd_diferente_nao_casa() {
+        let want = Database::opt_out_key("5575988052539");
+        assert_eq!(Database::opt_out_key("557588052539"), want); // como o WhatsApp mostra
+        assert_eq!(Database::opt_out_key("5575988052539"), want); // contato "Esfera 55759..."
+        assert_ne!(Database::opt_out_key("551188052539"), want); // mesmo final, outro DDD
+    }
 }

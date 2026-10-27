@@ -45,6 +45,17 @@ esfera_int32_t esfera_hpc_sanitize_png_buffer(
 
 esfera_int32_t esfera_hpc_calculate_gaussian_delay(esfera_int32_t min_ms, esfera_int32_t max_ms);
 
+/*
+ * Modelo psicomotor de digitação (tecla a tecla).
+ * Devolve o intervalo em ms entre a tecla anterior (prev_cp, 0 = início) e a tecla
+ * atual (cur_cp, code point Unicode):
+ *  - base: normal truncada  mu=110ms  sigma=35ms  limites [45, 250]
+ *  - penalidade +80..180ms: Shift (minúscula -> maiúscula), número, símbolo, acento/ç
+ *  - espaço: pausa reflexiva inter-palavra log-normal (mais longa após . ? ! e quebra de linha)
+ *  - emoji: abertura do painel, +400..900ms
+ */
+esfera_int32_t esfera_hpc_keystroke_delay_ms(esfera_int32_t prev_cp, esfera_int32_t cur_cp);
+
 void esfera_hpc_generate_hardware_uuid(char* out_uuid_buf, esfera_size_t max_len);
 
 esfera_int32_t esfera_hpc_generate_bezier_points(

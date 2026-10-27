@@ -280,6 +280,17 @@ pub struct DeviceWithActiveUser {
     pub assigned_user_name: Option<String>,
 }
 
+/// Resultado da gravação durável de um pedido de descadastro recebido por API.
+#[derive(Debug, Clone)]
+pub struct OptOutRecordOutcome {
+    /// "recorded" (gravado agora) ou "duplicate" (EventId já conhecido; nada mudou).
+    pub status: &'static str,
+    pub phone_key: String,
+    pub suppressed: usize,
+    /// Em duplicata: se o evento já gravado pertence à mesma empresa do pedido atual.
+    pub same_company: bool,
+}
+
 // ============================================================
 // DATABASE TRANSACTION RAII
 // ============================================================
@@ -775,6 +786,39 @@ impl Database {
             [],
         )?;
 
+        // 10b. ESF_OptOut (descadastro: quem pediu para não receber mais mensagens).
+        // Política do WhatsApp: pedidos de bloqueio/descadastro devem ser respeitados sempre.
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_OptOut (
+                CompanyId INTEGER NOT NULL,
+                PhoneDigits TEXT NOT NULL,
+                Reason TEXT NOT NULL DEFAULT '',
+                CreatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (CompanyId, PhoneDigits)
+            );",
+            [],
+        )?;
+
+        // 10c. ESF_OptOutEvent (descadastro central: cada pedido recebido por API, ex.: VEXOR,
+        // é gravado UMA vez pelo seu EventId estável; reenvios/retries viram "duplicate").
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_OptOutEvent (
+                EventId TEXT PRIMARY KEY,
+                CompanyId INTEGER NOT NULL,
+                PhoneDigits TEXT NOT NULL,
+                PhoneE164 TEXT NOT NULL DEFAULT '',
+                Source TEXT NOT NULL DEFAULT '',
+                Reason TEXT NOT NULL DEFAULT '',
+                ReceivedAt TEXT NOT NULL DEFAULT '',
+                RecordedAt TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+            [],
+        )?;
+        self.conn().execute(
+            "CREATE INDEX IF NOT EXISTS idx_optout_event_company ON ESF_OptOutEvent(CompanyId, RecordedAt);",
+            [],
+        )?;
+
         // 11. ESF_DeviceStatus (bans por pacote por campanha)
         self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_DeviceStatus (
@@ -1122,8 +1166,9 @@ impl Database {
                  ON CONFLICT(AdbDeviceId) DO UPDATE SET
                     DeviceNumber = excluded.DeviceNumber,
                     EsferaDeviceId = excluded.EsferaDeviceId,
-                    CurrentAdbAddress = excluded.CurrentAdbAddress,
-                    DeviceIp = excluded.DeviceIp;",
+                    -- IP/endereço são voláteis: só preenche se vazio, nunca volta para o IP antigo da tabela
+                    CurrentAdbAddress = COALESCE(NULLIF(ESF_Device.CurrentAdbAddress, ''), excluded.CurrentAdbAddress),
+                    DeviceIp = COALESCE(NULLIF(ESF_Device.DeviceIp, ''), excluded.DeviceIp);",
                 params![usb_serial, default_name, model, ip, num, esf_id, adb_addr, now],
             );
         }
@@ -1833,16 +1878,26 @@ impl Database {
     }
 
     pub fn soft_delete_campaign(&self, id: i32) -> Result<(), String> {
-        self.conn().execute(
-            "UPDATE ESF_Campaign SET ExcluidoEm=datetime('now'), Status='stopped' WHERE CampaignId=?1;",
-            params![id],
-        ).map_err(|e| e.to_string())?;
-        // Soft delete contatos também
-        self.conn().execute(
-            "UPDATE ESF_Contact SET ExcluidoEm=datetime('now') WHERE CampaignId=?1 AND ExcluidoEm IS NULL;",
-            params![id],
-        ).map_err(|e| e.to_string())?;
-        Ok(())
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<(), String> {
+            let changed = conn.execute(
+                "UPDATE ESF_Campaign SET ExcluidoEm=datetime('now'), Status='stopped' WHERE CampaignId=?1 AND ExcluidoEm IS NULL AND Status != 'running';",
+                params![id],
+            ).map_err(|e| e.to_string())?;
+            if changed == 0 {
+                return Err("Campanha não encontrada ou em andamento. Pare a campanha antes de excluí-la.".to_string());
+            }
+            conn.execute(
+                "UPDATE ESF_Contact SET ExcluidoEm=datetime('now') WHERE CampaignId=?1 AND ExcluidoEm IS NULL;",
+                params![id],
+            ).map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;").map_err(|e| { let _ = conn.execute_batch("ROLLBACK;"); e.to_string() }),
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK;"); Err(e) }
+        }
     }
 
     pub fn set_campaign_status(&self, id: i32, status: &str) -> Result<(), String> {
@@ -2176,6 +2231,8 @@ impl Database {
                     params![campaign_id, name, phone],
                 )?;
             }
+            // Reimportação não ressuscita descadastrados: aplica a lista da empresa na hora.
+            Self::suppress_campaign_opt_outs_on(&conn, campaign_id)?;
             conn.execute(
                 "UPDATE ESF_Campaign SET TotalContacts=(SELECT COUNT(*) FROM ESF_Contact WHERE CampaignId=?1 AND ExcluidoEm IS NULL), UpdatedAt=datetime('now') WHERE CampaignId=?1;",
                 params![campaign_id],
@@ -2241,6 +2298,8 @@ impl Database {
                 "UPDATE ESF_Contact SET Status='pending', RetryCount=0 WHERE CampaignId=?1 AND ExcluidoEm IS NULL",
                 params![campaign_id],
             )?;
+            // Reiniciar a fila não desfaz um descadastro.
+            Self::suppress_campaign_opt_outs_on(&conn, campaign_id)?;
             conn.execute(
                 "UPDATE ESF_Campaign SET SentContacts=0, FailedContacts=0, Status='draft', UpdatedAt=datetime('now') WHERE CampaignId=?1",
                 params![campaign_id],
@@ -2263,6 +2322,26 @@ impl Database {
 
     pub fn get_next_pending_contact(&self, campaign_id: i32) -> Option<Contact> {
         self.try_get_next_pending_contact(campaign_id).ok().flatten()
+    }
+
+    /// Próximo contato pendente com id maior que `after_id` (pré-carregamento da mensagem).
+    pub fn try_get_pending_contact_after(&self, campaign_id: i32, after_id: i32) -> Result<Option<Contact>> {
+        self.pooled_conn()?.query_row(
+            "SELECT ContactId, CampaignId, ContactName, Phone, Status, SentAt
+             FROM ESF_Contact WHERE CampaignId = ?1 AND Status = 'pending' AND ExcluidoEm IS NULL AND ContactId > ?2
+             ORDER BY ContactId ASC LIMIT 1",
+            params![campaign_id, after_id],
+            |row| {
+                Ok(Contact {
+                    id: row.get(0)?,
+                    campaign_id: row.get(1)?,
+                    contact_name: row.get(2)?,
+                    phone: row.get(3)?,
+                    status: row.get(4)?,
+                    sent_at: row.get(5)?,
+                })
+            },
+        ).optional()
     }
 
     pub fn try_get_next_pending_contact(&self, campaign_id: i32) -> Result<Option<Contact>> {
@@ -2299,6 +2378,216 @@ impl Database {
 
     pub fn was_already_sent(&self, phone: &str, campaign_id: i32) -> bool {
         self.try_was_already_sent(phone, campaign_id).unwrap_or(false)
+    }
+
+    // ============================================================
+    // DESCADASTRO (opt-out)
+    // ============================================================
+
+    /// Chave do descadastro: só dígitos, sem o 9º dígito do celular BR, para casar
+    /// "+55 75 98805-2539" com "557588052539" (como o WhatsApp mostra).
+    pub fn opt_out_key(phone: &str) -> String {
+        let d: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+        let d = d.trim_start_matches('0').to_string();
+        // Só remove o DDI 55 quando ele está presente (12-13 dígitos): o DDD 55 (RS) também existe.
+        let local = if (d.len() == 12 || d.len() == 13) && d.starts_with("55") { &d[2..] } else { &d[..] };
+        let core = if local.len() == 11 && local.as_bytes()[2] == b'9' {
+            format!("{}{}", &local[..2], &local[3..])
+        } else {
+            local.to_string()
+        };
+        core
+    }
+
+    /// Falha fechada: se a consulta der erro, trata como descadastrado (não envia).
+    pub fn is_opted_out(&self, company_id: i32, phone: &str) -> bool {
+        let key = Self::opt_out_key(phone);
+        if key.is_empty() {
+            return false;
+        }
+        self.conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ESF_OptOut WHERE CompanyId = ?1 AND PhoneDigits = ?2);",
+                params![company_id, key],
+                |row| row.get(0),
+            )
+            .unwrap_or(true)
+    }
+
+    /// Marca como 'opt_out' os contatos ainda não enviados (pendentes ou com falha) desse número
+    /// em TODAS as campanhas da empresa. Só a empresa do pedido é afetada.
+    pub fn suppress_pending_for_opt_out(&self, company_id: i32, phone: &str) -> usize {
+        let key = Self::opt_out_key(phone);
+        let conn = self.conn();
+        Self::suppress_company_contacts_on(&conn, company_id, &key)
+    }
+
+    /// Versão sobre uma conexão já aberta (uso dentro de transações). Não chama `self.conn()`
+    /// porque o guard do banco não é reentrante.
+    fn suppress_company_contacts_on(conn: &Connection, company_id: i32, key: &str) -> usize {
+        if key.is_empty() {
+            return 0;
+        }
+        let mut stmt = match conn.prepare(
+            "SELECT c.ContactId, c.Phone FROM ESF_Contact c JOIN ESF_Campaign k ON k.CampaignId = c.CampaignId
+             WHERE k.CompanyId = ?1 AND c.Status IN ('pending', 'failed') AND c.ExcluidoEm IS NULL;",
+        ) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        let ids: Vec<i32> = stmt
+            .query_map(params![company_id], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))
+            .map(|rows| rows.filter_map(|r| r.ok()).filter(|(_, p)| Self::opt_out_key(p) == key).map(|(id, _)| id).collect())
+            .unwrap_or_default();
+        drop(stmt);
+        for id in &ids {
+            let _ = conn.execute("UPDATE ESF_Contact SET Status = 'opt_out' WHERE ContactId = ?1;", params![id]);
+        }
+        ids.len()
+    }
+
+    /// Reaplica a lista de descadastrados da empresa sobre uma campanha (usado ao importar ou
+    /// reiniciar a fila): quem pediu SAIR nunca volta a 'pending', mesmo numa reimportação.
+    fn suppress_campaign_opt_outs_on(conn: &Connection, campaign_id: i32) -> rusqlite::Result<usize> {
+        let company_id: i32 = match conn
+            .query_row("SELECT CompanyId FROM ESF_Campaign WHERE CampaignId = ?1;", params![campaign_id], |r| r.get(0))
+            .optional()?
+        {
+            Some(id) => id,
+            None => return Ok(0),
+        };
+        let keys: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("SELECT PhoneDigits FROM ESF_OptOut WHERE CompanyId = ?1;")?;
+            let rows = stmt.query_map(params![company_id], |r| r.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<i32> = {
+            let mut stmt = conn.prepare(
+                "SELECT ContactId, Phone FROM ESF_Contact WHERE CampaignId = ?1 AND Status IN ('pending', 'failed') AND ExcluidoEm IS NULL;",
+            )?;
+            let rows = stmt.query_map(params![campaign_id], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))?;
+            rows.filter_map(|r| r.ok()).filter(|(_, p)| keys.contains(&Self::opt_out_key(p))).map(|(id, _)| id).collect()
+        };
+        for id in &ids {
+            conn.execute("UPDATE ESF_Contact SET Status = 'opt_out' WHERE ContactId = ?1;", params![id])?;
+        }
+        Ok(ids.len())
+    }
+
+    /// Grava um pedido de descadastro vindo por API (ex.: VEXOR) de forma durável e idempotente.
+    /// Tudo numa única transação: evento (chave estável), ESF_OptOut e supressão nas campanhas
+    /// da empresa. Só retorna Ok depois do COMMIT com `synchronous=FULL` (fsync), que é o que
+    /// autoriza o ACK ao remetente. Reenvio do mesmo EventId devolve "duplicate" sem alterar nada.
+    pub fn record_opt_out_event(
+        &self,
+        event_id: &str,
+        company_id: i32,
+        phone: &str,
+        source: &str,
+        reason: &str,
+        received_at: &str,
+    ) -> std::result::Result<OptOutRecordOutcome, String> {
+        let key = Self::opt_out_key(phone);
+        if key.len() < 8 {
+            return Err("Número inválido.".to_string());
+        }
+        if event_id.trim().is_empty() || event_id.len() > 200 {
+            return Err("EventId inválido.".to_string());
+        }
+        let conn = self.conn();
+        let _ = conn.execute_batch("PRAGMA synchronous=FULL;");
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<OptOutRecordOutcome> {
+            let existing: Option<(i32, String)> = conn
+                .query_row(
+                    "SELECT CompanyId, PhoneDigits FROM ESF_OptOutEvent WHERE EventId = ?1;",
+                    params![event_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((existing_company, existing_key)) = existing {
+                return Ok(OptOutRecordOutcome {
+                    status: "duplicate",
+                    phone_key: existing_key,
+                    suppressed: 0,
+                    same_company: existing_company == company_id,
+                });
+            }
+            conn.execute(
+                "INSERT INTO ESF_OptOutEvent (EventId, CompanyId, PhoneDigits, PhoneE164, Source, Reason, ReceivedAt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+                params![event_id, company_id, key, phone.trim(), source, reason, received_at],
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO ESF_OptOut (CompanyId, PhoneDigits, Reason, CreatedAt) VALUES (?1, ?2, ?3, datetime('now'));",
+                params![company_id, key, reason],
+            )?;
+            let suppressed = Self::suppress_company_contacts_on(&conn, company_id, &key);
+            Ok(OptOutRecordOutcome { status: "recorded", phone_key: key.clone(), suppressed, same_company: true })
+        })();
+        let outcome = match result {
+            Ok(o) => conn.execute_batch("COMMIT;").map(|_| o).map_err(|e| e.to_string()),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(e.to_string())
+            }
+        };
+        let _ = conn.execute_batch("PRAGMA synchronous=NORMAL;");
+        outcome
+    }
+
+    /// Lista os eventos de descadastro recebidos por API para auditoria (sem conversas).
+    pub fn list_opt_out_events(&self, company_id: i32, limit: i32) -> Vec<(String, String, String, String, String)> {
+        let conn = self.conn();
+        let mut stmt = match conn.prepare(
+            "SELECT EventId, PhoneDigits, Source, Reason, RecordedAt FROM ESF_OptOutEvent WHERE CompanyId = ?1 ORDER BY RecordedAt DESC LIMIT ?2;",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![company_id, limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn add_opt_out(&self, company_id: i32, phone: &str, reason: &str) -> Result<(), String> {
+        let key = Self::opt_out_key(phone);
+        if key.len() < 8 {
+            return Err("Número inválido.".to_string());
+        }
+        self.conn()
+            .execute(
+                "INSERT OR REPLACE INTO ESF_OptOut (CompanyId, PhoneDigits, Reason, CreatedAt) VALUES (?1, ?2, ?3, datetime('now'));",
+                params![company_id, key, reason],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn remove_opt_out(&self, company_id: i32, phone_digits: &str) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "DELETE FROM ESF_OptOut WHERE CompanyId = ?1 AND PhoneDigits = ?2;",
+                params![company_id, Self::opt_out_key(phone_digits)],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn list_opt_outs(&self, company_id: i32) -> Vec<(String, String, String)> {
+        let conn = self.conn();
+        let mut stmt = match conn.prepare(
+            "SELECT PhoneDigits, Reason, CreatedAt FROM ESF_OptOut WHERE CompanyId = ?1 ORDER BY CreatedAt DESC;",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     }
 
     pub fn try_was_already_sent(&self, phone: &str, campaign_id: i32) -> Result<bool> {
@@ -3104,6 +3393,17 @@ impl Database {
         Ok(token)
     }
 
+    /// Existência de uma empresa ativa (sem depender de colunas calculadas).
+    pub fn company_exists(&self, company_id: i32) -> bool {
+        self.conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ESF_Company WHERE CompanyId = ?1 AND IsActive = 1);",
+                params![company_id],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    }
+
     /// Busca empresa por ID (para obter o nome no Register do hub).
     pub fn get_company_by_id(&self, company_id: i32) -> Option<Company> {
         self.conn()
@@ -3133,3 +3433,54 @@ impl Database {
 
 
 
+
+#[cfg(test)]
+mod opt_out_event_tests {
+    use super::Database;
+
+    fn temp_db(tag: &str) -> Database {
+        let path = std::env::temp_dir().join(format!("esfera_optout_db_{}_{}.db", tag, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Database::init(path.to_string_lossy().as_ref()).expect("db")
+    }
+
+    #[test]
+    fn evento_duravel_idempotente_e_isolado_por_empresa() {
+        let db = temp_db("event");
+        let other = db.create_company("Outra", 5).unwrap();
+        let first = db.record_opt_out_event("whatsapp:c:1", 1, "+5575988052539", "vexor", "SAIR", "2026-10-27T12:00:00Z").unwrap();
+        assert_eq!(first.status, "recorded");
+        assert_eq!(first.phone_key, "7588052539");
+        assert!(db.is_opted_out(1, "5575988052539"));
+        assert!(!db.is_opted_out(other.id, "5575988052539"));
+        let again = db.record_opt_out_event("whatsapp:c:1", 1, "+5575988052539", "vexor", "SAIR", "").unwrap();
+        assert_eq!(again.status, "duplicate");
+        assert!(again.same_company);
+        let stolen = db.record_opt_out_event("whatsapp:c:1", other.id, "+5575988052539", "vexor", "SAIR", "").unwrap();
+        assert_eq!(stolen.status, "duplicate");
+        assert!(!stolen.same_company);
+        assert!(!db.is_opted_out(other.id, "5575988052539"));
+        assert_eq!(db.list_opt_out_events(1, 10).len(), 1);
+        assert!(db.record_opt_out_event("whatsapp:c:2", 1, "123", "vexor", "", "").is_err());
+        assert!(db.record_opt_out_event("", 1, "+5575988052539", "vexor", "", "").is_err());
+        // Após rollback/erro a conexão segue utilizável.
+        assert_eq!(db.record_opt_out_event("whatsapp:c:3", 1, "5575911112222", "vexor", "", "").unwrap().status, "recorded");
+    }
+}
+
+#[cfg(test)]
+mod opt_out_key_tests {
+    use super::Database;
+    #[test]
+    fn mesmo_numero_mesma_chave() {
+        let k = Database::opt_out_key("+55 75 98805-2539");
+        assert_eq!(k, "7588052539");
+        assert_eq!(Database::opt_out_key("5575988052539"), k);
+        assert_eq!(Database::opt_out_key("557588052539"), k);
+        assert_eq!(Database::opt_out_key("(75) 98805-2539"), k);
+        assert_eq!(Database::opt_out_key("075988052539"), k);
+        // DDD 55 (RS) sem DDI e com DDI devem dar a mesma chave
+        assert_eq!(Database::opt_out_key("55999998888"), Database::opt_out_key("+55 55 99999-8888"));
+        assert_eq!(Database::opt_out_key("55999998888"), "5599998888");
+    }
+}

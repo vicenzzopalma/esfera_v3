@@ -493,7 +493,7 @@ export default function SettingsTab() {
                       type="text"
                       value={aiModel}
                       onChange={(e) => setAiModel(e.target.value)}
-                      placeholder="openrouter/free ou llama-3.3-70b-versatile"
+                      placeholder="openai/gpt-oss-120b"
                       className="font-mono"
                     />
                     {providerInfo && providerInfo.suggestedModels.length > 0 && (

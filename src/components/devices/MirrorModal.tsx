@@ -29,7 +29,7 @@ import {
   SunMedium,
 } from "lucide-react";
 
-type MirrorMode = "frame" | "scrcpy" | "scrcpy_off" | "virtual";
+type MirrorMode = "frame" | "scrcpy" | "scrcpy_off";
 
 interface MirrorModalProps {
   isOpen: boolean;
@@ -115,13 +115,6 @@ export function MirrorModal({
         msg = await api<string>("launch_scrcpy_stream", { serial, turnScreenOff: false });
       } else if (next === "scrcpy_off") {
         msg = await api<string>("launch_scrcpy_stream", { serial, turnScreenOff: true });
-      } else if (next === "virtual") {
-        msg = await api<string>("launch_virtual_display_stream", {
-          serial,
-          width: 1080,
-          height: 1920,
-          dpi: 320,
-        });
       }
       setStreamMsg(`${msg}\nJanela externa ativa: controle e pré-visualização sincronizados.`);
     } catch (e: any) {
@@ -311,11 +304,11 @@ export function MirrorModal({
                 { id: "frame", label: "Pré-visualização" },
                 { id: "scrcpy", label: "Scrcpy" },
                 { id: "scrcpy_off", label: "Tela apagada" },
-                { id: "virtual", label: "Display virtual" },
               ]}
               value={mode}
               onChange={(m) => !busy && startMode(m)}
             />
+            <p className="text-[0.75rem] text-secondary">Display virtual indisponível no Scrcpy 2.4 empacotado.</p>
             {busy && (
               <p className="flex items-center gap-1.5 text-[0.75rem] text-secondary">
                 <RefreshCw size={12} className="animate-spin" /> Iniciando...

@@ -22,12 +22,13 @@ export const AI_PROVIDERS: AiProviderInfo[] = [
     name: "OpenRouter (Modelos 100% Free)",
     category: "cloud_free",
     defaultEndpoint: "https://openrouter.ai/api/v1/chat/completions",
-    defaultModel: "minimax/minimax-m3.1-flash:free",
+    defaultModel: "nvidia/nemotron-3.5-lightning:free",
     keyPlaceholder: "sk-or-v1-...",
     keyUrl: "https://openrouter.ai/keys",
     keyHint: "Obtenha grátis em openrouter.ai/keys",
     suggestedModels: [
-      { id: "minimax/minimax-m3.1-flash:free", name: "MiniMax M3.1 Flash", tag: "Recomendado · Rápido & BR" },
+      { id: "nvidia/nemotron-3.5-lightning:free", name: "NVIDIA Nemotron Lightning", tag: "Grátis · lento" },
+      { id: "xingchen-agi/xing4.0-29b-a4b:free", name: "Xing 4.0 29B", tag: "Grátis · lento" },
       { id: "openrouter/free", name: "Free Router (Auto)", tag: "Sempre Ativo" },
       { id: "liquid/lfm-2.5-2.6b:free", name: "Liquid LFM 2.6B", tag: "Ultra Leve" },
       { id: "nvidia/nemotron-3-super-120b-a12b:free", name: "NVIDIA Super 120B", tag: "Potente" },
@@ -35,17 +36,17 @@ export const AI_PROVIDERS: AiProviderInfo[] = [
   },
   {
     id: "groq",
-    name: "GroqCloud (Grátis & LPU Ultrarrápida)",
+    name: "Groq (grátis, recomendado)",
     category: "cloud_free",
     defaultEndpoint: "https://api.groq.com/openai/v1/chat/completions",
-    defaultModel: "llama-3.3-70b-versatile",
+    defaultModel: "openai/gpt-oss-120b",
     keyPlaceholder: "gsk_...",
     keyUrl: "https://console.groq.com/keys",
     keyHint: "Obtenha grátis em console.groq.com/keys",
     suggestedModels: [
-      { id: "llama-3.3-70b-versatile", name: "Llama 3.3 70B", tag: "Mais Inteligente" },
-      { id: "llama-3.1-8b-instant", name: "Llama 3.1 8B", tag: "Instantâneo" },
-      { id: "mixtral-8x7b-32768", name: "Mixtral 8x7B", tag: "Robusto" },
+      { id: "openai/gpt-oss-120b", name: "GPT-OSS 120B", tag: "Recomendado · ~2s" },
+      { id: "openai/gpt-oss-20b", name: "GPT-OSS 20B", tag: "Mais rápido" },
+      { id: "qwen/qwen3.8-27b", name: "Qwen 3.8 27B", tag: "Alternativo" },
     ],
   },
   {
@@ -128,7 +129,6 @@ export function getAiProviderInfo(providerId: string): AiProviderInfo | undefine
   return AI_PROVIDERS.find((p) => p.id === providerId.toLowerCase());
 }
 
+// Persona padrão da empresa. As regras legais (CDC/LGPD) ficam fixas no backend (ai_engine.rs).
 export const DEFAULT_WHATSAPP_SYSTEM_PROMPT =
-  "Você é um assistente comercial brasileiro experiente. Redija mensagens diretas, simpáticas e humanizadas para o WhatsApp. " +
-  "Mantenha sempre intactos todos os links (http/https), chaves PIX, números de telefone, datas e valores em Reais (R$). " +
-  "Nunca adicione introduções ou explicações robóticas como 'Aqui está a mensagem:'. Devolva estritamente a mensagem final.";
+  "Você é um atendente de cobrança e relacionamento de uma empresa brasileira, falando com o próprio cliente pelo WhatsApp. Seja cordial, respeitoso, claro e breve. O objetivo é convidar o cliente a regularizar a pendência pelo canal de negociação, nunca pressionar. Nunca mencione valores. Mantenha datas, links e canais de negociação exatamente como estão.";

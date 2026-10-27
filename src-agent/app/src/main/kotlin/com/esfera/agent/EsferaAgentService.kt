@@ -60,9 +60,12 @@ import java.util.concurrent.TimeUnit
 @Serializable
 data class EsferaConfig(
     val serverUrl: String = "",
+    // Servidor de fallback (ex.: VPS) quando o PROGRAMA DESKTOP ATUAL (127.0.0.1
+    // via adb reverse) não responder. serverUrl é sempre tentado primeiro.
+    val fallbackServerUrl: String = "",
     val deviceId: String = "",
     val tunnelEnabled: Boolean = true,
-    val tunnelPort: Int = 8888,
+    val tunnelPort: Int = 8889,
     // COMPANY_ID: identidade de isolamento. Sem ela o VPS recusa check-in
     // (nunca derivamos empresa de IP/porta/ordem de conexão).
     val companyId: Int = 0
@@ -253,7 +256,9 @@ class EsferaAgentService : Service() {
     // Lifecycle
     // ----------------------------------------------------------------\
 
-    private var presenceClient: PresenceClient? = null
+    // Um cliente de presença por destino (desktop atual via adb reverse + host/VPS),
+    // todos ativos ao mesmo tempo. O ID é a âncora; cada transporte é independente.
+    private val presenceClients = mutableListOf<PresenceClient>()
 
     // Guarda de idempotência: loadConfigAndStart só roda UMA vez. O BootJobService
     // (disparado pelo próprio onCreate) e múltiplas chamadas de onStartCommand criam
@@ -302,7 +307,7 @@ class EsferaAgentService : Service() {
         releaseWakeLock()
         checkInJob?.cancel()
         tunnelJob?.cancel()
-        presenceClient?.stop()
+        presenceClients.forEach { it.stop() }; presenceClients.clear()
         scope.cancel()
         httpClient.close()
         // RESPAWN DEFENSIVO: se o sistema (OEM/Moto) matar o service sem reboot,
@@ -354,11 +359,21 @@ class EsferaAgentService : Service() {
         // vazio NÃO deve vencer um válido em outra posição da lista.
         var fileConfig = EsferaConfig()
         for (candidate in resolveConfigCandidates()) {
-            if (candidate.exists()) {
-                try {
+            try {
+                if (candidate.exists()) {
                     val c = json.decodeFromString<EsferaConfig>(candidate.readText())
-                    if (isConfigValid(c)) { fileConfig = c; break }
-                } catch (_: Exception) {}
+                    if (isConfigValid(c)) {
+                        android.util.Log.i("EsferaAgent", "Config carregada de ${candidate.absolutePath}")
+                        fileConfig = c
+                        break
+                    }
+                    android.util.Log.w("EsferaAgent", "Config inválida em ${candidate.absolutePath}")
+                } else if (candidate.absolutePath == "/sdcard/esfera_config.json" &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !android.os.Environment.isExternalStorageManager()) {
+                    android.util.Log.w("EsferaAgent", "Sem acesso a /sdcard/esfera_config.json: conceda acesso a todos os arquivos")
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("EsferaAgent", "Falha ao ler config em ${candidate.absolutePath}: ${e.message}")
             }
         }
         // Se nenhum arquivo válido, tenta SharedPreferences (fallback).
@@ -366,10 +381,16 @@ class EsferaAgentService : Service() {
             val prefs = getSharedPreferences("esfera_agent", MODE_PRIVATE)
             val pc = EsferaConfig(
                 serverUrl = prefs.getString("serverUrl", "") ?: "",
+                fallbackServerUrl = prefs.getString("fallbackServerUrl", "") ?: "",
                 deviceId = prefs.getString("deviceId", "") ?: "",
+                tunnelEnabled = prefs.getBoolean("tunnelEnabled", true),
+                tunnelPort = prefs.getInt("tunnelPort", 8889),
                 companyId = prefs.getInt("companyId", 0)
             )
-            if (isConfigValid(pc)) fileConfig = pc
+            if (isConfigValid(pc)) {
+                android.util.Log.i("EsferaAgent", "Config carregada de SharedPreferences")
+                fileConfig = pc
+            }
         }
 
         // Fallback de prop (só funciona com root) — tem precedência MENOR que o arquivo.
@@ -385,6 +406,9 @@ class EsferaAgentService : Service() {
         val resolvedDeviceId = fileConfig.deviceId.ifBlank { propDeviceId }
         val resolvedCompany = if (fileConfig.companyId > 0) fileConfig.companyId else if (propCompany > 0) propCompany else FALLBACK_COMPANY_ID
         val resolvedServer = fileConfig.serverUrl.ifBlank { if (propServer.isNotBlank()) propServer else FALLBACK_SERVER_URL }
+        // Preserva fallback (VPS) e tunnelPort vindos do arquivo escrito pelo Desktop.
+        val resolvedFallback = fileConfig.fallbackServerUrl
+        val resolvedTunnelPort = fileConfig.tunnelPort
 
         // BLOQUEIO DE IDENTIDADE FACTUAL: um deviceId ESF- vindo do arquivo/prop é
         // IMUTÁVEL — nunca é substituído por ANDROID_ID (que muda em reinstall/clear
@@ -399,7 +423,7 @@ class EsferaAgentService : Service() {
         // Espelha a identidade resolvida de volta para o armazenamento DO APP
         // (writable sem permissão especial; o /sdcard é escrito pelo Desktop).
         try {
-            val out = EsferaConfig(serverUrl = resolvedServer, deviceId = finalDeviceId, companyId = resolvedCompany)
+            val out = EsferaConfig(serverUrl = resolvedServer, fallbackServerUrl = resolvedFallback, deviceId = finalDeviceId, tunnelEnabled = fileConfig.tunnelEnabled, tunnelPort = resolvedTunnelPort, companyId = resolvedCompany)
             val ext = getExternalFilesDir(null)
             val writeTarget = if (ext != null && (ext.exists() || ext.mkdirs())) File(ext, "esfera_config.json") else File(filesDir, "esfera_config.json")
             writeTarget.writeText(json.encodeToString(EsferaConfig.serializer(), out))
@@ -411,12 +435,15 @@ class EsferaAgentService : Service() {
         try {
             getSharedPreferences("esfera_agent", MODE_PRIVATE).edit()
                 .putString("serverUrl", resolvedServer)
+                .putString("fallbackServerUrl", resolvedFallback)
                 .putString("deviceId", finalDeviceId)
+                .putBoolean("tunnelEnabled", fileConfig.tunnelEnabled)
+                .putInt("tunnelPort", resolvedTunnelPort)
                 .putInt("companyId", resolvedCompany)
                 .apply()
         } catch (_: Exception) {}
 
-        return EsferaConfig(serverUrl = resolvedServer, deviceId = finalDeviceId, companyId = resolvedCompany)
+        return EsferaConfig(serverUrl = resolvedServer, fallbackServerUrl = resolvedFallback, deviceId = finalDeviceId, tunnelEnabled = fileConfig.tunnelEnabled, tunnelPort = resolvedTunnelPort, companyId = resolvedCompany)
     }
 
     /**
@@ -472,7 +499,7 @@ class EsferaAgentService : Service() {
     }
 
     private fun startPresenceLoop(config: EsferaConfig) {
-        presenceClient?.stop()
+        presenceClients.forEach { it.stop() }; presenceClients.clear()
         val cleaned = config.serverUrl
             .replace("http://", "")
             .replace("https://", "")
@@ -484,16 +511,32 @@ class EsferaAgentService : Service() {
         } else {
             7779
         }
-        presenceClient = PresenceClient(
-            context = this,
-            deviceId = config.deviceId,
-            serverHost = host,
-            wsPort = wsPort,
-            companyId = config.companyId,
-            useTls = useTls,
-            adbAddressProvider = { resolveCurrentIp()?.let { "$it:5555" } ?: "" },
-            adbSerial = resolveAdbSerial()
-        ).apply { start() }
+        // DUAS FORMAS, AO MESMO TEMPO, ambas por ID:
+        //  (1) reversa: celular -> host/VPS (fallbackServerUrl). O celular inicia a
+        //      conexão, então o IP dele nunca importa; o desktop o vê pelo hub.
+        //  (2) direta: celular -> desktop atual (serverUrl = 127.0.0.1 via adb
+        //      reverse, USB ou Wi-Fi). Cai sozinha quando o transporte ADB some e
+        //      volta quando ele retorna — sem derrubar a (1).
+        val hubHost = config.fallbackServerUrl
+            .replace("http://", "").replace("https://", "")
+            .substringBefore(':').substringBefore('/')
+        val targets = buildList {
+            add(host)
+            if (hubHost.isNotBlank() && hubHost != host) add(hubHost)
+        }
+        val adbSerial = resolveAdbSerial()
+        for (target in targets) {
+            presenceClients += PresenceClient(
+                context = this,
+                deviceId = config.deviceId,
+                serverHost = target,
+                wsPort = wsPort,
+                companyId = config.companyId,
+                useTls = useTls,
+                adbAddressProvider = { resolveCurrentIp()?.let { "$it:5555" } ?: "" },
+                adbSerial = adbSerial
+            ).apply { start() }
+        }
     }
 
     private fun loadConfigAndStart() {
@@ -520,11 +563,15 @@ class EsferaAgentService : Service() {
     private fun startCheckInLoop(config: EsferaConfig) {
         android.util.Log.d("EsferaAgent", "startCheckInLoop: iniciado")
         checkInJob?.cancel()
-        val host = config.serverUrl
+        // Check-in HTTP registra o aparelho no HUB/VPS. serverUrl agora é o
+        // programa desktop local (127.0.0.1, sem servidor de check-in); por isso
+        // o check-in usa o fallbackServerUrl (VPS) quando existir.
+        val checkInBase = config.fallbackServerUrl.ifBlank { config.serverUrl }
+        val host = checkInBase
             .replace("https://", "").replace("http://", "")
             .substringBefore(':').substringBefore('/').ifEmpty { "10.8.0.1" }
         // Compartilhado com o disparo imediato do NetworkCallback (troca de rede).
-        checkInUrls = config.serverUrl to "http://$host:8080"
+        checkInUrls = checkInBase to "http://$host:8080"
         checkInJob = scope.launch {
             // BACKOFF EXPONENCIAL INDESTRUTÍVEL: 2s -> 4s -> 8s -> ... -> máx 30s.
             // Reset para 2s após sucesso. Uma falha temporária de rede NUNCA derruba
@@ -676,14 +723,20 @@ class EsferaAgentService : Service() {
         tunnelJob = scope.launch {
             val instanceUuid = java.util.UUID.randomUUID().toString().substring(0, 8)
             android.util.Log.i("EsferaAgent", "[TUNNEL] loop_instance_created=$instanceUuid")
+            // Candidatos: programa desktop atual (serverUrl -> 127.0.0.1 via adb
+            // reverse) primeiro, VPS (fallbackServerUrl) como fallback.
+            fun hostOf(u: String) = u
+                .replace("http://", "").replace("https://", "")
+                .substringBefore(':').substringBefore('/')
+            val tunHosts = buildList {
+                add(hostOf(config.serverUrl).ifEmpty { "10.8.0.1" })
+                val fb = hostOf(config.fallbackServerUrl)
+                if (fb.isNotBlank() && fb != get(0)) add(fb)
+            }
+            var tunHostIdx = 0
             var backoffMs = 5_000L
             while (isActive) {
-                val host = config.serverUrl
-                    .replace("http://", "")
-                    .replace("https://", "")
-                    .substringBefore(':')
-                    .substringBefore('/')
-                    .ifEmpty { "10.8.0.1" }
+                val host = tunHosts[tunHostIdx]
                 android.util.Log.i("EsferaAgent", "[TUNNEL] server_url=$host instance=$instanceUuid")
                 android.util.Log.i("EsferaAgent", "[TUNNEL] tunnel_port=${config.tunnelPort}")
                 try {
@@ -693,10 +746,13 @@ class EsferaAgentService : Service() {
                     }
                     openTunnel(host, config.tunnelPort, config.deviceId, if (config.companyId <= 0) 1 else config.companyId, instanceUuid)
                     backoffMs = 5_000L
+                    tunHostIdx = 0 // conexão OK: volta a preferir o desktop
                 } catch (e: Exception) {
                     android.util.Log.e("EsferaAgent", "[TUNNEL] connect_error instance=$instanceUuid: ${e.javaClass.simpleName}: ${e.message}")
                     lastDisconnectReason = "tunnel_error: ${e.message}"
                     transition(AgentState.RECONNECTING, "erro túnel: ${e.message}")
+                    // Falhou neste host: próxima tentativa alterna (desktop <-> VPS)
+                    if (tunHosts.size > 1) tunHostIdx = (tunHostIdx + 1) % tunHosts.size
                 }
                 if (first) { first = false; backoffMs = 1_000L }
                 

@@ -82,6 +82,9 @@ export async function api<T>(cmd: string, args: Record<string, unknown> = {}): P
     return await invoke<T>(cmd, { token: _token || "default-token", ...args });
   } catch (err: any) {
     const errMsg = typeof err === "string" ? err : err?.message || "";
+    if (cmd !== "login" && errMsg.includes("token de sessão inválido")) {
+      window.dispatchEvent(new Event("esfera:session-expired"));
+    }
     const isCommandNotFound = errMsg.toLowerCase().includes("command") && errMsg.toLowerCase().includes("not found");
 
     // Apenas tenta rotear via Hub se for modo master E o comando não foi encontrado no binário local
