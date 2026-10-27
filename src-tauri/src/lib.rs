@@ -13,6 +13,7 @@ pub mod config;
 pub mod db;
 mod dispatcher;
 pub mod empresa_server;
+pub mod optout_api;
 pub mod hub;
 pub mod hub_client;
 pub mod presence_server;
@@ -145,6 +146,7 @@ pub fn run() {
 
             dispatcher::Dispatcher::start_worker(db_arc_clone.clone(), Some(app.handle().clone()));
             dispatcher::Dispatcher::start_persistent_adb_keepalive_loop(db_arc_clone.clone());
+            dispatcher::Dispatcher::start_opt_out_import_loop(db_arc_clone.clone());
             adb_manager::AdbManager::start_status_monitor(db_arc_clone);
             diag("ETAPA [5] backend/servers iniciados no setup; setup retorna Ok");
             Ok(())
@@ -271,6 +273,9 @@ pub fn run() {
             stop_campaign,
             retry_failed_campaign_contacts,
             reset_campaign_contacts,
+            list_opt_outs,
+            add_opt_outs,
+            remove_opt_out,
             start_campaign,
             rewrite_message_ai,
             // Hub / Master

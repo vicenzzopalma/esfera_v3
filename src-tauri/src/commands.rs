@@ -266,6 +266,32 @@ fn get_cached_adb_devices() -> Vec<AdbDeviceInfo> {
     list
 }
 
+/// Cache serial ADB (USB "0082925603" ou Wi-Fi "192.168.1.92:5555") -> EsferaDeviceId.
+/// O ID de hardware é a âncora; o serial/IP é só transporte. Evita 1-3 `adb shell`
+/// por aparelho a cada polling do get_devices.
+static ADB_HW_ID_CACHE: std::sync::LazyLock<
+    RwLock<std::collections::HashMap<String, (String, Instant)>>,
+> = std::sync::LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
+const ADB_HW_ID_TTL: Duration = Duration::from_secs(600);
+
+/// Resolve o EsferaDeviceId de um aparelho ADB conectado (estado "device"),
+/// usando cache. Fonte: /sdcard/.esfera_device_id -> persist.esfera.device_id ->
+/// "ESF-" + 8 primeiros de ro.serialno (ver AdbManager::get_persistent_device_id).
+fn resolve_hw_id_cached(serial: &str) -> Option<String> {
+    if let Ok(cache) = ADB_HW_ID_CACHE.read() {
+        if let Some((id, t)) = cache.get(serial) {
+            if t.elapsed() < ADB_HW_ID_TTL {
+                return Some(id.clone());
+            }
+        }
+    }
+    let id = AdbManager::get_persistent_device_id(serial)?;
+    if let Ok(mut cache) = ADB_HW_ID_CACHE.write() {
+        cache.insert(serial.to_string(), (id.clone(), Instant::now()));
+    }
+    Some(id)
+}
+
 fn get_cached_battery(serial: &str) -> i32 {
     if let Ok(lvl) = AdbManager::get_battery_level(serial) {
         return lvl;
@@ -459,6 +485,12 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         let active_adb_list = get_cached_adb_devices();
 
         let mut changed = false;
+        // serial ADB atual -> EsferaDeviceId, preenchido no laço abaixo
+        let mut adb_hw_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Esquece seriais que saíram do ADB (o mesmo IP pode voltar em outro aparelho)
+        if let Ok(mut cache) = ADB_HW_ID_CACHE.write() {
+            cache.retain(|s, _| active_adb_list.iter().any(|a| &a.serial == s && a.state == "device"));
+        }
 
         for adb_dev in &active_adb_list {
             if adb_dev.serial == "*" || adb_dev.serial.starts_with('*') {
@@ -509,18 +541,36 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             };
 
             let persistent_id = if adb_dev.state == "device" {
-                AdbManager::get_persistent_device_id(&adb_dev.serial)
+                resolve_hw_id_cached(&adb_dev.serial)
             } else { None };
+            if let Some(ref pid) = persistent_id {
+                adb_hw_ids.insert(adb_dev.serial.clone(), pid.clone());
+            }
 
             let (brand, model) = AdbManager::get_device_info(&adb_dev.serial);
 
-            let existing_idx = db_devices.iter().position(|d| {
-                d.serial == adb_dev.serial
-                    || (persistent_id.is_some() && d.esfera_device_id.as_deref() == persistent_id.as_deref())
-                    || (persistent_id.is_some() && d.serial == persistent_id.as_deref().unwrap())
-                    || (!ip_only.is_empty() && d.ip == ip_only)
-                    || d.current_adb_address.as_deref() == Some(&adb_dev.serial)
-            });
+            // 1º: ID de hardware (âncora). IP/serial antigos no banco não importam.
+            // 2º: só por transporte (serial/endereço/IP) se a linha não pertencer a OUTRO hardware.
+            let existing_idx = persistent_id
+                .as_deref()
+                .and_then(|pid| {
+                    db_devices.iter().position(|d| {
+                        d.esfera_device_id.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(pid))
+                            || d.serial.eq_ignore_ascii_case(pid)
+                    })
+                })
+                .or_else(|| {
+                    db_devices.iter().position(|d| {
+                        let other_hw = match (d.esfera_device_id.as_deref(), persistent_id.as_deref()) {
+                            (Some(e), Some(pid)) => !e.eq_ignore_ascii_case(pid),
+                            _ => false,
+                        };
+                        !other_hw
+                            && (d.serial == adb_dev.serial
+                                || (!ip_only.is_empty() && d.ip == ip_only)
+                                || d.current_adb_address.as_deref() == Some(&adb_dev.serial))
+                    })
+                });
 
             // PROTEÇÃO ABSOLUTA DE IDENTIDADE (regra §5 skill: nome protegido contra VPS):
             // 1. Se já estiver no ESF_DeviceIdentity pelo Hardware ID (persistente), usa o nome salvo lá.
@@ -569,6 +619,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 db_devices[idx].current_adb_address = Some(adb_dev.serial.clone());
                 if persistent_id.is_some() { db_devices[idx].esfera_device_id = persistent_id.clone(); }
                 if is_wireless && !ip_only.is_empty() { db_devices[idx].ip = ip_only.clone(); }
+                db_devices[idx].last_seen_utc = Some(chrono::Utc::now().to_rfc3339());
                 if adb_dev.state == "device" {
                     db_devices[idx].battery = get_cached_battery(&adb_dev.serial);
                 } else {
@@ -659,12 +710,19 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             let matching_adb = active_adb_list
                 .iter()
                 .filter(|adb_d| {
+                    let dev_hw = dev.esfera_device_id.as_deref().unwrap_or("");
+                    let adb_hw = adb_hw_ids.get(&adb_d.serial).map(String::as_str);
+                    // Âncora: ID de hardware resolvido do aparelho conectado (USB ou TCP)
+                    if !dev_hw.is_empty() {
+                        if let Some(hw) = adb_hw {
+                            return hw.eq_ignore_ascii_case(dev_hw);
+                        }
+                    }
+                    // Sem ID resolvido (ex.: unauthorized): casa por transporte
                     adb_d.serial == dev.serial
                         || dev.current_adb_address.as_deref() == Some(&adb_d.serial)
                         || (!dev.ip.is_empty() && (adb_d.serial == dev.ip || adb_d.serial.starts_with(&format!("{}:", dev.ip))))
-                        || (dev.esfera_device_id.is_some()
-                            && (adb_d.serial.to_uppercase().starts_with(dev.esfera_device_id.as_deref().unwrap_or("___"))
-                                || dev.serial.to_uppercase().starts_with(dev.esfera_device_id.as_deref().unwrap_or("___"))))
+                        || (!dev_hw.is_empty() && device_id_from_serial(&adb_d.serial).eq_ignore_ascii_case(dev_hw))
                 })
                 .max_by_key(|adb_d| match adb_d.state.as_str() {
                     "device" => 2,
@@ -1638,9 +1696,21 @@ pub fn update_campaign(state: State<'_, AppState>, token: String, campaign: Camp
 
 #[tauri::command]
 pub fn soft_delete_campaign(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<(), String> {
-    let _session = validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
     let db = &state.db;
-    db.soft_delete_campaign(campaign_id)
+    let company_id = db.get_campaign_company_id(campaign_id)
+        .ok_or_else(|| "Campanha não encontrada.".to_string())?;
+    check_company_access(&session, company_id)?;
+    if session.role == "colaborador" {
+        return Err("Acesso Negado: Colaborador não pode excluir campanhas.".to_string());
+    }
+    let devices = db.get_campaigns(company_id).into_iter().find(|c| c.id == campaign_id).map(|c| c.device_ids);
+    db.soft_delete_campaign(campaign_id)?;
+    // Campanha pausada excluída: apaga também os contatos temporários dos aparelhos dela.
+    if let Some(device_ids) = devices {
+        crate::dispatcher::cleanup_campaign_contacts(state.db.clone(), company_id, device_ids);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2719,7 +2789,12 @@ pub fn stop_campaign(state: State<'_, AppState>, token: String, campaign_id: i32
     let company_id = state.db.get_campaign_company_id(campaign_id)
         .ok_or_else(|| "Campanha não encontrada.".to_string())?;
     check_company_access(&session, company_id)?;
-    state.db.set_campaign_status(campaign_id, "stopped")
+    state.db.set_campaign_status(campaign_id, "stopped")?;
+    // Parou: apaga os contatos temporários salvos nos aparelhos desta campanha.
+    if let Some(c) = state.db.get_campaigns(company_id).into_iter().find(|c| c.id == campaign_id) {
+        crate::dispatcher::cleanup_campaign_contacts(state.db.clone(), company_id, c.device_ids);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2732,6 +2807,35 @@ pub fn retry_failed_campaign_contacts(state: State<'_, AppState>, token: String,
         return Err("Pause a campanha antes de reprocessar falhas.".to_string());
     }
     state.db.retry_failed_contacts(campaign_id)
+}
+
+#[tauri::command]
+pub fn list_opt_outs(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<serde_json::Value>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    Ok(state.db.list_opt_outs(company_id).into_iter()
+        .map(|(phone, reason, created)| serde_json::json!({ "phone": phone, "reason": reason, "createdAt": created }))
+        .collect())
+}
+
+#[tauri::command]
+pub fn add_opt_outs(state: State<'_, AppState>, token: String, company_id: i32, phones: Vec<String>, reason: String) -> Result<usize, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    let mut added = 0;
+    for p in phones {
+        if state.db.add_opt_out(company_id, &p, &reason).is_ok() {
+            added += 1;
+        }
+    }
+    Ok(added)
+}
+
+#[tauri::command]
+pub fn remove_opt_out(state: State<'_, AppState>, token: String, company_id: i32, phone: String) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    state.db.remove_opt_out(company_id, &phone)
 }
 
 #[tauri::command]
@@ -2758,6 +2862,12 @@ pub fn start_campaign(state: State<'_, AppState>, token: String, campaign_id: i3
         .ok_or_else(|| "Campanha não encontrada nesta empresa.".to_string())?;
     if campaign.device_ids.is_empty() { return Err("Selecione ao menos um aparelho para a campanha.".to_string()); }
     if campaign.message.trim().is_empty() { return Err("Informe o corpo da mensagem.".to_string()); }
+    if campaign.greeting.trim().is_empty() || campaign.closing.trim().is_empty() {
+        return Err("Preencha a saudação e o encerramento: a mensagem sai sempre em 3 partes.".to_string());
+    }
+    if [&campaign.greeting, &campaign.message, &campaign.closing].iter().any(|t| crate::ai_engine::AiEngine::has_money(t)) {
+        return Err("A mensagem cita valores (R$, reais, %, quantias). Remova antes de iniciar.".to_string());
+    }
     if campaign.delay_min < 1 || campaign.delay_max < campaign.delay_min {
         return Err("Intervalo de envio inválido.".to_string());
     }
@@ -2792,7 +2902,11 @@ pub fn start_campaign(state: State<'_, AppState>, token: String, campaign_id: i3
     if !db.get_devices(campaign.company_id).iter().any(|d| d.status == "online" && campaign.device_ids.iter().any(|id| d.esfera_device_id.as_deref() == Some(id.as_str()) || d.serial == *id)) {
         return Err("Nenhum dos aparelhos selecionados está online.".to_string());
     }
-    db.set_campaign_status(campaign_id, "running")
+    db.set_campaign_status(campaign_id, "running")?;
+    // Salva todos os contatos pendentes na agenda dos aparelhos (busca no WhatsApp sem deep link).
+    crate::dispatcher::seed_campaign_contacts(state.db.clone(), campaign_id, campaign.company_id, campaign.device_ids.clone());
+    crate::dispatcher::Dispatcher::wake();
+    Ok(())
 }
 
 #[tauri::command]

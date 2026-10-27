@@ -206,6 +206,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     saveToStorage(STORAGE_KEY_COMPANY, null);
   }, []);
 
+  // Sessão expirada (ex.: app reiniciado com token antigo salvo): volta para o login.
+  useEffect(() => {
+    const onExpired = () => logout();
+    window.addEventListener("esfera:session-expired", onExpired);
+    return () => window.removeEventListener("esfera:session-expired", onExpired);
+  }, [logout]);
+
   const enterCompany = useCallback((companyId: number) => {
     setSelectedCompanyId(companyId);
     saveToStorage(STORAGE_KEY_COMPANY, companyId);

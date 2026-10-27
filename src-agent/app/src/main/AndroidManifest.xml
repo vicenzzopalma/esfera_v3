@@ -12,6 +12,7 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
         android:name=".EsferaApp"
@@ -26,6 +27,16 @@
             android:foregroundServiceType="dataSync" />
 
         <service
+            android:name=".EsferaOptOutNotificationListener"
+            android:exported="true"
+            android:label="Esfera: pedidos de descadastro"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <service
             android:name=".BootJobService"
             android:exported="true"
             android:permission="android.permission.BIND_JOB_SERVICE"
@@ -38,6 +49,18 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Digitação tecla a tecla e leitura da tela pedidas pelo Desktop (adb shell am broadcast).
+             Permissão DUMP: só o shell do ADB chama; outro app do celular não lê a tela nem digita. -->
+        <receiver
+            android:name=".TypeTextReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="com.esfera.agent.TYPE_TEXT" />
+                <action android:name="com.esfera.agent.DUMP_UI" />
             </intent-filter>
         </receiver>
 

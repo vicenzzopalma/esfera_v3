@@ -30,6 +30,17 @@ async fn main() {
     println!("Banco de dados SQLite carregado com sucesso!");
     let _ = std::io::stdout().flush();
 
+    // Canais opcionais desligáveis por ambiente, ex.: ESFERA_HUB_DISABLE=tunnel,tls,mqtt,router
+    // Permite rodar o hub só como IDENTIDADE/PRESENÇA (master 8555 + check-in + presença),
+    // sem expor túnel/controle remoto numa VPS compartilhada.
+    let disabled: std::collections::HashSet<String> = env::var("ESFERA_HUB_DISABLE")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let off = |name: &str| disabled.contains(name);
+
     // 1. Inicia o Hub TCP Master (relay master <-> empresas)
     let hub = hub::Hub::new(port, db.clone());
     tokio::spawn(async move {
@@ -76,10 +87,14 @@ async fn main() {
     });
 
     // 4b. Router de porta lógica (proxy reverso VPS:porta_lógica -> túnel -> adbd)
-    let db_router = db.clone();
-    tokio::spawn(async move {
-        router::start(db_router).await;
-    });
+    if off("router") {
+        println!("Router de porta lógica DESATIVADO (ESFERA_HUB_DISABLE)");
+    } else {
+        let db_router = db.clone();
+        tokio::spawn(async move {
+            router::start(db_router).await;
+        });
+    }
 
     // 5. Tunnel server (agente RUST) :8888 — canal de CONTROLE ADB
     let tunnel_port: u16 = env::var("TUNNEL_PORT")
@@ -87,17 +102,21 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8888);
     let tp = tunnel_port;
-    tokio::spawn(async move {
-        match tunnel_server::start(tp).await {
-            Ok(()) => {}
-            Err(e) => {
-                // Erro CRÍTICO: o handler de túnel não subiu (ex: porta 8888 já
-                // ocupada por zumbi/segunda instância). Sem isso, o agente conecta
-                // num processo que não responde handshake e o celular nunca aparece.
-                eprintln!("❌ TUNNEL SERVER FALHOU AO SUBIR: {}", e);
+    if off("tunnel") {
+        println!("Tunnel server DESATIVADO (ESFERA_HUB_DISABLE) — hub só identidade/presença");
+    } else {
+        tokio::spawn(async move {
+            match tunnel_server::start(tp).await {
+                Ok(()) => {}
+                Err(e) => {
+                    // Erro CRÍTICO: o handler de túnel não subiu (ex: porta 8888 já
+                    // ocupada por zumbi/segunda instância). Sem isso, o agente conecta
+                    // num processo que não responde handshake e o celular nunca aparece.
+                    eprintln!("❌ TUNNEL SERVER FALHOU AO SUBIR: {}", e);
+                }
             }
-        }
-    });
+        });
+    }
 
     // 6. Presence WebSocket (agente KOTLIN) :7779 — telemetria
     let presence_port: u16 = env::var("PRESENCE_PORT")
@@ -116,19 +135,27 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8443);
-    let db_tls = db.clone();
-    tokio::spawn(async move {
-        tls_server::start(db_tls, tls_port).await;
-    });
+    if off("tls") {
+        println!("Servidor TLS DESATIVADO (ESFERA_HUB_DISABLE)");
+    } else {
+        let db_tls = db.clone();
+        tokio::spawn(async move {
+            tls_server::start(db_tls, tls_port).await;
+        });
+    }
 
     // 8. MQTT Fallback Server :1883 — Canal Secundário Redundante
     let mqtt_port: u16 = env::var("MQTT_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(1883);
-    tokio::spawn(async move {
-        mqtt_fallback_server::start(mqtt_port).await;
-    });
+    if off("mqtt") {
+        println!("MQTT fallback DESATIVADO (ESFERA_HUB_DISABLE)");
+    } else {
+        tokio::spawn(async move {
+            mqtt_fallback_server::start(mqtt_port).await;
+        });
+    }
 
     println!(
         "Hub Standalone ATIVO: master={} checkin={} tunnel={} presence={} tls={} mqtt={}",
