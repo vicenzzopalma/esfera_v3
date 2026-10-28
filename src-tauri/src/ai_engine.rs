@@ -805,26 +805,60 @@ impl AiEngine {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
             .join("esfera_v3")
-            .join("gemini-web-profile")
+            .join("gemini-edge-profile")
     }
 
-    /// Caminhos padrão do Chrome e do Edge no Windows.
+    /// Detecta o ProgId do navegador padrão do Windows (HKCU\...\UrlAssociations\https\UserChoice).
+    fn windows_default_https_prog_id() -> String {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            if let Ok(out) = std::process::Command::new("reg")
+                .args([
+                    "query",
+                    r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+                    "/v",
+                    "ProgId",
+                ])
+                .creation_flags(0x08000000)
+                .output()
+            {
+                return String::from_utf8_lossy(&out.stdout).to_lowercase();
+            }
+        }
+        String::new()
+    }
+
+    /// Caminhos padrão do navegador no Windows, priorizando o navegador padrão do sistema (Microsoft Edge).
     pub fn default_browser_candidates() -> Vec<std::path::PathBuf> {
         let mut candidates = Vec::new();
         let mut roots = Vec::new();
-        for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        for var in ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"] {
             if let Some(val) = std::env::var_os(var) {
                 roots.push(std::path::PathBuf::from(val));
             }
         }
-        roots.push(std::path::PathBuf::from(r"C:\Program Files"));
         roots.push(std::path::PathBuf::from(r"C:\Program Files (x86)"));
+        roots.push(std::path::PathBuf::from(r"C:\Program Files"));
 
-        for root in &roots {
-            candidates.push(root.join("Google").join("Chrome").join("Application").join("chrome.exe"));
-        }
-        for root in &roots {
-            candidates.push(root.join("Microsoft").join("Edge").join("Application").join("msedge.exe"));
+        let prog_id = Self::windows_default_https_prog_id();
+        let prefer_chrome = prog_id.contains("chrome") && !prog_id.contains("edge");
+
+        if prefer_chrome {
+            for root in &roots {
+                candidates.push(root.join("Google").join("Chrome").join("Application").join("chrome.exe"));
+            }
+            for root in &roots {
+                candidates.push(root.join("Microsoft").join("Edge").join("Application").join("msedge.exe"));
+            }
+        } else {
+            // Prioriza Microsoft Edge (msedge.exe) quando o Edge é o navegador padrão do sistema
+            for root in &roots {
+                candidates.push(root.join("Microsoft").join("Edge").join("Application").join("msedge.exe"));
+            }
+            for root in &roots {
+                candidates.push(root.join("Google").join("Chrome").join("Application").join("chrome.exe"));
+            }
         }
         candidates
     }
@@ -834,7 +868,7 @@ impl AiEngine {
         candidates.iter().find(|p| p.is_file()).cloned()
     }
 
-    /// Procura `chrome.exe` ou `msedge.exe` instalados nos caminhos padrão do Windows.
+    /// Procura `msedge.exe` (padrão) ou `chrome.exe` instalados nos caminhos padrão do Windows.
     pub fn find_chromium_browser() -> Option<std::path::PathBuf> {
         Self::find_chromium_browser_from_candidates(&Self::default_browser_candidates())
     }
@@ -850,15 +884,17 @@ impl AiEngine {
         ];
         if minimized {
             args.push("--start-minimized".to_string());
+        } else {
+            args.push("--new-window".to_string());
         }
         args.push(Self::GEMINI_WEB_APP_URL.to_string());
         args
     }
 
-    /// Abre o Chrome ou Edge com o perfil do Gemini Web e porta de depuração 9223.
+    /// Abre o navegador padrão (Microsoft Edge) com o perfil do Gemini Web e porta de depuração 9223.
     pub fn launch_gemini_web_browser(minimized: bool) -> Result<String, String> {
         let browser = Self::find_chromium_browser().ok_or_else(|| {
-            "Google Chrome (chrome.exe) ou Microsoft Edge (msedge.exe) não encontrado nos caminhos padrão.".to_string()
+            "Microsoft Edge (msedge.exe) ou Google Chrome (chrome.exe) não encontrado nos caminhos padrão.".to_string()
         })?;
         let profile_dir = Self::gemini_web_profile_dir();
         std::fs::create_dir_all(&profile_dir)
@@ -888,11 +924,11 @@ impl AiEngine {
     /// Verifica em um HTML da página do Gemini se a sessão está logada (tem caixa de texto do chat e não exibe "Fazer login").
     pub fn detect_gemini_login_from_html(html: &str) -> bool {
         let lower = html.to_lowercase();
-        let has_login_prompt = lower.contains(">fazer login<")
-            || lower.contains(">sign in<")
+        let has_login_prompt = lower.contains("fazer login")
+            || lower.contains("sign in")
+            || lower.contains("iniciar sessão")
             || lower.contains("accounts.google.com/servicelogin")
-            || lower.contains("aria-label=\"fazer login\"")
-            || lower.contains("aria-label=\"sign in\"");
+            || lower.contains("accounts.google.com/v3/signin");
         if has_login_prompt {
             return false;
         }
@@ -1020,8 +1056,41 @@ impl AiEngine {
         Ok(res.get("result").and_then(|r| r.get("value")).cloned().unwrap_or(serde_json::Value::Null))
     }
 
-    /// Localiza (ou abre) a aba do Gemini na porta 9223 e retorna a URL de WebSocket CDP da aba.
+    /// Verifica se o navegador aberto na porta 9223 é um Chrome residual quando o navegador preferido é o Microsoft Edge.
+    async fn cdp_close_if_wrong_browser(client: &Client) {
+        let preferred_is_edge = Self::find_chromium_browser()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+            .map(|n| n.contains("msedge"))
+            .unwrap_or(false);
+        if !preferred_is_edge {
+            return;
+        }
+        let ver_url = format!("http://127.0.0.1:{}/json/version", Self::GEMINI_WEB_CDP_PORT);
+        if let Ok(resp) = client.get(&ver_url).send().await {
+            if let Ok(ver) = resp.json::<serde_json::Value>().await {
+                let browser_str = ver.get("Browser").and_then(|v| v.as_str()).unwrap_or("");
+                if !browser_str.is_empty() && !browser_str.contains("Edg/") {
+                    if let Some(ws_url) = ver.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+                        if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(ws_url).await {
+                            let _ = Self::cdp_send_cmd(&mut ws, 1, "Browser.close", json!({})).await;
+                        }
+                    }
+                    // Aguarda a porta 9223 liberar completamente
+                    for _ in 0..15 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        if client.get(&ver_url).send().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Localiza (ou abre) a aba do Gemini / login Google na porta 9223 e retorna a URL de WebSocket CDP da aba.
     async fn cdp_get_gemini_page_ws(client: &Client) -> Result<(String, String), String> {
+        Self::cdp_close_if_wrong_browser(client).await;
+
         let list_url = format!("http://127.0.0.1:{}/json/list", Self::GEMINI_WEB_CDP_PORT);
         let resp = client
             .get(&list_url)
@@ -1033,9 +1102,12 @@ impl AiEngine {
             .await
             .map_err(|e| format!("Resposta inválida da porta {}: {}", Self::GEMINI_WEB_CDP_PORT, e))?;
 
+        // 1. Prioriza aba do Gemini ou da tela de login da Conta Google (accounts.google.com)
         if let Some(t) = targets.iter().find(|t| {
-            t.get("type").and_then(|v| v.as_str()) == Some("page")
-                && t.get("url").and_then(|v| v.as_str()).unwrap_or("").contains("gemini.google.com")
+            let is_page = t.get("type").and_then(|v| v.as_str()) == Some("page");
+            let url = t.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            is_page
+                && (url.contains("gemini.google.com") || url.contains("accounts.google.com"))
                 && t.get("webSocketDebuggerUrl").and_then(|v| v.as_str()).is_some()
         }) {
             let ws = t["webSocketDebuggerUrl"].as_str().unwrap_or_default().to_string();
@@ -1043,8 +1115,13 @@ impl AiEngine {
             return Ok((ws, url));
         }
 
+        // 2. Qualquer outra aba de página visível (não extensão)
         if let Some(t) = targets.iter().find(|t| {
-            t.get("type").and_then(|v| v.as_str()) == Some("page")
+            let is_page = t.get("type").and_then(|v| v.as_str()) == Some("page");
+            let url = t.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            is_page
+                && !url.starts_with("chrome-extension://")
+                && !url.starts_with("devtools://")
                 && t.get("webSocketDebuggerUrl").and_then(|v| v.as_str()).is_some()
         }) {
             let ws = t["webSocketDebuggerUrl"].as_str().unwrap_or_default().to_string();
@@ -1074,6 +1151,29 @@ impl AiEngine {
         Ok((ws, url))
     }
 
+    /// Traz a janela/aba do Gemini Web no Microsoft Edge para a frente.
+    pub async fn bring_gemini_web_to_front() -> Result<(), String> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let (ws_url, page_url) = Self::cdp_get_gemini_page_ws(&client).await?;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = Self::cdp_send_cmd(&mut ws, 1, "Page.bringToFront", json!({})).await;
+        if !page_url.contains("gemini.google.com") && !page_url.contains("accounts.google.com") {
+            let _ = Self::cdp_send_cmd(
+                &mut ws,
+                2,
+                "Page.navigate",
+                json!({ "url": Self::GEMINI_WEB_APP_URL }),
+            )
+            .await;
+        }
+        Ok(())
+    }
+
     /// Conecta na porta 9223 (CDP) e verifica se o usuário está logado no Gemini Web.
     pub async fn check_gemini_web_status() -> GeminiWebStatus {
         let client = match Client::builder().timeout(Duration::from_secs(4)).build() {
@@ -1092,10 +1192,18 @@ impl AiEngine {
                 return GeminiWebStatus {
                     connected: false,
                     browser_open: false,
-                    detail: "Navegador não está aberto. Clique em “Entrar com Google” para abrir e fazer login.".to_string(),
+                    detail: "Navegador não está aberto. Clique em “Entrar com Google” para abrir o Microsoft Edge e fazer login.".to_string(),
                 };
             }
         };
+
+        if page_url.contains("accounts.google.com") {
+            return GeminiWebStatus {
+                connected: false,
+                browser_open: true,
+                detail: "Microsoft Edge aberto na tela de login do Google — conclua o login para conectar.".to_string(),
+            };
+        }
 
         let (mut ws, _) = match tokio_tungstenite::connect_async(&ws_url).await {
             Ok(v) => v,
@@ -1124,23 +1232,28 @@ impl AiEngine {
         let js_check = r#"(() => {
             const href = location.href || '';
             if (href.includes('accounts.google.com')) {
-                return { loggedIn: false, reason: 'Aguardando login na conta Google.' };
+                return { loggedIn: false, hasSignIn: true };
             }
             const input = document.querySelector(
                 'div.ql-editor[contenteditable="true"], rich-textarea [contenteditable="true"], div[role="textbox"][contenteditable="true"], textarea'
             );
-            const links = Array.from(document.querySelectorAll('a, button'));
+            const links = Array.from(document.querySelectorAll('a, button, [role="button"]'));
             const signInBtn = links.find(el => {
-                const t = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                const t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
                 const h = (el.getAttribute('href') || '').toLowerCase();
-                return t === 'fazer login' || t === 'sign in' || t === 'entrar' || h.includes('accounts.google.com/servicelogin');
+                return t === 'fazer login'
+                    || t.startsWith('fazer login')
+                    || t === 'sign in'
+                    || t.startsWith('sign in')
+                    || t === 'iniciar sessão'
+                    || t === 'entrar'
+                    || h.includes('accounts.google.com/servicelogin')
+                    || h.includes('accounts.google.com/v3/signin');
             });
-            const html = document.body ? document.body.innerHTML : '';
             return {
                 loggedIn: Boolean(input) && !Boolean(signInBtn),
                 hasInput: Boolean(input),
-                hasSignIn: Boolean(signInBtn),
-                htmlSample: html.slice(0, 150000)
+                hasSignIn: Boolean(signInBtn)
             };
         })()"#;
 
@@ -1154,37 +1267,54 @@ impl AiEngine {
                 };
             }
         };
-        let dom_logged = val.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
-        let html_sample = val.get("htmlSample").and_then(|v| v.as_str()).unwrap_or("");
-        let logged_in = dom_logged || Self::detect_gemini_login_from_html(html_sample);
+        let logged_in = val.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
 
         if logged_in {
             GeminiWebStatus {
                 connected: true,
                 browser_open: true,
-                detail: "Conectado ao Gemini Web (sessão ativa na porta 9223).".to_string(),
+                detail: "Conectado ao Gemini Web no Microsoft Edge (sessão ativa na porta 9223).".to_string(),
             }
         } else {
             GeminiWebStatus {
                 connected: false,
                 browser_open: true,
-                detail: "Navegador aberto — conclua o login na janela do Google Gemini.".to_string(),
+                detail: "Microsoft Edge aberto — clique em “Fazer login” na janela do Gemini para entrar na sua Conta Google.".to_string(),
             }
         }
     }
 
-    /// Fecha o navegador do perfil conectado na porta 9223.
+    /// Fecha o navegador do perfil conectado na porta 9223 e aguarda liberar a porta.
     pub async fn close_gemini_web_browser() -> Result<(), String> {
         let client = Client::builder()
             .timeout(Duration::from_secs(3))
             .build()
             .map_err(|e| e.to_string())?;
-        if let Ok((ws_url, _)) = Self::cdp_get_gemini_page_ws(&client).await {
-            if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&ws_url).await {
-                let _ = Self::cdp_send_cmd(&mut ws, 1, "Browser.close", json!({})).await;
+        let ver_url = format!("http://127.0.0.1:{}/json/version", Self::GEMINI_WEB_CDP_PORT);
+        let mut closed = false;
+        if let Ok(resp) = client.get(&ver_url).send().await {
+            if let Ok(ver) = resp.json::<serde_json::Value>().await {
+                if let Some(ws_url) = ver.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+                    if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(ws_url).await {
+                        let _ = Self::cdp_send_cmd(&mut ws, 1, "Browser.close", json!({})).await;
+                        closed = true;
+                    }
+                }
             }
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        if !closed {
+            if let Ok((ws_url, _)) = Self::cdp_get_gemini_page_ws(&client).await {
+                if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&ws_url).await {
+                    let _ = Self::cdp_send_cmd(&mut ws, 1, "Browser.close", json!({})).await;
+                }
+            }
+        }
+        for _ in 0..15 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if client.get(&ver_url).send().await.is_err() {
+                break;
+            }
+        }
         Ok(())
     }
 

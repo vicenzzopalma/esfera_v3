@@ -825,7 +825,7 @@ function IntegrationsSection({ companyId, isMaster }: { companyId: number; isMas
             <div className="min-w-0">
               <p className="text-[0.8125rem] font-medium text-primary">Gemini Web (Conta Google — Sem Chave de API)</p>
               <p className="text-[0.75rem] text-tertiary">
-                Usa o navegador Chrome/Edge instalado com perfil próprio do Esfera para reescrever mensagens gratuitamente no site do Gemini, logo após o Groq na cadeia de reserva.
+                Usa o navegador padrão do sistema (Microsoft Edge) com perfil dedicado do Esfera para reescrever mensagens gratuitamente no site do Gemini, logo após o Groq na cadeia de reserva.
               </p>
             </div>
             <span
