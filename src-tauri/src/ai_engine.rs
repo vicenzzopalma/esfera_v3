@@ -87,32 +87,31 @@ impl AiEngine {
         Ok(sanitized)
     }
 
-    /// Reescreve saudação, corpo e finalização SEPARADAMENTE (blocos separados por linha em
-    /// branco) e devolve os blocos na mesma ordem, para serem enviados como mensagens próprias.
-    pub async fn generate_parts_chain(
-        chain: &[AiConfig],
-        base_message: &str,
-        contact_name: &str,
-    ) -> Result<String, String> {
+    /// Reescreve cada parte (blocos separados por linha em branco) e devolve as partes reescritas.
+    /// Usa o marcador {nome} no lugar do nome: a IA não recebe o nome do devedor e a mesma versão
+    /// serve para qualquer contato (o nome entra só na hora do envio).
+    pub async fn rewrite_parts(chain: &[AiConfig], base_message: &str) -> Result<Vec<String>, String> {
         let parts: Vec<&str> = base_message
             .split("\n\n")
             .map(|p| p.trim())
             .filter(|p| !p.is_empty())
             .collect();
-        if parts.len() <= 1 {
-            return Self::generate_message_chain(chain, base_message, contact_name).await;
+        if parts.is_empty() {
+            return Err("texto base vazio".to_string());
         }
-        // Saudação, corpo e finalização em paralelo: o tempo total é o da parte mais lenta.
         let results = futures_util::future::join_all(
-            parts.iter().map(|part| Self::generate_message_chain(chain, part, contact_name)),
+            parts.iter().map(|part| Self::generate_message_chain(chain, part, "{nome}")),
         )
         .await;
         let mut out = Vec::with_capacity(results.len());
-        for r in results {
-            let text = r?;
-            out.push(text.split_whitespace().collect::<Vec<_>>().join(" "));
+        for (original, r) in parts.iter().zip(results) {
+            let text = r?.split_whitespace().collect::<Vec<_>>().join(" ");
+            if original.contains("{nome}") && !text.contains("{nome}") {
+                return Err("a IA tirou o nome do contato da mensagem".to_string());
+            }
+            out.push(text);
         }
-        Ok(out.join("\n\n"))
+        Ok(out)
     }
 
     /// Tenta cada provedor em ordem (cada um com no máximo 20s) até um devolver texto válido.

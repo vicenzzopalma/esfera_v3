@@ -337,6 +337,132 @@ fn campaign_fingerprint(c: &crate::db::Campaign) -> u64 {
     h.finish()
 }
 
+/// Variações de IA por parte guardadas por campanha. Cada contato recebe uma combinação ainda não
+/// usada (12 versões de cada parte = 1.728 combinações). Só chama a IA enquanto faltar versão,
+/// então os planos gratuitos não esgotam, e a IA reescreve com {nome}, sem o nome do devedor.
+const AI_VARIANTS_PER_PART: usize = 12;
+
+#[derive(Default)]
+struct VariantPool {
+    parts: Vec<Vec<String>>,
+    used: std::collections::HashSet<Vec<usize>>,
+}
+
+static AI_VARIANT_POOLS: std::sync::LazyLock<Mutex<HashMap<(i32, u64), VariantPool>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Texto da campanha com o spintax resolvido, mantendo {nome} para a IA (o spintax trataria
+/// "{nome}" como bloco de uma variante só).
+fn base_with_name_placeholder(campaign: &crate::db::Campaign) -> String {
+    let mut full = String::new();
+    if !campaign.greeting.trim().is_empty() {
+        full.push_str(&campaign.greeting);
+        full.push_str("\n\n");
+    }
+    full.push_str(&campaign.message);
+    if !campaign.closing.trim().is_empty() {
+        full.push_str("\n\n");
+        full.push_str(&campaign.closing);
+    }
+    let full = AiEngine::normalize_name_variables(&full);
+    if !campaign.use_spintax {
+        return full;
+    }
+    const MARK: &str = "\u{1}NOME\u{1}";
+    crate::spintax::resolve_spintax(&full.replace("{nome}", MARK)).replace(MARK, "{nome}")
+}
+
+/// Guarda a versão nova (se veio) e escolhe uma combinação ainda não usada nesta campanha.
+fn pool_take(pool: &mut VariantPool, fresh: Option<Vec<String>>) -> Option<Vec<String>> {
+    if let Some(parts) = fresh {
+        if pool.parts.is_empty() {
+            pool.parts = vec![Vec::new(); parts.len()];
+        }
+        if pool.parts.len() == parts.len() {
+            let mut combo = Vec::with_capacity(parts.len());
+            for (i, text) in parts.into_iter().enumerate() {
+                let idx = match pool.parts[i].iter().position(|t| *t == text) {
+                    Some(j) => j,
+                    None => {
+                        pool.parts[i].push(text);
+                        pool.parts[i].len() - 1
+                    }
+                };
+                combo.push(idx);
+            }
+            if pool.used.insert(combo.clone()) {
+                return Some(combo.iter().enumerate().map(|(i, &j)| pool.parts[i][j].clone()).collect());
+            }
+        }
+    }
+    if pool.parts.is_empty() || pool.parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let total: usize = pool.parts.iter().map(|p| p.len()).product();
+    if pool.used.len() >= total {
+        // Todas as combinações já saíram (só com campanha maior que o banco): recomeça.
+        pool.used.clear();
+    }
+    let pick = |combo: &[usize]| -> Vec<String> { combo.iter().enumerate().map(|(i, &j)| pool.parts[i][j].clone()).collect() };
+    for _ in 0..200 {
+        let combo: Vec<usize> = pool.parts.iter().map(|p| rand::random::<usize>() % p.len()).collect();
+        if !pool.used.contains(&combo) {
+            let out = pick(&combo);
+            pool.used.insert(combo);
+            return Some(out);
+        }
+    }
+    // Varredura completa (banco quase todo usado).
+    let sizes: Vec<usize> = pool.parts.iter().map(|p| p.len()).collect();
+    for n in 0..total {
+        let mut rest = n;
+        let combo: Vec<usize> = sizes
+            .iter()
+            .map(|&len| {
+                let i = rest % len;
+                rest /= len;
+                i
+            })
+            .collect();
+        if !pool.used.contains(&combo) {
+            let out = pick(&combo);
+            pool.used.insert(combo);
+            return Some(out);
+        }
+    }
+    None
+}
+
+async fn pooled_ai_message(campaign: &crate::db::Campaign, chain: &[crate::db::AiConfig], contact_name: &str) -> Result<String, String> {
+    let key = (campaign.id, campaign_fingerprint(campaign));
+    let need_more = AI_VARIANT_POOLS
+        .lock()
+        .map(|pools| {
+            pools
+                .get(&key)
+                .map_or(true, |p| p.parts.is_empty() || p.parts.iter().any(|v| v.len() < AI_VARIANTS_PER_PART))
+        })
+        .unwrap_or(true);
+    let mut fresh = None;
+    let mut error = None;
+    if need_more {
+        let base = base_with_name_placeholder(campaign);
+        match timeout(Duration::from_secs(45), AiEngine::rewrite_parts(chain, &base)).await {
+            Ok(Ok(parts)) => fresh = Some(parts),
+            Ok(Err(e)) => error = Some(e),
+            Err(_) => error = Some("Tempo limite total de 45s na geração de IA".to_string()),
+        }
+    }
+    let chosen = {
+        let mut pools = AI_VARIANT_POOLS.lock().map_err(|_| "banco de variações indisponível".to_string())?;
+        pool_take(pools.entry(key).or_default(), fresh)
+    };
+    match chosen {
+        Some(parts) => Ok(AiEngine::replace_contact_name(&parts.join("\n\n"), contact_name)),
+        None => Err(error.unwrap_or_else(|| "sem variações de IA disponíveis".to_string())),
+    }
+}
+
 /// Monta o texto do contato: saudação + corpo + despedida, Spintax e reescrita por IA (com fallback).
 async fn build_message(
     db_arc: Arc<Database>,
@@ -409,7 +535,7 @@ async fn build_message(
 
                 // Cadeia: provedor da campanha/global primeiro, depois os outros com chave salva.
                 let mut chain = vec![config.clone()];
-                for alt in ["groq", "openrouter", "cerebras"] {
+                for alt in ["groq", "cerebras", "openrouter"] {
                     if alt == config.provider.to_lowercase() {
                         continue;
                     }
@@ -425,9 +551,28 @@ async fn build_message(
                         chain.push(alt_cfg);
                     }
                 }
-                let ai_result = timeout(Duration::from_secs(45), AiEngine::generate_parts_chain(&chain, &campaign_text, &next_contact.contact_name))
-                    .await
-                    .unwrap_or_else(|_| Err("Tempo limite total de 45s na geração de IA".to_string()));
+                // O Groq conta o limite diário por modelo: se o principal esgotar, tenta o gpt-oss-20b
+                // com a mesma chave antes de passar para outro provedor.
+                if let Some(pos) = chain
+                    .iter()
+                    .position(|c| c.provider.eq_ignore_ascii_case("groq") && !c.model.contains("gpt-oss-20b"))
+                {
+                    let mut small = chain[pos].clone();
+                    small.model = "openai/gpt-oss-20b".to_string();
+                    chain.insert(pos + 1, small);
+                }
+                // OpenRouter: se o modelo grátis escolhido falhar ou demorar, o roteador automático de
+                // modelos grátis ("openrouter/free") tenta outro com a mesma chave.
+                if let Some(pos) = chain
+                    .iter()
+                    .position(|c| c.provider.eq_ignore_ascii_case("openrouter") && c.model != "openrouter/free")
+                {
+                    let mut auto = chain[pos].clone();
+                    auto.model = "openrouter/free".to_string();
+                    chain.insert(pos + 1, auto);
+                }
+                // Variações da IA reaproveitadas na campanha (poucas chamadas; nome não vai para a IA).
+                let ai_result = pooled_ai_message(&campaign, &chain, &next_contact.contact_name).await;
                 match ai_result {
                     Ok(custom_msg) => custom_msg,
                     Err(error) => {
@@ -1013,5 +1158,36 @@ mod dispatcher_tests {
         assert!(!created_again);
         assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
         assert_eq!(inserter_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod variant_pool_tests {
+    use super::{pool_take, VariantPool};
+
+    #[test]
+    fn combinacoes_nao_repetem_e_guardam_versoes_novas() {
+        let mut pool = VariantPool::default();
+        let a = pool_take(&mut pool, Some(vec!["Oi {nome}".into(), "Corpo A".into(), "Fim A".into()])).unwrap();
+        assert_eq!(a, vec!["Oi {nome}", "Corpo A", "Fim A"]);
+        let b = pool_take(&mut pool, Some(vec!["Olá {nome}".into(), "Corpo B".into(), "Fim A".into()])).unwrap();
+        assert_eq!(b, vec!["Olá {nome}", "Corpo B", "Fim A"]);
+        assert_eq!(pool.parts[2].len(), 1, "versão repetida não duplica");
+        // Sem versão nova: as 2x2x1 = 4 combinações saem sem repetir.
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(a.join("|"));
+        seen.insert(b.join("|"));
+        for _ in 0..2 {
+            assert!(seen.insert(pool_take(&mut pool, None).unwrap().join("|")));
+        }
+        assert_eq!(seen.len(), 4);
+        // Banco esgotado: recomeça em vez de travar a campanha.
+        assert!(pool_take(&mut pool, None).is_some());
+    }
+
+    #[test]
+    fn banco_vazio_sem_versao_nova_cai_no_texto_original() {
+        let mut pool = VariantPool::default();
+        assert!(pool_take(&mut pool, None).is_none());
     }
 }
