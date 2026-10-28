@@ -447,10 +447,12 @@ async fn pooled_ai_message(campaign: &crate::db::Campaign, chain: &[crate::db::A
     let mut error = None;
     if need_more {
         let base = base_with_name_placeholder(campaign);
-        match timeout(Duration::from_secs(45), AiEngine::rewrite_parts(chain, &base)).await {
+        let has_gemini_web = chain.iter().any(|c| c.provider.eq_ignore_ascii_case("gemini_web"));
+        let total_timeout_secs = if has_gemini_web { 180 } else { 45 };
+        match timeout(Duration::from_secs(total_timeout_secs), AiEngine::rewrite_parts(chain, &base)).await {
             Ok(Ok(parts)) => fresh = Some(parts),
             Ok(Err(e)) => error = Some(e),
-            Err(_) => error = Some("Tempo limite total de 45s na geração de IA".to_string()),
+            Err(_) => error = Some(format!("Tempo limite total de {}s na geração de IA", total_timeout_secs)),
         }
     }
     let chosen = {
@@ -461,6 +463,82 @@ async fn pooled_ai_message(campaign: &crate::db::Campaign, chain: &[crate::db::A
         Some(parts) => Ok(AiEngine::replace_contact_name(&parts.join("\n\n"), contact_name)),
         None => Err(error.unwrap_or_else(|| "sem variações de IA disponíveis".to_string())),
     }
+}
+
+/// Monta a cadeia de reserva de IA:
+/// Groq 120b -> Groq 20b -> gemini_web (quando conectado) -> Cerebras -> OpenRouter -> openrouter/free.
+pub fn build_ai_fallback_chain(
+    db: &Database,
+    company_id: i32,
+    config: &crate::db::AiConfig,
+) -> Vec<crate::db::AiConfig> {
+    let mut chain = vec![config.clone()];
+    for alt in ["groq", "cerebras", "openrouter"] {
+        if alt == config.provider.to_lowercase() {
+            continue;
+        }
+        if let Some((key, ep, model)) = db.get_ai_provider_key(company_id, alt) {
+            if key.trim().is_empty() {
+                continue;
+            }
+            let mut alt_cfg = config.clone();
+            alt_cfg.provider = alt.to_string();
+            alt_cfg.api_key = key;
+            alt_cfg.endpoint = ep;
+            alt_cfg.model = model;
+            chain.push(alt_cfg);
+        }
+    }
+    // O Groq conta o limite diário por modelo: se o principal esgotar, tenta o gpt-oss-20b
+    // com a mesma chave antes de passar para outro provedor.
+    if let Some(pos) = chain
+        .iter()
+        .position(|c| c.provider.eq_ignore_ascii_case("groq") && !c.model.contains("gpt-oss-20b"))
+    {
+        let mut small = chain[pos].clone();
+        small.model = "openai/gpt-oss-20b".to_string();
+        chain.insert(pos + 1, small);
+    }
+    // Gemini Web (login Google sem chave de API): entra logo depois do Groq (120b -> 20b -> gemini_web)
+    // quando o usuário tiver conectado na aba Integrações.
+    if !chain.iter().any(|c| c.provider.eq_ignore_ascii_case("gemini_web")) {
+        if let Some((key, ep, model)) = db.get_ai_provider_key(company_id, "gemini_web") {
+            if !key.trim().is_empty() {
+                let mut gw_cfg = config.clone();
+                gw_cfg.provider = "gemini_web".to_string();
+                gw_cfg.api_key = key;
+                gw_cfg.endpoint = if ep.is_empty() {
+                    "http://127.0.0.1:9223".to_string()
+                } else {
+                    ep
+                };
+                gw_cfg.model = if model.is_empty() {
+                    "gemini-web".to_string()
+                } else {
+                    model
+                };
+                if let Some(last_groq_pos) = chain
+                    .iter()
+                    .rposition(|c| c.provider.eq_ignore_ascii_case("groq"))
+                {
+                    chain.insert(last_groq_pos + 1, gw_cfg);
+                } else {
+                    chain.push(gw_cfg);
+                }
+            }
+        }
+    }
+    // OpenRouter: se o modelo grátis escolhido falhar ou demorar, o roteador automático de
+    // modelos grátis ("openrouter/free") tenta outro com a mesma chave.
+    if let Some(pos) = chain
+        .iter()
+        .position(|c| c.provider.eq_ignore_ascii_case("openrouter") && c.model != "openrouter/free")
+    {
+        let mut auto = chain[pos].clone();
+        auto.model = "openrouter/free".to_string();
+        chain.insert(pos + 1, auto);
+    }
+    chain
 }
 
 /// Monta o texto do contato: saudação + corpo + despedida, Spintax e reescrita por IA (com fallback).
@@ -533,44 +611,9 @@ async fn build_message(
                     config.system_prompt = campaign.ai_prompt.clone();
                 }
 
-                // Cadeia: provedor da campanha/global primeiro, depois os outros com chave salva.
-                let mut chain = vec![config.clone()];
-                for alt in ["groq", "cerebras", "openrouter"] {
-                    if alt == config.provider.to_lowercase() {
-                        continue;
-                    }
-                    if let Some((key, ep, model)) = db_arc.get_ai_provider_key(campaign.company_id, alt) {
-                        if key.trim().is_empty() {
-                            continue;
-                        }
-                        let mut alt_cfg = config.clone();
-                        alt_cfg.provider = alt.to_string();
-                        alt_cfg.api_key = key;
-                        alt_cfg.endpoint = ep;
-                        alt_cfg.model = model;
-                        chain.push(alt_cfg);
-                    }
-                }
-                // O Groq conta o limite diário por modelo: se o principal esgotar, tenta o gpt-oss-20b
-                // com a mesma chave antes de passar para outro provedor.
-                if let Some(pos) = chain
-                    .iter()
-                    .position(|c| c.provider.eq_ignore_ascii_case("groq") && !c.model.contains("gpt-oss-20b"))
-                {
-                    let mut small = chain[pos].clone();
-                    small.model = "openai/gpt-oss-20b".to_string();
-                    chain.insert(pos + 1, small);
-                }
-                // OpenRouter: se o modelo grátis escolhido falhar ou demorar, o roteador automático de
-                // modelos grátis ("openrouter/free") tenta outro com a mesma chave.
-                if let Some(pos) = chain
-                    .iter()
-                    .position(|c| c.provider.eq_ignore_ascii_case("openrouter") && c.model != "openrouter/free")
-                {
-                    let mut auto = chain[pos].clone();
-                    auto.model = "openrouter/free".to_string();
-                    chain.insert(pos + 1, auto);
-                }
+                // Cadeia: provedor da campanha/global primeiro, depois os outros com chave salva
+                // (Groq 120b -> Groq 20b -> gemini_web -> Cerebras -> OpenRouter).
+                let chain = build_ai_fallback_chain(&db_arc, campaign.company_id, &config);
                 // Variações da IA reaproveitadas na campanha (poucas chamadas; nome não vai para a IA).
                 let ai_result = pooled_ai_message(&campaign, &chain, &next_contact.contact_name).await;
                 match ai_result {
@@ -1189,5 +1232,54 @@ mod variant_pool_tests {
     fn banco_vazio_sem_versao_nova_cai_no_texto_original() {
         let mut pool = VariantPool::default();
         assert!(pool_take(&mut pool, None).is_none());
+    }
+
+    #[test]
+    fn cadeia_reserva_inclui_gemini_web_logo_apos_groq() {
+        let tmp = std::env::temp_dir().join(format!(
+            "esfera_chain_gemini_web_test_{}_{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let db = crate::db::Database::init(tmp.to_str().unwrap()).expect("db temp");
+        db.save_ai_provider_key(1, "groq", "gsk_test", "", "openai/gpt-oss-120b").unwrap();
+        db.save_ai_provider_key(1, "gemini_web", "connected", "http://127.0.0.1:9223", "gemini-web").unwrap();
+        db.save_ai_provider_key(1, "cerebras", "csk_test", "", "llama3.1-8b").unwrap();
+        db.save_ai_provider_key(1, "openrouter", "sk-or-test", "", "meta-llama/llama-3.3-70b-instruct:free").unwrap();
+
+        let primary = crate::db::AiConfig {
+            company_id: 1,
+            provider: "groq".to_string(),
+            model: "openai/gpt-oss-120b".to_string(),
+            temperature: 0.7,
+            system_prompt: String::new(),
+            api_key: "gsk_test".to_string(),
+            endpoint: String::new(),
+        };
+
+        let chain = super::build_ai_fallback_chain(&db, 1, &primary);
+        let providers_and_models: Vec<(String, String)> = chain
+            .iter()
+            .map(|c| (c.provider.clone(), c.model.clone()))
+            .collect();
+
+        assert_eq!(
+            providers_and_models,
+            vec![
+                ("groq".to_string(), "openai/gpt-oss-120b".to_string()),
+                ("groq".to_string(), "openai/gpt-oss-20b".to_string()),
+                ("gemini_web".to_string(), "gemini-web".to_string()),
+                ("cerebras".to_string(), "llama3.1-8b".to_string()),
+                ("openrouter".to_string(), "meta-llama/llama-3.3-70b-instruct:free".to_string()),
+                ("openrouter".to_string(), "openrouter/free".to_string()),
+            ]
+        );
+
+        // Se desconectar o gemini_web (chave vazia), ele sai da cadeia:
+        db.save_ai_provider_key(1, "gemini_web", "", "", "").unwrap();
+        let chain_disconnected = super::build_ai_fallback_chain(&db, 1, &primary);
+        assert!(!chain_disconnected.iter().any(|c| c.provider == "gemini_web"));
+
+        let _ = std::fs::remove_file(tmp);
     }
 }

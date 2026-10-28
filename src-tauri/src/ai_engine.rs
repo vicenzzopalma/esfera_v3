@@ -8,6 +8,13 @@ use reqwest::Client;
 use serde_json::json;
 use std::time::Duration;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GeminiWebStatus {
+    pub connected: bool,
+    pub browser_open: bool,
+    pub detail: String,
+}
+
 pub struct AiEngine;
 
 impl AiEngine {
@@ -59,6 +66,7 @@ impl AiEngine {
 
         let raw_response = match config.provider.to_lowercase().as_str() {
             "groq" => Self::call_groq(&client, config, &prompt).await?,
+            "gemini_web" => Self::call_gemini_web(&prompt).await?,
             "openrouter" => Self::call_openrouter(&client, config, &prompt).await?,
             "cerebras" => Self::call_cerebras(&client, config, &prompt).await?,
             "lmstudio" | "lm_studio" => Self::call_lmstudio(&client, config, &prompt).await?,
@@ -122,12 +130,13 @@ impl AiEngine {
     ) -> Result<String, String> {
         let mut errors = Vec::new();
         for cfg in chain {
+            let max_secs = if cfg.provider.eq_ignore_ascii_case("gemini_web") { 180 } else { 20 };
             let attempt = tokio::time::timeout(
-                Duration::from_secs(20),
+                Duration::from_secs(max_secs),
                 Self::generate_message(cfg, base_message, contact_name),
             )
             .await
-            .unwrap_or_else(|_| Err("tempo limite de 20s".to_string()));
+            .unwrap_or_else(|_| Err(format!("tempo limite de {}s", max_secs)));
             match attempt {
                 Ok(text) => return Ok(text),
                 Err(e) => {
@@ -773,6 +782,639 @@ impl AiEngine {
     /// Requisição para Endpoint Customizado (formato OpenAI)
     async fn call_custom_endpoint(client: &Client, config: &AiConfig, prompt: &str) -> Result<String, String> {
         Self::call_openai(client, config, prompt).await
+    }
+
+    // ============================================================
+    // GEMINI WEB (Login Google via navegador Chrome/Edge + CDP 9223)
+    // ============================================================
+
+    pub const GEMINI_WEB_CDP_PORT: u16 = 9223;
+    pub const GEMINI_WEB_APP_URL: &'static str = "https://gemini.google.com/app";
+    pub const GEMINI_WEB_MIN_INTERVAL_MS: u64 = 4000;
+    pub const GEMINI_WEB_TIMEOUT_SECS: u64 = 60;
+
+    fn gemini_web_lock() -> &'static tokio::sync::Mutex<Option<std::time::Instant>> {
+        static LOCK: std::sync::LazyLock<tokio::sync::Mutex<Option<std::time::Instant>>> =
+            std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+        &LOCK
+    }
+
+    /// Pasta do perfil exclusivo do navegador para manter o login Google do Gemini Web.
+    pub fn gemini_web_profile_dir() -> std::path::PathBuf {
+        std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("esfera_v3")
+            .join("gemini-web-profile")
+    }
+
+    /// Caminhos padrão do Chrome e do Edge no Windows.
+    pub fn default_browser_candidates() -> Vec<std::path::PathBuf> {
+        let mut candidates = Vec::new();
+        let mut roots = Vec::new();
+        for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+            if let Some(val) = std::env::var_os(var) {
+                roots.push(std::path::PathBuf::from(val));
+            }
+        }
+        roots.push(std::path::PathBuf::from(r"C:\Program Files"));
+        roots.push(std::path::PathBuf::from(r"C:\Program Files (x86)"));
+
+        for root in &roots {
+            candidates.push(root.join("Google").join("Chrome").join("Application").join("chrome.exe"));
+        }
+        for root in &roots {
+            candidates.push(root.join("Microsoft").join("Edge").join("Application").join("msedge.exe"));
+        }
+        candidates
+    }
+
+    /// Retorna o primeiro executável de navegador existente na lista de candidatos.
+    pub fn find_chromium_browser_from_candidates(candidates: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+        candidates.iter().find(|p| p.is_file()).cloned()
+    }
+
+    /// Procura `chrome.exe` ou `msedge.exe` instalados nos caminhos padrão do Windows.
+    pub fn find_chromium_browser() -> Option<std::path::PathBuf> {
+        Self::find_chromium_browser_from_candidates(&Self::default_browser_candidates())
+    }
+
+    /// Monta os argumentos de linha de comando para abrir o navegador com perfil próprio e CDP na porta 9223.
+    pub fn build_gemini_browser_args(profile_dir: &std::path::Path, minimized: bool) -> Vec<String> {
+        let mut args = vec![
+            format!("--user-data-dir={}", profile_dir.display()),
+            format!("--remote-debugging-port={}", Self::GEMINI_WEB_CDP_PORT),
+            "--remote-allow-origins=*".to_string(),
+            "--no-first-run".to_string(),
+            "--no-default-browser-check".to_string(),
+        ];
+        if minimized {
+            args.push("--start-minimized".to_string());
+        }
+        args.push(Self::GEMINI_WEB_APP_URL.to_string());
+        args
+    }
+
+    /// Abre o Chrome ou Edge com o perfil do Gemini Web e porta de depuração 9223.
+    pub fn launch_gemini_web_browser(minimized: bool) -> Result<String, String> {
+        let browser = Self::find_chromium_browser().ok_or_else(|| {
+            "Google Chrome (chrome.exe) ou Microsoft Edge (msedge.exe) não encontrado nos caminhos padrão.".to_string()
+        })?;
+        let profile_dir = Self::gemini_web_profile_dir();
+        std::fs::create_dir_all(&profile_dir)
+            .map_err(|e| format!("Falha ao criar pasta de perfil {:?}: {}", profile_dir, e))?;
+        let args = Self::build_gemini_browser_args(&profile_dir, minimized);
+        std::process::Command::new(&browser)
+            .args(&args)
+            .spawn()
+            .map_err(|e| format!("Falha ao iniciar navegador {:?}: {}", browser, e))?;
+        Ok(browser.to_string_lossy().to_string())
+    }
+
+    /// Aplica intervalo mínimo entre chamadas ao Gemini Web mantendo o controle de instante.
+    pub async fn enforce_gemini_web_rate_limit(
+        last_call: &mut Option<std::time::Instant>,
+        min_interval: Duration,
+    ) {
+        if let Some(prev) = *last_call {
+            let elapsed = prev.elapsed();
+            if elapsed < min_interval {
+                tokio::time::sleep(min_interval - elapsed).await;
+            }
+        }
+        *last_call = Some(std::time::Instant::now());
+    }
+
+    /// Verifica em um HTML da página do Gemini se a sessão está logada (tem caixa de texto do chat e não exibe "Fazer login").
+    pub fn detect_gemini_login_from_html(html: &str) -> bool {
+        let lower = html.to_lowercase();
+        let has_login_prompt = lower.contains(">fazer login<")
+            || lower.contains(">sign in<")
+            || lower.contains("accounts.google.com/servicelogin")
+            || lower.contains("aria-label=\"fazer login\"")
+            || lower.contains("aria-label=\"sign in\"");
+        if has_login_prompt {
+            return false;
+        }
+        lower.contains("ql-editor")
+            || lower.contains("rich-textarea")
+            || (lower.contains("contenteditable=\"true\"") && lower.contains("role=\"textbox\""))
+            || lower.contains("peça ao gemini")
+            || lower.contains("ask gemini")
+    }
+
+    /// Extrai o texto limpo da última resposta do modelo a partir de um HTML da conversa do Gemini.
+    pub fn extract_gemini_response_from_html(html: &str) -> Option<String> {
+        let markers = [
+            "model-response-text",
+            "data-message-author-role=\"model\"",
+            "<message-content",
+            "<model-response",
+        ];
+        let mut best_slice: Option<&str> = None;
+        for marker in markers {
+            if let Some(pos) = html.rfind(marker) {
+                if let Some(gt) = html[pos..].find('>') {
+                    let after_open = &html[pos + gt + 1..];
+                    let end = after_open
+                        .find("</model-response>")
+                        .or_else(|| after_open.find("</message-content>"))
+                        .unwrap_or(after_open.len());
+                    best_slice = Some(&after_open[..end]);
+                    break;
+                }
+            }
+        }
+        let raw_fragment = best_slice?;
+        let text = Self::strip_html_tags(raw_fragment);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    fn strip_html_tags(fragment: &str) -> String {
+        let normalized = fragment
+            .replace("<br>", "\n")
+            .replace("<br/>", "\n")
+            .replace("<br />", "\n")
+            .replace("</p>", "\n")
+            .replace("</div>", "\n")
+            .replace("</li>", "\n");
+        let mut out = String::with_capacity(normalized.len());
+        let mut in_tag = false;
+        for c in normalized.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out.replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Envia um comando JSON-RPC via WebSocket CDP e aguarda a resposta com o mesmo `id`.
+    async fn cdp_send_cmd(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let payload = json!({
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        ws.send(Message::Text(payload.to_string()))
+            .await
+            .map_err(|e| format!("Erro ao enviar comando CDP {}: {}", method, e))?;
+
+        while let Some(msg) = ws.next().await {
+            let msg = msg.map_err(|e| format!("Erro ao ler WebSocket CDP: {}", e))?;
+            if let Message::Text(txt) = msg {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+                        if let Some(err) = v.get("error") {
+                            return Err(format!("Erro CDP em {}: {}", method, err));
+                        }
+                        return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
+                    }
+                }
+            }
+        }
+        Err("Conexão CDP encerrada antes da resposta".to_string())
+    }
+
+    async fn cdp_eval_js(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        id: u64,
+        expression: &str,
+    ) -> Result<serde_json::Value, String> {
+        let res = Self::cdp_send_cmd(
+            ws,
+            id,
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true,
+            }),
+        )
+        .await?;
+        Ok(res.get("result").and_then(|r| r.get("value")).cloned().unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Localiza (ou abre) a aba do Gemini na porta 9223 e retorna a URL de WebSocket CDP da aba.
+    async fn cdp_get_gemini_page_ws(client: &Client) -> Result<(String, String), String> {
+        let list_url = format!("http://127.0.0.1:{}/json/list", Self::GEMINI_WEB_CDP_PORT);
+        let resp = client
+            .get(&list_url)
+            .send()
+            .await
+            .map_err(|e| format!("Porta {} indisponível: {}", Self::GEMINI_WEB_CDP_PORT, e))?;
+        let targets: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| format!("Resposta inválida da porta {}: {}", Self::GEMINI_WEB_CDP_PORT, e))?;
+
+        if let Some(t) = targets.iter().find(|t| {
+            t.get("type").and_then(|v| v.as_str()) == Some("page")
+                && t.get("url").and_then(|v| v.as_str()).unwrap_or("").contains("gemini.google.com")
+                && t.get("webSocketDebuggerUrl").and_then(|v| v.as_str()).is_some()
+        }) {
+            let ws = t["webSocketDebuggerUrl"].as_str().unwrap_or_default().to_string();
+            let url = t.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            return Ok((ws, url));
+        }
+
+        if let Some(t) = targets.iter().find(|t| {
+            t.get("type").and_then(|v| v.as_str()) == Some("page")
+                && t.get("webSocketDebuggerUrl").and_then(|v| v.as_str()).is_some()
+        }) {
+            let ws = t["webSocketDebuggerUrl"].as_str().unwrap_or_default().to_string();
+            let url = t.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            return Ok((ws, url));
+        }
+
+        let new_url = format!(
+            "http://127.0.0.1:{}/json/new?{}",
+            Self::GEMINI_WEB_CDP_PORT,
+            Self::GEMINI_WEB_APP_URL
+        );
+        let created: serde_json::Value = client
+            .put(&new_url)
+            .send()
+            .await
+            .map_err(|e| format!("Falha ao abrir aba no navegador CDP: {}", e))?
+            .json()
+            .await
+            .map_err(|e| format!("Resposta inválida ao criar aba CDP: {}", e))?;
+        let ws = created
+            .get("webSocketDebuggerUrl")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Aba criada sem webSocketDebuggerUrl".to_string())?
+            .to_string();
+        let url = created.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        Ok((ws, url))
+    }
+
+    /// Conecta na porta 9223 (CDP) e verifica se o usuário está logado no Gemini Web.
+    pub async fn check_gemini_web_status() -> GeminiWebStatus {
+        let client = match Client::builder().timeout(Duration::from_secs(4)).build() {
+            Ok(c) => c,
+            Err(e) => {
+                return GeminiWebStatus {
+                    connected: false,
+                    browser_open: false,
+                    detail: e.to_string(),
+                };
+            }
+        };
+        let (ws_url, page_url) = match Self::cdp_get_gemini_page_ws(&client).await {
+            Ok(v) => v,
+            Err(_) => {
+                return GeminiWebStatus {
+                    connected: false,
+                    browser_open: false,
+                    detail: "Navegador não está aberto. Clique em “Entrar com Google” para abrir e fazer login.".to_string(),
+                };
+            }
+        };
+
+        let (mut ws, _) = match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok(v) => v,
+            Err(e) => {
+                return GeminiWebStatus {
+                    connected: false,
+                    browser_open: true,
+                    detail: format!("Falha ao conectar via WebSocket na porta 9223: {}", e),
+                };
+            }
+        };
+
+        let mut cmd_id = 1u64;
+        if !page_url.contains("gemini.google.com") && !page_url.contains("accounts.google.com") {
+            let _ = Self::cdp_send_cmd(
+                &mut ws,
+                cmd_id,
+                "Page.navigate",
+                json!({ "url": Self::GEMINI_WEB_APP_URL }),
+            )
+            .await;
+            cmd_id += 1;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+
+        let js_check = r#"(() => {
+            const href = location.href || '';
+            if (href.includes('accounts.google.com')) {
+                return { loggedIn: false, reason: 'Aguardando login na conta Google.' };
+            }
+            const input = document.querySelector(
+                'div.ql-editor[contenteditable="true"], rich-textarea [contenteditable="true"], div[role="textbox"][contenteditable="true"], textarea'
+            );
+            const links = Array.from(document.querySelectorAll('a, button'));
+            const signInBtn = links.find(el => {
+                const t = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                const h = (el.getAttribute('href') || '').toLowerCase();
+                return t === 'fazer login' || t === 'sign in' || t === 'entrar' || h.includes('accounts.google.com/servicelogin');
+            });
+            const html = document.body ? document.body.innerHTML : '';
+            return {
+                loggedIn: Boolean(input) && !Boolean(signInBtn),
+                hasInput: Boolean(input),
+                hasSignIn: Boolean(signInBtn),
+                htmlSample: html.slice(0, 150000)
+            };
+        })()"#;
+
+        let val = match Self::cdp_eval_js(&mut ws, cmd_id, js_check).await {
+            Ok(v) => v,
+            Err(e) => {
+                return GeminiWebStatus {
+                    connected: false,
+                    browser_open: true,
+                    detail: e,
+                };
+            }
+        };
+        let dom_logged = val.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+        let html_sample = val.get("htmlSample").and_then(|v| v.as_str()).unwrap_or("");
+        let logged_in = dom_logged || Self::detect_gemini_login_from_html(html_sample);
+
+        if logged_in {
+            GeminiWebStatus {
+                connected: true,
+                browser_open: true,
+                detail: "Conectado ao Gemini Web (sessão ativa na porta 9223).".to_string(),
+            }
+        } else {
+            GeminiWebStatus {
+                connected: false,
+                browser_open: true,
+                detail: "Navegador aberto — conclua o login na janela do Google Gemini.".to_string(),
+            }
+        }
+    }
+
+    /// Fecha o navegador do perfil conectado na porta 9223.
+    pub async fn close_gemini_web_browser() -> Result<(), String> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|e| e.to_string())?;
+        if let Ok((ws_url, _)) = Self::cdp_get_gemini_page_ws(&client).await {
+            if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&ws_url).await {
+                let _ = Self::cdp_send_cmd(&mut ws, 1, "Browser.close", json!({})).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        Ok(())
+    }
+
+    /// Reescreve mensagem usando o Gemini Web via CDP (porta 9223):
+    /// 1 pedido por vez (mutex global), intervalo mínimo entre pedidos e tempo-limite de 60 s.
+    pub async fn call_gemini_web(prompt: &str) -> Result<String, String> {
+        let mut guard = Self::gemini_web_lock().lock().await;
+        Self::enforce_gemini_web_rate_limit(
+            &mut *guard,
+            Duration::from_millis(Self::GEMINI_WEB_MIN_INTERVAL_MS),
+        )
+        .await;
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(Self::GEMINI_WEB_TIMEOUT_SECS),
+            Self::call_gemini_web_inner(prompt),
+        )
+        .await
+        .unwrap_or_else(|_| Err("Tempo limite de 60s excedido no Gemini Web".to_string()));
+
+        *guard = Some(std::time::Instant::now());
+        res
+    }
+
+    async fn call_gemini_web_inner(prompt: &str) -> Result<String, String> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        // Se o navegador do perfil não estiver aberto na porta 9223, abre minimizado e aguarda subir.
+        if Self::cdp_get_gemini_page_ws(&client).await.is_err() {
+            Self::launch_gemini_web_browser(true)?;
+            let start = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if Self::cdp_get_gemini_page_ws(&client).await.is_ok() {
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(12) {
+                    return Err("Não foi possível conectar na porta 9223 do navegador Gemini Web.".to_string());
+                }
+            }
+        }
+
+        let (ws_url, _) = Self::cdp_get_gemini_page_ws(&client).await?;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .map_err(|e| format!("Falha ao conectar ao WebSocket CDP: {}", e))?;
+
+        let mut cmd_id = 1u64;
+        // Abre um chat novo em https://gemini.google.com/app
+        let _ = Self::cdp_send_cmd(
+            &mut ws,
+            cmd_id,
+            "Page.navigate",
+            json!({ "url": Self::GEMINI_WEB_APP_URL }),
+        )
+        .await?;
+        cmd_id += 1;
+
+        // Aguarda a caixa de texto do chat carregar (até 15s)
+        let wait_input_js = r#"(() => {
+            const links = Array.from(document.querySelectorAll('a, button'));
+            const signIn = links.some(el => {
+                const t = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                const h = (el.getAttribute('href') || '').toLowerCase();
+                return t === 'fazer login' || t === 'sign in' || h.includes('accounts.google.com/servicelogin');
+            });
+            const el = document.querySelector(
+                'div.ql-editor[contenteditable="true"], rich-textarea [contenteditable="true"], div[role="textbox"][contenteditable="true"], textarea'
+            );
+            const responses = document.querySelectorAll(
+                'model-response, message-content, .model-response-text, [data-message-author-role="model"]'
+            ).length;
+            return { ready: Boolean(el) && !signIn, signIn, responses };
+        })()"#;
+
+        let mut baseline_responses = 0usize;
+        let mut ready = false;
+        let nav_start = std::time::Instant::now();
+        while nav_start.elapsed() < Duration::from_secs(15) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let state = Self::cdp_eval_js(&mut ws, cmd_id, wait_input_js).await?;
+            cmd_id += 1;
+            if state.get("signIn").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return Err("Gemini Web não está logado. Acesse Configurações → Integrações → Entrar com Google.".to_string());
+            }
+            if state.get("ready").and_then(|v| v.as_bool()).unwrap_or(false) {
+                baseline_responses = state.get("responses").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                ready = true;
+                break;
+            }
+        }
+        if !ready {
+            return Err("Caixa de texto do Gemini Web não ficou pronta (verifique se o login Google está ativo).".to_string());
+        }
+
+        // Foca e limpa a caixa de texto
+        let focus_js = r#"(() => {
+            const el = document.querySelector(
+                'div.ql-editor[contenteditable="true"], rich-textarea [contenteditable="true"], div[role="textbox"][contenteditable="true"], textarea'
+            );
+            if (!el) return false;
+            el.focus();
+            if ('value' in el) {
+                el.value = '';
+            } else {
+                el.innerHTML = '';
+            }
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            return true;
+        })()"#;
+        let focused = Self::cdp_eval_js(&mut ws, cmd_id, focus_js).await?;
+        cmd_id += 1;
+        if !focused.as_bool().unwrap_or(false) {
+            return Err("Não foi possível focar o campo de mensagem do Gemini Web.".to_string());
+        }
+
+        // Digita o prompt via Input.insertText (com fallback via DOM caso necessário)
+        if Self::cdp_send_cmd(&mut ws, cmd_id, "Input.insertText", json!({ "text": prompt }))
+            .await
+            .is_err()
+        {
+            cmd_id += 1;
+            let set_text_js = format!(
+                r#"(() => {{
+                    const el = document.querySelector('div.ql-editor[contenteditable="true"], rich-textarea [contenteditable="true"], div[role="textbox"][contenteditable="true"], textarea');
+                    if (!el) return false;
+                    const txt = {};
+                    if ('value' in el) {{ el.value = txt; }} else {{ el.textContent = txt; }}
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    return true;
+                }})()"#,
+                serde_json::to_string(prompt).unwrap_or_else(|_| "\"\"".to_string())
+            );
+            let _ = Self::cdp_eval_js(&mut ws, cmd_id, &set_text_js).await?;
+        }
+        cmd_id += 1;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Envia a mensagem clicando no botão de envio ou pressionando Enter
+        let send_js = r#"(() => {
+            const btn = document.querySelector(
+                'button.send-button, button[aria-label*="Enviar"], button[aria-label*="Send"], .send-button-container button'
+            );
+            if (btn && !btn.disabled) {
+                btn.click();
+                return 'clicked';
+            }
+            const el = document.querySelector(
+                'div.ql-editor[contenteditable="true"], rich-textarea [contenteditable="true"], div[role="textbox"][contenteditable="true"], textarea'
+            );
+            if (el) {
+                el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+                return 'enter';
+            }
+            return '';
+        })()"#;
+        let sent_mode = Self::cdp_eval_js(&mut ws, cmd_id, send_js).await?;
+        cmd_id += 1;
+        if sent_mode.as_str().unwrap_or("").is_empty() {
+            return Err("Não foi possível acionar o envio no Gemini Web.".to_string());
+        }
+
+        // Aguarda a resposta terminar: botão de parar some e o texto para de mudar por 2 s
+        let poll_js = r#"(() => {
+            const nodes = Array.from(document.querySelectorAll(
+                'message-content, .model-response-text, model-response, [data-message-author-role="model"]'
+            ));
+            const count = nodes.length;
+            const last = count > 0 ? nodes[count - 1] : null;
+            const text = last ? (last.innerText || last.textContent || '').trim() : '';
+            const html = last ? (last.outerHTML || '') : '';
+            const stopBtn = document.querySelector(
+                'button[aria-label*="Parar"], button[aria-label*="Stop"], .stop-button, mat-icon[data-mat-icon-name="stop"]'
+            );
+            const generating = Boolean(stopBtn && stopBtn.offsetParent !== null);
+            return { count, text, html, generating };
+        })()"#;
+
+        let mut last_text = String::new();
+        let mut stable_since: Option<std::time::Instant> = None;
+        let poll_start = std::time::Instant::now();
+
+        while poll_start.elapsed() < Duration::from_secs(50) {
+            tokio::time::sleep(Duration::from_millis(450)).await;
+            let state = Self::cdp_eval_js(&mut ws, cmd_id, poll_js).await?;
+            cmd_id += 1;
+
+            let count = state.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let generating = state.get("generating").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mut text = state
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                if let Some(html_str) = state.get("html").and_then(|v| v.as_str()) {
+                    if let Some(extracted) = Self::extract_gemini_response_from_html(html_str) {
+                        text = extracted;
+                    }
+                }
+            }
+
+            if count > baseline_responses && !text.is_empty() {
+                if text != last_text {
+                    last_text = text;
+                    stable_since = Some(std::time::Instant::now());
+                } else if !generating {
+                    if let Some(since) = stable_since {
+                        if since.elapsed() >= Duration::from_secs(2) {
+                            return Ok(last_text);
+                        }
+                    } else {
+                        stable_since = Some(std::time::Instant::now());
+                    }
+                } else {
+                    // Enquanto o botão de parar está visível, reinicia a janela de estabilidade de 2s
+                    stable_since = Some(std::time::Instant::now());
+                }
+            }
+        }
+
+        if !last_text.is_empty() {
+            Ok(last_text)
+        } else {
+            Err("Gemini Web não retornou texto de resposta dentro do tempo esperado.".to_string())
+        }
     }
 
     /// Apelidos do nome do contato aceitos no texto, além de {nome}: o nome da coluna da planilha
@@ -1526,5 +2168,69 @@ mod has_money_tests {
             orig_num,
             "Entre em contato pelo (75) 3333-4475 dentro de 24 horas informando o protocolo 852."
         ).is_err());
+    }
+
+    #[test]
+    fn gemini_web_browser_path_and_args_detection() {
+        let tmp_exe = std::env::temp_dir().join(format!("esfera_fake_chrome_{}.exe", std::process::id()));
+        std::fs::write(&tmp_exe, b"fake").unwrap();
+        let missing = std::env::temp_dir().join("nao_existe_123456.exe");
+
+        let found = AiEngine::find_chromium_browser_from_candidates(&[missing, tmp_exe.clone()]);
+        assert_eq!(found, Some(tmp_exe.clone()));
+        let _ = std::fs::remove_file(&tmp_exe);
+
+        let profile = std::path::PathBuf::from(r"C:\Users\Operador\AppData\Local\esfera_v3\gemini-web-profile");
+        let args_normal = AiEngine::build_gemini_browser_args(&profile, false);
+        assert!(args_normal.iter().any(|a| a.starts_with("--user-data-dir=") && a.contains("gemini-web-profile")));
+        assert!(args_normal.contains(&"--remote-debugging-port=9223".to_string()));
+        assert!(args_normal.contains(&"--no-first-run".to_string()));
+        assert!(args_normal.contains(&"https://gemini.google.com/app".to_string()));
+        assert!(!args_normal.contains(&"--start-minimized".to_string()));
+
+        let args_min = AiEngine::build_gemini_browser_args(&profile, true);
+        assert!(args_min.contains(&"--start-minimized".to_string()));
+    }
+
+    #[test]
+    fn gemini_web_html_login_and_response_extraction() {
+        let html_logged_out = r#"
+            <html><body>
+                <header><a href="https://accounts.google.com/ServiceLogin">Fazer login</a></header>
+            </body></html>
+        "#;
+        assert!(!AiEngine::detect_gemini_login_from_html(html_logged_out));
+
+        let html_logged_in = r#"
+            <html><body>
+                <rich-textarea><div class="ql-editor" contenteditable="true" role="textbox"></div></rich-textarea>
+                <model-response>
+                    <message-content class="model-response-text">
+                        <p>Olá {nome}, tudo bem?</p>
+                        <p>Entre em contato pelo (75) 3333-4475 até 20/10/2026 ou responda SAIR.</p>
+                    </message-content>
+                </model-response>
+            </body></html>
+        "#;
+        assert!(AiEngine::detect_gemini_login_from_html(html_logged_in));
+        let extracted = AiEngine::extract_gemini_response_from_html(html_logged_in).expect("deve extrair resposta");
+        assert!(extracted.contains("Olá {nome}, tudo bem?"));
+        assert!(extracted.contains("(75) 3333-4475"));
+        assert!(extracted.contains("20/10/2026"));
+        assert!(AiEngine::validate_rewrite(
+            "Oi {nome}! Ligue para (75) 3333-4475 até 20/10/2026. Responda SAIR.",
+            &extracted
+        ).is_ok());
+    }
+
+    #[tokio::test]
+    async fn gemini_web_rate_limit_interval() {
+        let mut last: Option<std::time::Instant> = None;
+        let min_wait = std::time::Duration::from_millis(80);
+        AiEngine::enforce_gemini_web_rate_limit(&mut last, min_wait).await;
+        assert!(last.is_some());
+        let t0 = std::time::Instant::now();
+        AiEngine::enforce_gemini_web_rate_limit(&mut last, min_wait).await;
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(70));
     }
 }

@@ -696,6 +696,13 @@ function ToggleRow({
 // Webhook de descadastro (SAIR): o VEXOR chama POST /api/optout/events no Esfera com o token da empresa.
 const OPTOUT_BASE_URL = "http://127.0.0.1:8080";
 
+interface GeminiWebStatus {
+  connected: boolean;
+  browserOpen: boolean;
+  savedConnected?: boolean;
+  detail: string;
+}
+
 function IntegrationsSection({ companyId, isMaster }: { companyId: number; isMaster: boolean }) {
   const [online, setOnline] = useState<boolean | null>(null);
   const [orgId, setOrgId] = useState("org-local");
@@ -703,6 +710,21 @@ function IntegrationsSection({ companyId, isMaster }: { companyId: number; isMas
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState("");
+
+  // Estado do cartão Gemini Web (Login Google sem chave de API)
+  const [geminiStatus, setGeminiStatus] = useState<GeminiWebStatus | null>(null);
+  const [geminiBusy, setGeminiBusy] = useState<"" | "login" | "test" | "logout">("");
+  const [geminiTestResult, setGeminiTestResult] = useState("");
+  const [geminiError, setGeminiError] = useState("");
+
+  const refreshGeminiStatus = async () => {
+    try {
+      const res = await api<GeminiWebStatus>("gemini_web_status", { companyId });
+      setGeminiStatus(res);
+    } catch (e) {
+      setGeminiStatus({ connected: false, browserOpen: false, detail: String(e) });
+    }
+  };
 
   useEffect(() => {
     let alive = true;
@@ -712,12 +734,59 @@ function IntegrationsSection({ companyId, isMaster }: { companyId: number; isMas
         .then(() => alive && setOnline(true))
         .catch(() => alive && setOnline(false));
     check();
-    const timer = setInterval(check, 10000);
+    refreshGeminiStatus();
+    const timer = setInterval(() => {
+      check();
+      refreshGeminiStatus();
+    }, 6000);
     return () => {
       alive = false;
       clearInterval(timer);
     };
-  }, []);
+  }, [companyId]);
+
+  const handleGeminiLogin = async () => {
+    setGeminiBusy("login");
+    setGeminiError("");
+    setGeminiTestResult("");
+    try {
+      const res = await api<GeminiWebStatus>("gemini_web_login", { companyId });
+      setGeminiStatus(res);
+    } catch (e) {
+      setGeminiError(String(e));
+    } finally {
+      setGeminiBusy("");
+    }
+  };
+
+  const handleGeminiTest = async () => {
+    setGeminiBusy("test");
+    setGeminiError("");
+    setGeminiTestResult("");
+    try {
+      const out = await api<string>("gemini_web_test", { companyId });
+      setGeminiTestResult(out);
+      await refreshGeminiStatus();
+    } catch (e) {
+      setGeminiError(String(e));
+    } finally {
+      setGeminiBusy("");
+    }
+  };
+
+  const handleGeminiLogout = async () => {
+    setGeminiBusy("logout");
+    setGeminiError("");
+    setGeminiTestResult("");
+    try {
+      await api<void>("gemini_web_logout", { companyId });
+      await refreshGeminiStatus();
+    } catch (e) {
+      setGeminiError(String(e));
+    } finally {
+      setGeminiBusy("");
+    }
+  };
 
   const envLine = token
     ? `ESFERA_OPTOUT_LINKS_JSON=${JSON.stringify({ [orgId.trim() || "org-local"]: { baseUrl: OPTOUT_BASE_URL, companyId, token } })}`
@@ -745,9 +814,96 @@ function IntegrationsSection({ companyId, isMaster }: { companyId: number; isMas
     }
   };
 
+  const isGeminiConnected = Boolean(geminiStatus?.connected || geminiStatus?.savedConnected);
+
   return (
-    <FormSection title="Integrações" description="Descadastro (SAIR) recebido pelo VEXOR e entregue ao Esfera.">
+    <FormSection title="Integrações" description="Conexão com Gemini Web (login Google sem chave de API) e webhook de descadastro (SAIR) do VEXOR.">
       <div className="space-y-5 max-w-2xl">
+        {/* Cartão Gemini Web (Login Google) */}
+        <div className="space-y-3 rounded-lg border border-border p-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="min-w-0">
+              <p className="text-[0.8125rem] font-medium text-primary">Gemini Web (Conta Google — Sem Chave de API)</p>
+              <p className="text-[0.75rem] text-tertiary">
+                Usa o navegador Chrome/Edge instalado com perfil próprio do Esfera para reescrever mensagens gratuitamente no site do Gemini, logo após o Groq na cadeia de reserva.
+              </p>
+            </div>
+            <span
+              className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[0.75rem] font-medium ${
+                geminiStatus === null
+                  ? "bg-secondary text-secondary"
+                  : isGeminiConnected
+                  ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                  : "bg-amber-500/10 text-amber-700 dark:text-amber-300"
+              }`}
+            >
+              {geminiStatus === null ? (
+                "Verificando…"
+              ) : isGeminiConnected ? (
+                <>
+                  <CheckCircle2 size={13} /> Conectado
+                </>
+              ) : (
+                <>
+                  <AlertCircle size={13} /> Não conectado
+                </>
+              )}
+            </span>
+          </div>
+
+          {geminiStatus?.detail && (
+            <p className="text-[0.75rem] text-secondary">{geminiStatus.detail}</p>
+          )}
+
+          <div className="flex flex-wrap items-center gap-2.5 pt-1">
+            <Button
+              icon={<Globe size={15} />}
+              onClick={handleGeminiLogin}
+              loading={geminiBusy === "login"}
+              disabled={geminiBusy !== ""}
+            >
+              Entrar com Google
+            </Button>
+            <Button
+              variant="secondary"
+              icon={<Play size={14} />}
+              onClick={handleGeminiTest}
+              loading={geminiBusy === "test"}
+              disabled={geminiBusy !== ""}
+            >
+              Testar
+            </Button>
+            <Button
+              variant="secondary"
+              icon={<RefreshCw size={14} />}
+              onClick={refreshGeminiStatus}
+              disabled={geminiBusy !== ""}
+            >
+              Atualizar status
+            </Button>
+            {(isGeminiConnected || geminiStatus?.browserOpen) && (
+              <Button
+                variant="secondary"
+                onClick={handleGeminiLogout}
+                loading={geminiBusy === "logout"}
+                disabled={geminiBusy !== ""}
+              >
+                Sair
+              </Button>
+            )}
+          </div>
+
+          {geminiError && (
+            <p className="text-[0.75rem] text-red-600 dark:text-red-400">{geminiError}</p>
+          )}
+
+          {geminiTestResult && (
+            <div className="rounded border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-[0.75rem] text-primary">
+              <p className="font-medium text-emerald-600 dark:text-emerald-400 mb-1">Resposta de teste do Gemini Web:</p>
+              <p className="whitespace-pre-wrap">{geminiTestResult}</p>
+            </div>
+          )}
+        </div>
         <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
           <div className="min-w-0">
             <p className="text-[0.8125rem] font-medium text-primary">Webhook de descadastro</p>
