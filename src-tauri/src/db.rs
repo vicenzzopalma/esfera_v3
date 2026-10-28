@@ -291,6 +291,34 @@ pub struct OptOutRecordOutcome {
     pub same_company: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OptOutReview {
+    pub id: i32,
+    pub company_id: i32,
+    pub title: String,
+    pub text: String,
+    pub device: String,
+    pub status: String,
+    pub resolved_phone: Option<String>,
+    pub resolved_by: Option<String>,
+    pub resolved_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OptOutAuditEntry {
+    pub id: i32,
+    pub company_id: i32,
+    pub phone: String,
+    pub action: String,
+    pub actor_name: String,
+    pub actor_role: String,
+    pub detail: String,
+    pub created_at: String,
+}
+
 // ============================================================
 // DATABASE TRANSACTION RAII
 // ============================================================
@@ -819,6 +847,46 @@ impl Database {
             [],
         )?;
 
+        // 10d. ESF_OptOutReview (pedidos de SAIR sem número identificável no título para revisão humana)
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_OptOutReview (
+                ReviewId INTEGER PRIMARY KEY AUTOINCREMENT,
+                CompanyId INTEGER NOT NULL DEFAULT 1,
+                Title TEXT NOT NULL DEFAULT '',
+                Text TEXT NOT NULL DEFAULT '',
+                Device TEXT NOT NULL DEFAULT '',
+                Status TEXT NOT NULL DEFAULT 'pending',
+                ResolvedPhone TEXT DEFAULT NULL,
+                ResolvedBy TEXT DEFAULT NULL,
+                ResolvedAt TEXT DEFAULT NULL,
+                CreatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+            [],
+        )?;
+        self.conn().execute(
+            "CREATE INDEX IF NOT EXISTS idx_optout_review_company ON ESF_OptOutReview(CompanyId, Status, ReviewId DESC);",
+            [],
+        )?;
+
+        // 10e. ESF_OptOutAudit (auditoria de quem adicionou ou removeu números da lista de descadastro)
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_OptOutAudit (
+                AuditId INTEGER PRIMARY KEY AUTOINCREMENT,
+                CompanyId INTEGER NOT NULL DEFAULT 1,
+                PhoneDigits TEXT NOT NULL,
+                Action TEXT NOT NULL,
+                ActorName TEXT NOT NULL DEFAULT '',
+                ActorRole TEXT NOT NULL DEFAULT '',
+                Detail TEXT NOT NULL DEFAULT '',
+                CreatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+            [],
+        )?;
+        self.conn().execute(
+            "CREATE INDEX IF NOT EXISTS idx_optout_audit_company ON ESF_OptOutAudit(CompanyId, AuditId DESC);",
+            [],
+        )?;
+
         // 11. ESF_DeviceStatus (bans por pacote por campanha)
         self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_DeviceStatus (
@@ -976,6 +1044,34 @@ impl Database {
 
     /// Migra tabelas existentes que não tinham as colunas novas
     fn migrate_existing_tables(&self) -> Result<()> {
+        // Garantir tabelas de revisão e auditoria de descadastro em bancos já existentes
+        let _ = self.conn().execute_batch("
+            CREATE TABLE IF NOT EXISTS ESF_OptOutReview (
+                ReviewId INTEGER PRIMARY KEY AUTOINCREMENT,
+                CompanyId INTEGER NOT NULL DEFAULT 1,
+                Title TEXT NOT NULL DEFAULT '',
+                Text TEXT NOT NULL DEFAULT '',
+                Device TEXT NOT NULL DEFAULT '',
+                Status TEXT NOT NULL DEFAULT 'pending',
+                ResolvedPhone TEXT DEFAULT NULL,
+                ResolvedBy TEXT DEFAULT NULL,
+                ResolvedAt TEXT DEFAULT NULL,
+                CreatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_optout_review_company ON ESF_OptOutReview(CompanyId, Status, ReviewId DESC);
+            CREATE TABLE IF NOT EXISTS ESF_OptOutAudit (
+                AuditId INTEGER PRIMARY KEY AUTOINCREMENT,
+                CompanyId INTEGER NOT NULL DEFAULT 1,
+                PhoneDigits TEXT NOT NULL,
+                Action TEXT NOT NULL,
+                ActorName TEXT NOT NULL DEFAULT '',
+                ActorRole TEXT NOT NULL DEFAULT '',
+                Detail TEXT NOT NULL DEFAULT '',
+                CreatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_optout_audit_company ON ESF_OptOutAudit(CompanyId, AuditId DESC);
+        ");
+
         // Tabela permanente de identidade vinculada ao Hardware ID
         let _ = self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_DeviceIdentity (
@@ -2553,11 +2649,35 @@ impl Database {
             .unwrap_or_default()
     }
 
-    pub fn add_opt_out(&self, company_id: i32, phone: &str, reason: &str) -> Result<(), String> {
-        let key = Self::opt_out_key(phone);
-        if key.len() < 8 {
-            return Err("Número inválido.".to_string());
+    /// Valida que o telefone para descadastro possui DDD (10 ou 11 dígitos locais, ou 12-13 com DDI 55).
+    /// Rejeita números de 8 ou 9 dígitos sem DDD com mensagem clara.
+    pub fn validate_opt_out_phone(phone: &str) -> std::result::Result<String, String> {
+        let d: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+        let d = d.trim_start_matches('0').to_string();
+        if d.is_empty() {
+            return Err("Número inválido: informe DDD + número.".to_string());
         }
+        if d.len() == 8 || d.len() == 9 {
+            return Err(format!(
+                "Número '{}' está sem DDD. Informe o DDD com 2 dígitos + número (ex.: 75988052539).",
+                phone.trim()
+            ));
+        }
+        let key = Self::opt_out_key(phone);
+        if key.len() < 10 {
+            return Err(format!(
+                "Número '{}' inválido ou sem DDD. Informe o DDD com 2 dígitos + número.",
+                phone.trim()
+            ));
+        }
+        if key.len() > 11 {
+            return Err(format!("Número '{}' inválido (dígitos em excesso).", phone.trim()));
+        }
+        Ok(key)
+    }
+
+    pub fn add_opt_out(&self, company_id: i32, phone: &str, reason: &str) -> Result<(), String> {
+        let key = Self::validate_opt_out_phone(phone)?;
         self.conn()
             .execute(
                 "INSERT OR REPLACE INTO ESF_OptOut (CompanyId, PhoneDigits, Reason, CreatedAt) VALUES (?1, ?2, ?3, datetime('now'));",
@@ -2588,6 +2708,190 @@ impl Database {
         stmt.query_map(params![company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
+    }
+
+    /// Registra auditoria de adição ou remoção no descadastro (quem, quando, número, ação).
+    pub fn record_opt_out_audit(
+        &self,
+        company_id: i32,
+        phone: &str,
+        action: &str,
+        actor_name: &str,
+        actor_role: &str,
+        detail: &str,
+    ) -> std::result::Result<(), String> {
+        let key = Self::opt_out_key(phone);
+        let phone_stored = if key.is_empty() { phone.trim().to_string() } else { key };
+        self.conn()
+            .execute(
+                "INSERT INTO ESF_OptOutAudit (CompanyId, PhoneDigits, Action, ActorName, ActorRole, Detail, CreatedAt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'));",
+                params![company_id, phone_stored, action, actor_name, actor_role, detail],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Lista registros de auditoria de descadastro da empresa.
+    pub fn list_opt_out_audit(&self, company_id: i32, limit: i32) -> Vec<OptOutAuditEntry> {
+        let conn = self.conn();
+        let mut stmt = match conn.prepare(
+            "SELECT AuditId, CompanyId, PhoneDigits, Action, ActorName, ActorRole, Detail, CreatedAt
+             FROM ESF_OptOutAudit
+             WHERE CompanyId = ?1
+             ORDER BY AuditId DESC
+             LIMIT ?2;",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![company_id, limit], |r| {
+            Ok(OptOutAuditEntry {
+                id: r.get(0)?,
+                company_id: r.get(1)?,
+                phone: r.get(2)?,
+                action: r.get(3)?,
+                actor_name: r.get(4)?,
+                actor_role: r.get(5)?,
+                detail: r.get(6)?,
+                created_at: r.get(7)?,
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Salva pedido de SAIR sem número identificável para revisão manual no banco.
+    pub fn add_opt_out_review(
+        &self,
+        company_id: i32,
+        title: &str,
+        text: &str,
+        device: &str,
+    ) -> std::result::Result<i32, String> {
+        let conn = self.conn();
+        if let Ok(Some(existing_id)) = conn
+            .query_row(
+                "SELECT ReviewId FROM ESF_OptOutReview
+                 WHERE CompanyId = ?1 AND Title = ?2 AND Text = ?3 AND Device = ?4 AND Status = 'pending'
+                 LIMIT 1;",
+                params![company_id, title.trim(), text.trim(), device.trim()],
+                |r| r.get::<_, i32>(0),
+            )
+            .optional()
+        {
+            return Ok(existing_id);
+        }
+        conn.execute(
+            "INSERT INTO ESF_OptOutReview (CompanyId, Title, Text, Device, Status, CreatedAt)
+             VALUES (?1, ?2, ?3, ?4, 'pending', datetime('now'));",
+            params![company_id, title.trim(), text.trim(), device.trim()],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_rowid() as i32)
+    }
+
+    /// Lista itens de descadastro para revisão (por padrão todos ou filtrados por status).
+    pub fn list_opt_out_reviews(&self, company_id: i32, status_filter: Option<&str>) -> Vec<OptOutReview> {
+        let conn = self.conn();
+        let sql = if status_filter.is_some() {
+            "SELECT ReviewId, CompanyId, Title, Text, Device, Status, ResolvedPhone, ResolvedBy, ResolvedAt, CreatedAt
+             FROM ESF_OptOutReview
+             WHERE CompanyId = ?1 AND Status = ?2
+             ORDER BY ReviewId DESC;"
+        } else {
+            "SELECT ReviewId, CompanyId, Title, Text, Device, Status, ResolvedPhone, ResolvedBy, ResolvedAt, CreatedAt
+             FROM ESF_OptOutReview
+             WHERE CompanyId = ?1
+             ORDER BY ReviewId DESC;"
+        };
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<OptOutReview> {
+            Ok(OptOutReview {
+                id: r.get(0)?,
+                company_id: r.get(1)?,
+                title: r.get(2)?,
+                text: r.get(3)?,
+                device: r.get(4)?,
+                status: r.get(5)?,
+                resolved_phone: r.get(6)?,
+                resolved_by: r.get(7)?,
+                resolved_at: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        };
+        if let Some(st) = status_filter {
+            stmt.query_map(params![company_id, st], map_row)
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        } else {
+            stmt.query_map(params![company_id], map_row)
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        }
+    }
+
+    /// Resolve um item de revisão descadastrando o número informado, cancelando envios pendentes e auditando.
+    pub fn resolve_opt_out_review(
+        &self,
+        company_id: i32,
+        review_id: i32,
+        phone: &str,
+        actor_name: &str,
+        actor_role: &str,
+    ) -> std::result::Result<usize, String> {
+        let key = Self::validate_opt_out_phone(phone)?;
+        let (title, text): (String, String) = self
+            .conn()
+            .query_row(
+                "SELECT Title, Text FROM ESF_OptOutReview WHERE ReviewId = ?1 AND CompanyId = ?2;",
+                params![review_id, company_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|_| "Item de revisão não encontrado.".to_string())?;
+        let snippet: String = text.chars().take(40).collect();
+        let reason = if title.is_empty() {
+            format!("Revisão manual (\"{}\") por {}", snippet, actor_name)
+        } else {
+            format!("Revisão de '{}' (\"{}\") por {}", title, snippet, actor_name)
+        };
+        self.add_opt_out(company_id, &key, &reason)?;
+        let suppressed = self.suppress_pending_for_opt_out(company_id, &key);
+        self.conn()
+            .execute(
+                "UPDATE ESF_OptOutReview
+                 SET Status = 'resolved', ResolvedPhone = ?1, ResolvedBy = ?2, ResolvedAt = datetime('now')
+                 WHERE ReviewId = ?3 AND CompanyId = ?4;",
+                params![key, actor_name, review_id, company_id],
+            )
+            .map_err(|e| e.to_string())?;
+        let _ = self.record_opt_out_audit(company_id, &key, "add", actor_name, actor_role, &reason);
+        Ok(suppressed)
+    }
+
+    /// Descarta um item de revisão sem descadastrar número.
+    pub fn discard_opt_out_review(
+        &self,
+        company_id: i32,
+        review_id: i32,
+        actor_name: &str,
+    ) -> std::result::Result<(), String> {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE ESF_OptOutReview
+                 SET Status = 'discarded', ResolvedBy = ?1, ResolvedAt = datetime('now')
+                 WHERE ReviewId = ?2 AND CompanyId = ?3;",
+                params![actor_name, review_id, company_id],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("Item de revisão não encontrado.".to_string());
+        }
+        Ok(())
     }
 
     pub fn try_was_already_sent(&self, phone: &str, campaign_id: i32) -> Result<bool> {
@@ -3482,5 +3786,55 @@ mod opt_out_key_tests {
         // DDD 55 (RS) sem DDI e com DDI devem dar a mesma chave
         assert_eq!(Database::opt_out_key("55999998888"), Database::opt_out_key("+55 55 99999-8888"));
         assert_eq!(Database::opt_out_key("55999998888"), "5599998888");
+    }
+
+    #[test]
+    fn revisao_auditoria_e_validacao_ddd_descadastro() {
+        let path = std::env::temp_dir().join(format!("esfera_optout_rev_audit_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).expect("db");
+
+        // 1. Rejeita número sem DDD com mensagem clara
+        let err_8 = db.add_opt_out(1, "3333-4444", "Manual").unwrap_err();
+        assert!(err_8.contains("sem DDD"), "esperava erro de sem DDD, veio: {}", err_8);
+        let err_9 = db.add_opt_out(1, "98805-2539", "Manual").unwrap_err();
+        assert!(err_9.contains("sem DDD"), "esperava erro de sem DDD, veio: {}", err_9);
+
+        // 2. Revisão de descadastro sem número identificável
+        let rev_id = db.add_opt_out_review(1, "Maria Loja", "SAIR por favor", "192.168.1.50:5555").unwrap();
+        // Idempotente enquanto pendente
+        let rev_id_dup = db.add_opt_out_review(1, "Maria Loja", "SAIR por favor", "192.168.1.50:5555").unwrap();
+        assert_eq!(rev_id, rev_id_dup);
+
+        let pendentes = db.list_opt_out_reviews(1, Some("pending"));
+        assert_eq!(pendentes.len(), 1);
+        assert_eq!(pendentes[0].title, "Maria Loja");
+        assert_eq!(pendentes[0].device, "192.168.1.50:5555");
+
+        // Tentar resolver sem DDD deve falhar
+        assert!(db.resolve_opt_out_review(1, rev_id, "988052539", "Gestor Ana", "gestor").is_err());
+
+        // Resolver com DDD válido descadastra, resolve revisão e grava auditoria
+        db.resolve_opt_out_review(1, rev_id, "(75) 98805-2539", "Gestor Ana", "gestor").unwrap();
+        assert!(db.is_opted_out(1, "5575988052539"));
+        assert_eq!(db.list_opt_out_reviews(1, Some("pending")).len(), 0);
+        let resolvidos = db.list_opt_out_reviews(1, Some("resolved"));
+        assert_eq!(resolvidos.len(), 1);
+        assert_eq!(resolvidos[0].resolved_phone.as_deref(), Some("7588052539"));
+
+        // Descartar revisão
+        let rev2 = db.add_opt_out_review(1, "Grupo Vendas", "sair", "USB-01").unwrap();
+        db.discard_opt_out_review(1, rev2, "Gestor Ana").unwrap();
+        assert_eq!(db.list_opt_out_reviews(1, Some("pending")).len(), 0);
+        assert_eq!(db.list_opt_out_reviews(1, Some("discarded")).len(), 1);
+
+        // 3. Auditoria de remoção
+        db.remove_opt_out(1, "7588052539").unwrap();
+        db.record_opt_out_audit(1, "7588052539", "remove", "Master Carlos", "master", "Removido manualmente").unwrap();
+        let logs = db.list_opt_out_audit(1, 10);
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].action, "remove");
+        assert_eq!(logs[0].actor_name, "Master Carlos");
+        assert_eq!(logs[0].phone, "7588052539");
     }
 }

@@ -22,7 +22,7 @@ use crate::adb_manager::{AdbDeviceInfo, AdbManager};
 use crate::config::{self, AppConfig};
 use crate::db::{
     AiConfig, AutomationRule, Campaign, Chip, Company, Contact, Database, Device,
-    DevicePackage, Permission, SectorPermission,
+    DevicePackage, OptOutAuditEntry, OptOutReview, Permission, SectorPermission,
 };
 use crate::hub_client::HubClient;
 use crate::session::{LoginResponse, SessionManager};
@@ -2809,33 +2809,156 @@ pub fn retry_failed_campaign_contacts(state: State<'_, AppState>, token: String,
     state.db.retry_failed_contacts(campaign_id)
 }
 
+fn session_actor_name(session: &crate::session::UserSession) -> String {
+    session.username.clone()
+}
+
+pub fn exec_list_opt_outs(
+    db: &Database,
+    session: &crate::session::UserSession,
+    company_id: i32,
+) -> Result<Vec<serde_json::Value>, String> {
+    check_company_access(session, company_id)?;
+    let audits = db.list_opt_out_audit(company_id, 500);
+    Ok(db
+        .list_opt_outs(company_id)
+        .into_iter()
+        .map(|(phone, reason, created)| {
+            let last_add = audits.iter().find(|a| a.phone == phone && a.action == "add");
+            let last_rem = audits.iter().find(|a| a.phone == phone && a.action == "remove");
+            serde_json::json!({
+                "phone": phone,
+                "reason": reason,
+                "createdAt": created,
+                "addedBy": last_add.map(|a| a.actor_name.clone()),
+                "removedBy": last_rem.map(|a| a.actor_name.clone()),
+                "removedAt": last_rem.map(|a| a.created_at.clone()),
+            })
+        })
+        .collect())
+}
+
+pub fn exec_add_opt_outs(
+    db: &Database,
+    session: &crate::session::UserSession,
+    company_id: i32,
+    phones: Vec<String>,
+    reason: String,
+) -> Result<usize, String> {
+    check_company_access(session, company_id)?;
+    let clean_phones: Vec<String> = phones
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if clean_phones.is_empty() {
+        return Err("Informe ao menos um número de telefone com DDD.".to_string());
+    }
+    // Valida todos os números antes de gravar: rejeita número sem DDD com mensagem clara
+    for p in &clean_phones {
+        Database::validate_opt_out_phone(p)?;
+    }
+    let actor = session_actor_name(session);
+    let mut added = 0;
+    for p in clean_phones {
+        db.add_opt_out(company_id, &p, &reason)?;
+        let _ = db.suppress_pending_for_opt_out(company_id, &p);
+        let _ = db.record_opt_out_audit(company_id, &p, "add", &actor, &session.role, &reason);
+        added += 1;
+    }
+    Ok(added)
+}
+
+pub fn exec_remove_opt_out(
+    db: &Database,
+    session: &crate::session::UserSession,
+    company_id: i32,
+    phone: String,
+) -> Result<(), String> {
+    check_company_access(session, company_id)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Acesso Negado: apenas Master ou Gestor podem remover números do descadastro.".to_string());
+    }
+    db.remove_opt_out(company_id, &phone)?;
+    let actor = session_actor_name(session);
+    db.record_opt_out_audit(
+        company_id,
+        &phone,
+        "remove",
+        &actor,
+        &session.role,
+        "Removido manualmente",
+    )?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn list_opt_outs(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<serde_json::Value>, String> {
     let session = validate_session(&state.sessions, &token)?;
-    check_company_access(&session, company_id)?;
-    Ok(state.db.list_opt_outs(company_id).into_iter()
-        .map(|(phone, reason, created)| serde_json::json!({ "phone": phone, "reason": reason, "createdAt": created }))
-        .collect())
+    exec_list_opt_outs(&state.db, &session, company_id)
 }
 
 #[tauri::command]
 pub fn add_opt_outs(state: State<'_, AppState>, token: String, company_id: i32, phones: Vec<String>, reason: String) -> Result<usize, String> {
     let session = validate_session(&state.sessions, &token)?;
-    check_company_access(&session, company_id)?;
-    let mut added = 0;
-    for p in phones {
-        if state.db.add_opt_out(company_id, &p, &reason).is_ok() {
-            added += 1;
-        }
-    }
-    Ok(added)
+    exec_add_opt_outs(&state.db, &session, company_id, phones, reason)
 }
 
 #[tauri::command]
 pub fn remove_opt_out(state: State<'_, AppState>, token: String, company_id: i32, phone: String) -> Result<(), String> {
     let session = validate_session(&state.sessions, &token)?;
+    exec_remove_opt_out(&state.db, &session, company_id, phone)
+}
+
+#[tauri::command]
+pub fn list_opt_out_reviews(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<Vec<OptOutReview>, String> {
+    let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
-    state.db.remove_opt_out(company_id, &phone)
+    Ok(state.db.list_opt_out_reviews(company_id, Some("pending")))
+}
+
+#[tauri::command]
+pub fn resolve_opt_out_review(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+    review_id: i32,
+    phone: String,
+) -> Result<usize, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    let actor = session_actor_name(&session);
+    state
+        .db
+        .resolve_opt_out_review(company_id, review_id, &phone, &actor, &session.role)
+}
+
+#[tauri::command]
+pub fn discard_opt_out_review(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+    review_id: i32,
+) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    let actor = session_actor_name(&session);
+    state.db.discard_opt_out_review(company_id, review_id, &actor)
+}
+
+#[tauri::command]
+pub fn list_opt_out_audit(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<Vec<OptOutAuditEntry>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    Ok(state.db.list_opt_out_audit(company_id, 100))
 }
 
 #[tauri::command]
@@ -3805,13 +3928,84 @@ mod tests {
         assert_eq!(device_id_from_serial("R58M1234567"), "ESF-R58M1234");
         assert_eq!(device_id_from_serial("abc"), "ESF-ABC");
     }
+
+    #[test]
+    fn opt_out_permissao_papel_auditoria_ddd_e_cancelamento_pendentes() {
+        let db_path = std::env::temp_dir().join(format!("esfera_cmd_optout_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        let db = Database::init(db_path.to_string_lossy().as_ref()).expect("db");
+
+        // Cria campanha com um envio pendente para o número 5575988052539
+        let camp_id = db.create_campaign(&Campaign {
+            id: 0,
+            name: "Campanha Teste".to_string(),
+            greeting: "Olá".to_string(),
+            message: "Msg".to_string(),
+            closing: "Att".to_string(),
+            delay_min: 15,
+            delay_max: 30,
+            use_spintax: false,
+            use_ai: false,
+            ai_model: String::new(),
+            ai_prompt: String::new(),
+            status: "draft".to_string(),
+            contacts_count: 0,
+            sent_count: 0,
+            failed_count: 0,
+            company_id: 1,
+            device_ids: vec![],
+            ai_provider: String::new(),
+            updated_at: String::new(),
+        }).unwrap();
+        db.import_contacts(camp_id, vec![("João".to_string(), "5575988052539".to_string())]).unwrap();
+        assert_eq!(db.get_pending_contacts(camp_id, 10).len(), 1);
+
+        let colab = crate::session::UserSession {
+            token: "t-colab".to_string(),
+            user_id: 10,
+            username: "João Colaborador".to_string(),
+            role: "colaborador".to_string(),
+            company_id: Some(1),
+            created_at: 0,
+            expires_at: i64::MAX,
+        };
+        let gestor = crate::session::UserSession {
+            token: "t-gestor".to_string(),
+            user_id: 2,
+            username: "Maria Gestora".to_string(),
+            role: "gestor".to_string(),
+            company_id: Some(1),
+            created_at: 0,
+            expires_at: i64::MAX,
+        };
+
+        // 1. Rejeita número sem DDD com mensagem clara
+        let err_no_ddd = exec_add_opt_outs(&db, &colab, 1, vec!["98805-2539".to_string()], "Pedido manual".to_string()).unwrap_err();
+        assert!(err_no_ddd.contains("sem DDD"), "deveria rejeitar sem DDD: {}", err_no_ddd);
+
+        // 2. add_opt_outs com DDD válido grava descadastro, cancela envios pendentes e registra auditoria
+        let added = exec_add_opt_outs(&db, &colab, 1, vec!["(75) 98805-2539".to_string()], "Pedido no atendimento".to_string()).unwrap();
+        assert_eq!(added, 1);
+        assert!(db.is_opted_out(1, "5575988052539"));
+        assert_eq!(db.get_pending_contacts(camp_id, 10).len(), 0, "envio pendente deve ser cancelado por suppress_pending_for_opt_out");
+
+        // 3. Colaborador NÃO pode remover descadastro
+        let err_colab = exec_remove_opt_out(&db, &colab, 1, "7588052539".to_string()).unwrap_err();
+        assert!(err_colab.contains("Acesso Negado"));
+        assert!(db.is_opted_out(1, "5575988052539"));
+
+        // 4. Gestor/Master pode remover e registra auditoria (quem, quando, número, ação)
+        exec_remove_opt_out(&db, &gestor, 1, "7588052539".to_string()).unwrap();
+        assert!(!db.is_opted_out(1, "5575988052539"));
+
+        let audits = db.list_opt_out_audit(1, 10);
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[0].action, "remove");
+        assert_eq!(audits[0].actor_name, "Maria Gestora");
+        assert_eq!(audits[0].phone, "7588052539");
+        assert_eq!(audits[1].action, "add");
+        assert_eq!(audits[1].actor_name, "João Colaborador");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
 }
-
-
-
-
-
-
-
-
-

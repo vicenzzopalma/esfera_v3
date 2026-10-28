@@ -160,14 +160,26 @@ impl AiEngine {
         if out.chars().count() > original.chars().count() * 3 + 200 {
             return Err("IA devolveu texto longo demais".to_string());
         }
-        let trim_punct = |w: &str| w.trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '"' | '\'')).to_string();
-        for raw in original.split_whitespace() {
-            let w = trim_punct(raw);
-            let digits = w.chars().filter(|c| c.is_ascii_digit()).count();
-            let is_url = w.starts_with("http://") || w.starts_with("https://");
-            let is_number = digits >= 4 && w.chars().all(|c| c.is_ascii_digit() || "./-:,".contains(c));
-            // Valores em dinheiro não precisam ser mantidos: a regra é retirá-los.
-            if (is_url || (is_number && !Self::has_money(&w))) && !out.contains(&w) {
+        let raw_orig: Vec<&str> = original.split_whitespace().collect();
+        let out_tokens: Vec<String> = out
+            .split_whitespace()
+            .map(Self::trim_token_punct)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        for (idx, raw) in raw_orig.iter().enumerate() {
+            let w = Self::trim_token_punct(raw);
+            if w.is_empty() {
+                continue;
+            }
+            let is_protected = Self::is_date_token(w)
+                || Self::is_cpf_or_cnpj_token(w)
+                || Self::is_url_token(w)
+                || Self::is_pix_key_token(w)
+                || (Self::is_number_token(w) && !Self::is_money_token_in_context(&raw_orig, idx, w));
+
+            if is_protected && !Self::contains_exact_token(out, &out_tokens, w) {
                 return Err(format!("IA alterou ou removeu '{}'", w));
             }
         }
@@ -178,6 +190,252 @@ impl AiEngine {
             return Err("IA citou valores (proibido falar de valores)".to_string());
         }
         Ok(())
+    }
+
+    fn trim_token_punct(raw: &str) -> &str {
+        raw.trim_matches(|c: char| {
+            matches!(
+                c,
+                '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+                    | '"' | '\'' | '“' | '”' | '‘' | '’'
+            )
+        })
+    }
+
+    /// Detecta datas como dd/mm/aaaa, dd/mm/aa, dd/mm, dd.mm.aaaa, dd.mm.aa, dd-mm-aaaa e aaaa-mm-dd.
+    fn is_date_token(w: &str) -> bool {
+        for sep in ['/', '.', '-'] {
+            if !w.contains(sep) {
+                continue;
+            }
+            let parts: Vec<&str> = w.split(sep).collect();
+            if !parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+                continue;
+            }
+            if sep == '/' && parts.len() == 2 {
+                let d: u32 = parts[0].parse().unwrap_or(0);
+                let m: u32 = parts[1].parse().unwrap_or(0);
+                if (1..=2).contains(&parts[0].len())
+                    && (1..=2).contains(&parts[1].len())
+                    && (1..=31).contains(&d)
+                    && (1..=12).contains(&m)
+                {
+                    return true;
+                }
+            } else if parts.len() == 3 {
+                if (1..=2).contains(&parts[0].len())
+                    && (1..=2).contains(&parts[1].len())
+                    && (parts[2].len() == 2 || parts[2].len() == 4)
+                {
+                    let d: u32 = parts[0].parse().unwrap_or(0);
+                    let m: u32 = parts[1].parse().unwrap_or(0);
+                    let y: u32 = parts[2].parse().unwrap_or(0);
+                    let y_ok = if parts[2].len() == 4 { (1900..=2100).contains(&y) } else { y <= 99 };
+                    if (1..=31).contains(&d) && (1..=12).contains(&m) && y_ok {
+                        return true;
+                    }
+                }
+                if parts[0].len() == 4
+                    && (1..=2).contains(&parts[1].len())
+                    && (1..=2).contains(&parts[2].len())
+                {
+                    let y: u32 = parts[0].parse().unwrap_or(0);
+                    let m: u32 = parts[1].parse().unwrap_or(0);
+                    let d: u32 = parts[2].parse().unwrap_or(0);
+                    if (1900..=2100).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Detecta CPF (formatado, mascarado ou 11 dígitos) e CNPJ (formatado ou 14 dígitos).
+    fn is_cpf_or_cnpj_token(w: &str) -> bool {
+        let b = w.as_bytes();
+        if b.len() == 14 && b[3] == b'.' && b[7] == b'.' && b[11] == b'-' {
+            let valid_chars = b.iter().enumerate().all(|(i, &c)| {
+                matches!(i, 3 | 7 | 11) || c.is_ascii_digit() || c == b'*'
+            });
+            if valid_chars && b.iter().any(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+        if b.len() == 18 && b[2] == b'.' && b[6] == b'.' && b[10] == b'/' && b[15] == b'-' {
+            let valid_chars = b.iter().enumerate().all(|(i, &c)| {
+                matches!(i, 2 | 6 | 10 | 15) || c.is_ascii_digit() || c == b'*'
+            });
+            if valid_chars && b.iter().any(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+        if (b.len() == 11 || b.len() == 14) && b.iter().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+        false
+    }
+
+    /// Detecta URLs com protocolo (http/https), www. ou domínios com caminho/TLD.
+    fn is_url_token(w: &str) -> bool {
+        let lower = w.to_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") {
+            return true;
+        }
+        if lower.contains('@') {
+            return false;
+        }
+        if let Some(slash_idx) = lower.find('/') {
+            let host = &lower[..slash_idx];
+            if host.contains('.')
+                && host.chars().any(|c| c.is_ascii_alphabetic())
+                && host.split('.').all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+            {
+                return true;
+            }
+        }
+        const TLDS: [&str; 12] = [
+            ".com.br", ".net.br", ".org.br", ".gov.br", ".emp.br",
+            ".com", ".net", ".org", ".io", ".app", ".me", ".ly",
+        ];
+        if TLDS.iter().any(|tld| lower.ends_with(tld))
+            && lower.split('.').all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Detecta chaves PIX: e-mail, UUID/EVP aleatória, telefone E.164 (+55...), Copia e Cola e CPF/CNPJ.
+    fn is_pix_key_token(w: &str) -> bool {
+        if Self::is_cpf_or_cnpj_token(w) {
+            return true;
+        }
+        if let Some((local, domain)) = w.split_once('@') {
+            if !local.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+                && !w.contains(char::is_whitespace)
+            {
+                return true;
+            }
+        }
+        let b = w.as_bytes();
+        if b.len() == 36 && b[8] == b'-' && b[13] == b'-' && b[18] == b'-' && b[23] == b'-' {
+            if b.iter().enumerate().all(|(i, &c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit()) {
+                return true;
+            }
+        }
+        if w.starts_with('+') {
+            let digits = w[1..].chars().filter(|c| c.is_ascii_digit()).count();
+            if digits >= 8 && w[1..].chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '.' | '(' | ')')) {
+                return true;
+            }
+        }
+        let lower = w.to_lowercase();
+        if (w.starts_with("000201") && w.len() >= 20) || lower.contains("br.gov.bcb.pix") {
+            return true;
+        }
+        false
+    }
+
+    /// Detecta números do texto original (telefones, DDD, protocolos, contratos, prazos).
+    fn is_number_token(w: &str) -> bool {
+        let digits = w.chars().filter(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
+            return false;
+        }
+        if w.chars().all(|c| c.is_ascii_digit() || "./-:,+*#ºª".contains(c)) {
+            return true;
+        }
+        let lower = w.to_lowercase();
+        for suffix in ["hs", "h"] {
+            if let Some(num) = lower.strip_suffix(suffix) {
+                if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Verifica se um token numérico no texto original faz parte de uma expressão de valor monetário
+    /// (que a IA tem obrigação de remover, e portanto não deve ser exigido na reescrita).
+    fn is_money_token_in_context(raw_tokens: &[&str], idx: usize, w: &str) -> bool {
+        if Self::is_date_token(w)
+            || Self::is_cpf_or_cnpj_token(w)
+            || Self::is_url_token(w)
+            || Self::is_pix_key_token(w)
+        {
+            return false;
+        }
+        let raw = raw_tokens[idx];
+        let raw_lower = raw.to_lowercase();
+        if raw_lower.starts_with("r$")
+            || raw_lower.starts_with("rs$")
+            || raw_lower.ends_with('%')
+            || Self::has_money(w)
+        {
+            return true;
+        }
+        const MONEY_KEYS: [&str; 24] = [
+            "r", "r$", "rs$", "brl", "valor", "valores", "saldo", "parcela", "parcelas",
+            "divida", "dívida", "debito", "débito", "total", "quantia", "montante",
+            "preco", "preço", "desconto", "juros", "multa", "pague", "pagar", "pagamento",
+        ];
+        let clean_word = |s: &str| -> String {
+            s.trim_matches(|c: char| !c.is_alphanumeric() && c != '$' && c != '%').to_lowercase()
+        };
+        let start = idx.saturating_sub(3);
+        for prev in &raw_tokens[start..idx] {
+            let pw = clean_word(prev);
+            if MONEY_KEYS.contains(&pw.as_str()) {
+                return true;
+            }
+        }
+        if let Some(next) = raw_tokens.get(idx + 1) {
+            let nw = clean_word(next);
+            if matches!(nw.as_str(), "%" | "reais" | "centavos" | "porcento") {
+                return true;
+            }
+            if nw == "por" {
+                if let Some(next2) = raw_tokens.get(idx + 2) {
+                    if clean_word(next2) == "cento" {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Confere se `target` aparece de forma idêntica em `out` sem ser apenas prefixo/sufixo de outro número/data/URL.
+    fn contains_exact_token(out: &str, out_tokens: &[String], target: &str) -> bool {
+        if out_tokens.iter().any(|t| t == target) {
+            return true;
+        }
+        for (start, _) in out.match_indices(target) {
+            let end = start + target.len();
+            let prev_char = out[..start].chars().next_back();
+            let next_char = out[end..].chars().next();
+
+            let prev_conflict = prev_char.map_or(false, |c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '/' | '-' | '@' | '_' | '+')
+                    || (c == '.' && out[..start - c.len_utf8()].chars().next_back().map_or(false, |p| p.is_ascii_alphanumeric()))
+            });
+            let next_conflict = next_char.map_or(false, |c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '/' | '-' | '@' | '_')
+                    || (matches!(c, '.' | ',') && out[end + c.len_utf8()..].chars().next().map_or(false, |n| n.is_ascii_alphanumeric()))
+            });
+
+            if !prev_conflict && !next_conflict {
+                return true;
+            }
+        }
+        false
     }
 
     /// Detecta menção a valores em dinheiro: R$, "reais", "centavos" ou quantia com centavos (350,00).
@@ -215,12 +473,13 @@ impl AiEngine {
                 return true;
             }
         }
-        // Quantia com centavos: "350,00" ou "350.00" (não confunde com data "10.10.2026").
+        // Quantia com centavos: "350,00" ou "350.00" (não confunde com data "10.10.2026" nem "10.10.26").
         let b = text.as_bytes();
         (1..b.len().saturating_sub(2)).any(|i| {
             (b[i] == b',' || b[i] == b'.')
                 && b[i - 1].is_ascii_digit() && b[i + 1].is_ascii_digit() && b[i + 2].is_ascii_digit()
                 && (i + 3 >= b.len() || !(b[i + 3].is_ascii_digit() || b[i + 3] == b'.' || b[i + 3] == b'/'))
+                && !(b[i] == b'.' && ((i >= 2 && b[i - 2] == b'.') || (i >= 3 && b[i - 3] == b'.')))
         })
     }
 
@@ -1161,5 +1420,112 @@ mod has_money_tests {
         assert!(AiEngine::has_money("condição especial de 10 % hoje"));
         assert!(AiEngine::has_money("abatimento de 30 por cento"));
         assert!(!AiEngine::has_money("Olá, tudo bem? Para deixar de receber mensagens, responda SAIR."));
+    }
+
+    #[test]
+    fn validate_rewrite_protege_datas_cnpj_cpf_urls_pix_e_numeros() {
+        // 1. Datas (dd/mm/aaaa, dd/mm/aa, dd/mm, dd.mm.aaaa, dd.mm.aa, aaaa-mm-dd)
+        let orig_data = "Olá João, referente ao contrato 4471 com vencimento em 20/10/2026. Responda SAIR para descadastrar.";
+        assert!(AiEngine::validate_rewrite(
+            orig_data,
+            "Oi João! Sobre o seu contrato 4471 que vence em 20/10/2026, fale conosco. Para não receber mais, envie SAIR."
+        ).is_ok());
+        assert!(AiEngine::validate_rewrite(
+            orig_data,
+            "Oi João! Sobre o seu contrato 4471 que vence em 21/10/2026, fale conosco. Envie SAIR."
+        ).is_err());
+        assert!(AiEngine::validate_rewrite(
+            orig_data,
+            "Oi João! Sobre o seu contrato 4471 que vence em 20/10/26, fale conosco. Envie SAIR."
+        ).is_err());
+
+        // Data curta dd/mm e dd.mm.aa
+        let orig_curta = "Prazo especial até 20/10 ou 25.10.26 para regularizar.";
+        assert!(AiEngine::validate_rewrite(
+            orig_curta,
+            "Aproveite o prazo até 20/10 ou 25.10.26 para regularizar sua situação."
+        ).is_ok());
+        assert!(AiEngine::validate_rewrite(
+            orig_curta,
+            "Aproveite o prazo até 20/10/2026 ou 25.10.26 para regularizar sua situação."
+        ).is_err());
+        assert!(AiEngine::validate_rewrite(
+            orig_curta,
+            "Aproveite o prazo até 20/10 ou 26.10.26 para regularizar sua situação."
+        ).is_err());
+
+        // 2. CNPJ e CPF
+        let orig_docs = "Credor REALESS CNPJ 12.345.678/0001-90 referente ao titular CPF 123.456.789-00.";
+        assert!(AiEngine::validate_rewrite(
+            orig_docs,
+            "Mensagem da REALESS (CNPJ 12.345.678/0001-90) para o titular de CPF 123.456.789-00."
+        ).is_ok());
+        assert!(AiEngine::validate_rewrite(
+            orig_docs,
+            "Mensagem da REALESS (CNPJ 12.345.678/0001-99) para o titular de CPF 123.456.789-00."
+        ).is_err());
+        assert!(AiEngine::validate_rewrite(
+            orig_docs,
+            "Mensagem da REALESS (CNPJ 12345678000190) para o titular de CPF 123.456.789-00."
+        ).is_err());
+        assert!(AiEngine::validate_rewrite(
+            orig_docs,
+            "Mensagem da REALESS (CNPJ 12.345.678/0001-90) para o titular de CPF 123.456.789-01."
+        ).is_err());
+
+        // 3. URLs
+        let orig_url = "Negocie pelo portal https://realess.com.br/negociar?id=987 ou www.realess.com.br/acordo";
+        assert!(AiEngine::validate_rewrite(
+            orig_url,
+            "Acesse https://realess.com.br/negociar?id=987 ou www.realess.com.br/acordo para negociar."
+        ).is_ok());
+        assert!(AiEngine::validate_rewrite(
+            orig_url,
+            "Acesse https://realess.com.br/negociar?id=98 ou www.realess.com.br/acordo para negociar."
+        ).is_err());
+        assert!(AiEngine::validate_rewrite(
+            orig_url,
+            "Acesse https://realess.com.br/negociar?id=987 ou www.realess.com.br/outro para negociar."
+        ).is_err());
+
+        // 4. Chaves PIX (e-mail, UUID aleatória, telefone +55, Copia e Cola)
+        let orig_pix_email = "Chave PIX: financeiro@realess.com.br ou aleatoria 123e4567-e89b-12d3-a456-426614174000";
+        assert!(AiEngine::validate_rewrite(
+            orig_pix_email,
+            "Utilize a chave PIX financeiro@realess.com.br ou a chave 123e4567-e89b-12d3-a456-426614174000."
+        ).is_ok());
+        assert!(AiEngine::validate_rewrite(
+            orig_pix_email,
+            "Utilize a chave PIX contato@realess.com.br ou a chave 123e4567-e89b-12d3-a456-426614174000."
+        ).is_err());
+        assert!(AiEngine::validate_rewrite(
+            orig_pix_email,
+            "Utilize a chave PIX financeiro@realess.com.br ou a chave 123e4567-e89b-12d3-a456-426614174001."
+        ).is_err());
+
+        let orig_pix_tel = "Chave PIX celular +5575988052539 ou código 00020126580014br.gov.bcb.pix0136123e4567";
+        assert!(AiEngine::validate_rewrite(
+            orig_pix_tel,
+            "Chave PIX +5575988052539 ou copia e cola 00020126580014br.gov.bcb.pix0136123e4567."
+        ).is_ok());
+        assert!(AiEngine::validate_rewrite(
+            orig_pix_tel,
+            "Chave PIX +5575988052530 ou copia e cola 00020126580014br.gov.bcb.pix0136123e4567."
+        ).is_err());
+
+        // 5. Números (DDD, telefone, prazo, protocolo) e remoção permitida de valores em dinheiro
+        let orig_num = "Ligue no (75) 3333-4475 em até 48 horas sobre o protocolo 852 (valor de R$ 350,00).";
+        assert!(AiEngine::validate_rewrite(
+            orig_num,
+            "Entre em contato pelo (75) 3333-4475 dentro de 48 horas informando o protocolo 852 para consultar condições."
+        ).is_ok());
+        assert!(AiEngine::validate_rewrite(
+            orig_num,
+            "Entre em contato pelo (11) 3333-4475 dentro de 48 horas informando o protocolo 852."
+        ).is_err());
+        assert!(AiEngine::validate_rewrite(
+            orig_num,
+            "Entre em contato pelo (75) 3333-4475 dentro de 24 horas informando o protocolo 852."
+        ).is_err());
     }
 }
