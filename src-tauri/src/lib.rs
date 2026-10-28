@@ -260,6 +260,10 @@ pub fn run() {
             get_ai_config,
             save_ai_config,
             get_ai_provider_keys,
+            gemini_web_login,
+            gemini_web_status,
+            gemini_web_test,
+            gemini_web_logout,
             // Permissions
             get_user_permissions,
             update_user_permission,

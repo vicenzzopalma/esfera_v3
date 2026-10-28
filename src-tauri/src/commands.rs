@@ -2962,6 +2962,118 @@ pub fn list_opt_out_audit(
 }
 
 #[tauri::command]
+pub async fn gemini_web_login(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<serde_json::Value, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+
+    let initial = crate::ai_engine::AiEngine::check_gemini_web_status().await;
+    if !initial.browser_open {
+        crate::ai_engine::AiEngine::launch_gemini_web_browser(false)?;
+        tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+    }
+
+    let status = crate::ai_engine::AiEngine::check_gemini_web_status().await;
+    if status.connected {
+        let _ = state.db.save_ai_provider_key(
+            company_id,
+            "gemini_web",
+            "connected",
+            "http://127.0.0.1:9223",
+            "gemini-web",
+        );
+    }
+
+    Ok(serde_json::json!({
+        "connected": status.connected,
+        "browserOpen": status.browser_open,
+        "detail": status.detail,
+    }))
+}
+
+#[tauri::command]
+pub async fn gemini_web_status(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<serde_json::Value, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+
+    let status = crate::ai_engine::AiEngine::check_gemini_web_status().await;
+    if status.connected {
+        let _ = state.db.save_ai_provider_key(
+            company_id,
+            "gemini_web",
+            "connected",
+            "http://127.0.0.1:9223",
+            "gemini-web",
+        );
+    }
+    let saved_connected = state
+        .db
+        .get_ai_provider_key(company_id, "gemini_web")
+        .map(|(k, _, _)| !k.trim().is_empty())
+        .unwrap_or(false);
+
+    Ok(serde_json::json!({
+        "connected": status.connected,
+        "browserOpen": status.browser_open,
+        "savedConnected": saved_connected,
+        "detail": status.detail,
+    }))
+}
+
+#[tauri::command]
+pub async fn gemini_web_test(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<String, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+
+    let cfg = crate::db::AiConfig {
+        company_id,
+        provider: "gemini_web".to_string(),
+        model: "gemini-web".to_string(),
+        temperature: 0.7,
+        system_prompt: String::new(),
+        api_key: "connected".to_string(),
+        endpoint: "http://127.0.0.1:9223".to_string(),
+    };
+    let sample = "Olá {nome}, vimos que a proposta com vencimento em 20/10/2026 continua disponível para análise.";
+    let rewritten = crate::ai_engine::AiEngine::generate_message(&cfg, sample, "{nome}").await?;
+    let _ = state.db.save_ai_provider_key(
+        company_id,
+        "gemini_web",
+        "connected",
+        "http://127.0.0.1:9223",
+        "gemini-web",
+    );
+    Ok(rewritten)
+}
+
+#[tauri::command]
+pub async fn gemini_web_logout(
+    state: State<'_, AppState>,
+    token: String,
+    company_id: i32,
+) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+
+    crate::ai_engine::AiEngine::close_gemini_web_browser().await?;
+    let _ = state
+        .db
+        .save_ai_provider_key(company_id, "gemini_web", "", "", "");
+    Ok(())
+}
+
+#[tauri::command]
 pub fn reset_campaign_contacts(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<usize, String> {
     let session = validate_session(&state.sessions, &token)?;
     let company_id = state.db.get_campaign_company_id(campaign_id)
@@ -3005,7 +3117,10 @@ pub fn start_campaign(state: State<'_, AppState>, token: String, campaign_id: i3
         };
 
         let prov = effective_provider.to_lowercase();
-        let is_local = prov == "ollama" || prov == "ollama_local" || prov == "lmstudio" || prov == "lm_studio";
+        let has_gemini_web = db.get_ai_provider_key(company_id, "gemini_web")
+            .map(|(k, _, _)| !k.trim().is_empty())
+            .unwrap_or(false);
+        let is_local = prov == "ollama" || prov == "ollama_local" || prov == "lmstudio" || prov == "lm_studio" || prov == "gemini_web" || has_gemini_web;
         if !is_local {
             let config = config_opt
                 .ok_or_else(|| format!("Configure o provedor de IA '{effective_provider}' com chave de API em Parâmetros de IA antes de iniciar."))?;
