@@ -2973,7 +2973,10 @@ pub async fn gemini_web_login(
     let initial = crate::ai_engine::AiEngine::check_gemini_web_status().await;
     if !initial.browser_open {
         crate::ai_engine::AiEngine::launch_gemini_web_browser(false)?;
-        tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    } else {
+        let _ = crate::ai_engine::AiEngine::bring_gemini_web_to_front().await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     let status = crate::ai_engine::AiEngine::check_gemini_web_status().await;
@@ -2985,11 +2988,16 @@ pub async fn gemini_web_login(
             "http://127.0.0.1:9223",
             "gemini-web",
         );
+    } else {
+        let _ = state
+            .db
+            .save_ai_provider_key(company_id, "gemini_web", "", "", "");
     }
 
     Ok(serde_json::json!({
         "connected": status.connected,
         "browserOpen": status.browser_open,
+        "savedConnected": status.connected,
         "detail": status.detail,
     }))
 }
@@ -3012,6 +3020,11 @@ pub async fn gemini_web_status(
             "http://127.0.0.1:9223",
             "gemini-web",
         );
+    } else if status.browser_open {
+        // Se o navegador está aberto e não logado, limpa qualquer indicador antigo
+        let _ = state
+            .db
+            .save_ai_provider_key(company_id, "gemini_web", "", "", "");
     }
     let saved_connected = state
         .db
