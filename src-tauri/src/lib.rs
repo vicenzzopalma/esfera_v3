@@ -276,6 +276,10 @@ pub fn run() {
             list_opt_outs,
             add_opt_outs,
             remove_opt_out,
+            list_opt_out_reviews,
+            resolve_opt_out_review,
+            discard_opt_out_review,
+            list_opt_out_audit,
             start_campaign,
             rewrite_message_ai,
             // Hub / Master

@@ -4170,6 +4170,47 @@ impl AdbManager {
         Ok(())
     }
 
+    /// Extrai os nomes de contatos temporários ("Esfera <número>") da saída do `content query`.
+    pub fn parse_temporary_contact_names_from_query(output: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("No result") {
+                continue;
+            }
+            for key in ["data1=", "display_name="] {
+                if let Some(pos) = trimmed.find(key) {
+                    let rest = &trimmed[pos + key.len()..];
+                    let val = rest.split(", ").next().unwrap_or(rest).trim();
+                    if !val.is_empty() && val != "NULL" {
+                        names.push(val.to_string());
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// Consulta uma única vez os nomes dos contatos já existentes na conta isolada `esfera_temp` do aparelho.
+    pub fn list_temporary_contact_names(serial: &str) -> Result<Vec<String>, String> {
+        let query_data = format!(
+            "content query --uri content://com.android.contacts/data --projection data1 --where \"account_name='{}' AND mimetype='vnd.android.cursor.item/name'\"",
+            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME
+        );
+        if let Ok(out) = Self::execute_shell(serial, &query_data, 8) {
+            let names = Self::parse_temporary_contact_names_from_query(&out);
+            if !names.is_empty() || out.contains("No result found") || out.contains("Row:") {
+                return Ok(names);
+            }
+        }
+        let query_raw = format!(
+            "content query --uri content://com.android.contacts/raw_contacts --projection display_name --where \"account_name='{}' AND (deleted IS NULL OR deleted=0)\"",
+            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME
+        );
+        let out = Self::execute_shell(serial, &query_raw, 8)?;
+        Ok(Self::parse_temporary_contact_names_from_query(&out))
+    }
+
     /// Alias histórico: digitação tecla a tecla (modelo psicomotor). Antes injetava palavras
     /// inteiras com `input text`, o que parecia colagem; agora delega à digitação humana.
     #[allow(dead_code)]

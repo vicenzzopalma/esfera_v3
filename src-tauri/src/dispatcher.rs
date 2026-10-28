@@ -63,43 +63,84 @@ pub fn import_opt_out_from_device(db: &Database, serial: &str, company_id: i32) 
         if out.trim().is_empty() {
             return;
         }
-        let mut all_saved = true;
-        for line in out.lines().filter(|l| l.trim().starts_with('{')) {
-            let v: serde_json::Value = match serde_json::from_str(line.trim()) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("");
-            let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
-            // O remetente vem no título: número sem contato salvo ou o contato temporário "Esfera <número>".
-            let digits = AdbManager::extract_phone_digits(title);
-            if digits.len() < 10 {
-                // Não descarta: guarda numa fila de revisão local para o operador descadastrar manualmente.
-                let dir = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("esfera_v3");
-                let _ = std::fs::create_dir_all(&dir);
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("descadastro_revisar.jsonl")) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "{}", line.trim());
-                }
-                eprintln!("[DESCADASTRO] Pedido sem número identificável (título '{}'); guardado em descadastro_revisar.jsonl para revisão.", title);
-                continue;
-            }
-            let reason = format!("Respondeu \"{}\" no WhatsApp", text.chars().take(40).collect::<String>());
-            match db.add_opt_out(company_id, &digits, &reason) {
-                Ok(()) => {
-                    let n = db.suppress_pending_for_opt_out(company_id, &digits);
-                    println!("[DESCADASTRO] {} descadastrado automaticamente ({} envio(s) pendente(s) cancelado(s)).", digits, n);
-                }
-                Err(e) => {
-                    all_saved = false;
-                    eprintln!("[DESCADASTRO] Falha ao registrar {}: {}", digits, e);
-                }
-            }
-        }
+        let all_saved = process_opt_out_jsonl(db, serial, company_id, &out, None);
         if all_saved {
             let _ = AdbManager::execute_shell(serial, "rm -f /sdcard/esfera_optout.reading", 4);
         }
     }
+}
+
+/// Processa linhas JSONL de descadastro vindas do agente Android.
+/// Quando o remetente não tem número identificável, grava na tabela `ESF_OptOutReview` do banco;
+/// mantém a gravação no arquivo `descadastro_revisar.jsonl` apenas como reserva se o banco falhar.
+pub fn process_opt_out_jsonl(
+    db: &Database,
+    serial: &str,
+    company_id: i32,
+    out: &str,
+    fallback_file: Option<&std::path::Path>,
+) -> bool {
+    let mut all_saved = true;
+    for line in out.lines().filter(|l| l.trim().starts_with('{')) {
+        let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("");
+        let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        // O remetente vem no título: número sem contato salvo ou o contato temporário "Esfera <número>".
+        let digits = AdbManager::extract_phone_digits(title);
+        if digits.len() < 10 {
+            // Grava no banco para revisão na interface; usa o arquivo JSONL só como reserva se o banco falhar.
+            match db.add_opt_out_review(company_id, title, text, serial) {
+                Ok(_) => {
+                    eprintln!(
+                        "[DESCADASTRO] Pedido sem número identificável (título '{}', aparelho '{}'); gravado no banco para revisão.",
+                        title, serial
+                    );
+                }
+                Err(e) => {
+                    let target_path = match fallback_file {
+                        Some(p) => p.to_path_buf(),
+                        None => {
+                            let dir = std::env::var_os("LOCALAPPDATA")
+                                .map(std::path::PathBuf::from)
+                                .unwrap_or_else(std::env::temp_dir)
+                                .join("esfera_v3");
+                            let _ = std::fs::create_dir_all(&dir);
+                            dir.join("descadastro_revisar.jsonl")
+                        }
+                    };
+                    if let Some(parent) = target_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&target_path) {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{}", line.trim());
+                    } else {
+                        all_saved = false;
+                    }
+                    eprintln!(
+                        "[DESCADASTRO] Falha ao gravar revisão no banco ({}); salvo em {:?} como reserva.",
+                        e, target_path
+                    );
+                }
+            }
+            continue;
+        }
+        let reason = format!("Respondeu \"{}\" no WhatsApp", text.chars().take(40).collect::<String>());
+        match db.add_opt_out(company_id, &digits, &reason) {
+            Ok(()) => {
+                let n = db.suppress_pending_for_opt_out(company_id, &digits);
+                println!("[DESCADASTRO] {} descadastrado automaticamente ({} envio(s) pendente(s) cancelado(s)).", digits, n);
+            }
+            Err(e) => {
+                all_saved = false;
+                eprintln!("[DESCADASTRO] Falha ao registrar {}: {}", digits, e);
+            }
+        }
+    }
+    all_saved
 }
 
 /// Janela de envio no horário local do PC: seg-sex 08:00-20:00, sábado 08:00-14:00, domingo fechado.
@@ -125,6 +166,11 @@ static TEMP_CONTACT_SAVED_AT: std::sync::LazyLock<Mutex<HashMap<String, Instant>
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static TEMP_CONTACTS_INFLIGHT: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+/// Aparelhos cuja conta `esfera_temp` já foi consultada nesta execução do app.
+static TEMP_CONTACTS_LOADED_DEVICES: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+static TEMP_CONTACTS_LOAD_LOCK: std::sync::LazyLock<Mutex<()>> =
+    std::sync::LazyLock::new(|| Mutex::new(()));
 
 /// Tempo que o WhatsApp leva para achar na busca um contato recém-salvo.
 const TEMP_CONTACT_INDEX_MS: u64 = 2500;
@@ -133,9 +179,51 @@ fn temp_key(serial: &str, phone: &str) -> String {
     format!("{}|{}", serial, AdbManager::extract_phone_digits(phone))
 }
 
+/// Na primeira chamada por aparelho após iniciar o app, carrega uma única vez os contatos
+/// já existentes na conta `esfera_temp` do aparelho para não duplicar contatos "Esfera <número>".
+fn ensure_device_temp_contacts_loaded_with<L>(serial: &str, loader: L)
+where
+    L: FnOnce(&str) -> Result<Vec<String>, String>,
+{
+    if TEMP_CONTACTS_LOADED_DEVICES.lock().map(|s| s.contains(serial)).unwrap_or(false) {
+        return;
+    }
+    let _guard = TEMP_CONTACTS_LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if TEMP_CONTACTS_LOADED_DEVICES.lock().map(|s| s.contains(serial)).unwrap_or(false) {
+        return;
+    }
+    if let Ok(existing_names) = loader(serial) {
+        if let Ok(mut s) = TEMP_CONTACTS.lock() {
+            for name in existing_names {
+                let digits = AdbManager::extract_phone_digits(&name);
+                if !digits.is_empty() {
+                    s.insert(format!("{}|{}", serial, digits));
+                }
+            }
+        }
+        if let Ok(mut loaded) = TEMP_CONTACTS_LOADED_DEVICES.lock() {
+            loaded.insert(serial.to_string());
+        }
+    }
+}
+
 /// Salva o contato no aparelho se ainda não estiver salvo. Retorna true se acabou de criar.
 /// Se outra thread (a semeadura) está salvando o mesmo contato, espera ela em vez de duplicar.
 pub fn ensure_temp_contact(serial: &str, phone: &str) -> bool {
+    ensure_temp_contact_with(
+        serial,
+        phone,
+        AdbManager::list_temporary_contact_names,
+        AdbManager::insert_temporary_contact,
+    )
+}
+
+pub fn ensure_temp_contact_with<L, I>(serial: &str, phone: &str, loader: L, inserter: I) -> bool
+where
+    L: FnOnce(&str) -> Result<Vec<String>, String>,
+    I: FnOnce(&str, &str, &str) -> Result<Option<i64>, String>,
+{
+    ensure_device_temp_contacts_loaded_with(serial, loader);
     let key = temp_key(serial, phone);
     let waited_since = Instant::now();
     loop {
@@ -151,7 +239,7 @@ pub fn ensure_temp_contact(serial: &str, phone: &str) -> bool {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let created = match AdbManager::insert_temporary_contact(serial, &temp_contact_name(phone), phone) {
+    let created = match inserter(serial, &temp_contact_name(phone), phone) {
         Ok(Some(_)) => {
             if let Ok(mut s) = TEMP_CONTACTS.lock() {
                 s.insert(key.clone());
@@ -807,5 +895,123 @@ impl Dispatcher {
                 }
             }
         });
+    }
+}
+
+
+#[cfg(test)]
+mod dispatcher_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn import_opt_out_salva_revisao_no_banco_e_usa_arquivo_so_como_reserva() {
+        let db_path = std::env::temp_dir().join(format!("esfera_disp_rev_{}.db", std::process::id()));
+        let fallback_path = std::env::temp_dir().join(format!("esfera_disp_fallback_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&fallback_path);
+
+        let db = Database::init(db_path.to_string_lossy().as_ref()).expect("db init");
+        let payload = concat!(
+            "{\"title\":\"Cliente Sem Numero\",\"text\":\"SAIR agora\"}\n",
+            "{\"title\":\"Esfera 5575988052539\",\"text\":\"SAIR\"}\n"
+        );
+
+        let all_saved = process_opt_out_jsonl(&db, "192.168.1.90:5555", 1, payload, Some(&fallback_path));
+        assert!(all_saved);
+
+        // O pedido com número foi descadastrado direto:
+        assert!(db.is_opted_out(1, "5575988052539"));
+
+        // O pedido sem número foi para ESF_OptOutReview no banco e NÃO criou o arquivo de reserva:
+        let reviews = db.list_opt_out_reviews(1, Some("pending"));
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].title, "Cliente Sem Numero");
+        assert_eq!(reviews[0].text, "SAIR agora");
+        assert_eq!(reviews[0].device, "192.168.1.90:5555");
+        assert!(!fallback_path.exists(), "arquivo de reserva não deve ser escrito quando o banco funciona");
+
+        // Simula falha no banco (tabela removida) -> deve gravar no arquivo de reserva
+        db.pooled_conn().unwrap().execute("DROP TABLE ESF_OptOutReview;", []).unwrap();
+        let line_sem_num = "{\"title\":\"Contato Oculto\",\"text\":\"pare de mandar\"}\n";
+        let ok_fallback = process_opt_out_jsonl(&db, "192.168.1.90:5555", 1, line_sem_num, Some(&fallback_path));
+        assert!(ok_fallback);
+        assert!(fallback_path.exists(), "arquivo de reserva deve ser criado quando o banco falha");
+        let saved_jsonl = std::fs::read_to_string(&fallback_path).unwrap();
+        assert!(saved_jsonl.contains("Contato Oculto"));
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&fallback_path);
+    }
+
+    #[test]
+    fn ensure_temp_contact_carrega_existentes_uma_vez_por_aparelho_e_nao_duplica_apos_reinicio() {
+        let serial = "test-serial-restart-01";
+        if let Ok(mut s) = TEMP_CONTACTS.lock() {
+            s.retain(|k| !k.starts_with(&format!("{}|", serial)));
+        }
+        if let Ok(mut d) = TEMP_CONTACTS_LOADED_DEVICES.lock() {
+            d.remove(serial);
+        }
+
+        // Também valida o parser da saída do `content query` na conta esfera_temp:
+        let sample_query = "Row: 0 data1=Esfera 5575988052539\nRow: 1 data1=Esfera 5511977776666\n";
+        let parsed = AdbManager::parse_temporary_contact_names_from_query(sample_query);
+        assert_eq!(parsed, vec!["Esfera 5575988052539".to_string(), "Esfera 5511977776666".to_string()]);
+
+        let loader_calls = AtomicUsize::new(0);
+        let inserter_calls = AtomicUsize::new(0);
+
+        // 1ª chamada após reiniciar: número 5575988052539 já existe no aparelho -> carrega 1 vez e NÃO insere de novo
+        let created_existing = ensure_temp_contact_with(
+            serial,
+            "+55 (75) 98805-2539",
+            |_| {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(parsed.clone())
+            },
+            |_, _, _| {
+                inserter_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(101))
+            },
+        );
+        assert!(!created_existing, "não deve duplicar contato que já existia na conta esfera_temp");
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 1, "deve consultar o aparelho na 1ª chamada");
+        assert_eq!(inserter_calls.load(Ordering::SeqCst), 0, "não deve inserir contato já existente");
+
+        // 2ª chamada no mesmo aparelho para número novo -> NÃO consulta o aparelho de novo, insere 1 vez
+        let created_new = ensure_temp_contact_with(
+            serial,
+            "5575999991111",
+            |_| {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![])
+            },
+            |_, name, _| {
+                assert_eq!(name, "Esfera 5575999991111");
+                inserter_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(102))
+            },
+        );
+        assert!(created_new, "deve criar contato inédito");
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 1, "não deve consultar content query novamente para o mesmo aparelho");
+        assert_eq!(inserter_calls.load(Ordering::SeqCst), 1);
+
+        // 3ª chamada para o mesmo número novo -> já consta em memória, não insere nem consulta
+        let created_again = ensure_temp_contact_with(
+            serial,
+            "5575999991111",
+            |_| {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![])
+            },
+            |_, _, _| {
+                inserter_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(103))
+            },
+        );
+        assert!(!created_again);
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inserter_calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -4045,7 +4045,38 @@ export default function CampaignsTab() {
 // Descadastrados (opt-out)
 // ============================================================
 
-type OptOut = { phone: string; reason: string; createdAt: string };
+type OptOut = {
+  phone: string;
+  reason: string;
+  createdAt: string;
+  addedBy?: string | null;
+  removedBy?: string | null;
+  removedAt?: string | null;
+};
+
+type OptOutReviewItem = {
+  id: number;
+  companyId: number;
+  title: string;
+  text: string;
+  device: string;
+  status: string;
+  resolvedPhone?: string | null;
+  resolvedBy?: string | null;
+  resolvedAt?: string | null;
+  createdAt: string;
+};
+
+type OptOutAuditItem = {
+  id: number;
+  companyId: number;
+  phone: string;
+  action: string;
+  actorName: string;
+  actorRole: string;
+  detail: string;
+  createdAt: string;
+};
 
 /** Mesma regra do backend (Database::opt_out_key): só dígitos, sem DDI 55 e sem o 9º dígito. */
 function optOutKey(phone: string) {
@@ -4060,7 +4091,13 @@ function formatOptOutPhone(d: string) {
 }
 
 function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () => void }) {
+  const { user } = useAuth();
+  const canRemove = user?.role === "master" || user?.role === "gestor";
   const [items, setItems] = useState<OptOut[]>([]);
+  const [reviews, setReviews] = useState<OptOutReviewItem[]>([]);
+  const [audits, setAudits] = useState<OptOutAuditItem[]>([]);
+  const [reviewPhones, setReviewPhones] = useState<Record<number, string>>({});
+  const [reviewBusyId, setReviewBusyId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
@@ -4068,21 +4105,29 @@ function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () =>
 
   const load = useCallback(() => {
     setLoading(true);
-    api<OptOut[]>("list_opt_outs", { companyId })
-      .then(setItems)
+    Promise.all([
+      api<OptOut[]>("list_opt_outs", { companyId }),
+      api<OptOutReviewItem[]>("list_opt_out_reviews", { companyId }).catch(() => [] as OptOutReviewItem[]),
+      api<OptOutAuditItem[]>("list_opt_out_audit", { companyId }).catch(() => [] as OptOutAuditItem[]),
+    ])
+      .then(([optOuts, revs, auds]) => {
+        setItems(optOuts);
+        setReviews(revs);
+        setAudits(auds);
+      })
       .catch((e) => setMsg({ ok: false, text: String(e) }))
       .finally(() => setLoading(false));
   }, [companyId]);
   useEffect(load, [load]);
 
-  const phones = text.split(/[\n,;]+/).map((l) => l.trim()).filter((l) => l.replace(/\D/g, "").length >= 8);
+  const phones = text.split(/[\n,;]+/).map((l) => l.trim()).filter((l) => l.length > 0);
 
   const add = async () => {
     if (!phones.length) return;
     setBusy(true);
     try {
       const n = await api<number>("add_opt_outs", { companyId, phones, reason: "Pediu para não receber (SAIR)" });
-      setMsg({ ok: true, text: `${n} número(s) descadastrado(s). Eles não recebem mais nenhuma campanha.` });
+      setMsg({ ok: true, text: `${n} número(s) descadastrado(s). Envios pendentes foram cancelados.` });
       setText("");
       load();
     } catch (e) {
@@ -4095,11 +4140,52 @@ function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () =>
   const remove = async (phone: string) => {
     try {
       await api("remove_opt_out", { companyId, phone });
+      setMsg({ ok: true, text: `Número ${formatOptOutPhone(phone)} removido do descadastro.` });
       load();
     } catch (e) {
       setMsg({ ok: false, text: String(e) });
     }
   };
+
+  const resolveReview = async (reviewId: number) => {
+    const phone = (reviewPhones[reviewId] || "").trim();
+    if (!phone) {
+      setMsg({ ok: false, text: "Informe o DDD + número para descadastrar este pedido." });
+      return;
+    }
+    setReviewBusyId(reviewId);
+    try {
+      const suppressed = await api<number>("resolve_opt_out_review", { companyId, reviewId, phone });
+      setMsg({
+        ok: true,
+        text: `Número descadastrado com sucesso (${suppressed} envio(s) pendente(s) cancelado(s)).`,
+      });
+      setReviewPhones((prev) => {
+        const next = { ...prev };
+        delete next[reviewId];
+        return next;
+      });
+      load();
+    } catch (e) {
+      setMsg({ ok: false, text: String(e) });
+    } finally {
+      setReviewBusyId(null);
+    }
+  };
+
+  const discardReview = async (reviewId: number) => {
+    setReviewBusyId(reviewId);
+    try {
+      await api("discard_opt_out_review", { companyId, reviewId });
+      load();
+    } catch (e) {
+      setMsg({ ok: false, text: String(e) });
+    } finally {
+      setReviewBusyId(null);
+    }
+  };
+
+  const removedAudits = audits.filter((a) => a.action === "remove");
 
   return (
     <Modal
@@ -4111,11 +4197,11 @@ function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () =>
       footer={<Button variant="secondary" onClick={onClose}>Fechar</Button>}
     >
       <div className="space-y-5">
-        <Field label="Adicionar números" hint="Um por linha. Aceita com ou sem DDI, com ou sem o 9.">
+        <Field label="Adicionar números" hint="Um por linha com DDD obrigatório (ex.: 75 98805-2539). Aceita com ou sem DDI e com ou sem o 9.">
           <textarea rows={4} value={text} onChange={(e) => setText(e.target.value)} placeholder={"75 98805-2539\n11 91234-5678"} className="font-mono" />
         </Field>
         <div className="flex items-center justify-between gap-3">
-          <span className="text-[0.75rem] text-tertiary">{phones.length ? `${phones.length} número(s) para adicionar` : "Nenhum número válido digitado"}</span>
+          <span className="text-[0.75rem] text-tertiary">{phones.length ? `${phones.length} número(s) para adicionar` : "Nenhum número digitado"}</span>
           <Button icon={<Ban size={14} />} onClick={add} loading={busy} disabled={!phones.length}>
             Descadastrar
           </Button>
@@ -4123,6 +4209,60 @@ function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () =>
         {msg && (
           <p className={`text-[0.8125rem] ${msg.ok ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}`}>{msg.text}</p>
         )}
+
+        {/* Seção Para revisar: pedidos de SAIR capturados sem número identificável */}
+        <div className="rounded-lg border border-border">
+          <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
+            <span className="text-[0.8125rem] font-medium text-primary">Para revisar</span>
+            <span className="text-[0.75rem] tabular-nums text-tertiary">{reviews.length}</span>
+          </div>
+          {reviews.length === 0 ? (
+            <p className="px-4 py-4 text-center text-[0.8125rem] text-tertiary">Nenhum pedido pendente de revisão.</p>
+          ) : (
+            <ul className="max-h-56 divide-y divide-[var(--color-border)] overflow-y-auto custom-scrollbar">
+              {reviews.map((rev) => (
+                <li key={rev.id} className="space-y-2 px-4 py-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-[0.8125rem] font-medium text-primary">{rev.title || "Remetente sem número"}</p>
+                      <p className="text-[0.75rem] text-secondary">“{rev.text || "SAIR"}”</p>
+                      <p className="text-[0.7rem] text-tertiary">
+                        Aparelho: {rev.device || "—"} · {formatDate(rev.createdAt)}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="text"
+                      value={reviewPhones[rev.id] || ""}
+                      onChange={(e) => setReviewPhones((prev) => ({ ...prev, [rev.id]: e.target.value }))}
+                      placeholder="DDD + número (ex.: 75 98805-2539)"
+                      className="h-8 flex-1 rounded-md border border-border bg-primary px-2.5 font-mono text-[0.75rem] text-primary"
+                    />
+                    <Button
+                      size="sm"
+                      icon={<Ban size={13} />}
+                      loading={reviewBusyId === rev.id}
+                      onClick={() => resolveReview(rev.id)}
+                    >
+                      Descadastrar
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      icon={<X size={13} />}
+                      disabled={reviewBusyId === rev.id}
+                      onClick={() => discardReview(rev.id)}
+                    >
+                      Descartar
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
         <div className="rounded-lg border border-border">
           <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
             <span className="text-[0.8125rem] font-medium text-primary">Lista</span>
@@ -4141,16 +4281,35 @@ function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () =>
                 <li key={it.phone} className="flex items-center justify-between gap-3 px-4 py-2">
                   <div className="min-w-0">
                     <p className="font-mono text-[0.8125rem] text-primary">{formatOptOutPhone(it.phone)}</p>
-                    <p className="truncate text-[0.75rem] text-tertiary">{it.reason || "—"} · {formatDate(it.createdAt)}</p>
+                    <p className="truncate text-[0.75rem] text-tertiary">
+                      {it.reason || "—"} · {formatDate(it.createdAt)}
+                      {it.addedBy ? ` · por ${it.addedBy}` : ""}
+                      {it.removedBy && it.removedAt ? ` · removido por ${it.removedBy} em ${formatDate(it.removedAt)}` : ""}
+                    </p>
                   </div>
-                  <Button variant="ghost" size="sm" icon={<Trash2 size={13} />} onClick={() => remove(it.phone)} aria-label={`Remover ${it.phone}`}>
-                    Remover
-                  </Button>
+                  {canRemove && (
+                    <Button variant="ghost" size="sm" icon={<Trash2 size={13} />} onClick={() => remove(it.phone)} aria-label={`Remover ${it.phone}`}>
+                      Remover
+                    </Button>
+                  )}
                 </li>
               ))}
             </ul>
           )}
         </div>
+
+        {removedAudits.length > 0 && (
+          <div className="rounded-lg border border-border px-4 py-2.5">
+            <p className="mb-1.5 text-[0.75rem] font-medium text-secondary">Histórico de remoções</p>
+            <ul className="max-h-32 space-y-1 overflow-y-auto text-[0.75rem] text-tertiary custom-scrollbar">
+              {removedAudits.slice(0, 20).map((a) => (
+                <li key={a.id} className="font-mono">
+                  {formatOptOutPhone(a.phone)} — removido por {a.actorName || "operador"} em {formatDate(a.createdAt)}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </div>
     </Modal>
   );
