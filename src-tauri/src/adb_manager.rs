@@ -4526,50 +4526,17 @@ impl AdbManager {
 
     /// Abre a conversa pela busca interna do WhatsApp. Só toca num resultado cuja linha
     /// mostre o próprio número (nunca abre conversa de outra pessoa). Retorna false se não achou.
-    fn wa_open_chat_via_search(
-        serial: &str,
-        pkg: &str,
-        digits: &str,
-        tail: &str,
-        screen_w: i32,
-        screen_h: i32,
-    ) -> Result<bool, String> {
-        let is_bar = |n: &UiNode| n.rid == format!("{}:id/search_text", pkg) || n.rid == format!("{}:id/my_search_bar", pkg);
-        let mut nodes = Self::ui_nodes(&Self::ui_dump(serial));
-        if !nodes.iter().any(|n| is_bar(n)) {
-            nodes = Self::ui_nodes(&Self::ui_dump_uiautomator(serial));
-        }
-        let bar = nodes.iter().find(|n| is_bar(n));
-        // Sem a barra de busca na tela (não está na lista de conversas): não toca nem digita às cegas.
-        let (bx, by) = match bar {
-            Some(b) => (b.cx, b.cy),
-            None => return Ok(false),
-        };
-        let _ = (screen_w, screen_h);
-        Self::soft_tap(serial, bx, by)?;
-        let d = Self::calculate_gaussian_delay(400, 600);
-        std::thread::sleep(Duration::from_millis(d as u64));
-        // Só digita se o campo de busca abriu de fato.
-        let search_id = format!("{}:id/search_input", pkg);
-        if !Self::ui_dump(serial).contains(&search_id) && !Self::ui_dump_uiautomator(serial).contains(&search_id) {
-            let _ = Self::send_keyevent(serial, 4);
-            return Ok(false);
-        }
-        // Campo de busca recém-aberto: o agente esvazia antes (a dica "Pesquisar" pode vir como texto).
-        Self::type_text_human_hpc_opts(serial, digits, true, true)?;
-        let d = Self::calculate_gaussian_delay(1000, 1400);
-        std::thread::sleep(Duration::from_millis(d as u64));
-
-        let results = Self::ui_nodes(&Self::ui_dump(serial));
-        // Confere DDD + 8 dígitos (sem DDI e sem o 9º), não só o final: "(11) 8805-2539" e
-        // "(75) 8805-2539" são pessoas diferentes. Linha sem DDD visível não é aceita.
+    /// Linha do resultado da busca que é o próprio número: o número puro (sem contato salvo) ou o
+    /// contato temporário "Esfera <número>". Confere DDD + 8 dígitos (sem DDI e sem o 9º), não só o
+    /// final: "(11) 8805-2539" e "(75) 8805-2539" são pessoas diferentes. Vale para a seção
+    /// "Conversas" e para "Pessoas" (contato sem conversa ainda, caso de todo primeiro disparo).
+    fn search_hit<'a>(results: &'a [UiNode], digits: &str, tail: &str) -> Option<&'a UiNode> {
         let want = crate::db::Database::opt_out_key(digits);
-        let hit = results.iter().find(|n| {
+        results.iter().find(|n| {
             if !n.rid.contains("contact_name") {
                 return false;
             }
-            // Só aceita linha cujo texto É o número (sem contato salvo) ou o contato temporário
-            // "Esfera <número>": um nome qualquer que só contenha os dígitos não serve.
+            // Um nome qualquer que só contenha os dígitos não serve.
             let t = n.text.trim();
             let is_number_only = t.chars().all(|c| c.is_ascii_digit() || " +-()".contains(c));
             let is_temp_contact = t.strip_prefix("Esfera ").map(|r| r.chars().all(|c| c.is_ascii_digit())).unwrap_or(false);
@@ -4578,22 +4545,96 @@ impl AdbManager {
                 && row.len() >= 10
                 && row.ends_with(tail)
                 && crate::db::Database::opt_out_key(&row) == want
-        });
+        })
+    }
+
+    /// Fecha teclado e busca, voltando à lista de conversas.
+    fn wa_close_search(serial: &str, pkg: &str) {
+        let search_id = format!("{}:id/search_input", pkg);
+        for _ in 0..2 {
+            if !Self::ui_dump(serial).contains(&search_id) {
+                break;
+            }
+            let _ = Self::send_keyevent(serial, 4);
+            std::thread::sleep(Duration::from_millis(350));
+        }
+    }
+
+    /// Abre a conversa pela busca interna do WhatsApp. Só toca num resultado cuja linha
+    /// mostre o próprio número (nunca abre conversa de outra pessoa). Retorna false se não achou.
+    fn wa_open_chat_via_search(
+        serial: &str,
+        pkg: &str,
+        digits: &str,
+        tail: &str,
+        screen_w: i32,
+        screen_h: i32,
+    ) -> Result<bool, String> {
+        let _ = (screen_w, screen_h);
+        let search_id = format!("{}:id/search_input", pkg);
+        let is_bar = |n: &UiNode| n.rid == format!("{}:id/search_text", pkg) || n.rid == format!("{}:id/my_search_bar", pkg);
+        let mut nodes = Self::ui_nodes(&Self::ui_dump(serial));
+        if !nodes.iter().any(|n| is_bar(n) || n.rid == search_id) {
+            nodes = Self::ui_nodes(&Self::ui_dump_uiautomator(serial));
+        }
+        // A busca pode já estar aberta: ao voltar da conversa anterior, o WhatsApp mostra os
+        // resultados da última busca (com o número antigo no campo). Reaproveita o campo em vez
+        // de desistir e abrir pelo link.
+        let field_empty = match nodes.iter().find(|n| n.rid == search_id) {
+            Some(field) => {
+                // Toca no campo para garantir o foco (o teclado pode ter sido fechado).
+                Self::soft_tap(serial, field.cx, field.cy)?;
+                let d = Self::calculate_gaussian_delay(250, 400);
+                std::thread::sleep(Duration::from_millis(d as u64));
+                field.text.trim_matches(|c: char| c == '\u{200b}' || c.is_whitespace()).is_empty()
+            }
+            None => {
+                // Sem a barra de busca na tela (não está na lista de conversas): não toca nem digita às cegas.
+                let (bx, by) = match nodes.iter().find(|n| is_bar(n)) {
+                    Some(b) => (b.cx, b.cy),
+                    None => return Ok(false),
+                };
+                Self::soft_tap(serial, bx, by)?;
+                let d = Self::calculate_gaussian_delay(400, 600);
+                std::thread::sleep(Duration::from_millis(d as u64));
+                // Só digita se o campo de busca abriu de fato.
+                if !Self::ui_dump(serial).contains(&search_id) && !Self::ui_dump_uiautomator(serial).contains(&search_id) {
+                    let _ = Self::send_keyevent(serial, 4);
+                    return Ok(false);
+                }
+                true
+            }
+        };
+        // O agente esvazia o campo antes (número anterior ou a dica "Pesquisar") e digita tecla a tecla.
+        if let Err(e) = Self::type_text_human_hpc_opts(serial, digits, true, field_empty) {
+            eprintln!("[BUSCA] Não foi possível digitar o número na busca ({}); abrindo pelo link.", e);
+            Self::wa_close_search(serial, pkg);
+            return Ok(false);
+        }
+        // Espera os resultados: o WhatsApp pode levar alguns segundos para listar o contato.
+        let d = Self::calculate_gaussian_delay(900, 1200);
+        std::thread::sleep(Duration::from_millis(d as u64));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let hit = loop {
+            let results = Self::ui_nodes(&Self::ui_dump(serial));
+            if let Some(n) = Self::search_hit(&results, digits, tail) {
+                break Some((n.cx, n.cy));
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(600));
+        };
         match hit {
-            Some(row) => {
-                Self::soft_tap(serial, row.cx, row.cy)?;
+            Some((x, y)) => {
+                Self::soft_tap(serial, x, y)?;
                 let d = Self::calculate_gaussian_delay(1100, 1600);
                 std::thread::sleep(Duration::from_millis(d as u64));
                 Ok(true)
             }
             None => {
-                // Fecha teclado e busca, voltando à lista de conversas
-                let _ = Self::send_keyevent(serial, 4);
-                std::thread::sleep(Duration::from_millis(250));
-                if !Self::wa_focus(serial).contains("HomeActivity") || Self::ui_dump(serial).contains(&format!("{}:id/search_input", pkg)) {
-                    let _ = Self::send_keyevent(serial, 4);
-                    std::thread::sleep(Duration::from_millis(300));
-                }
+                println!("[BUSCA] {} não apareceu na busca do WhatsApp em 5 s; abrindo pelo link.", digits);
+                Self::wa_close_search(serial, pkg);
                 Ok(false)
             }
         }
@@ -5314,6 +5355,26 @@ struct UiNode {
     text: String,
     cx: i32,
     cy: i32,
+}
+
+#[cfg(test)]
+mod search_hit_tests {
+    use super::AdbManager;
+
+    #[test]
+    fn acha_contato_temporario_na_secao_pessoas_e_recusa_outro_numero() {
+        // Tela capturada no moto g22 em 28/10: busca aberta, contato sem conversa em "Pessoas".
+        let xml = r#"<node index="0" text="​5534991359303" resource-id="com.whatsapp:id/search_input" bounds="[105,90][468,146]"></node>
+<node index="0" text="Pessoas" resource-id="com.whatsapp:id/title" bounds="[0,189][720,227]"></node>
+<node index="0" text="Esfera 5534991359303" resource-id="com.whatsapp:id/conversations_row_contact_name" bounds="[140,286][442,324]"></node>
+<node index="0" text="Nenhum resultado encontrado" resource-id="com.whatsapp:id/search_no_matches" bounds="[0,440][720,548]"></node>"#;
+        let nodes = AdbManager::ui_nodes(xml);
+        let hit = AdbManager::search_hit(&nodes, "5534991359303", "91359303").expect("deveria achar o contato");
+        assert_eq!(hit.text, "Esfera 5534991359303");
+        assert_eq!((hit.cx, hit.cy), (291, 305));
+        // Mesmo final com outro DDD não é a mesma pessoa.
+        assert!(AdbManager::search_hit(&nodes, "5511991359303", "91359303").is_none());
+    }
 }
 
 #[cfg(test)]
