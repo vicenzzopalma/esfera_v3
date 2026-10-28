@@ -30,9 +30,12 @@ import {
   Settings,
   Eye,
   EyeOff,
+  Plug,
+  Copy,
+  KeyRound,
 } from "lucide-react";
 
-type SettingsSection = "geral" | "notificacoes" | "adb" | "hub" | "ia" | "seguranca";
+type SettingsSection = "geral" | "notificacoes" | "adb" | "hub" | "ia" | "integracoes" | "seguranca";
 
 export default function SettingsTab() {
   const { selectedCompanyId, user } = useAuth();
@@ -231,6 +234,7 @@ export default function SettingsTab() {
     { id: "adb", label: "Aparelhos e ADB", icon: <Smartphone size={16} /> },
     { id: "hub", label: "Conexão e servidores", icon: <Wifi size={16} /> },
     { id: "ia", label: "Inteligência artificial", icon: <Sparkles size={16} /> },
+    { id: "integracoes", label: "Integrações", icon: <Plug size={16} /> },
     { id: "seguranca", label: "Segurança e backup", icon: <Shield size={16} /> },
   ];
 
@@ -570,6 +574,8 @@ export default function SettingsTab() {
               </FormSection>
             )}
 
+            {activeSection === "integracoes" && <IntegrationsSection companyId={selectedCompanyId ?? 1} isMaster={isMasterUser} />}
+
             {activeSection === "seguranca" && (
               <FormSection title="Segurança e backup" description="Proteção de dados e retenção de registros.">
                 <div className="space-y-5 max-w-xl">
@@ -683,5 +689,117 @@ function ToggleRow({
         <Toggle checked={checked} onChange={onChange} size="sm" />
       </div>
     </div>
+  );
+}
+
+// ---------- Integrações ----------
+// Webhook de descadastro (SAIR): o VEXOR chama POST /api/optout/events no Esfera com o token da empresa.
+const OPTOUT_BASE_URL = "http://127.0.0.1:8080";
+
+function IntegrationsSection({ companyId, isMaster }: { companyId: number; isMaster: boolean }) {
+  const [online, setOnline] = useState<boolean | null>(null);
+  const [orgId, setOrgId] = useState("org-local");
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    // no-cors: só interessa saber se a porta responde (o status exige token).
+    const check = () =>
+      fetch(`${OPTOUT_BASE_URL}/api/optout/status`, { mode: "no-cors" })
+        .then(() => alive && setOnline(true))
+        .catch(() => alive && setOnline(false));
+    check();
+    const timer = setInterval(check, 10000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, []);
+
+  const envLine = token
+    ? `ESFERA_OPTOUT_LINKS_JSON=${JSON.stringify({ [orgId.trim() || "org-local"]: { baseUrl: OPTOUT_BASE_URL, companyId, token } })}`
+    : "";
+
+  const generate = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      setToken(await api<string>("generate_company_token", { companyId }));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copy = async (what: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(what);
+      setTimeout(() => setCopied(""), 2000);
+    } catch {
+      setError("Não foi possível copiar. Selecione o texto e copie manualmente.");
+    }
+  };
+
+  return (
+    <FormSection title="Integrações" description="Descadastro (SAIR) recebido pelo VEXOR e entregue ao Esfera.">
+      <div className="space-y-5 max-w-2xl">
+        <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
+          <div className="min-w-0">
+            <p className="text-[0.8125rem] font-medium text-primary">Webhook de descadastro</p>
+            <p className="font-mono text-[0.75rem] text-tertiary">POST {OPTOUT_BASE_URL}/api/optout/events</p>
+          </div>
+          <span
+            className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[0.75rem] font-medium ${
+              online === null ? "bg-secondary text-secondary" : online ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" : "bg-red-500/10 text-red-600 dark:text-red-400"
+            }`}
+          >
+            {online === null ? "Verificando…" : online ? <><CheckCircle2 size={13} /> Ativo</> : <><AlertCircle size={13} /> Fora do ar</>}
+          </span>
+        </div>
+        {online === false && (
+          <p className="text-[0.75rem] text-red-600 dark:text-red-400">
+            A porta 8080 não respondeu. Clique em “Salvar alterações” e reabra o Esfera para ligar o webhook.
+          </p>
+        )}
+
+        {!isMaster ? (
+          <p className="text-[0.8125rem] text-secondary">Só o usuário Master gera o token da integração.</p>
+        ) : (
+          <div className="space-y-4">
+            <Field label="Organização no VEXOR" htmlFor="int-org" hint="ID da organização do VEXOR que recebe o SAIR (no ambiente local: org-local).">
+              <input id="int-org" type="text" value={orgId} onChange={(e) => setOrgId(e.target.value)} />
+            </Field>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button icon={<KeyRound size={15} />} onClick={generate} loading={busy}>
+                {token ? "Gerar outro token" : "Gerar token"}
+              </Button>
+              <p className="text-[0.75rem] text-tertiary">Gerar de novo invalida o token anterior (o VEXOR precisa do novo).</p>
+            </div>
+            {error && <p className="text-[0.75rem] text-red-600 dark:text-red-400">{error}</p>}
+            {token && (
+              <div className="space-y-3 rounded-lg border border-border p-4">
+                <p className="text-[0.75rem] text-amber-700 dark:text-amber-300">
+                  O token aparece só agora. Copie a linha abaixo para o arquivo .env do VEXOR e reinicie o VEXOR.
+                </p>
+                <div className="flex items-start gap-2">
+                  <code className="min-w-0 flex-1 break-all rounded bg-secondary px-2.5 py-2 font-mono text-[0.75rem] text-primary">{envLine}</code>
+                  <Button variant="secondary" icon={<Copy size={14} />} onClick={() => copy("env", envLine)}>
+                    {copied === "env" ? "Copiado" : "Copiar"}
+                  </Button>
+                </div>
+                <button type="button" onClick={() => copy("token", token)} className="text-[0.75rem] text-secondary underline cursor-pointer">
+                  {copied === "token" ? "Token copiado" : "Copiar só o token"}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </FormSection>
   );
 }

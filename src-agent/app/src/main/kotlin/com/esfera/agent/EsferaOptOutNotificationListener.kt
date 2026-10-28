@@ -76,7 +76,27 @@ class EsferaOptOutNotificationListener : NotificationListenerService() {
             .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
             .trim().replace(Regex("\\s+"), " ")
         if (normalized.isEmpty() || normalized.split(' ').size > 8) return false
-        return normalized in PHRASES
+        return normalized in PHRASES || isSairTypo(normalized)
+    }
+
+    /** "sai", "sairr", "saiiir", "siar", "sar": erro de digitação de "sair" (palavra isolada). */
+    private fun isSairTypo(word: String): Boolean {
+        if (word.contains(' ') || word.length < 3 || word.length > 8) return false
+        val collapsed = word.replace(Regex("(.)\\1+"), "$1")
+        if (collapsed == "sair") return true
+        return collapsed.first() == 's' && editDistance(collapsed, "sair") <= 1
+    }
+
+    private fun editDistance(a: String, b: String): Int {
+        val d = Array(a.length + 1) { IntArray(b.length + 1) }
+        for (i in 0..a.length) d[i][0] = i
+        for (j in 0..b.length) d[0][j] = j
+        for (i in 1..a.length) for (j in 1..b.length) {
+            val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+            d[i][j] = minOf(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) d[i][j] = minOf(d[i][j], d[i - 2][j - 2] + 1)
+        }
+        return d[a.length][b.length]
     }
 
     companion object {
@@ -91,7 +111,14 @@ class EsferaOptOutNotificationListener : NotificationListenerService() {
             "cancelar mensagens", "cancelar envio", "quero cancelar", "quero me descadastrar",
             "me descadastrar", "me descadastre", "descadastre meu numero",
             "remova meu numero", "excluir meu numero", "exclua meu numero",
-            "retirar meu numero", "retire meu numero", "remover numero", "remova meu contato"
+            "retirar meu numero", "retire meu numero", "remover numero", "remova meu contato",
+            // Mesmas frases do VEXOR (packages/connectors/src/opt-out.ts) e variações curtas inequívocas
+            "cancela", "descadastra", "remover", "remove", "me tira dessa lista", "me tire dessa lista",
+            "me tira da lista", "me tire da lista", "tira meu numero", "tire meu numero", "nao quero mais",
+            "nao quero", "nao tenho interesse", "sem interesse", "sair por favor", "por favor sair",
+            "quero sair da lista", "sair da lista", "me remove", "me remova", "me exclua",
+            "nao quero mais receber essas mensagens", "pare de me mandar mensagem", "parem de mandar",
+            "parem de enviar", "pode tirar meu numero", "quero sair dessa lista", "sair dessa lista"
         )
     }
 }
