@@ -10,6 +10,7 @@ pub struct AppConfig {
     /// (EsferaHubMaster_9f2c4a7b8e1d6c3f5a0b) que bate com o seed do VPS.
     /// Configurável em Settings (master) para alinhar com HUB_MASTER_TOKEN da VPS.
     pub hub_token: String,
+    pub vexor_token: String,
     pub empresa_server_enabled: bool,
     pub empresa_server_port: u16,
     pub checkin_server_enabled: bool,
@@ -26,6 +27,7 @@ impl Default for AppConfig {
             // Modo Standalone Local (Opera direto via USB ou WireGuard VPN P2P)
             hub_address: "127.0.0.1:8555".to_string(),
             hub_token: "root123".to_string(),
+            vexor_token: String::new(),
             empresa_server_enabled: false,
             empresa_server_port: 7777,
             checkin_server_enabled: true,
@@ -56,6 +58,12 @@ pub fn load_config() -> AppConfig {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(_) => AppConfig::default(),
     }
+}
+
+pub fn vexor_token() -> String {
+    let stored = load_config().vexor_token;
+    if !stored.trim().is_empty() { return stored.trim().to_string(); }
+    std::env::var("ESFERA_SAIR_TOKEN").or_else(|_| std::env::var("ESFERA_COMPANY_TOKEN")).unwrap_or_default().trim().to_string()
 }
 
 pub fn save_config(config: &AppConfig) -> Result<(), String> {

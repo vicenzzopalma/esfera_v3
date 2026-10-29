@@ -54,20 +54,23 @@ pub fn import_opt_out_from_device(db: &Database, serial: &str, company_id: i32) 
     {
         let out = match AdbManager::execute_shell(
             serial,
-            "if [ ! -s /sdcard/esfera_optout.reading ] && [ -s /sdcard/esfera_optout.jsonl ]; then mv /sdcard/esfera_optout.jsonl /sdcard/esfera_optout.reading; fi; cat /sdcard/esfera_optout.reading 2>/dev/null",
+            "if [ ! -s /sdcard/esfera_optout.reading ] && [ -s /sdcard/esfera_optout.jsonl ]; then mv /sdcard/esfera_optout.jsonl /sdcard/esfera_optout.reading; fi; if [ -f /sdcard/esfera_optout.reading ]; then cat /sdcard/esfera_optout.reading; fi",
             6,
         ) {
             Ok(o) => o,
             Err(_) => return false,
         };
-        if out.trim().is_empty() {
-            return true;
+        // Mesmo com um lote antigo retido para sincronização, examina as novas respostas.
+        let newer = match AdbManager::execute_shell(serial, "if [ -f /sdcard/esfera_optout.jsonl ]; then cat /sdcard/esfera_optout.jsonl; fi", 6) {
+            Ok(o) => o, Err(_) => return false,
+        };
+        if !process_opt_out_jsonl(db, serial, company_id, &out, None)
+            || !process_opt_out_jsonl(db, serial, company_id, &newer, None) { return false; }
+        if !out.trim().is_empty() && forward_device_messages(db, serial, company_id, &out) {
+            // Só apaga o lote após o VEXOR reconhecer todas as respostas.
+            let _ = AdbManager::execute_shell(serial, "rm -f /sdcard/esfera_optout.reading", 4);
         }
-        let all_saved = forward_device_messages(db, serial, company_id, &out);
-        if all_saved {
-            return AdbManager::execute_shell(serial, "rm -f /sdcard/esfera_optout.reading", 4).is_ok();
-        }
-        false
+        true
     }
 }
 
@@ -75,7 +78,7 @@ pub fn import_opt_out_from_device(db: &Database, serial: &str, company_id: i32) 
 pub const OPT_OUT_CONFIRMATION_TEXT: &str = "Pronto, seu número foi retirado das nossas mensagens automáticas. Você não receberá mais avisos por este canal, conforme o seu direito de oposição previsto na LGPD (Lei 13.709/2018, art. 18) e as regras de cobrança do Código de Defesa do Consumidor.\nEste pedido não altera e não reconhece nenhum débito.";
 
 fn forward_device_messages(db: &Database, serial: &str, company: i32, lines: &str) -> bool {
-    let token = std::env::var("ESFERA_SAIR_TOKEN").or_else(|_| std::env::var("ESFERA_COMPANY_TOKEN")).unwrap_or_default();
+    let token = crate::config::vexor_token();
     if token.trim().is_empty() { eprintln!("[SAIR] Token da integração não configurado; mensagens mantidas no aparelho."); return false; }
     forward_device_messages_at(db, serial, company, lines, token.trim(), "http://127.0.0.1:4000/esfera/device-messages")
 }
@@ -92,7 +95,7 @@ fn forward_device_messages_at(db: &Database, serial: &str, company: i32, lines: 
         let text = v.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let phone = AdbManager::extract_phone_digits(title);
         if phone.len() < 10 {
-            if db.add_opt_out_review(company,title,text,serial).is_err() { return false; }
+            if local_opt_out(text) && db.add_opt_out_review(company,title,text,serial).is_err() { return false; }
             continue;
         }
         let id = hex::encode(Sha256::digest(format!("{}|{}",device,line).as_bytes()));
@@ -124,6 +127,51 @@ fn forward_device_messages_at(db: &Database, serial: &str, company: i32, lines: 
     true
 }
 
+/// Classificação local conservadora para proteger o descadastro sem depender da rede.
+fn local_opt_out(text: &str) -> bool {
+    let mut normalized = String::new();
+    for c in text.to_lowercase().chars() {
+        let c = match c {
+            'á'|'à'|'â'|'ã'|'ä' => 'a', 'é'|'è'|'ê'|'ë' => 'e',
+            'í'|'ì'|'î'|'ï' => 'i', 'ó'|'ò'|'ô'|'õ'|'ö' => 'o',
+            'ú'|'ù'|'û'|'ü' => 'u', 'ç' => 'c', _ => c,
+        };
+        if c.is_alphanumeric() { normalized.push(c); } else { normalized.push(' '); }
+    }
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    if words.is_empty() { return false; }
+    // Um pedido explícito de SAIR permanece válido mesmo em mensagem mais longa.
+    if words.contains(&"sair") { return true; }
+    if words.len() > 8 { return false; }
+    let phrase = words.join(" ");
+    let phrases = ["sair", "parar", "pare", "stop", "cancelar", "descadastrar", "nao quero mais receber", "remover meu numero",
+        "quero sair", "quero parar", "pode parar", "pare de enviar", "pare de mandar", "parar de enviar", "parar de mandar",
+        "nao envie mais", "nao mande mais", "nao me envie mais mensagens", "nao quero receber", "nao quero receber mensagens",
+        "nao quero mais receber mensagens", "nao quero mais mensagens", "cancelar mensagens", "cancelar envio", "quero cancelar",
+        "quero me descadastrar", "me descadastrar", "me descadastre", "descadastre meu numero", "remova meu numero",
+        "excluir meu numero", "exclua meu numero", "retirar meu numero", "retire meu numero", "remover numero", "remova meu contato",
+        "cancela", "descadastra", "remover", "remove", "me tira dessa lista", "me tire dessa lista", "me tira da lista", "me tire da lista",
+        "tira meu numero", "tire meu numero", "nao quero mais", "nao quero", "nao tenho interesse", "sem interesse", "sair por favor",
+        "por favor sair", "quero sair da lista", "sair da lista", "me remove", "me remova", "me exclua",
+        "nao quero mais receber essas mensagens", "pare de me mandar mensagem", "parem de mandar", "parem de enviar",
+        "pode tirar meu numero", "quero sair dessa lista", "sair dessa lista"];
+    if phrases.contains(&phrase.as_str()) || phrase.starts_with("sair ") { return true; }
+    if words.len() != 1 { return false; }
+    let mut collapsed = String::new();
+    for c in phrase.chars() { if !collapsed.ends_with(c) { collapsed.push(c); } }
+    if collapsed == "sair" { return true; }
+    if !collapsed.starts_with('s') || collapsed.len() < 3 || collapsed.len() > 8 { return false; }
+    let a: Vec<char> = collapsed.chars().collect(); let b: Vec<char> = "sair".chars().collect();
+    let mut d = vec![vec![0usize; b.len()+1]; a.len()+1];
+    for i in 0..=a.len() { d[i][0]=i; }
+    for j in 0..=b.len() { d[0][j]=j; }
+    for i in 1..=a.len() { for j in 1..=b.len() {
+        d[i][j] = (d[i-1][j]+1).min(d[i][j-1]+1).min(d[i-1][j-1]+usize::from(a[i-1]!=b[j-1]));
+        if i>1 && j>1 && a[i-1]==b[j-2] && a[i-2]==b[j-1] { d[i][j]=d[i][j].min(d[i-2][j-2]+1); }
+    }}
+    d[a.len()][b.len()] <= 1
+}
+
 /// Processa linhas JSONL de descadastro vindas do agente Android.
 /// Quando o remetente não tem número identificável, grava na tabela `ESF_OptOutReview` do banco;
 /// mantém a gravação no arquivo `descadastro_revisar.jsonl` apenas como reserva se o banco falhar.
@@ -138,10 +186,11 @@ pub fn process_opt_out_jsonl(
     for line in out.lines().filter(|l| l.trim().starts_with('{')) {
         let v: serde_json::Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => { all_saved = false; continue; },
         };
         let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("");
         let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        if !local_opt_out(text) { continue; }
         // O remetente vem no título: número sem contato salvo ou o contato temporário "Esfera <número>".
         let digits = AdbManager::extract_phone_digits(title);
         if digits.len() < 10 {
@@ -197,12 +246,20 @@ pub fn process_opt_out_jsonl(
     all_saved
 }
 
+fn confirmation_allowed(within_window: bool, device_busy: bool) -> bool {
+    within_window && !device_busy
+}
+
 /// Janela de envio no horário local do PC: seg-sex 08:00-20:00, sábado 08:00-14:00, domingo fechado.
 pub fn within_send_window() -> bool {
-    use chrono::{Datelike, Timelike, Weekday};
+    use chrono::{Datelike, Timelike};
     let now = chrono::Local::now();
-    let h = now.hour();
-    match now.weekday() {
+    send_window_at(now.weekday(), now.hour())
+}
+
+fn send_window_at(day: chrono::Weekday, h: u32) -> bool {
+    use chrono::Weekday;
+    match day {
         Weekday::Sun => false,
         Weekday::Sat => (8..14).contains(&h),
         _ => (8..20).contains(&h),
@@ -977,12 +1034,8 @@ impl Dispatcher {
                         let contact_id_for_safety = next_contact.id;
                         let send_res = spawn_blocking(move || {
                             // Traz os "SAIR" capturados pelo agente agora, e revalida o descadastro no último instante.
-                            let token = std::env::var("ESFERA_SAIR_TOKEN").or_else(|_| std::env::var("ESFERA_COMPANY_TOKEN")).unwrap_or_default();
-                            if token.trim().is_empty() {
-                                return Err("TRAVA: Configure o token da integração SAIR antes de disparar.".into());
-                            }
                             if !import_opt_out_from_device(&db_last, &serial, company_last) {
-                                return Err("TRAVA: Não foi possível processar as respostas do aparelho no VEXOR; verifique a conexão e o token.".into());
+                                return Err("TRAVA: Não foi possível ler ou registrar as respostas do aparelho; verifique a conexão e o banco.".into());
                             }
                             if db_last.is_opted_out(company_last, &phone2) {
                                 return Err("Contato descadastrado durante o preparo; envio cancelado".to_string());
@@ -1162,7 +1215,7 @@ impl Dispatcher {
         });
     }
 
-    /// Envia confirmações somente quando o aparelho não está disparando ou fora da janela.
+    /// Envia confirmações apenas dentro do horário e com o aparelho sem campanha em execução.
     async fn flush_confirmations(db: Arc<Database>) {
         for (company, key, phone, original_serial, text) in db.pending_confirmations() {
             let text = if text.is_empty() { OPT_OUT_CONFIRMATION_TEXT.to_string() } else { text };
@@ -1178,8 +1231,8 @@ impl Dispatcher {
             let current_chips = db.get_chips(device.id);
             if current_chips.len() != 1 || current_chips[0].id != chips[0].id || current_chips[0].status != "livre" || current_chips[0].restricted_until.is_some() { continue; }
             let chip_id = current_chips[0].id;
-            let busy = || within_send_window() && db.get_running_campaigns().map(|cs| cs.iter().any(|c| c.company_id == company && c.device_ids.iter().any(|id| id == &device.serial || device.esfera_device_id.as_deref() == Some(id.as_str())))).unwrap_or(true);
-            if busy() || db.chip_cooldown_seconds(chip_id).unwrap_or(u64::MAX) > 0 { continue; }
+            let busy = || db.get_running_campaigns().map(|cs| cs.iter().any(|c| c.company_id == company && c.device_ids.iter().any(|id| id == &device.serial || device.esfera_device_id.as_deref() == Some(id.as_str())))).unwrap_or(true);
+            if !confirmation_allowed(within_send_window(), busy()) || db.chip_cooldown_seconds(chip_id).unwrap_or(u64::MAX) > 0 { continue; }
             if !db.claim_confirmation(company, &key).unwrap_or(false) { continue; }
             let attempt = match db.reserve_chip_attempt(&current_chips[0],company,0,&phone,true) {
                 Ok(id) => id,
@@ -1189,7 +1242,7 @@ impl Dispatcher {
             let device2 = device.clone();
             let result = spawn_blocking(move || {
                 prepare_temp_contact_for_send(&serial, &phone);
-                let check = || !within_send_window() || !db2.get_running_campaigns().map(|cs| cs.iter().any(|c| c.company_id == company && c.device_ids.iter().any(|id| id == &device2.serial || device2.esfera_device_id.as_deref() == Some(id.as_str())))).unwrap_or(true);
+                let check = || confirmation_allowed(within_send_window(), db2.get_running_campaigns().map(|cs| cs.iter().any(|c| c.company_id == company && c.device_ids.iter().any(|id| id == &device2.serial || device2.esfera_device_id.as_deref() == Some(id.as_str())))).unwrap_or(true));
                 AdbManager::send_whatsapp_parts(&serial, &phone, &[text], Some("com.whatsapp"), &check)
             }).await;
             let (sent, error) = match result { Ok(Ok(())) => (true,String::new()), Ok(Err(e)) => (false,e), Err(e) => (false,e.to_string()) };
@@ -1543,5 +1596,49 @@ mod vexor_device_bridge_tests {
         server.join().unwrap();
         assert!(db.is_opted_out(1,"75988052539"));
         assert_eq!(db.pending_confirmations().len(),1);
+    }
+}
+
+#[cfg(test)]
+mod local_fallback_tests {
+    use super::*;
+    use crate::db::Campaign;
+    use chrono::Weekday;
+
+    #[test]
+    fn janela_de_confirmacao_exige_horario_e_aparelho_livre() {
+        assert!(send_window_at(Weekday::Mon,8));
+        assert!(!send_window_at(Weekday::Mon,7));
+        assert!(!send_window_at(Weekday::Fri,20));
+        assert!(send_window_at(Weekday::Sat,13));
+        assert!(!send_window_at(Weekday::Sat,14));
+        assert!(!send_window_at(Weekday::Sun,10));
+        assert!(confirmation_allowed(true,false));
+        assert!(!confirmation_allowed(true,true));
+        assert!(!confirmation_allowed(false,false));
+        assert!(!confirmation_allowed(false,true));
+    }
+
+    #[test]
+    fn descadastro_local_protege_fila_sem_vexor_e_preserva_outros_numeros() {
+        let path=std::env::temp_dir().join(format!("esfera_local_sair_{}.db",std::process::id()));
+        let _=std::fs::remove_file(&path);
+        let db=Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let campaign=Campaign { id:0, name:"Teste".into(), greeting:"Olá".into(), message:"Teste".into(), closing:"SAIR".into(), delay_min:30, delay_max:60, use_spintax:false, use_ai:false, ai_model:String::new(), ai_provider:String::new(), ai_prompt:String::new(), device_ids:vec![], status:"draft".into(), contacts_count:0, sent_count:0, failed_count:0, company_id:1, updated_at:String::new() };
+        let id=db.create_campaign(&campaign).unwrap();
+        db.import_contacts(id,vec![("Pessoa".into(),"5575988052539".into()),("Outra".into(),"5575911112222".into())]).unwrap();
+        let old=r#"{"title":"Esfera 5575988052539","text":"SAIIR"}"#;
+        let new=r#"{"title":"Esfera 5575911112222","text":"Bom dia"}"#;
+        assert!(process_opt_out_jsonl(&db,"celular",1,old,None));
+        assert!(process_opt_out_jsonl(&db,"celular",1,new,None));
+        assert!(db.is_opted_out(1,"5575988052539"));
+        assert!(!db.is_opted_out(1,"5575911112222"));
+        assert!(db.get_contacts(id).iter().any(|c| c.phone=="5575988052539" && c.status=="opt_out"));
+        assert!(db.get_contacts(id).iter().any(|c| c.phone=="5575911112222" && c.status=="pending"));
+        // A sincronização pode falhar sem desfazer o registro local.
+        assert!(!forward_device_messages_at(&db,"celular",1,old,"teste","http://127.0.0.1:0/esfera/device-messages"));
+        assert!(db.is_opted_out(1,"5575988052539"));
+        assert!(local_opt_out("Por favor quero SAIR das mensagens agora mesmo, obrigada."));
+        assert!(!local_opt_out("Bom dia, vou verificar"));
     }
 }

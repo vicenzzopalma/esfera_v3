@@ -336,6 +336,6 @@ Para ajustar ao iniciar o Esfera, defina `ESFERA_CHIP_HOURLY_LIMIT`, `ESFERA_CHI
 
 ### Descadastro pelo celular
 
-Para encaminhar notificações ao VEXOR local, inicie o Esfera com a variável `ESFERA_SAIR_TOKEN` contendo o mesmo token da integração SAIR configurada no VEXOR. Em sua ausência, o motor aceita `ESFERA_COMPANY_TOKEN`. Sem token ou sem conexão ao VEXOR, as notificações permanecem no aparelho para nova tentativa. O agente Android atualizado precisa estar instalado no aparelho e ter acesso às notificações e à acessibilidade.
+Para encaminhar notificações ao VEXOR local, configure em Configurações > Integrações o mesmo token SAIR do VEXOR. Como alternativa, o motor aceita as variáveis `ESFERA_SAIR_TOKEN` ou `ESFERA_COMPANY_TOKEN`. Sem token ou sem conexão ao VEXOR, os pedidos reconhecidos são registrados localmente e as notificações permanecem no aparelho para sincronização posterior. O agente Android atualizado precisa estar instalado no aparelho e ter acesso às notificações e à acessibilidade.
 
-As confirmações aguardam o fim ou a parada do disparo, ou o fechamento da janela de envio. Estados de resultado incerto não são reenviados automaticamente; a tela de campanha informa quantos precisam de revisão. Números capturados antes de existir histórico por chip podem não ter campanha identificada para os contadores.
+As confirmações aguardam o fim ou a parada do disparo e só são enviadas dentro da janela de envio. Estados de resultado incerto não são reenviados automaticamente; a tela de campanha informa quantos precisam de revisão. Números capturados antes de existir histórico por chip podem não ter campanha identificada para os contadores.

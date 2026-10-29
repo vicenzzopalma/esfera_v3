@@ -3455,7 +3455,9 @@ pub async fn debloat_all_devices(_token: String) -> Result<Vec<String>, String> 
 
 #[tauri::command]
 pub fn get_app_config(_token: Option<String>) -> AppConfig {
-    config::load_config()
+    let mut cfg = config::load_config();
+    cfg.vexor_token.clear(); // a consulta geral de configuração não revela o segredo
+    cfg
 }
 
 #[tauri::command]
@@ -3475,7 +3477,9 @@ pub fn save_app_config(
 ) -> Result<(), String> {
     let mut final_cfg = config::load_config();
     if let Some(c) = config {
+        let existing_vexor_token = final_cfg.vexor_token.clone();
         final_cfg = c;
+        final_cfg.vexor_token = existing_vexor_token;
     } else {
         if let Some(v) = hub_enabled { final_cfg.hub_enabled = v; }
         if let Some(v) = hub_address { final_cfg.hub_address = v; }
@@ -3489,6 +3493,82 @@ pub fn save_app_config(
         if let Some(v) = mode { final_cfg.mode = v; }
     }
     config::save_config(&final_cfg)
+}
+
+fn authorize_vexor_config(state: &AppState, token: &str, company_id: i32) -> Result<(), String> {
+    let session = validate_session(&state.sessions, token)?;
+    if company_id <= 0 || !state.db.company_exists(company_id) { return Err("Empresa não encontrada.".into()); }
+    if session.role == "master" || (session.role == "gestor" && session.company_id == Some(company_id)) { Ok(()) }
+    else { Err("Apenas master ou gestor da empresa pode configurar o VEXOR.".into()) }
+}
+
+#[tauri::command]
+pub fn get_vexor_token_status(state: State<'_, AppState>, token: String, company_id: i32) -> Result<bool, String> {
+    authorize_vexor_config(&state, &token, company_id)?;
+    Ok(!config::vexor_token().is_empty())
+}
+
+#[tauri::command]
+pub fn save_vexor_token(state: State<'_, AppState>, token: String, company_id: i32, vexor_token: String) -> Result<(), String> {
+    authorize_vexor_config(&state, &token, company_id)?;
+    let value = vexor_token.trim();
+    if value.len() > 512 || value.chars().any(char::is_control) { return Err("Token inválido.".into()); }
+    let mut cfg = config::load_config();
+    cfg.vexor_token = value.to_string();
+    config::save_config(&cfg)
+}
+
+#[tauri::command]
+pub async fn test_vexor_token(state: State<'_, AppState>, token: String, company_id: i32) -> Result<String, String> {
+    authorize_vexor_config(&state, &token, company_id)?;
+    let secret = config::vexor_token();
+    if secret.is_empty() { return Err("Configure e salve o token do VEXOR.".into()); }
+    probe_vexor_token("http://127.0.0.1:4000/esfera/device-messages", &secret, company_id).await
+}
+
+async fn probe_vexor_token(endpoint: &str, secret: &str, company_id: i32) -> Result<String, String> {
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().map_err(|_| "Não foi possível iniciar o teste.".to_string())?;
+    let response = client.post(endpoint).bearer_auth(secret)
+        .header("X-Esfera-Company", company_id.to_string()).json(&serde_json::json!({"messages":[]}))
+        .send().await.map_err(|_| "VEXOR indisponível. Verifique se a API local está ligada.".to_string())?;
+    vexor_probe_result(response.status().as_u16())
+}
+
+fn vexor_probe_result(status: u16) -> Result<String, String> {
+    match status {
+        400 => Ok("Token aceito pelo VEXOR.".into()),
+        401 | 403 => Err("Token ou empresa rejeitado pelo VEXOR.".into()),
+        status => Err(format!("Resposta inesperada do VEXOR: HTTP {}.", status)),
+    }
+}
+
+#[cfg(test)]
+mod vexor_probe_tests {
+    #[test]
+    fn corpo_vazio_so_confirma_token_em_http_400() {
+        assert!(super::vexor_probe_result(400).is_ok());
+        assert!(super::vexor_probe_result(401).is_err());
+        assert!(super::vexor_probe_result(403).is_err());
+        assert!(super::vexor_probe_result(500).is_err());
+        assert!(super::vexor_probe_result(200).is_err());
+    }
+
+    #[tokio::test]
+    async fn teste_envia_cabecalhos_e_corpo_vazio_para_api_local() {
+        use axum::{http::{HeaderMap, StatusCode}, routing::post, Json, Router};
+        let app = Router::new().route("/esfera/device-messages", post(|headers: HeaderMap, Json(body): Json<serde_json::Value>| async move {
+            assert_eq!(headers.get("x-esfera-company").unwrap(), "1");
+            assert_eq!(body, serde_json::json!({"messages":[]}));
+            if headers.get("authorization").unwrap() == "Bearer certo" { StatusCode::BAD_REQUEST } else { StatusCode::UNAUTHORIZED }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move { axum::serve(listener,app).await.unwrap(); });
+        let url=format!("http://{}/esfera/device-messages",address);
+        assert!(super::probe_vexor_token(&url,"certo",1).await.is_ok());
+        assert!(super::probe_vexor_token(&url,"errado",1).await.is_err());
+        server.abort();
+    }
 }
 
 // ============================================================

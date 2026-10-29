@@ -315,6 +315,9 @@ pub fn run() {
             // Config
             get_app_config,
             save_app_config,
+            get_vexor_token_status,
+            save_vexor_token,
+            test_vexor_token,
         ])
         .build(tauri::generate_context!())
         .expect("Erro ao construir aplicação Tauri")
