@@ -574,7 +574,7 @@ export default function SettingsTab() {
               </FormSection>
             )}
 
-            {activeSection === "integracoes" && <IntegrationsSection companyId={selectedCompanyId ?? 1} isMaster={isMasterUser} />}
+            {activeSection === "integracoes" && <IntegrationsSection companyId={selectedCompanyId ?? 1} isMaster={isMasterUser} canManage={isMasterUser || user?.role === "gestor"} />}
 
             {activeSection === "seguranca" && (
               <FormSection title="Segurança e backup" description="Proteção de dados e retenção de registros.">
@@ -703,7 +703,33 @@ interface GeminiWebStatus {
   detail: string;
 }
 
-function IntegrationsSection({ companyId, isMaster }: { companyId: number; isMaster: boolean }) {
+function IntegrationsSection({ companyId, isMaster, canManage }: { companyId: number; isMaster: boolean; canManage: boolean }) {
+  const [vexorToken, setVexorToken] = useState("");
+  const [vexorConfigured, setVexorConfigured] = useState<boolean | null>(null);
+  const [vexorBusy, setVexorBusy] = useState<"" | "save" | "test">("");
+  const [vexorResult, setVexorResult] = useState("");
+  useEffect(() => {
+    let active = true;
+    setVexorConfigured(null);
+    setVexorToken("");
+    setVexorResult("");
+    if (canManage) api<boolean>("get_vexor_token_status", { companyId }).then((v) => { if (active) setVexorConfigured(v); }).catch((e) => { if (active) setVexorResult(String(e)); });
+    return () => { active = false; };
+  }, [companyId, canManage]);
+  const saveVexor = async () => {
+    setVexorBusy("save"); setVexorResult("");
+    try {
+      await api("save_vexor_token", { companyId, vexorToken });
+      setVexorToken("");
+      setVexorConfigured(await api<boolean>("get_vexor_token_status", { companyId }));
+      setVexorResult("Token salvo.");
+    } catch (e) { setVexorResult(String(e)); } finally { setVexorBusy(""); }
+  };
+  const testVexor = async () => {
+    setVexorBusy("test"); setVexorResult("");
+    try { setVexorResult(await api<string>("test_vexor_token", { companyId })); }
+    catch (e) { setVexorResult(String(e)); } finally { setVexorBusy(""); }
+  };
   const [online, setOnline] = useState<boolean | null>(null);
   const [orgId, setOrgId] = useState("org-local");
   const [token, setToken] = useState("");
@@ -923,6 +949,20 @@ function IntegrationsSection({ companyId, isMaster }: { companyId: number; isMas
           </p>
         )}
 
+        {canManage && (
+          <div className="space-y-3 rounded-lg border border-border p-4">
+            <p className="text-[0.8125rem] font-medium text-primary">Token do VEXOR</p>
+            <p className="text-[0.75rem] text-secondary">{vexorConfigured === null ? "Verificando…" : vexorConfigured ? "Token configurado." : "Token não configurado."}</p>
+            <Field label="Token do VEXOR" htmlFor="int-vexor-token" hint="Use o mesmo token da integração SAIR configurada no VEXOR. O valor salvo não é exibido.">
+              <SecretInput id="int-vexor-token" value={vexorToken} onChange={setVexorToken} placeholder="Cole o token" />
+            </Field>
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={saveVexor} loading={vexorBusy === "save"} disabled={vexorBusy !== "" || !vexorToken.trim()}>Salvar token</Button>
+              <Button variant="secondary" onClick={testVexor} loading={vexorBusy === "test"} disabled={vexorBusy !== "" || !vexorConfigured}>Testar</Button>
+            </div>
+            {vexorResult && <p className="text-[0.75rem] text-secondary" role="status">{vexorResult}</p>}
+          </div>
+        )}
         {!isMaster ? (
           <p className="text-[0.8125rem] text-secondary">Só o usuário Master gera o token da integração.</p>
         ) : (

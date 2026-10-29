@@ -4405,7 +4405,7 @@ impl AdbManager {
                     format!("PARCIAL: {}/{} partes enviadas; interrompido (descadastro ou campanha parada)", i, parts.len())
                 });
             }
-            if let Err(e) = Self::wa_fill_and_send(serial, pkg, &digits, phone, part, screen_w, screen_h) {
+            if let Err(e) = Self::wa_fill_and_send(serial, pkg, &digits, phone, part, screen_w, screen_h, should_continue) {
                 let _ = Self::send_keyevent(serial, 111);
                 return Err(if i > 0 && !e.starts_with("INCERTO:") {
                     format!("PARCIAL: {}/{} partes enviadas; parte {} falhou: {}", i, parts.len(), i + 1, e)
@@ -4488,6 +4488,7 @@ impl AdbManager {
         text: &str,
         screen_w: i32,
         screen_h: i32,
+        should_continue: &dyn Fn() -> bool,
     ) -> Result<(), String> {
         let _ = digits;
         let entry = match Self::wa_entry(serial, pkg) {
@@ -4528,6 +4529,8 @@ impl AdbManager {
             }
         }
 
+        // Reconfere depois da digitação: um SAIR pode ter chegado enquanto o texto era digitado.
+        if !should_continue() { return Err("CANCELADO: descadastro ou campanha interrompida antes de enviar".into()); }
         // Toca em Enviar pela posição real do botão (fallback: posição relativa padrão).
         let send_id = format!("{}:id/send", pkg);
         let send_btn = Self::ui_nodes(&Self::ui_dump(serial))
