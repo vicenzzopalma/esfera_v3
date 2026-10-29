@@ -1799,6 +1799,7 @@ const contactStatus: Record<string, { variant: "success" | "danger" | "neutral" 
   opt_out: { variant: "warning", label: "Descadastrado" },
   partial: { variant: "warning", label: "Envio parcial (revisar)" },
   already_sent: { variant: "neutral", label: "Já recebeu" },
+  no_whatsapp: { variant: "neutral", label: "Sem WhatsApp (não disparar)" },
 };
 
 function ContactsPanel({

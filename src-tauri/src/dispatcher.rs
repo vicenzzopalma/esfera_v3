@@ -797,6 +797,15 @@ impl Dispatcher {
                         return;
                     }
 
+                    // Lista "não disparar": número já identificado sem WhatsApp não é tentado de novo.
+                    if db_arc.is_no_whatsapp(campaign.company_id, &phone) {
+                        let db2 = db_arc.clone();
+                        let cid = next_contact.id;
+                        let _ = spawn_blocking(move || db2.update_contact_status(cid, "no_whatsapp")).await;
+                        println!("[DISPATCHER] {} não tem WhatsApp (lista não disparar); contato pulado.", phone);
+                        return;
+                    }
+
                     // Horário de envio: seg-sex 8h-20h, sáb 8h-14h, domingo não (CDC art. 71: descanso e lazer).
                     if !within_send_window() {
                         if let Some(ref handle) = app_handle {
@@ -966,6 +975,14 @@ impl Dispatcher {
                                 let contact_id = next_contact.id;
                                 let _ = spawn_blocking(move || db2.update_contact_status(contact_id, "opt_out")).await;
                             }
+                        }
+                        SendOutcome::SendFailed(ref e) if e.starts_with("SEM_WHATSAPP:") => {
+                            // Sem WhatsApp: vai para a lista "não disparar" já na 1ª vez, sem novas tentativas.
+                            let db_nowa = db_arc.clone();
+                            let company_id = campaign.company_id;
+                            let phone_nowa = phone.clone();
+                            let reason = format!("aviso do WhatsApp na campanha {}", campaign.id);
+                            let _ = spawn_blocking(move || db_nowa.add_no_whatsapp(company_id, &phone_nowa, &reason)).await;
                         }
                         SendOutcome::SendFailed(_) => {
                             let db_failure = db_arc.clone();

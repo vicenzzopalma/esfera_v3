@@ -815,6 +815,18 @@ impl Database {
         )?;
 
         // 10b. ESF_OptOut (descadastro: quem pediu para não receber mais mensagens).
+        // Números sem WhatsApp: nunca são tentados de novo em nenhuma campanha da empresa
+        // (tentar abrir conversa com número inexistente é sinal de disparo em massa).
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_NoWhatsApp (
+                CompanyId INTEGER NOT NULL,
+                PhoneDigits TEXT NOT NULL,
+                Reason TEXT NOT NULL DEFAULT '',
+                CreatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (CompanyId, PhoneDigits)
+            );",
+            [],
+        )?;
         // Política do WhatsApp: pedidos de bloqueio/descadastro devem ser respeitados sempre.
         self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_OptOut (
@@ -2493,6 +2505,58 @@ impl Database {
             local.to_string()
         };
         core
+    }
+
+    /// Número na lista "não disparar" por não ter WhatsApp.
+    pub fn is_no_whatsapp(&self, company_id: i32, phone: &str) -> bool {
+        let key = Self::opt_out_key(phone);
+        if key.is_empty() {
+            return false;
+        }
+        self.conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ESF_NoWhatsApp WHERE CompanyId = ?1 AND PhoneDigits = ?2);",
+                params![company_id, key],
+                |row| row.get(0),
+            )
+            .unwrap_or(false)
+    }
+
+    /// Põe o número na lista "não disparar" e marca como 'no_whatsapp' os contatos dele ainda não
+    /// enviados em todas as campanhas da empresa.
+    pub fn add_no_whatsapp(&self, company_id: i32, phone: &str, reason: &str) -> Result<(), String> {
+        let key = Self::opt_out_key(phone);
+        if key.is_empty() {
+            return Err("número inválido".to_string());
+        }
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR IGNORE INTO ESF_NoWhatsApp (CompanyId, PhoneDigits, Reason) VALUES (?1, ?2, ?3);",
+            params![company_id, key, reason],
+        )
+        .map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.ContactId, c.Phone, c.CampaignId FROM ESF_Contact c JOIN ESF_Campaign k ON k.CampaignId = c.CampaignId
+                 WHERE k.CompanyId = ?1 AND c.Status IN ('pending', 'failed') AND c.ExcluidoEm IS NULL;",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<(i32, String, i32)> = stmt
+            .query_map(params![company_id], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?, r.get::<_, i32>(2)?)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .filter(|(_, p, _)| Self::opt_out_key(p) == key)
+            .collect();
+        drop(stmt);
+        for (contact_id, _, campaign_id) in rows {
+            let _ = conn.execute("UPDATE ESF_Contact SET Status='no_whatsapp' WHERE ContactId=?1;", params![contact_id]);
+            let _ = conn.execute(
+                "UPDATE ESF_Campaign SET FailedContacts=(SELECT COUNT(*) FROM ESF_Contact WHERE CampaignId=?1 AND Status='failed' AND ExcluidoEm IS NULL)
+                 WHERE CampaignId=?1",
+                params![campaign_id],
+            );
+        }
+        Ok(())
     }
 
     /// Falha fechada: se a consulta der erro, trata como descadastrado (não envia).
