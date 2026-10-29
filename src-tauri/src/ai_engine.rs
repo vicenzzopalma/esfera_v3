@@ -1372,15 +1372,35 @@ impl AiEngine {
         cmd_id += 1;
         let _ = Self::cdp_send_cmd(&mut ws, cmd_id, "Page.setWebLifecycleState", json!({ "state": "active" })).await;
         cmd_id += 1;
-        // Abre um chat novo em https://gemini.google.com/app
-        let _ = Self::cdp_send_cmd(
-            &mut ws,
-            cmd_id,
-            "Page.navigate",
-            json!({ "url": Self::GEMINI_WEB_APP_URL }),
-        )
-        .await?;
+        // Abre um chat novo. Recarregar o Gemini (Page.navigate) deixa a página travada por 20s+,
+        // então, já estando no Gemini, clica em "Nova conversa" (troca sem recarregar).
+        let new_chat_js = r#"(() => {
+            if (location.hostname !== 'gemini.google.com') return 'nav';
+            const busy = document.querySelector('message-content, model-response, user-query');
+            if (location.pathname === '/app' && !busy) return 'ok';
+            const a = document.querySelector(
+                'a[href="/app"], [aria-label="Nova conversa"], [aria-label="New chat"], side-nav-action-button[data-test-id="new-chat-button"] a'
+            );
+            if (a) { a.click(); return 'clicked'; }
+            return 'nav';
+        })()"#;
+        let new_chat = tokio::time::timeout(Duration::from_secs(5), Self::cdp_eval_js(&mut ws, cmd_id, new_chat_js))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "nav".to_string());
         cmd_id += 1;
+        if new_chat == "nav" {
+            let _ = Self::cdp_send_cmd(
+                &mut ws,
+                cmd_id,
+                "Page.navigate",
+                json!({ "url": Self::GEMINI_WEB_APP_URL }),
+            )
+            .await?;
+            cmd_id += 1;
+        }
 
         // Aguarda a caixa de texto do chat carregar (até 15s)
         let wait_input_js = r#"(() => {
@@ -2176,6 +2196,20 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod gemini_web_live_tests {
+    use super::AiEngine;
+    /// Teste manual contra o Edge do Esfera logado (porta 9223):
+    /// cargo test --lib gemini_web_ao_vivo -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn gemini_web_ao_vivo() {
+        let out = AiEngine::call_gemini_web("Responda apenas com a palavra: pronto").await;
+        println!("RESULTADO: {:?}", out);
+        assert!(out.is_ok());
+    }
+}
 
 #[cfg(test)]
 mod has_money_tests {
