@@ -147,6 +147,7 @@ pub fn run() {
             dispatcher::Dispatcher::start_worker(db_arc_clone.clone(), Some(app.handle().clone()));
             dispatcher::Dispatcher::start_persistent_adb_keepalive_loop(db_arc_clone.clone());
             dispatcher::Dispatcher::start_opt_out_import_loop(db_arc_clone.clone());
+            dispatcher::Dispatcher::start_agent_update_loop(db_arc_clone.clone());
             adb_manager::AdbManager::start_status_monitor(db_arc_clone);
             diag("ETAPA [5] backend/servers iniciados no setup; setup retorna Ok");
             Ok(())
@@ -249,6 +250,7 @@ pub fn run() {
             inject_base64_frame,
             optimize_device_hpc,
             install_agent_apk,
+            get_agent_update_status,
             provision_device,
             provision_all_devices,
             debloat_device,

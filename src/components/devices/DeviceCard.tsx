@@ -9,8 +9,19 @@ import { Monitor, Camera, Zap, Copy, Check, Info, Settings2, Bell, User } from "
 import { RowMenu } from "./RowMenu";
 import { StatusDot, BatteryMeter, ORIGIN_LABEL, sectorLabel, deviceDisplayName } from "./deviceUi";
 
+export interface AgentUpdateStatus {
+  deviceId: string;
+  companyId: number;
+  versionCode: number | null;
+  versionName: string;
+  expectedCode: number;
+  status: string;
+  detail: string;
+}
+
 export interface DeviceItemProps {
   device: Device;
+  agentStatus?: AgentUpdateStatus;
   activeUserDisplayName?: string;
   pendingRequest?: DevicePermissionRequest;
   onApproveRequest?: (requestId: number) => void;
@@ -76,6 +87,12 @@ function CopyId({ id }: { id: string }) {
   );
 }
 
+function AgentStatus({ status }: { status?: AgentUpdateStatus }) {
+  if (!status) return <p className="text-[0.6875rem] text-tertiary">Agente: aguardando verificação</p>;
+  const version = status.versionCode == null ? (status.versionName || "versão não identificada") : `${status.versionName || "versão"} (${status.versionCode})`;
+  return <p className={`break-words text-[0.6875rem] ${status.status === "error" ? "text-red-600 dark:text-red-400" : "text-tertiary"}`} role={status.status === "error" ? "status" : undefined}>Agente: {version} · {status.detail}</p>;
+}
+
 export const DeviceCard = memo(function DeviceCard(props: DeviceItemProps) {
   const { device, activeUserDisplayName, pendingRequest, onApproveRequest, onRejectRequest, isSelected, onToggleSelect, onOpenMirror } = props;
   const { isUsbOnly, origin, displayName, model, address } = useDeviceInfo(device);
@@ -105,6 +122,8 @@ export const DeviceCard = memo(function DeviceCard(props: DeviceItemProps) {
         <BatteryMeter level={device.battery} />
         <Badge variant="neutral">{ORIGIN_LABEL[origin]}</Badge>
       </div>
+
+      <AgentStatus status={props.agentStatus} />
 
       {activeUserDisplayName && (
         <div className="flex items-center gap-1.5 rounded-lg bg-emerald-500/10 px-2.5 py-1.5 text-[0.75rem] text-emerald-600 dark:text-emerald-400">
@@ -174,6 +193,7 @@ export const DeviceRow = memo(function DeviceRow(props: DeviceItemProps) {
           {displayName}
         </p>
         <p className="max-w-[16rem] truncate text-[0.75rem] text-secondary">{model}</p>
+        <AgentStatus status={props.agentStatus} />
       </td>
       <td className="px-3 py-2.5">
         <StatusDot status={device.status} />

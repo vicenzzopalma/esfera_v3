@@ -339,3 +339,8 @@ Para ajustar ao iniciar o Esfera, defina `ESFERA_CHIP_HOURLY_LIMIT`, `ESFERA_CHI
 Para encaminhar notificações ao VEXOR local, configure em Configurações > Integrações o mesmo token SAIR do VEXOR. Como alternativa, o motor aceita as variáveis `ESFERA_SAIR_TOKEN` ou `ESFERA_COMPANY_TOKEN`. Sem token ou sem conexão ao VEXOR, os pedidos reconhecidos são registrados localmente e as notificações permanecem no aparelho para sincronização posterior. O agente Android atualizado precisa estar instalado no aparelho e ter acesso às notificações e à acessibilidade.
 
 As confirmações aguardam o fim ou a parada do disparo e só são enviadas dentro da janela de envio. Estados de resultado incerto não são reenviados automaticamente; a tela de campanha informa quantos precisam de revisão. Números capturados antes de existir histórico por chip podem não ter campanha identificada para os contadores.
+
+
+### Atualização do agente Android
+
+O Esfera consulta a versão instalada ao conectar e periodicamente. O `versionCode` esperado é lido do Gradle do agente na compilação do desktop. Para disponibilizar uma versão nova, compile e assine o agente e coloque o APK correspondente em `src-tauri/binaries/Esfera_Agent_ADB.apk` antes de empacotar o desktop. O atualizador confere o manifesto do APK e não instala um arquivo com versão ou pacote incorretos. Ele aguarda o aparelho ficar livre e informa a versão, o andamento e os erros na tela Dispositivos.

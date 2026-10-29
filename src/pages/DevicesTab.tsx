@@ -19,7 +19,7 @@ import type { Device, DeviceStatus, DeviceWithActiveUser, DevicePermissionReques
 import { api } from "../tauri";
 
 // Sub-componentes modularizados
-import { DeviceCard, DeviceRow } from "../components/devices/DeviceCard";
+import { DeviceCard, DeviceRow, type AgentUpdateStatus } from "../components/devices/DeviceCard";
 import { DeviceToolbar, DeviceHeaderActions, type StatusFilter } from "../components/devices/DeviceToolbar";
 import { isOnlineStatus } from "../components/devices/deviceUi";
 import { ConnectDeviceModal } from "../components/devices/ConnectDeviceModal";
@@ -54,6 +54,7 @@ function ManagerDevicesView() {
 
   // Device Data & Selection
   const [devicesList, setDevicesList] = useState<Device[]>([]);
+  const [agentStatuses, setAgentStatuses] = useState<Record<string, AgentUpdateStatus>>({});
   const [selectedSerials, setSelectedSerials] = useState<string[]>([]);
   const [permissionRequests, setPermissionRequests] = useState<DevicePermissionRequest[]>([]);
   const [activeUserMap, setActiveUserMap] = useState<
@@ -98,6 +99,10 @@ function ManagerDevicesView() {
         setLoadError(typeof err === "string" ? err : err?.message || "Não foi possível carregar os aparelhos.");
       })
       .finally(() => setLoadingDevices(false));
+
+    api<AgentUpdateStatus[]>("get_agent_update_status", { companyId: effectiveCompanyId })
+      .then((items) => setAgentStatuses(Object.fromEntries(items.map((item) => [item.deviceId, item]))))
+      .catch(() => setAgentStatuses({}));
 
     api<DeviceWithActiveUser[]>("get_devices_with_active_user_map", { companyId: effectiveCompanyId })
       .then((data) => {
@@ -526,6 +531,8 @@ function ManagerDevicesView() {
 
   const itemProps = (device: Device) => ({
     device,
+    agentStatus: agentStatuses[device.esferaDeviceId || device.serial]?.companyId === effectiveCompanyId
+      ? agentStatuses[device.esferaDeviceId || device.serial] : undefined,
     activeUserDisplayName: activeUserMap[device.serial]?.activeUserDisplayName,
     pendingRequest: findPending(device),
     onApproveRequest: handleApproveRequest,
