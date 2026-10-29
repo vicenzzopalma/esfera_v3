@@ -278,6 +278,7 @@ pub fn run() {
             retry_failed_campaign_contacts,
             reset_campaign_contacts,
             list_opt_outs,
+            get_confirmation_counts,
             add_opt_outs,
             remove_opt_out,
             list_opt_out_reviews,

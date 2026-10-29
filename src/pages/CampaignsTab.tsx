@@ -2942,6 +2942,14 @@ function CampaignDetail({
   const [tab, setTab] = useState<DetailTab>(initialTab);
   const [draft, setDraft] = useState<Draft>(() => draftFrom(campaign));
   const [contacts, setContacts] = useState<Contact[]>([]);
+  const [confirmations, setConfirmations] = useState<{pending: number; sent: number; uncertain: number} | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const refresh = () => api<{pending: number; sent: number; uncertain: number}>("get_confirmation_counts", { campaignId: campaign.id }).then((v) => { if (alive) setConfirmations(v); }).catch(() => { if (alive) setConfirmations(null); });
+    refresh();
+    const timer = setInterval(refresh, 5000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [campaign.id]);
   const [contactsLoading, setContactsLoading] = useState(true);
   const [devices, setDevices] = useState<Device[]>([]);
   const [devicesLoading, setDevicesLoading] = useState(true);
@@ -3326,6 +3334,7 @@ function CampaignDetail({
                   hint={pending > 0 ? (isRunning ? "no ritmo atual" : "se iniciar agora") : undefined}
                 />
               </div>
+              {confirmations && <p className="mt-4 text-[0.8125rem] text-secondary">Confirmações de SAIR: {formatNumber(confirmations.pending)} aguardam envio · {formatNumber(confirmations.sent)} enviadas{confirmations.uncertain > 0 ? ` · ${formatNumber(confirmations.uncertain)} em revisão` : ""}</p>}
               {canReset && (
                 <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border px-3.5 py-3">
                   <p className="text-[0.8125rem] text-secondary">Todos os contatos já foram processados. Reinicie a fila para enviar de novo à mesma lista.</p>

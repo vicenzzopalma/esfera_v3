@@ -49,7 +49,7 @@ pub fn import_opt_out_requests(db: &Database) {
 /// Importa os "SAIR" de um aparelho. O arquivo é movido para `.reading` antes de ler (linhas novas
 /// caem num arquivo novo) e só é apagado depois que todas as linhas foram gravadas no banco. Se a
 /// conexão cair no meio, o `.reading` fica e é lido de novo na próxima vez (o registro não duplica).
-pub fn import_opt_out_from_device(db: &Database, serial: &str, company_id: i32) {
+pub fn import_opt_out_from_device(db: &Database, serial: &str, company_id: i32) -> bool {
     let _guard = OPT_OUT_IMPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     {
         let out = match AdbManager::execute_shell(
@@ -58,16 +58,70 @@ pub fn import_opt_out_from_device(db: &Database, serial: &str, company_id: i32) 
             6,
         ) {
             Ok(o) => o,
-            Err(_) => return,
+            Err(_) => return false,
         };
         if out.trim().is_empty() {
-            return;
+            return true;
         }
-        let all_saved = process_opt_out_jsonl(db, serial, company_id, &out, None);
+        let all_saved = forward_device_messages(db, serial, company_id, &out);
         if all_saved {
-            let _ = AdbManager::execute_shell(serial, "rm -f /sdcard/esfera_optout.reading", 4);
+            return AdbManager::execute_shell(serial, "rm -f /sdcard/esfera_optout.reading", 4).is_ok();
+        }
+        false
+    }
+}
+
+/// Texto aprovado, mantido íntegro para revisões que chegam depois pelo endpoint do Esfera.
+pub const OPT_OUT_CONFIRMATION_TEXT: &str = "Pronto, seu número foi retirado das nossas mensagens automáticas. Você não receberá mais avisos por este canal, conforme o seu direito de oposição previsto na LGPD (Lei 13.709/2018, art. 18) e as regras de cobrança do Código de Defesa do Consumidor.\nEste pedido não altera e não reconhece nenhum débito.";
+
+fn forward_device_messages(db: &Database, serial: &str, company: i32, lines: &str) -> bool {
+    let token = std::env::var("ESFERA_SAIR_TOKEN").or_else(|_| std::env::var("ESFERA_COMPANY_TOKEN")).unwrap_or_default();
+    if token.trim().is_empty() { eprintln!("[SAIR] Token da integração não configurado; mensagens mantidas no aparelho."); return false; }
+    forward_device_messages_at(db, serial, company, lines, token.trim(), "http://127.0.0.1:4000/esfera/device-messages")
+}
+
+fn forward_device_messages_at(db: &Database, serial: &str, company: i32, lines: &str, token: &str, endpoint: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let client = match reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(10)).build() { Ok(c) => c, Err(_) => return false };
+    let stable_serial = db.get_all_devices().into_iter().find(|d| d.company_id == company && (d.serial == serial || d.current_adb_address.as_deref() == Some(serial))).map(|d| d.esfera_device_id.filter(|s| !s.trim().is_empty()).unwrap_or(d.serial)).unwrap_or_else(|| serial.to_string());
+    let device: String = stable_serial.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-')).take(64).collect();
+    let device = if device.is_empty() { "celular" } else { &device };
+    for line in lines.lines().filter(|l| l.trim().starts_with('{')) {
+        let v: serde_json::Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => return false };
+        let title = v.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let text = v.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let phone = AdbManager::extract_phone_digits(title);
+        if phone.len() < 10 {
+            if db.add_opt_out_review(company,title,text,serial).is_err() { return false; }
+            continue;
+        }
+        let id = hex::encode(Sha256::digest(format!("{}|{}",device,line).as_bytes()));
+        let event = format!("device:{}:{}",device,id);
+        if db.remember_device_inbound(&event,company,&phone,&stable_serial,OPT_OUT_CONFIRMATION_TEXT).is_err() { return false; }
+        use chrono::TimeZone;
+        let received_at = v.get("ts").and_then(|x| x.as_i64()).and_then(|ms| chrono::Utc.timestamp_millis_opt(ms).single()).map(|t| t.to_rfc3339());
+        let mut message = serde_json::json!({"id":id,"from":phone,"text":text,"device":device});
+        if let Some(t) = received_at { message["receivedAt"] = t.into(); }
+        let body = serde_json::json!({"messages":[message]});
+        let response = match client.post(endpoint)
+            .bearer_auth(token.trim()).header("X-Esfera-Company",company.to_string()).json(&body).send() {
+            Ok(r) if r.status().is_success() => r, _ => return false,
+        };
+        let result: serde_json::Value = match response.json() { Ok(v) => v, Err(_) => return false };
+        let item = match result.get("results").and_then(|v| v.as_array()).and_then(|a| a.iter().find(|r| r.get("id").and_then(|x|x.as_str()) == Some(id.as_str()))) { Some(v) => v, None => return false };
+        match item.get("decision").and_then(|v| v.as_str()) {
+            Some("OPT_OUT") => {
+                if item.get("confirmationText").and_then(|v|v.as_str()) != Some(OPT_OUT_CONFIRMATION_TEXT) { return false; }
+                match db.record_opt_out_event(&event,company,&phone,"celular","Pedido pelo WhatsApp","") {
+                    Ok(outcome) if outcome.same_company && outcome.phone_key == Database::opt_out_key(&phone) => (),
+                    _ => return false,
+                }
+            }
+            Some("REVIEW") | Some("NONE") => (),
+            _ => return false,
         }
     }
+    true
 }
 
 /// Processa linhas JSONL de descadastro vindas do agente Android.
@@ -923,7 +977,13 @@ impl Dispatcher {
                         let contact_id_for_safety = next_contact.id;
                         let send_res = spawn_blocking(move || {
                             // Traz os "SAIR" capturados pelo agente agora, e revalida o descadastro no último instante.
-                            import_opt_out_from_device(&db_last, &serial, company_last);
+                            let token = std::env::var("ESFERA_SAIR_TOKEN").or_else(|_| std::env::var("ESFERA_COMPANY_TOKEN")).unwrap_or_default();
+                            if token.trim().is_empty() {
+                                return Err("TRAVA: Configure o token da integração SAIR antes de disparar.".into());
+                            }
+                            if !import_opt_out_from_device(&db_last, &serial, company_last) {
+                                return Err("TRAVA: Não foi possível processar as respostas do aparelho no VEXOR; verifique a conexão e o token.".into());
+                            }
                             if db_last.is_opted_out(company_last, &phone2) {
                                 return Err("Contato descadastrado durante o preparo; envio cancelado".to_string());
                             }
@@ -944,7 +1004,7 @@ impl Dispatcher {
                                 return Err("TRAVA: O chip do aparelho mudou durante a pausa.".into());
                             }
                             let chip = &fresh[0];
-                            let attempt = db_last.reserve_chip_attempt(chip, company_last, campaign_last, &phone2)
+                            let attempt = db_last.reserve_chip_attempt(chip, company_last, campaign_last, &phone2, false)
                                 .map_err(|e| format!("TRAVA: {}", e))?;
                             let name_ref = if contact_name.trim().is_empty() { None } else { Some(contact_name.as_str()) };
                             println!("[DISPATCHER] Disparando contato '{}' ({}) via navegacao nativa WhatsApp no aparelho {}", contact_name, phone2, serial);
@@ -954,8 +1014,8 @@ impl Dispatcher {
                             let parts = AdbManager::split_human_parts(&msg);
                             // Antes de cada parte: dentro do horário, ainda não descadastrado e campanha ainda rodando.
                             let check = || {
-                                import_opt_out_from_device(&db_last, &serial, company_last);
-                                within_send_window()
+                                import_opt_out_from_device(&db_last, &serial, company_last)
+                                    && within_send_window()
                                     && !db_last.is_opted_out(company_last, &phone2)
                                     && db_last
                                         .get_running_campaigns()
@@ -1102,14 +1162,65 @@ impl Dispatcher {
         });
     }
 
+    /// Envia confirmações somente quando o aparelho não está disparando ou fora da janela.
+    async fn flush_confirmations(db: Arc<Database>) {
+        for (company, key, phone, original_serial, text) in db.pending_confirmations() {
+            let text = if text.is_empty() { OPT_OUT_CONFIRMATION_TEXT.to_string() } else { text };
+            if text != OPT_OUT_CONFIRMATION_TEXT { continue; }
+            let device = match db.get_all_devices().into_iter().find(|d| d.company_id == company && d.status == "online" && (d.serial == original_serial || d.esfera_device_id.as_deref() == Some(original_serial.as_str()) || d.current_adb_address.as_deref() == Some(original_serial.as_str()))) {
+                Some(d) => d, None => continue,
+            };
+            let chips = db.get_chips(device.id);
+            if chips.len() != 1 || chips[0].status != "livre" || chips[0].restricted_until.is_some() { continue; }
+            let serial = device.current_adb_address.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| device.serial.clone());
+            let lock = { let mut locks = DEVICE_SEND_LOCKS.lock().unwrap(); locks.entry(serial.clone()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone() };
+            let _guard = lock.lock().await;
+            let current_chips = db.get_chips(device.id);
+            if current_chips.len() != 1 || current_chips[0].id != chips[0].id || current_chips[0].status != "livre" || current_chips[0].restricted_until.is_some() { continue; }
+            let chip_id = current_chips[0].id;
+            let busy = || within_send_window() && db.get_running_campaigns().map(|cs| cs.iter().any(|c| c.company_id == company && c.device_ids.iter().any(|id| id == &device.serial || device.esfera_device_id.as_deref() == Some(id.as_str())))).unwrap_or(true);
+            if busy() || db.chip_cooldown_seconds(chip_id).unwrap_or(u64::MAX) > 0 { continue; }
+            if !db.claim_confirmation(company, &key).unwrap_or(false) { continue; }
+            let attempt = match db.reserve_chip_attempt(&current_chips[0],company,0,&phone,true) {
+                Ok(id) => id,
+                Err(e) => { let _ = db.finish_confirmation(company,&key,false,&format!("CANCELADO: {}",e)); continue; }
+            };
+            let db2 = db.clone();
+            let device2 = device.clone();
+            let result = spawn_blocking(move || {
+                prepare_temp_contact_for_send(&serial, &phone);
+                let check = || !within_send_window() || !db2.get_running_campaigns().map(|cs| cs.iter().any(|c| c.company_id == company && c.device_ids.iter().any(|id| id == &device2.serial || device2.esfera_device_id.as_deref() == Some(id.as_str())))).unwrap_or(true);
+                AdbManager::send_whatsapp_parts(&serial, &phone, &[text], Some("com.whatsapp"), &check)
+            }).await;
+            let (sent, error) = match result { Ok(Ok(())) => (true,String::new()), Ok(Err(e)) => (false,e), Err(e) => (false,e.to_string()) };
+            let _ = db.finish_chip_attempt(attempt,sent);
+            if error.starts_with("CONTA_RESTRITA:") {
+                let _ = db.set_chip_restriction(chip_id, "banido", "9999-12-31 23:59:59");
+            }
+            let _ = db.finish_confirmation(company,&key,sent,&error);
+            drop(_guard);
+            // Intervalo humano entre confirmações, sem bloquear outras campanhas.
+            use rand::Rng;
+            let pause = rand::thread_rng().gen_range(30..=90);
+            sleep(Duration::from_secs(pause)).await;
+        }
+    }
+
     /// A cada 30s, lê dos celulares conectados os pedidos de descadastro ("SAIR") capturados pelo
     /// agente (/sdcard/esfera_optout.jsonl), grava em ESF_OptOut e tira o número das filas pendentes.
     pub fn start_opt_out_import_loop(db_arc: Arc<Database>) {
+        let import_db = db_arc.clone();
         tauri::async_runtime::spawn(async move {
             loop {
                 sleep(Duration::from_secs(30)).await;
-                let db = db_arc.clone();
+                let db = import_db.clone();
                 let _ = spawn_blocking(move || import_opt_out_requests(&db)).await;
+            }
+        });
+        tauri::async_runtime::spawn(async move {
+            loop {
+                Self::flush_confirmations(db_arc.clone()).await;
+                sleep(Duration::from_secs(30)).await;
             }
         });
     }
@@ -1389,5 +1500,48 @@ mod antiban_link_tests {
         assert!(super::contains_link("fale em wa.me/5511999999999"));
         assert!(super::contains_link("acesse exemplo.com.br"));
         assert!(!super::contains_link("Olá, estamos disponíveis para conversar."));
+    }
+}
+
+#[cfg(test)]
+mod vexor_device_bridge_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    #[test]
+    fn optout_do_vexor_grava_e_enfileira_sem_duplicar() {
+        let path = std::env::temp_dir().join(format!("esfera_vexor_bridge_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream,_) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new(); let mut buf = [0u8;4096];
+                let (start, length) = loop {
+                    let n = stream.read(&mut buf).unwrap(); assert!(n > 0); request.extend_from_slice(&buf[..n]);
+                    if let Some(i) = request.windows(4).position(|w| w==b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..i]).to_lowercase();
+                        assert!(headers.contains("authorization: bearer teste"));
+                        assert!(headers.contains("x-esfera-company: 1"));
+                        let len: usize = headers.lines().find_map(|l| l.strip_prefix("content-length:").and_then(|v|v.trim().parse().ok())).unwrap();
+                        break (i+4,len);
+                    }
+                };
+                while request.len() < start+length { let n=stream.read(&mut buf).unwrap(); assert!(n>0); request.extend_from_slice(&buf[..n]); }
+                let payload: serde_json::Value = serde_json::from_slice(&request[start..start+length]).unwrap();
+                let id=payload["messages"][0]["id"].as_str().unwrap();
+                let response=serde_json::json!({"results":[{"id":id,"decision":"OPT_OUT","confirmationText":OPT_OUT_CONFIRMATION_TEXT}]}).to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",response.len(),response).unwrap();
+            }
+        });
+        let line = r#"{"title":"Esfera 5575988052539","text":"SAIR","ts":1793180000000}"#;
+        let endpoint=format!("http://{}/esfera/device-messages",addr);
+        assert!(forward_device_messages_at(&db,"device1",1,line,"teste",&endpoint));
+        assert!(forward_device_messages_at(&db,"device1",1,line,"teste",&endpoint));
+        server.join().unwrap();
+        assert!(db.is_opted_out(1,"75988052539"));
+        assert_eq!(db.pending_confirmations().len(),1);
     }
 }

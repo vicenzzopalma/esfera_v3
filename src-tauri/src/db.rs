@@ -781,6 +781,8 @@ impl Database {
         ); CREATE INDEX IF NOT EXISTS idx_chip_attempt ON ESF_ChipAttempt(ChipId, AttemptId DESC);
         CREATE TABLE IF NOT EXISTS ESF_ChipCooldown (ChipId INTEGER PRIMARY KEY, NextAt TEXT NOT NULL);")?;
 
+        let _ = self.conn().execute("ALTER TABLE ESF_ChipAttempt ADD COLUMN Purpose TEXT NOT NULL DEFAULT 'campaign'", []);
+
         // 8. ESF_Contact (com custom_message, device_id, retry_count, excluido_em)
         self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_Contact (
@@ -846,6 +848,23 @@ impl Database {
             );",
             [],
         )?;
+
+        // Fila durável de confirmação por empresa e número. Compatível com o banco já existente.
+        self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_OptOutConfirm (
+            CompanyId INTEGER NOT NULL, PhoneDigits TEXT NOT NULL, Phone TEXT NOT NULL,
+            Serial TEXT NOT NULL, Status TEXT NOT NULL DEFAULT 'pending',
+            Attempts INTEGER NOT NULL DEFAULT 0, LastError TEXT NOT NULL DEFAULT '',
+            CreatedAt TEXT NOT NULL DEFAULT (datetime('now')), SentAt TEXT,
+            PRIMARY KEY (CompanyId, PhoneDigits)
+        );")?;
+
+        self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_DeviceInbound (
+            EventId TEXT PRIMARY KEY, CompanyId INTEGER NOT NULL, PhoneDigits TEXT NOT NULL,
+            Phone TEXT NOT NULL, Serial TEXT NOT NULL, CampaignId INTEGER, ConfirmationText TEXT NOT NULL DEFAULT ''
+        );")?;
+        // Campos adicionados ao banco já existente sem recriar a fila nem alterar seus registros.
+        let _ = self.conn().execute("ALTER TABLE ESF_OptOutConfirm ADD COLUMN CampaignId INTEGER", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_OptOutConfirm ADD COLUMN ConfirmationText TEXT NOT NULL DEFAULT ''", []);
 
         // 10c. ESF_OptOutEvent (descadastro central: cada pedido recebido por API, ex.: VEXOR,
         // é gravado UMA vez pelo seu EventId estável; reenvios/retries viram "duplicate").
@@ -2192,7 +2211,7 @@ impl Database {
     }
 
     /// Reserva uma tentativa antes de tocar no WhatsApp. Tentativas interrompidas contam como falha.
-    pub fn reserve_chip_attempt(&self, chip: &Chip, company_id: i32, campaign_id: i32, phone: &str) -> Result<i64, String> {
+    pub fn reserve_chip_attempt(&self, chip: &Chip, company_id: i32, campaign_id: i32, phone: &str, confirmation: bool) -> Result<i64, String> {
         if chip.status != "livre" || chip.restricted_until.is_some() {
             return Err("Chip restrito ou indisponível. Verifique o aparelho antes de retomar.".into());
         }
@@ -2217,12 +2236,12 @@ impl Database {
         let (count, failed, optouts): (i64, i64, i64) = conn.query_row(
             "SELECT count(*), coalesce(sum(CASE WHEN a.Outcome != 'enviado' THEN 1 ELSE 0 END),0),
                     coalesce(sum(CASE WHEN EXISTS(SELECT 1 FROM ESF_OptOut o WHERE o.CompanyId=a.CompanyId AND o.PhoneDigits=a.PhoneDigits) THEN 1 ELSE 0 END),0)
-             FROM (SELECT CompanyId,PhoneDigits,Outcome FROM ESF_ChipAttempt WHERE ChipId=?1 ORDER BY AttemptId DESC LIMIT 20) a",
+             FROM (SELECT CompanyId,PhoneDigits,Outcome FROM ESF_ChipAttempt WHERE ChipId=?1 AND Purpose='campaign' ORDER BY AttemptId DESC LIMIT 20) a",
             params![chip.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e| e.to_string())?;
-        if count >= 20 && (failed * 100 > count * 15 || optouts * 100 > count * 10) {
+        if !confirmation && count >= 20 && (failed * 100 > count * 15 || optouts * 100 > count * 10) {
             return Err(format!("Freio automático: nas últimas {} tentativas, {} falhas e {} pedidos de SAIR.", count, failed, optouts));
         }
-        conn.execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits) VALUES (?1,?2,?3,?4)", params![chip.id,company_id,campaign_id,Self::opt_out_key(phone)]).map_err(|e| e.to_string())?;
+        conn.execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Purpose) VALUES (?1,?2,?3,?4,?5)", params![chip.id,company_id,campaign_id,Self::opt_out_key(phone),if confirmation {"confirmation"} else {"campaign"}]).map_err(|e| e.to_string())?;
         let id = conn.last_insert_rowid();
         let n = config("BREAK_EVERY", 10);
         let total: i64 = conn.query_row("SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1", params![chip.id], |r| r.get(0)).map_err(|e| e.to_string())?;
@@ -2731,6 +2750,9 @@ impl Database {
                 )
                 .optional()?;
             if let Some((existing_company, existing_key)) = existing {
+                if existing_company == company_id && existing_key == key {
+                    conn.execute("INSERT OR IGNORE INTO ESF_OptOutConfirm (CompanyId,PhoneDigits,Phone,Serial,CampaignId,ConfirmationText) SELECT CompanyId,PhoneDigits,Phone,Serial,CampaignId,ConfirmationText FROM ESF_DeviceInbound WHERE EventId=?1 AND CompanyId=?2 AND PhoneDigits=?3", params![event_id,company_id,key])?;
+                }
                 return Ok(OptOutRecordOutcome {
                     status: "duplicate",
                     phone_key: existing_key,
@@ -2748,6 +2770,12 @@ impl Database {
                 params![company_id, key, reason],
             )?;
             let suppressed = Self::suppress_company_contacts_on(&conn, company_id, &key);
+            // Revisões aprovadas no VEXOR retornam pelo mesmo eventId do aparelho.
+            conn.execute("INSERT OR IGNORE INTO ESF_OptOutConfirm
+                (CompanyId, PhoneDigits, Phone, Serial, CampaignId, ConfirmationText)
+                SELECT CompanyId, PhoneDigits, Phone, Serial, CampaignId, ConfirmationText
+                FROM ESF_DeviceInbound WHERE EventId=?1 AND CompanyId=?2 AND PhoneDigits=?3",
+                params![event_id, company_id, key])?;
             Ok(OptOutRecordOutcome { status: "recorded", phone_key: key.clone(), suppressed, same_company: true })
         })();
         let outcome = match result {
@@ -2759,6 +2787,36 @@ impl Database {
         };
         let _ = conn.execute_batch("PRAGMA synchronous=NORMAL;");
         outcome
+    }
+
+    /// Guarda a origem antes de enviar ao VEXOR; assim uma revisão posterior volta ao aparelho certo.
+    pub fn remember_device_inbound(&self, event_id: &str, company: i32, phone: &str, serial: &str, text: &str) -> Result<(), String> {
+        let key = Self::validate_opt_out_phone(phone)?;
+        let conn = self.conn();
+        let campaign: Option<i32> = conn.query_row(
+            "SELECT a.CampaignId FROM ESF_ChipAttempt a JOIN ESF_Chip c ON c.ChipId=a.ChipId JOIN ESF_Device d ON d.rowid=c.DeviceId WHERE a.CompanyId=?1 AND a.PhoneDigits=?2 AND a.Purpose='campaign' AND (d.AdbDeviceId=?3 OR d.EsferaDeviceId=?3 OR d.CurrentAdbAddress=?3) ORDER BY a.AttemptId DESC LIMIT 1",
+            params![company, key, serial], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        conn.execute("INSERT OR IGNORE INTO ESF_DeviceInbound(EventId, CompanyId, PhoneDigits, Phone, Serial, CampaignId, ConfirmationText) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![event_id, company, key, phone, serial, campaign, text]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn confirmation_counts(&self, company: i32, campaign: i32) -> Result<(i64,i64,i64), String> {
+        self.conn().query_row("SELECT COALESCE(SUM(CASE WHEN Status='pending' THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN Status='sent' THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN Status IN ('sending','uncertain') THEN 1 ELSE 0 END),0) FROM ESF_OptOutConfirm WHERE CompanyId=?1 AND CampaignId=?2", params![company,campaign], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e| e.to_string())
+    }
+
+    /// Lista somente itens pendentes: um envio iniciado e interrompido não é repetido automaticamente.
+    pub fn pending_confirmations(&self) -> Vec<(i32,String,String,String,String)> {
+        let conn = self.conn();
+        let mut q = match conn.prepare("SELECT CompanyId,PhoneDigits,Phone,Serial,ConfirmationText FROM ESF_OptOutConfirm WHERE Status='pending' ORDER BY CreatedAt LIMIT 100") { Ok(q) => q, Err(_) => return vec![] };
+        q.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map(|v| v.filter_map(|x| x.ok()).collect()).unwrap_or_default()
+    }
+
+    pub fn claim_confirmation(&self, company: i32, key: &str) -> Result<bool, String> {
+        self.conn().execute("UPDATE ESF_OptOutConfirm SET Status='sending',Attempts=Attempts+1 WHERE CompanyId=?1 AND PhoneDigits=?2 AND Status='pending'", params![company,key]).map(|n| n==1).map_err(|e| e.to_string())
+    }
+    pub fn finish_confirmation(&self, company: i32, key: &str, sent: bool, error: &str) -> Result<(), String> {
+        self.conn().execute("UPDATE ESF_OptOutConfirm SET Status=?1, LastError=?2, SentAt=CASE WHEN ?3 THEN datetime('now') ELSE NULL END WHERE CompanyId=?4 AND PhoneDigits=?5 AND Status='sending'", params![if sent {"sent"} else if error.starts_with("CANCELADO:") || error.starts_with("CONTA_RESTRITA:") {"pending"} else {"uncertain"},error,sent,company,key]).map(|_| ()).map_err(|e| e.to_string())
     }
 
     /// Lista os eventos de descadastro recebidos por API para auditoria (sem conversas).
@@ -3978,16 +4036,42 @@ mod antiban_tests {
         for i in 0..20 {
             db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId, CompanyId, CampaignId, PhoneDigits, Outcome, CreatedAt) VALUES(1, 1, 1, ?1, ?2, datetime('now','-2 days'))", params![Database::opt_out_key(&format!("1199999{:04}",i)), if i < 4 {"falhou"} else {"enviado"}]).unwrap();
         }
-        let error = db.reserve_chip_attempt(&chip, 1, 1, "11999990000").unwrap_err();
+        let error = db.reserve_chip_attempt(&chip, 1, 1, "11999990000", false).unwrap_err();
         assert!(error.contains("Freio automático"));
         db.conn().execute("UPDATE ESF_ChipAttempt SET Outcome='enviado'", []).unwrap();
         for i in 0..3 {
             db.add_opt_out(1, &format!("1199999{:04}", i), "SAIR").unwrap();
         }
-        assert!(db.reserve_chip_attempt(&chip, 1, 1, "11999990000").unwrap_err().contains("3 pedidos de SAIR"));
+        assert!(db.reserve_chip_attempt(&chip, 1, 1, "11999990000", false).unwrap_err().contains("3 pedidos de SAIR"));
         db.conn().execute("DELETE FROM ESF_OptOut", []).unwrap();
-        let id = db.reserve_chip_attempt(&chip, 1, 1, "11999990000").unwrap();
+        let id = db.reserve_chip_attempt(&chip, 1, 1, "11999990000", false).unwrap();
         db.finish_chip_attempt(id, true).unwrap();
-        assert!(db.reserve_chip_attempt(&Chip { status: "banido".into(), ..chip }, 1, 1, "11999990000").is_err());
+        assert!(db.reserve_chip_attempt(&Chip { status: "banido".into(), ..chip }, 1, 1, "11999990000", false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod confirmation_queue_tests {
+    use super::Database;
+    #[test]
+    fn revisao_confirmada_enfileira_uma_vez_e_envio_incerto_nao_repete() {
+        let path = std::env::temp_dir().join(format!("esfera_confirm_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let event = "device:celular:evento123";
+        db.remember_device_inbound(event, 1, "+5575988052539", "celular", "texto aprovado").unwrap();
+        assert!(db.pending_confirmations().is_empty());
+        db.record_opt_out_event(event,1,"+5575988052539","vexor","revisão aprovada","").unwrap();
+        assert!(db.is_opted_out(1,"75988052539"));
+        assert_eq!(db.pending_confirmations().len(),1);
+        db.record_opt_out_event(event,1,"+5575988052539","vexor","revisão aprovada","").unwrap();
+        assert_eq!(db.pending_confirmations().len(),1);
+        let key = Database::opt_out_key("75988052539");
+        assert!(db.claim_confirmation(1,&key).unwrap());
+        assert!(!db.claim_confirmation(1,&key).unwrap());
+        db.finish_confirmation(1,&key,false,"INCERTO: sem confirmação").unwrap();
+        assert!(db.pending_confirmations().is_empty());
+        db.record_opt_out_event(event,1,"+5575988052539","vexor","revisão aprovada","").unwrap();
+        assert!(db.pending_confirmations().is_empty());
     }
 }
