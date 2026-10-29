@@ -550,7 +550,10 @@ export function unknownVariables(text: string): string[] {
 export function messageError(greeting: string, body: string, closing: string) {
   if (!body.trim()) return "Escreva a mensagem que será enviada.";
   if (!greeting.trim() || !closing.trim()) return "Preencha a saudação e o encerramento: a mensagem sai sempre em 3 partes.";
-  return moneyError(joinMessage(greeting, body, closing));
+  const full = joinMessage(greeting, body, closing);
+  if (/(?:https?:\/\/|www\.|\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/|\b))/i.test(full))
+    return "Remova os links da primeira mensagem para contatos novos, incluindo links wa.me.";
+  return moneyError(full);
 }
 
 // Junta saudação + corpo + encerramento como o motor de disparo faz.
@@ -1282,7 +1285,7 @@ function MessageFields({
         required
         error={bodyError}
         aside={<Counter value={total} limit={WHATSAPP_LIMIT} />}
-        hint="Links e chaves PIX saem exatamente como escritos. Não cite valores (R$, reais, %, quantias): a mensagem é bloqueada."
+        hint="Não inclua links na primeira mensagem para contatos novos. Chaves PIX saem exatamente como escritas. Não cite valores (R$, reais, %, quantias): a mensagem é bloqueada."
       >
         <textarea
           id="cmp-body"

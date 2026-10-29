@@ -669,6 +669,24 @@ fn prefetch_next_message(db_arc: Arc<Database>, campaign: crate::db::Campaign, a
     });
 }
 
+/// Bloqueia URLs na mensagem preparada, inclusive quando inseridas pela IA ou spintax.
+fn contains_link(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    if lower.contains("http://") || lower.contains("https://") || lower.contains("www.") {
+        return true;
+    }
+    lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+        .any(|word| {
+            let mut pieces = word.trim_matches('.').rsplit('.');
+            match (pieces.next(), pieces.next()) {
+                (Some(tld), Some(host)) => tld.len() >= 2 && tld.len() <= 24
+                    && tld.chars().all(|c| c.is_ascii_alphabetic())
+                    && !host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                _ => false,
+            }
+        })
+}
+
 const KEEPALIVE_COOLDOWN_SECS: i64 = 90;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -844,6 +862,20 @@ impl Dispatcher {
                         None => build_message(db_arc.clone(), campaign.clone(), next_contact.clone(), app_handle.clone()).await,
                     };
 
+                    // Sem prova confiável de conversa anterior, tratar o contato como novo.
+                    if contains_link(&message_to_send) {
+                        let _ = db_arc.set_campaign_status(campaign.id, "paused");
+                        if let Some(ref handle) = app_handle {
+                            let _ = handle.emit("campaign-progress", CampaignProgressEvent {
+                                campaign_id: campaign.id, campaign_name: campaign.name.clone(),
+                                sent_count: campaign.sent_count, total_contacts: campaign.contacts_count,
+                                last_contact_phone: String::new(), delay_used_ms: 0,
+                                status: "Campanha pausada: remova links da primeira mensagem para contatos novos.".to_string(),
+                            });
+                        }
+                        return;
+                    }
+
                     let db2 = db_arc.clone();
                     let active_devices = match spawn_blocking(move || db2.get_devices(campaign.company_id)).await {
                         Ok(v) => v,
@@ -864,15 +896,15 @@ impl Dispatcher {
                     } else if online_devices.is_empty() {
                         SendOutcome::NoOnlineDevice
                     } else {
-                        let serial = {
+                        let (serial, device_id) = {
                             let mut idx_map = CAMPAIGN_DEVICE_INDEX.lock().unwrap();
                             let idx = idx_map.entry(campaign.id).or_insert(0);
                             let target_dev = &online_devices[*idx % online_devices.len()];
                             *idx = (*idx + 1) % online_devices.len();
-                            target_dev.current_adb_address.as_ref()
+                            (target_dev.current_adb_address.as_ref()
                                 .filter(|a| !a.trim().is_empty())
                                 .cloned()
-                                .unwrap_or_else(|| target_dev.serial.clone())
+                                .unwrap_or_else(|| target_dev.serial.clone()), target_dev.id)
                         };
 
                         let msg = message_to_send.clone();
@@ -888,12 +920,32 @@ impl Dispatcher {
                         let db_last = db_arc.clone();
                         let company_last = campaign.company_id;
                         let campaign_last = campaign.id;
+                        let contact_id_for_safety = next_contact.id;
                         let send_res = spawn_blocking(move || {
                             // Traz os "SAIR" capturados pelo agente agora, e revalida o descadastro no último instante.
                             import_opt_out_from_device(&db_last, &serial, company_last);
                             if db_last.is_opted_out(company_last, &phone2) {
                                 return Err("Contato descadastrado durante o preparo; envio cancelado".to_string());
                             }
+                            let chips = db_last.get_chips(device_id);
+                            if chips.len() != 1 {
+                                return Err("TRAVA: Cadastre exatamente um chip no aparelho para aplicar os limites de envio.".into());
+                            }
+                            let chip = &chips[0];
+                            let cooldown = db_last.chip_cooldown_seconds(chip.id).map_err(|e| format!("TRAVA: {}", e))?;
+                            for _ in 0..cooldown {
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                                if !within_send_window() || !db_last.get_running_campaigns().map(|l| l.iter().any(|c| c.id == campaign_last)).unwrap_or(false) {
+                                    return Err("CANCELADO: campanha parada durante a pausa longa".into());
+                                }
+                            }
+                            let fresh = db_last.get_chips(device_id);
+                            if fresh.len() != 1 || fresh[0].id != chip.id {
+                                return Err("TRAVA: O chip do aparelho mudou durante a pausa.".into());
+                            }
+                            let chip = &fresh[0];
+                            let attempt = db_last.reserve_chip_attempt(chip, company_last, campaign_last, &phone2)
+                                .map_err(|e| format!("TRAVA: {}", e))?;
                             let name_ref = if contact_name.trim().is_empty() { None } else { Some(contact_name.as_str()) };
                             println!("[DISPATCHER] Disparando contato '{}' ({}) via navegacao nativa WhatsApp no aparelho {}", contact_name, phone2, serial);
                             // Garante o contato na agenda; espera só o que falta para o WhatsApp indexar.
@@ -910,7 +962,18 @@ impl Dispatcher {
                                         .map(|l| l.iter().any(|c| c.id == campaign_last))
                                         .unwrap_or(false)
                             };
-                            AdbManager::send_whatsapp_parts(&serial, &phone2, &parts, Some("com.whatsapp"), &check)
+                            let result = AdbManager::send_whatsapp_parts(&serial, &phone2, &parts, Some("com.whatsapp"), &check);
+                            if let Err(ref e) = result {
+                                if e.starts_with("CONTA_RESTRITA:") {
+                                    let _ = db_last.set_chip_restriction(chip.id, "banido", "9999-12-31 23:59:59");
+                                }
+                            }
+                            if let Err(e) = db_last.finish_chip_attempt(attempt, result.is_ok()) {
+                                // A mensagem pode ter saído: não deixe este contato elegível para reenvio.
+                                let _ = db_last.update_contact_status(contact_id_for_safety, "partial");
+                                return Err(format!("TRAVA: Falha ao registrar tentativa; contato enviado para revisão: {}", e));
+                            }
+                            result
                         }).await;
 
                         match send_res {
@@ -928,6 +991,19 @@ impl Dispatcher {
                             }
                         }
                     };
+                    if let SendOutcome::SendFailed(ref error) = outcome {
+                        if error.starts_with("TRAVA:") || error.starts_with("CONTA_RESTRITA:") {
+                            let _ = db_arc.set_campaign_status(campaign.id, "paused");
+                            if let Some(ref handle) = app_handle {
+                                let _ = handle.emit("campaign-progress", CampaignProgressEvent {
+                                    campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
+                                    total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
+                                    status: format!("Campanha pausada: {}", error),
+                                });
+                            }
+                            return;
+                        }
+                    }
                     // Envio parcial/incerto: grava "partial" AGORA (antes da pausa), para nunca reenviar.
                     if let SendOutcome::SendFailed(ref e) = outcome {
                         if e.starts_with("PARCIAL:") || e.starts_with("INCERTO:") {
@@ -946,7 +1022,11 @@ impl Dispatcher {
 
                     let delay_min_ms = campaign.delay_min * 1000;
                     let delay_max_ms = campaign.delay_max * 1000;
-                    let gaussian_delay_ms = AdbManager::calculate_gaussian_delay(delay_min_ms, delay_max_ms);
+                    // Distribuição uniforme ampla, inclusive quando mínimo e máximo foram iguais.
+                    use rand::Rng;
+                    let low = delay_min_ms.max(1000);
+                    let high = delay_max_ms.max(low.saturating_mul(2));
+                    let gaussian_delay_ms = rand::thread_rng().gen_range(low..=high);
 
                     // A IA do próximo contato trabalha durante a pausa, não depois dela.
                     prefetch_next_message(db_arc.clone(), campaign.clone(), next_contact.id, app_handle.clone());
@@ -1298,5 +1378,16 @@ mod variant_pool_tests {
         assert!(!chain_disconnected.iter().any(|c| c.provider == "gemini_web"));
 
         let _ = std::fs::remove_file(tmp);
+    }
+}
+
+#[cfg(test)]
+mod antiban_link_tests {
+    #[test]
+    fn bloqueia_links_no_texto_final() {
+        assert!(super::contains_link("acesse https://exemplo.com"));
+        assert!(super::contains_link("fale em wa.me/5511999999999"));
+        assert!(super::contains_link("acesse exemplo.com.br"));
+        assert!(!super::contains_link("Olá, estamos disponíveis para conversar."));
     }
 }

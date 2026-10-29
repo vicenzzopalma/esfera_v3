@@ -773,6 +773,14 @@ impl Database {
             [],
         )?;
 
+        // Tentativas são vinculadas ao chip e persistem mesmo após reiniciar o app.
+        self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_ChipAttempt (
+            AttemptId INTEGER PRIMARY KEY AUTOINCREMENT, ChipId INTEGER NOT NULL,
+            CompanyId INTEGER NOT NULL, CampaignId INTEGER NOT NULL, PhoneDigits TEXT NOT NULL,
+            Outcome TEXT NOT NULL DEFAULT 'iniciado', CreatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+        ); CREATE INDEX IF NOT EXISTS idx_chip_attempt ON ESF_ChipAttempt(ChipId, AttemptId DESC);
+        CREATE TABLE IF NOT EXISTS ESF_ChipCooldown (ChipId INTEGER PRIMARY KEY, NextAt TEXT NOT NULL);")?;
+
         // 8. ESF_Contact (com custom_message, device_id, retry_count, excluido_em)
         self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_Contact (
@@ -2181,6 +2189,60 @@ impl Database {
             params![device_id, phone, name],
         ).map_err(|e| e.to_string())?;
         Ok(self.conn().last_insert_rowid() as i32)
+    }
+
+    /// Reserva uma tentativa antes de tocar no WhatsApp. Tentativas interrompidas contam como falha.
+    pub fn reserve_chip_attempt(&self, chip: &Chip, company_id: i32, campaign_id: i32, phone: &str) -> Result<i64, String> {
+        if chip.status != "livre" || chip.restricted_until.is_some() {
+            return Err("Chip restrito ou indisponível. Verifique o aparelho antes de retomar.".into());
+        }
+        let config = |suffix: &str, default: i64| {
+            std::env::var(format!("ESFERA_CHIP_{}_{}", chip.id, suffix)).ok()
+                .or_else(|| std::env::var(format!("ESFERA_CHIP_{}", suffix)).ok())
+                .and_then(|v| v.parse::<i64>().ok()).filter(|v| *v > 0).unwrap_or(default)
+        };
+        let hour_limit = config("HOURLY_LIMIT", 10);
+        let day_limit = config("DAILY_LIMIT", 60);
+        let conn = self.conn();
+        let (hour, day, age): (i64, i64, i64) = conn.query_row(
+            "SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= datetime('now','-1 hour')),
+                    (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND date(CreatedAt,'localtime')=date('now','localtime')),
+                    max(0, CAST(julianday('now') - julianday(?2) AS INTEGER))",
+            params![chip.id, chip.created_at], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e| e.to_string())?;
+        // O dia de cadastro começa com 15 tentativas; o teto cresce cinco por dia.
+        let warm_limit = (15 + age * 5).min(day_limit);
+        if hour >= hour_limit || day >= warm_limit {
+            return Err(format!("Limite do chip atingido: {} por hora e {} por dia (aquecimento).", hour_limit, warm_limit));
+        }
+        let (count, failed, optouts): (i64, i64, i64) = conn.query_row(
+            "SELECT count(*), coalesce(sum(CASE WHEN a.Outcome != 'enviado' THEN 1 ELSE 0 END),0),
+                    coalesce(sum(CASE WHEN EXISTS(SELECT 1 FROM ESF_OptOut o WHERE o.CompanyId=a.CompanyId AND o.PhoneDigits=a.PhoneDigits) THEN 1 ELSE 0 END),0)
+             FROM (SELECT CompanyId,PhoneDigits,Outcome FROM ESF_ChipAttempt WHERE ChipId=?1 ORDER BY AttemptId DESC LIMIT 20) a",
+            params![chip.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e| e.to_string())?;
+        if count >= 20 && (failed * 100 > count * 15 || optouts * 100 > count * 10) {
+            return Err(format!("Freio automático: nas últimas {} tentativas, {} falhas e {} pedidos de SAIR.", count, failed, optouts));
+        }
+        conn.execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits) VALUES (?1,?2,?3,?4)", params![chip.id,company_id,campaign_id,Self::opt_out_key(phone)]).map_err(|e| e.to_string())?;
+        let id = conn.last_insert_rowid();
+        let n = config("BREAK_EVERY", 10);
+        let total: i64 = conn.query_row("SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1", params![chip.id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if total % n == 0 {
+            use rand::Rng;
+            let seconds = rand::thread_rng().gen_range(180..=480);
+            conn.execute("INSERT INTO ESF_ChipCooldown(ChipId,NextAt) VALUES (?1,datetime('now',?2)) ON CONFLICT(ChipId) DO UPDATE SET NextAt=excluded.NextAt",
+                params![chip.id, format!("+{} seconds", seconds)]).map_err(|e| e.to_string())?;
+        }
+        Ok(id)
+    }
+
+    pub fn chip_cooldown_seconds(&self, chip_id: i32) -> Result<u64, String> {
+        let seconds: i64 = self.conn().query_row("SELECT coalesce(max(0, CAST(strftime('%s',NextAt) AS INTEGER)-CAST(strftime('%s','now') AS INTEGER)),0) FROM ESF_ChipCooldown WHERE ChipId=?1", params![chip_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        Ok(seconds as u64)
+    }
+
+    pub fn finish_chip_attempt(&self, attempt_id: i64, sent: bool) -> Result<(), String> {
+        self.conn().execute("UPDATE ESF_ChipAttempt SET Outcome=?1 WHERE AttemptId=?2", params![if sent { "enviado" } else { "falhou" }, attempt_id]).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn update_chip_status(&self, chip_id: i32, status: &str) -> Result<(), String> {
@@ -3900,5 +3962,32 @@ mod opt_out_key_tests {
         assert_eq!(logs[0].action, "remove");
         assert_eq!(logs[0].actor_name, "Master Carlos");
         assert_eq!(logs[0].phone, "7588052539");
+    }
+}
+
+#[cfg(test)]
+mod antiban_tests {
+    use super::{Chip, Database};
+    use rusqlite::params;
+    #[test]
+    fn freio_janela_e_limites_persistentes() {
+        let path = std::env::temp_dir().join(format!("esfera_antiban_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let chip = Chip { id: 1, device_id: 1, phone_number: "".into(), chip_name: "".into(), status: "livre".into(), restricted_until: None, created_at: "2020-01-01 00:00:00".into() };
+        for i in 0..20 {
+            db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId, CompanyId, CampaignId, PhoneDigits, Outcome, CreatedAt) VALUES(1, 1, 1, ?1, ?2, datetime('now','-2 days'))", params![Database::opt_out_key(&format!("1199999{:04}",i)), if i < 4 {"falhou"} else {"enviado"}]).unwrap();
+        }
+        let error = db.reserve_chip_attempt(&chip, 1, 1, "11999990000").unwrap_err();
+        assert!(error.contains("Freio automático"));
+        db.conn().execute("UPDATE ESF_ChipAttempt SET Outcome='enviado'", []).unwrap();
+        for i in 0..3 {
+            db.add_opt_out(1, &format!("1199999{:04}", i), "SAIR").unwrap();
+        }
+        assert!(db.reserve_chip_attempt(&chip, 1, 1, "11999990000").unwrap_err().contains("3 pedidos de SAIR"));
+        db.conn().execute("DELETE FROM ESF_OptOut", []).unwrap();
+        let id = db.reserve_chip_attempt(&chip, 1, 1, "11999990000").unwrap();
+        db.finish_chip_attempt(id, true).unwrap();
+        assert!(db.reserve_chip_attempt(&Chip { status: "banido".into(), ..chip }, 1, 1, "11999990000").is_err());
     }
 }
