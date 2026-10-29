@@ -527,15 +527,16 @@ pub fn run_cmd_timeout(
         Err(_) => {
             #[cfg(windows)]
             {
+                // O processo de limpeza não deve prender o próprio caminho de timeout.
                 let _ = create_cmd("taskkill")
                     .args(["/F", "/PID", &pid.to_string()])
-                    .output();
+                    .spawn();
             }
             #[cfg(unix)]
             {
                 let _ = std::process::Command::new("kill")
                     .arg(pid.to_string())
-                    .output();
+                    .spawn();
             }
             Err(format!(
                 "Comando excedeu timeout de {}s.",
@@ -1157,7 +1158,6 @@ impl AdbManager {
     /// Desconecta de um dispositivo via `adb disconnect serial`
     pub fn disconnect_device(serial: &str) -> Result<String, String> {
         // Expurga da pool nativa e do registro de túneis (idempotente)
-        crate::adb_tcp::evict(serial);
         crate::adb_tcp::unregister_tunnel_serial(serial);
 
         let output = create_cmd("adb")
@@ -1313,53 +1313,12 @@ impl AdbManager {
 
     /// Envia um toque na tela via `adb -s <serial> shell input tap x y`
     pub fn tap_screen(serial: &str, x: u32, y: u32) -> Result<(), String> {
-        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
-        let tap_cmd = format!("input tap {} {}", x, y);
-
-        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
-        if Self::use_native_adb(&target_serial) && crate::adb_tcp::exec_shell_bytes(&target_serial, &tap_cmd).is_ok() {
-            return Ok(());
-        }
-
-        let output = create_cmd("adb")
-            .args(["-s", &target_serial, "shell", "input", "tap", &x.to_string(), &y.to_string()])
-            .output()
-            .map_err(|e| format!("Falha ao enviar toque ADB: {}", e))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err("Comando tap ADB falhou".to_string())
-        }
+        Self::execute_shell(serial, &format!("input tap {} {}", x, y), 6).map(|_| ())
     }
 
-    /// Envia um evento de tecla via `adb -s <serial> shell input keyevent <keycode>`
+    /// Envia um evento de tecla com limite de tempo e sem trocar o aparelho.
     pub fn send_keyevent(serial: &str, keycode: u32) -> Result<(), String> {
-        let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
-        let key_cmd = format!("input keyevent {}", keycode);
-
-        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
-        if Self::use_native_adb(&target_serial) && crate::adb_tcp::exec_shell_bytes(&target_serial, &key_cmd).is_ok() {
-            return Ok(());
-        }
-
-        let output = create_cmd("adb")
-            .args([
-                "-s",
-                &target_serial,
-                "shell",
-                "input",
-                "keyevent",
-                &keycode.to_string(),
-            ])
-            .output()
-            .map_err(|e| format!("Falha ao enviar keyevent ADB: {}", e))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err("Comando keyevent ADB falhou".to_string())
-        }
+        Self::execute_shell(serial, &format!("input keyevent {}", keycode), 6).map(|_| ())
     }
 
     /// Digitação direta de texto no celular (tecla a tecla, modelo psicomotor humano)
@@ -3206,7 +3165,8 @@ impl AdbManager {
         let requested = requested_serial.trim();
 
         // 0. Fast-path: serial de túnel esfera-agent (UUID) já é roteável diretamente
-        if crate::adb_tcp::is_tunnel_serial(requested) {
+        if crate::adb_tcp::is_tunnel_serial(requested) || requested.parse::<std::net::SocketAddr>().is_ok() {
+            // Um endereço de rede explícito nunca pode ser redirecionado para outro aparelho.
             return Ok(requested.to_string());
         }
 
@@ -3309,9 +3269,6 @@ impl AdbManager {
         // (ex: 0082925603 ou 420012cad28ca5c7), redireciona automaticamente para o dispositivo USB ativo.
         let ready_devices: Vec<&AdbDeviceInfo> = active_devices.iter().filter(|d| d.state == "device").collect();
         if !ready_devices.is_empty() {
-            if ready_devices.len() == 1 {
-                return Ok(ready_devices[0].serial.clone());
-            }
             for usb_dev in &ready_devices {
                 if let Ok(wifi_ip) = Self::get_device_wifi_ip(&usb_dev.serial) {
                     if wifi_ip.contains(requested_ip) || requested_ip.contains(&wifi_ip) {
@@ -3322,6 +3279,17 @@ impl AdbManager {
         }
 
         Err(format!("Dispositivo '{}' não está pronto no ADB. Certifique-se de que ele está conectado e com 'Depuração USB' autorizada.", requested))
+    }
+
+    /// Confere o endereço exato do aparelho e reconecta apenas aquele alvo de rede.
+    pub fn ensure_dispatch_target(serial: &str) -> Result<(), String> {
+        let addr: std::net::SocketAddr = match serial.parse() { Ok(a) => a, Err(_) => return Ok(()) };
+        let ready = |devices: &[AdbDeviceInfo]| devices.iter().any(|d| d.serial == serial && d.state == "device");
+        if ready(&Self::list_devices().unwrap_or_default()) { return Ok(()); }
+        Self::connect_device(&addr.ip().to_string(), i32::from(addr.port()))
+            .map_err(|e| format!("Aparelho Wi-Fi {} indisponível: {}", serial, e))?;
+        if ready(&Self::list_devices().unwrap_or_default()) { Ok(()) }
+        else { Err(format!("Aparelho Wi-Fi {} não ficou disponível no ADB.", serial)) }
     }
 
     /// Provisiona um dispositivo: gera UUID, injeta ID + config + imunidade, instala APK, inicia serviço
@@ -3858,51 +3826,19 @@ impl AdbManager {
 
     /// Obtém a resolução da tela física do dispositivo (Physical size: WxH)
     pub fn get_device_screen_size(serial: &str) -> (i32, i32) {
-        // Wi-Fi: protocolo ADB nativo em vez de adb.exe
-        if Self::use_native_adb(serial) {
-            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "wm size") {
-                for line in stdout.lines() {
-                    if line.contains("Physical size:") || line.contains("Override size:") {
-                        if let Some(res) = line.split(':').nth(1) {
-                            let parts: Vec<&str> = res.trim().split('x').collect();
-                            if parts.len() == 2 {
-                                if let (Ok(w), Ok(h)) = (
-                                    parts[0].trim().parse::<i32>(),
-                                    parts[1].trim().parse::<i32>(),
-                                ) {
-                                    return (w, h);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let output = create_cmd("adb")
-            .arg("-s")
-            .arg(serial)
-            .arg("shell")
-            .arg("wm")
-            .arg("size")
-            .output();
-
-        if let Ok(out) = output {
-            let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Ok(stdout) = Self::execute_shell(serial, "wm size", 5) {
             for line in stdout.lines() {
                 if line.contains("Physical size:") || line.contains("Override size:") {
                     if let Some(res) = line.split(':').nth(1) {
                         let parts: Vec<&str> = res.trim().split('x').collect();
                         if parts.len() == 2 {
-                            if let (Ok(w), Ok(h)) = (parts[0].trim().parse::<i32>(), parts[1].trim().parse::<i32>()) {
-                                return (w, h);
-                            }
+                            if let (Ok(w), Ok(h)) = (parts[0].trim().parse::<i32>(), parts[1].trim().parse::<i32>()) { return (w,h); }
                         }
                     }
                 }
             }
         }
-        (1080, 2400) // Fallback seguro padrão
+        (1080, 2400)
     }
 
     /// Escapa um valor para uso seguro entre aspas simples no shell do dispositivo
@@ -3944,7 +3880,7 @@ impl AdbManager {
             Err(_) => serial.to_string(),
         });
         if Self::use_native_adb(&target_serial) {
-            crate::adb_tcp::exec_shell(&target_serial, shell_cmd)
+            crate::adb_tcp::exec_shell_with_timeout(&target_serial, shell_cmd, Duration::from_secs(timeout_secs))
         } else {
             let mut cmd = create_cmd("adb");
             cmd.args(["-s", &target_serial, "shell", shell_cmd]);
@@ -4546,7 +4482,7 @@ impl AdbManager {
                 (x, y)
             }
         };
-        Self::soft_tap(serial, sx, sy)?;
+        Self::soft_tap(serial, sx, sy).map_err(|e| format!("INCERTO: não foi possível confirmar o toque em Enviar: {}", e))?;
         let d = Self::calculate_gaussian_delay(900, 1300);
         std::thread::sleep(Duration::from_millis(d as u64));
 
@@ -5105,7 +5041,6 @@ impl AdbManager {
     /// Reconecta todos os dispositivos ativos limpos de soquetes zumbis do Windows com varredura por TCP Probe
     pub fn force_reconnect_all_adb(db: &crate::db::Database) -> Result<String, String> {
         // Expurga a pool nativa e os registros de túnel (serão renegociados sob demanda)
-        crate::adb_tcp::reset_pool();
         crate::adb_tcp::unregister_all_tunnel_serials();
 
         let mut kill_cmd = create_cmd("adb");
@@ -5467,5 +5402,14 @@ mod antiban_screen_tests {
         assert!(AdbManager::shows_restricted_account("Esta conta não pode mais usar o WhatsApp"));
         assert!(AdbManager::shows_restricted_account("This account can no longer use WhatsApp"));
         assert!(!AdbManager::shows_restricted_account("Conversas do WhatsApp"));
+    }
+}
+
+#[cfg(test)]
+mod wifi_serial_tests {
+    use super::AdbManager;
+    #[test]
+    fn endereco_wifi_explicito_nao_redireciona_para_outro_aparelho() {
+        assert_eq!(AdbManager::resolve_target_serial("192.168.1.92:5555").unwrap(), "192.168.1.92:5555");
     }
 }
