@@ -1390,7 +1390,7 @@ impl AiEngine {
             const responses = document.querySelectorAll(
                 'model-response, message-content, .model-response-text, [data-message-author-role="model"]'
             ).length;
-            return { ready: Boolean(el) && !signIn, signIn, responses };
+            return { ready: Boolean(el) && !signIn && document.readyState === 'complete', signIn, responses };
         })()"#;
 
         let mut baseline_responses = 0usize;
@@ -1428,9 +1428,19 @@ impl AiEngine {
             el.dispatchEvent(new Event('input', { bubbles: true }));
             return true;
         })()"#;
-        let focused = Self::cdp_eval_js(&mut ws, cmd_id, focus_js).await?;
-        cmd_id += 1;
-        if !focused.as_bool().unwrap_or(false) {
+        // A navegação pode trocar a página logo depois da checagem acima: tenta de novo por até 10s.
+        let mut focused = false;
+        let focus_start = std::time::Instant::now();
+        while focus_start.elapsed() < Duration::from_secs(10) {
+            let res = Self::cdp_eval_js(&mut ws, cmd_id, focus_js).await;
+            cmd_id += 1;
+            if res.ok().and_then(|v| v.as_bool()).unwrap_or(false) {
+                focused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        if !focused {
             return Err("Não foi possível focar o campo de mensagem do Gemini Web.".to_string());
         }
 
