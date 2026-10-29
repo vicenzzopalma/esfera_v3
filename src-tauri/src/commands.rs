@@ -3316,6 +3316,15 @@ pub async fn optimize_device_hpc(_token: String, serial: String) -> Result<Strin
 }
 
 #[tauri::command]
+pub fn get_agent_update_status(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<crate::dispatcher::AgentUpdateStatus>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.company_id != Some(company_id) {
+        return Err("Acesso negado aos aparelhos de outra empresa.".into());
+    }
+    Ok(crate::dispatcher::agent_update_statuses(company_id))
+}
+
+#[tauri::command]
 pub async fn install_agent_apk(_token: String, serial: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::install_agent_apk(&serial)

@@ -24,6 +24,65 @@ static SEND_DEVICE_PREPARED: std::sync::LazyLock<Mutex<HashMap<String, Instant>>
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static DEVICE_SEND_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Mesmo bloqueio para disparo, confirmação e instalação do agente.
+fn device_lock_for_key(key: &str) -> Arc<AsyncMutex<()>> {
+    let mut locks = DEVICE_SEND_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    locks.entry(key.to_string()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone()
+}
+
+pub fn device_operation_lock_for_id(id: i32) -> Arc<AsyncMutex<()>> {
+    device_lock_for_key(&format!("device:{}", id))
+}
+
+/// O botão manual e o provisionamento podem receber serial USB ou endereço Wi-Fi.
+pub fn device_operation_lock(serial: &str) -> Result<Arc<AsyncMutex<()>>, String> {
+    use rusqlite::OptionalExtension;
+    let conn = rusqlite::Connection::open_with_flags(crate::get_db_path(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| format!("Não foi possível verificar o aparelho: {}",e))?;
+    conn.busy_timeout(std::time::Duration::from_secs(2)).map_err(|e| e.to_string())?;
+    let id: Option<i32> = conn.query_row("SELECT rowid FROM ESF_Device WHERE AdbDeviceId=?1 OR CurrentAdbAddress=?1 OR EsferaDeviceId=?1 LIMIT 1", [serial], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+    Ok(match id { Some(id) => device_operation_lock_for_id(id), None => device_lock_for_key(&format!("serial:{}",serial)) })
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUpdateStatus {
+    pub device_id: String,
+    pub company_id: i32,
+    pub version_code: Option<u32>,
+    pub version_name: String,
+    pub expected_code: u32,
+    pub status: String,
+    pub detail: String,
+}
+#[derive(Default)]
+struct AgentMonitorState {
+    statuses: HashMap<String, AgentUpdateStatus>,
+    last_check: HashMap<String, Instant>,
+    inflight: std::collections::HashSet<String>,
+    online: std::collections::HashSet<String>,
+    last_logged: HashMap<String, String>,
+}
+static AGENT_MONITOR: std::sync::LazyLock<Mutex<AgentMonitorState>> = std::sync::LazyLock::new(|| Mutex::new(AgentMonitorState::default()));
+
+pub fn agent_update_statuses(company: i32) -> Vec<AgentUpdateStatus> {
+    AGENT_MONITOR.lock().map(|m| m.statuses.values().filter(|s| s.company_id == company).cloned().collect()).unwrap_or_default()
+}
+
+fn update_agent_status(db: &Database, key: &str, status: AgentUpdateStatus, audit: bool) {
+    let mut log = None;
+    if let Ok(mut state) = AGENT_MONITOR.lock() {
+        if audit {
+            let fingerprint = format!("{}:{}:{}", status.status, status.version_code.unwrap_or(0), status.detail);
+            if state.last_logged.get(key) != Some(&fingerprint) {
+                state.last_logged.insert(key.to_string(), fingerprint);
+                log = Some(format!("Aparelho {}: {}",status.device_id,status.detail));
+            }
+        }
+        state.statuses.insert(key.to_string(), status.clone());
+    }
+    if let Some(message)=log { db.queue_add_log(status.company_id, if status.status=="error" {"error"} else {"info"}, "Agente Android", &message); }
+}
+
 /// Contatos temporários já salvos na agenda de cada aparelho ("serial|digitos").
 static TEMP_CONTACTS: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
@@ -1043,12 +1102,7 @@ impl Dispatcher {
                         let msg = message_to_send.clone();
                         let phone2 = phone.clone();
                         let contact_name = next_contact.contact_name.clone();
-                        let device_lock = {
-                            let mut locks = DEVICE_SEND_LOCKS.lock().unwrap();
-                            locks.entry(serial.clone())
-                                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                                .clone()
-                        };
+                        let device_lock = device_operation_lock_for_id(device_id);
                         let _device_guard = device_lock.lock().await;
                         let db_last = db_arc.clone();
                         let company_last = campaign.company_id;
@@ -1262,7 +1316,7 @@ impl Dispatcher {
             let chips = db.get_chips(device.id);
             if chips.len() != 1 || chips[0].status != "livre" || chips[0].restricted_until.is_some() { continue; }
             let serial = device.current_adb_address.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| device.serial.clone());
-            let lock = { let mut locks = DEVICE_SEND_LOCKS.lock().unwrap(); locks.entry(serial.clone()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone() };
+            let lock = device_operation_lock_for_id(device.id);
             let _guard = lock.lock().await;
             let current_chips = db.get_chips(device.id);
             if current_chips.len() != 1 || current_chips[0].id != chips[0].id || current_chips[0].status != "livre" || current_chips[0].restricted_until.is_some() { continue; }
@@ -1310,6 +1364,99 @@ impl Dispatcher {
             loop {
                 Self::flush_confirmations(db_arc.clone()).await;
                 sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
+
+    /// Verifica aparelhos conectados em segundo plano, com limite de concorrência.
+    pub fn start_agent_update_loop(db: Arc<Database>) {
+        tauri::async_runtime::spawn(async move {
+            let slots = Arc::new(tokio::sync::Semaphore::new(4));
+            loop {
+                let devices = db.get_all_devices();
+                let online: std::collections::HashSet<String> = devices.iter().filter(|d| d.status == "online").map(|d| {
+                    let id = d.esfera_device_id.as_deref().filter(|s| !s.is_empty()).unwrap_or(&d.serial);
+                    format!("{}|{}", d.company_id, id)
+                }).collect();
+                if let Ok(mut state) = AGENT_MONITOR.lock() {
+                    for key in online.difference(&state.online).cloned().collect::<Vec<_>>() { state.last_check.remove(&key); }
+                    state.online = online;
+                }
+                for device in devices.into_iter().filter(|d| d.status == "online") {
+                    let id = device.esfera_device_id.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| device.serial.clone());
+                    let key = format!("{}|{}",device.company_id,id);
+                    let permit = match slots.clone().try_acquire_owned() { Ok(p) => p, Err(_) => break };
+                    let eligible = if let Ok(mut state) = AGENT_MONITOR.lock() {
+                        let due = state.last_check.get(&key).map(|t| t.elapsed() >= std::time::Duration::from_secs(60)).unwrap_or(true);
+                        if due && !state.inflight.contains(&key) { state.inflight.insert(key.clone()); state.last_check.insert(key.clone(),Instant::now()); true } else { false }
+                    } else { false };
+                    if !eligible { continue; }
+                    let db = db.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let expected = crate::adb_manager::expected_agent_version().unwrap_or(0);
+                        let mut status = AgentUpdateStatus { device_id:id, company_id:device.company_id, version_code:None, version_name:String::new(), expected_code:expected, status:"checking".into(), detail:"Verificando agente".into() };
+                        update_agent_status(&db,&key,status.clone(),false);
+                        let serial = device.current_adb_address.clone().filter(|a| !a.trim().is_empty()).unwrap_or_else(|| device.serial.clone());
+                        let lock = device_operation_lock_for_id(device.id);
+                        if let Ok(_guard) = lock.try_lock() {
+                            let serial2=serial.clone();
+                            let checked = spawn_blocking(move || {
+                                if expected == 0 { return Err("Versão esperada do agente inválida.".to_string()); }
+                                AdbManager::ensure_dispatch_target(&serial2)?;
+                                AdbManager::installed_agent_version(&serial2)
+                            }).await;
+                            match checked {
+                                Ok(Ok(installed)) => {
+                                    if let Some((code,name)) = installed { status.version_code=Some(code); status.version_name=name; }
+                                    else { status.version_name="não instalado".into(); }
+                                    if status.version_code.unwrap_or(0) >= expected {
+                                        match db.agent_restore_pending(device.id) {
+                                            Ok(false) => { status.status="current".into(); status.detail="Agente atualizado".into(); update_agent_status(&db,&key,status.clone(),false); }
+                                            Ok(true) => {
+                                                let serial_check=serial.clone();
+                                                let restored = spawn_blocking(move || AdbManager::ensure_agent_services(&serial_check)).await;
+                                                let outcome = match restored { Ok(Ok(())) => db.set_agent_restore_pending(device.id,false), Ok(Err(e)) => Err(e), Err(e) => Err(e.to_string()) };
+                                                match outcome {
+                                                    Ok(()) => { status.status="current".into(); status.detail="Agente atualizado e serviços ativados".into(); update_agent_status(&db,&key,status.clone(),true); }
+                                                    Err(e) => { status.status="error".into(); status.detail=format!("Falha ao ativar serviços do agente: {}",e); update_agent_status(&db,&key,status.clone(),true); }
+                                                }
+                                            }
+                                            Err(e) => { status.status="error".into(); status.detail=format!("Falha ao consultar serviços do agente: {}",e); update_agent_status(&db,&key,status.clone(),true); }
+                                        }
+                                    } else {
+                                        status.status="updating".into(); status.detail="Atualizando agente…".into();
+                                        update_agent_status(&db,&key,status.clone(),false);
+                                        let prepared = db.set_agent_restore_pending(device.id,true);
+                                        let result = match prepared {
+                                            Ok(()) => match spawn_blocking(move || AdbManager::auto_update_agent_unlocked(&serial,expected)).await { Ok(r) => r, Err(e) => Err(e.to_string()) },
+                                            Err(e) => Err(format!("Não foi possível registrar a atualização: {}",e)),
+                                        };
+                                        match result {
+                                            Ok((code,name)) => {
+                                                status.version_code=Some(code); status.version_name=name;
+                                                match db.set_agent_restore_pending(device.id,false) {
+                                                    Ok(()) => { status.status="current".into(); status.detail=format!("Agente atualizado para versão {}",code); }
+                                                    Err(e) => { status.status="error".into(); status.detail=format!("Agente instalado; falha ao registrar ativação: {}",e); }
+                                                }
+                                            }
+                                            Err(e) => { status.status="error".into(); status.detail=e; }
+                                        }
+                                        update_agent_status(&db,&key,status.clone(),true);
+                                    }
+                                }
+                                Ok(Err(e)) => { status.status="error".into(); status.detail=format!("Não foi possível verificar o agente: {}",e); update_agent_status(&db,&key,status.clone(),true); }
+                                Err(e) => { status.status="error".into(); status.detail=format!("Falha ao verificar agente: {}",e); update_agent_status(&db,&key,status.clone(),true); }
+                            }
+                        } else {
+                            status.status="waiting".into(); status.detail="Aguardando o aparelho terminar o envio".into();
+                            update_agent_status(&db,&key,status,false);
+                            if let Ok(mut state)=AGENT_MONITOR.lock() { state.last_check.remove(&key); }
+                        }
+                        if let Ok(mut state)=AGENT_MONITOR.lock() { state.inflight.remove(&key); }
+                    });
+                }
+                sleep(Duration::from_secs(10)).await;
             }
         });
     }
@@ -1676,5 +1823,17 @@ mod local_fallback_tests {
         assert!(db.is_opted_out(1,"5575988052539"));
         assert!(local_opt_out("Por favor quero SAIR das mensagens agora mesmo, obrigada."));
         assert!(!local_opt_out("Bom dia, vou verificar"));
+    }
+}
+
+#[cfg(test)]
+mod agent_install_lock_tests {
+    use super::*;
+    #[tokio::test]
+    async fn atualizacao_aguarda_disparo_no_mesmo_aparelho() {
+        let sending=device_operation_lock_for_id(999999);
+        let _guard=sending.lock().await;
+        assert!(device_operation_lock_for_id(999999).try_lock().is_err());
+        assert!(device_operation_lock_for_id(999998).try_lock().is_ok());
     }
 }

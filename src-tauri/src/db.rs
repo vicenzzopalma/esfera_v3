@@ -699,6 +699,9 @@ impl Database {
             [],
         )?;
 
+        // Mantém a necessidade de restaurar serviços caso a instalação seja interrompida.
+        self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_AgentRestorePending (DeviceId INTEGER PRIMARY KEY);")?;
+
         // 4. ESF_Campaign (com SelectedDevices e ExcluidoEm)
         self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_Campaign (
@@ -2173,6 +2176,16 @@ impl Database {
     // ============================================================
     // CHIPS (com 6 status, holder, reservas)
     // ============================================================
+
+    pub fn agent_restore_pending(&self, device_id: i32) -> Result<bool, String> {
+        self.conn().query_row("SELECT EXISTS(SELECT 1 FROM ESF_AgentRestorePending WHERE DeviceId=?1)", params![device_id], |r| r.get(0)).map_err(|e| e.to_string())
+    }
+
+    pub fn set_agent_restore_pending(&self, device_id: i32, pending: bool) -> Result<(), String> {
+        if pending { self.conn().execute("INSERT OR IGNORE INTO ESF_AgentRestorePending(DeviceId) VALUES(?1)", params![device_id]) }
+        else { self.conn().execute("DELETE FROM ESF_AgentRestorePending WHERE DeviceId=?1", params![device_id]) }
+            .map(|_| ()).map_err(|e| e.to_string())
+    }
 
     pub fn get_chips(&self, device_id: i32) -> Vec<Chip> {
         let conn = self.conn();
@@ -4073,5 +4086,25 @@ mod confirmation_queue_tests {
         assert!(db.pending_confirmations().is_empty());
         db.record_opt_out_event(event,1,"+5575988052539","vexor","revisão aprovada","").unwrap();
         assert!(db.pending_confirmations().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod agent_restore_tests {
+    use super::Database;
+    #[test]
+    fn restauracao_pendente_sobrevive_a_reabertura() {
+        let path=std::env::temp_dir().join(format!("esfera_agent_restore_{}.db",std::process::id()));
+        let _=std::fs::remove_file(&path);
+        {
+            let db=Database::init(path.to_string_lossy().as_ref()).unwrap();
+            assert!(!db.agent_restore_pending(17).unwrap());
+            db.set_agent_restore_pending(17,true).unwrap();
+        }
+        let db=Database::init(path.to_string_lossy().as_ref()).unwrap();
+        assert!(db.agent_restore_pending(17).unwrap());
+        assert!(!db.agent_restore_pending(18).unwrap());
+        db.set_agent_restore_pending(17,false).unwrap();
+        assert!(!db.agent_restore_pending(17).unwrap());
     }
 }

@@ -3643,6 +3643,12 @@ impl AdbManager {
 
     /// Instala silenciosamente o aplicativo Agente Esfera v3 (.APK) no celular via ADB com auto-reconexão e tratamento de 'device offline'
     pub fn install_agent_apk(serial: &str) -> Result<String, String> {
+        let lock = crate::dispatcher::device_operation_lock(serial)?;
+        let _guard = lock.blocking_lock();
+        Self::install_agent_apk_unlocked(serial)
+    }
+
+    fn install_agent_apk_unlocked(serial: &str) -> Result<String, String> {
         let apk_path_buf = Self::find_agent_apk_path()?;
         let apk_str = apk_path_buf
             .to_str()
@@ -3714,6 +3720,61 @@ impl AdbManager {
                 combined.trim()
             ))
         }
+    }
+
+    /// Versão instalada consultada no aparelho; erro de ADB nunca significa "não instalado".
+    pub fn installed_agent_version(serial: &str) -> Result<Option<(u32,String)>, String> {
+        let out = Self::execute_shell(serial, "result=$(pm list packages com.esfera.agent) || exit 1; if echo \"$result\" | grep -qx 'package:com.esfera.agent'; then dumpsys package com.esfera.agent; else echo ESFERA_AGENT_NOT_INSTALLED; fi", 8)?;
+        parse_installed_agent_version(&out)
+    }
+
+    /// A chamada deve segurar o bloqueio do aparelho antes de instalar.
+    pub fn auto_update_agent_unlocked(serial: &str, expected: u32) -> Result<(u32,String), String> {
+        if crate::adb_tcp::is_tunnel_serial(serial) { return Err("Atualização automática por túnel reverso não está disponível; use USB ou Wi-Fi ADB.".into()); }
+        let apk = find_matching_agent_apk(expected)?;
+        Self::ensure_dispatch_target(serial)?;
+        let path = apk.to_str().ok_or("Caminho do APK inválido")?;
+        let mut cmd = create_cmd("adb");
+        cmd.args(["-s",serial,"install","-r","-g",path]);
+        let result = run_cmd_timeout(cmd,Duration::from_secs(90)).map_err(|e| format!("Falha ao atualizar o agente: {}",e))?;
+        let text = format!("{} {}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+        if !result.status.success() || !text.to_lowercase().contains("success") { return Err(format!("Falha ao instalar o agente: {}",text.trim())); }
+        let installed = Self::installed_agent_version(serial)?.ok_or("Agente não encontrado após a instalação")?;
+        if installed.0 < expected { return Err("A versão instalada não corresponde ao APK esperado.".into()); }
+        Self::restore_agent_services_after_update(serial)?;
+        Ok(installed)
+    }
+
+    pub fn ensure_agent_services(serial: &str) -> Result<(), String> {
+        let accessibility=Self::execute_shell(serial, "settings get secure enabled_accessibility_services", 6)?;
+        let listeners=Self::execute_shell(serial, "settings get secure enabled_notification_listeners", 6)?;
+        let enabled=Self::execute_shell(serial, "settings get secure accessibility_enabled", 6)?;
+        if accessibility.contains(Self::AGENT_ACCESSIBILITY_COMPONENT) && listeners.contains("com.esfera.agent/") && enabled.trim() == "1" { return Ok(()); }
+        Self::restore_agent_services_after_update(serial)
+    }
+
+    fn restore_agent_services_after_update(serial: &str) -> Result<(), String> {
+        let current = Self::execute_shell(serial, "settings get secure enabled_accessibility_services", 6)
+            .map_err(|e| format!("Agente instalado, mas não foi possível ler a acessibilidade: {}",e))?;
+        let current = current.trim();
+        if !current.contains(Self::AGENT_ACCESSIBILITY_COMPONENT) {
+            let updated = if current.is_empty() || current == "null" { Self::AGENT_ACCESSIBILITY_COMPONENT.to_string() } else { format!("{}:{}",current,Self::AGENT_ACCESSIBILITY_COMPONENT) };
+            Self::execute_shell(serial, &format!("settings put secure enabled_accessibility_services '{}'",Self::shell_quote(&updated)), 6)
+                .map_err(|e| format!("Agente instalado, mas não foi possível ativar acessibilidade: {}",e))?;
+        }
+        Self::execute_shell(serial, "settings put secure accessibility_enabled 1", 6)
+            .map_err(|e| format!("Agente instalado, mas não foi possível ativar acessibilidade: {}",e))?;
+        let accessibility = Self::execute_shell(serial, "settings get secure enabled_accessibility_services", 6)
+            .map_err(|e| format!("Não foi possível confirmar acessibilidade: {}",e))?;
+        if !accessibility.contains(Self::AGENT_ACCESSIBILITY_COMPONENT) { return Err("Agente instalado, mas a acessibilidade não foi confirmada.".into()); }
+        Self::execute_shell(serial, "cmd notification allow_listener com.esfera.agent/com.esfera.agent.EsferaOptOutNotificationListener", 6)
+            .map_err(|e| format!("Agente instalado, mas não foi possível ativar notificações: {}",e))?;
+        let listeners = Self::execute_shell(serial, "settings get secure enabled_notification_listeners", 6)
+            .map_err(|e| format!("Não foi possível confirmar notificações: {}",e))?;
+        if !listeners.contains("com.esfera.agent/") { return Err("Agente instalado, mas o acesso às notificações não foi confirmado.".into()); }
+        Self::execute_shell(serial, "am start-foreground-service -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am startservice -n com.esfera.agent/.EsferaAgentService", 6)
+            .map_err(|e| format!("Agente instalado, mas o serviço não iniciou: {}",e))?;
+        Ok(())
     }
 
     /// Monitor de status: marca devices como offline se check-in expirou
@@ -5411,5 +5472,138 @@ mod wifi_serial_tests {
     #[test]
     fn endereco_wifi_explicito_nao_redireciona_para_outro_aparelho() {
         assert_eq!(AdbManager::resolve_target_serial("192.168.1.92:5555").unwrap(), "192.168.1.92:5555");
+    }
+}
+
+/// A versão esperada vem do mesmo Gradle que gera o APK; não há número duplicado no Rust.
+pub fn expected_agent_version() -> Result<u32, String> {
+    include_str!("../../src-agent/app/build.gradle.kts").lines().find_map(|line| {
+        line.trim().strip_prefix("versionCode = ").and_then(|v| v.trim().parse::<u32>().ok())
+    }).filter(|v| *v > 0).ok_or_else(|| "Versão do agente não encontrada no Gradle.".into())
+}
+
+fn axml_u16(data: &[u8], at: usize) -> Result<u16, String> {
+    let b = data.get(at..at+2).ok_or("Manifesto APK truncado")?;
+    Ok(u16::from_le_bytes([b[0],b[1]]))
+}
+fn axml_u32(data: &[u8], at: usize) -> Result<u32, String> {
+    let b = data.get(at..at+4).ok_or("Manifesto APK truncado")?;
+    Ok(u32::from_le_bytes([b[0],b[1],b[2],b[3]]))
+}
+fn axml_len8(data: &[u8], pos: &mut usize) -> Result<usize, String> {
+    let b = *data.get(*pos).ok_or("Manifesto APK truncado")?; *pos += 1;
+    if b & 0x80 == 0 { return Ok(b as usize); }
+    let second = *data.get(*pos).ok_or("Manifesto APK truncado")?; *pos += 1;
+    Ok((((b & 0x7f) as usize) << 8) | second as usize)
+}
+fn axml_len16(data: &[u8], pos: &mut usize) -> Result<usize, String> {
+    let first=axml_u16(data,*pos)?; *pos+=2;
+    if first & 0x8000 == 0 { return Ok(first as usize); }
+    let second=axml_u16(data,*pos)?; *pos+=2;
+    Ok((((first & 0x7fff) as usize) << 16) | second as usize)
+}
+
+/// Lê o manifesto binário diretamente do APK, sem depender de SDK/aapt instalado no cliente.
+fn apk_agent_version(path: &std::path::Path) -> Result<u32, String> {
+    use std::io::Read;
+    let file=std::fs::File::open(path).map_err(|e| format!("Não foi possível abrir o APK: {}",e))?;
+    let mut zip=zip::ZipArchive::new(file).map_err(|_| "APK inválido".to_string())?;
+    let manifest=zip.by_name("AndroidManifest.xml").map_err(|_| "APK sem manifesto".to_string())?;
+    if manifest.size() > 1024*1024 { return Err("Manifesto APK grande demais".into()); }
+    let mut data=Vec::new(); manifest.take(1024*1024+1).read_to_end(&mut data).map_err(|_| "Falha ao ler manifesto APK".to_string())?;
+    if data.len() > 1024*1024 { return Err("Manifesto APK grande demais".into()); }
+    if axml_u16(&data,0)? != 0x0003 { return Err("Manifesto APK inválido".into()); }
+    let mut offset=axml_u16(&data,2)? as usize;
+    let mut strings: Vec<String> = Vec::new();
+    while offset + 8 <= data.len() {
+        let kind=axml_u16(&data,offset)?; let header=axml_u16(&data,offset+2)? as usize; let size=axml_u32(&data,offset+4)? as usize;
+        let end=offset.checked_add(size).filter(|e| *e<=data.len()).ok_or("Manifesto APK truncado")?;
+        if size < header || header < 8 { return Err("Manifesto APK inválido".into()); }
+        if kind == 0x0001 {
+            let count=axml_u32(&data,offset+8)? as usize;
+            if count > 100000 || 28usize.checked_add(count.saturating_mul(4)).filter(|n| *n<=size).is_none() { return Err("Tabela de texto inválida".into()); }
+            let utf8=axml_u32(&data,offset+16)? & 0x100 != 0;
+            let base=offset.checked_add(axml_u32(&data,offset+20)? as usize).ok_or("Manifesto inválido")?;
+            strings.clear();
+            for i in 0..count {
+                let mut pos=base.checked_add(axml_u32(&data,offset+header+i*4)? as usize).filter(|x| *x<end).ok_or("Texto inválido")?;
+                let value = if utf8 {
+                    let _ = axml_len8(&data,&mut pos)?; let len=axml_len8(&data,&mut pos)?;
+                    let bytes=data.get(pos..pos.checked_add(len).filter(|e| *e<=end).ok_or("Texto inválido")?).ok_or("Texto inválido")?;
+                    String::from_utf8(bytes.to_vec()).map_err(|_| "Texto inválido no APK")?
+                } else {
+                    let len=axml_len16(&data,&mut pos)?;
+                    if len > (end.saturating_sub(pos))/2 { return Err("Texto inválido".into()); }
+                    let mut words=Vec::with_capacity(len); for n in 0..len { words.push(axml_u16(&data,pos+n*2)?); }
+                    String::from_utf16(&words).map_err(|_| "Texto inválido no APK")?
+                };
+                strings.push(value);
+            }
+        } else if kind == 0x0102 && size >= 36 {
+            let name=axml_u32(&data,offset+20)? as usize;
+            if strings.get(name).map(String::as_str) == Some("manifest") {
+                let attr_start=offset+16+axml_u16(&data,offset+24)? as usize;
+                let attr_size=axml_u16(&data,offset+26)? as usize;
+                let count=axml_u16(&data,offset+28)? as usize;
+                if attr_size < 20 || attr_start.checked_add(count.saturating_mul(attr_size)).filter(|v| *v<=end).is_none() { return Err("Atributos inválidos no APK".into()); }
+                let mut package=None; let mut version=None;
+                for n in 0..count {
+                    let a=attr_start+n*attr_size; let key=axml_u32(&data,a+4)? as usize;
+                    let value=axml_u32(&data,a+16)?; let typ=*data.get(a+15).ok_or("Atributo inválido")?;
+                    match strings.get(key).map(String::as_str) {
+                        Some("package") if typ == 3 => package=strings.get(value as usize).cloned(),
+                        Some("versionCode") if typ == 0x10 || typ == 0x11 => version=Some(value),
+                        _ => (),
+                    }
+                }
+                if package.as_deref()!=Some("com.esfera.agent") { return Err("O APK não é o agente Esfera.".into()); }
+                return version.filter(|v| *v>0).ok_or_else(|| "APK sem versionCode válido".into());
+            }
+        }
+        offset=end;
+    }
+    Err("Manifesto do agente não encontrado".into())
+}
+
+#[cfg(test)]
+mod agent_apk_version_tests {
+    use super::*;
+    #[test]
+    fn versao_esperada_vem_do_gradle_e_apk_tem_manifesto_valido() {
+        assert_eq!(expected_agent_version().unwrap(), 2);
+        let file=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries/Esfera_Agent_ADB.apk");
+        assert!(apk_agent_version(&file).unwrap() > 0);
+    }
+    #[test]
+    fn manifesto_truncado_e_rejeitado() { assert!(axml_u32(&[1,2],0).is_err()); }
+}
+
+fn parse_installed_agent_version(output: &str) -> Result<Option<(u32,String)>, String> {
+    if output.contains("ESFERA_AGENT_NOT_INSTALLED") || output.contains("Unable to find package") || output.contains("Unknown package") || output.contains("Package not found") { return Ok(None); }
+    let code = output.lines().find_map(|line| line.split("versionCode=").nth(1).and_then(|x| x.split(|c:char| !c.is_ascii_digit()).next()).and_then(|x| x.parse::<u32>().ok()));
+    let name = output.lines().find_map(|line| line.trim().strip_prefix("versionName=").map(|x| x.trim().to_string())).unwrap_or_default();
+    code.filter(|v| *v>0).map(|v| Some((v,name))).ok_or_else(|| "Não foi possível ler a versão do agente no aparelho.".into())
+}
+
+fn find_matching_agent_apk(expected: u32) -> Result<PathBuf, String> {
+    let mut paths=Vec::new();
+    for dir in tools_dir_candidates() { paths.push(dir.join("Esfera_Agent_ADB.apk")); }
+    paths.extend([PathBuf::from("src-tauri/binaries/Esfera_Agent_ADB.apk"), PathBuf::from("binaries/Esfera_Agent_ADB.apk"), PathBuf::from("../src-tauri/binaries/Esfera_Agent_ADB.apk")]);
+    if let Ok(exe)=std::env::current_exe() { if let Some(dir)=exe.parent() { paths.push(dir.join("binaries/Esfera_Agent_ADB.apk")); paths.push(dir.join("Esfera_Agent_ADB.apk")); } }
+    let mut found=false;
+    for path in paths { if path.is_file() { found=true; if apk_agent_version(&path).ok()==Some(expected) { return Ok(path); } } }
+    if found { Err(format!("O APK empacotado ainda não é a versão {}. Atualize o APK do agente.",expected)) }
+    else { Err("APK do agente não encontrado no pacote do Esfera.".into()) }
+}
+
+#[cfg(test)]
+mod agent_installed_version_tests {
+    use super::parse_installed_agent_version;
+    #[test]
+    fn reconhece_versao_e_ausencia_sem_confundir_erro() {
+        assert_eq!(parse_installed_agent_version("versionCode=2 minSdk=26\nversionName=1.0.1\n").unwrap(),Some((2,"1.0.1".into())));
+        assert_eq!(parse_installed_agent_version("Unable to find package: com.esfera.agent").unwrap(),None);
+        assert_eq!(parse_installed_agent_version("ESFERA_AGENT_NOT_INSTALLED").unwrap(),None);
+        assert!(parse_installed_agent_version("dispositivo offline").is_err());
     }
 }
