@@ -4451,6 +4451,22 @@ impl AdbManager {
         None
     }
 
+    /// Tela com o aviso do WhatsApp de que o número não tem conta (pt, en, es).
+    fn shows_no_whatsapp(xml: &str) -> bool {
+        let lower = xml.to_lowercase().replace('\u{2019}', "'").replace("&apos;", "'");
+        [
+            "não está no whatsapp",
+            "nao esta no whatsapp",
+            "não tem whatsapp",
+            "isn't on whatsapp",
+            "is not on whatsapp",
+            "no está en whatsapp",
+            "no esta en whatsapp",
+        ]
+        .iter()
+        .any(|p| lower.contains(p))
+    }
+
     /// Coloca `text` no campo da conversa aberta e envia, conferindo antes e depois.
     fn wa_fill_and_send(
         serial: &str,
@@ -4466,7 +4482,12 @@ impl AdbManager {
             Some(e) => e,
             None => {
                 let focus = Self::wa_focus(serial);
+                // O WhatsApp avisa "O número ... não está no WhatsApp": lê antes de fechar o aviso.
+                let no_whatsapp = Self::shows_no_whatsapp(&Self::ui_dump(serial));
                 let _ = Self::send_keyevent(serial, 4); // fecha diálogo/aviso sem sair do WhatsApp
+                if no_whatsapp {
+                    return Err(format!("SEM_WHATSAPP: o número {} não está no WhatsApp", phone));
+                }
                 if focus.contains("AppAuthentication") {
                     return Err("WhatsApp bloqueado por senha/biometria: a conversa não abriu".to_string());
                 }
@@ -5355,6 +5376,20 @@ struct UiNode {
     text: String,
     cx: i32,
     cy: i32,
+}
+
+#[cfg(test)]
+mod no_whatsapp_tests {
+    use super::AdbManager;
+
+    #[test]
+    fn reconhece_aviso_de_numero_sem_whatsapp() {
+        assert!(AdbManager::shows_no_whatsapp(
+            r#"<node text="O número de telefone +55 11 91234-5678 compartilhado por link não está no WhatsApp." />"#
+        ));
+        assert!(AdbManager::shows_no_whatsapp(r#"<node text="Phone number +55 11 91234-5678 shared via url isn&apos;t on WhatsApp." />"#));
+        assert!(!AdbManager::shows_no_whatsapp(r#"<node text="Mensagem" /><node text="Conversas" />"#));
+    }
 }
 
 #[cfg(test)]
