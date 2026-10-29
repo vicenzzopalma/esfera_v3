@@ -3767,10 +3767,18 @@ impl AdbManager {
         let accessibility = Self::execute_shell(serial, "settings get secure enabled_accessibility_services", 6)
             .map_err(|e| format!("Não foi possível confirmar acessibilidade: {}",e))?;
         if !accessibility.contains(Self::AGENT_ACCESSIBILITY_COMPONENT) { return Err("Agente instalado, mas a acessibilidade não foi confirmada.".into()); }
-        Self::execute_shell(serial, "cmd notification allow_listener com.esfera.agent/com.esfera.agent.EsferaOptOutNotificationListener", 6)
-            .map_err(|e| format!("Agente instalado, mas não foi possível ativar notificações: {}",e))?;
-        let listeners = Self::execute_shell(serial, "settings get secure enabled_notification_listeners", 6)
+        const LISTENER: &str = "com.esfera.agent/com.esfera.agent.EsferaOptOutNotificationListener";
+        // Android 8 (ex.: Samsung) não tem "cmd notification": o erro é ignorado e cai na gravação direta abaixo.
+        let _ = Self::execute_shell(serial, &format!("cmd notification allow_listener {}", LISTENER), 6);
+        let mut listeners = Self::execute_shell(serial, "settings get secure enabled_notification_listeners", 6)
             .map_err(|e| format!("Não foi possível confirmar notificações: {}",e))?;
+        if !listeners.contains("com.esfera.agent/") {
+            let current = listeners.trim();
+            let updated = if current.is_empty() || current == "null" { LISTENER.to_string() } else { format!("{}:{}", current, LISTENER) };
+            let _ = Self::execute_shell(serial, &format!("settings put secure enabled_notification_listeners '{}'", Self::shell_quote(&updated)), 6);
+            listeners = Self::execute_shell(serial, "settings get secure enabled_notification_listeners", 6)
+                .map_err(|e| format!("Não foi possível confirmar notificações: {}",e))?;
+        }
         if !listeners.contains("com.esfera.agent/") { return Err("Agente instalado, mas o acesso às notificações não foi confirmado.".into()); }
         Self::execute_shell(serial, "am start-foreground-service -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am startservice -n com.esfera.agent/.EsferaAgentService", 6)
             .map_err(|e| format!("Agente instalado, mas o serviço não iniciou: {}",e))?;
