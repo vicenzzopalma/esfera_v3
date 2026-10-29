@@ -4507,7 +4507,8 @@ impl AdbManager {
             }
         };
 
-        if !Self::same_text(&entry.text, text) {
+        let confirmation = text == crate::dispatcher::OPT_OUT_CONFIRMATION_TEXT;
+        if confirmation || !Self::same_text(&entry.text, text) {
             // Campo vazio mostra a dica "Mensagem"; qualquer outro texto é rascunho antigo.
             let empty = entry.text.trim().is_empty() || entry.text.trim().eq_ignore_ascii_case("mensagem");
             if text.chars().count() > 1500 {
@@ -4522,7 +4523,7 @@ impl AdbManager {
             let d = Self::calculate_gaussian_delay(300, 500);
             std::thread::sleep(Duration::from_millis(d as u64));
             let now = Self::wa_entry(serial, pkg).map(|n| n.text).unwrap_or_default();
-            if !Self::same_text(&now, text) {
+            if (confirmation && Self::decode_xml_numeric(&now) != text) || (!confirmation && !Self::same_text(&now, text)) {
                 return Err("O texto no campo não confere com a mensagem; envio cancelado".to_string());
             }
         }

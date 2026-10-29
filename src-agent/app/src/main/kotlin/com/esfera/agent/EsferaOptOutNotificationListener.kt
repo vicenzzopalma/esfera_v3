@@ -52,13 +52,13 @@ class EsferaOptOutNotificationListener : NotificationListenerService() {
     }
 
     private fun recordIfOptOut(notificationKey: String, title: String, text: String, timestamp: Long) {
-        if (!isOptOut(text)) return
+        if (text.isBlank()) return
         val key = "$notificationKey\u0000$timestamp\u0000$title\u0000$text"
         synchronized(recorded) {
             if (key in recorded) return
             try {
                 val row = JSONObject().put("title", title).put("text", text)
-                    .put("ts", System.currentTimeMillis()).toString()
+                    .put("ts", timestamp).toString()
                 File("/sdcard/esfera_optout.jsonl").appendText("$row\n", Charsets.UTF_8)
                 recorded.add(key)
                 if (recorded.size > 512) recorded.remove(recorded.first())

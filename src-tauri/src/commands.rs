@@ -2809,6 +2809,15 @@ pub fn retry_failed_campaign_contacts(state: State<'_, AppState>, token: String,
     state.db.retry_failed_contacts(campaign_id)
 }
 
+#[tauri::command]
+pub fn get_confirmation_counts(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<serde_json::Value, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let company = state.db.get_campaign_company_id(campaign_id).ok_or_else(|| "Campanha não encontrada.".to_string())?;
+    check_company_access(&session, company)?;
+    let (pending, sent, uncertain) = state.db.confirmation_counts(company,campaign_id)?;
+    Ok(serde_json::json!({"pending": pending, "sent": sent, "uncertain": uncertain}))
+}
+
 fn session_actor_name(session: &crate::session::UserSession) -> String {
     session.username.clone()
 }
