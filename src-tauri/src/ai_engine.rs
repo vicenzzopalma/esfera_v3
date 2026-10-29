@@ -1366,6 +1366,12 @@ impl AiEngine {
             .map_err(|e| format!("Falha ao conectar ao WebSocket CDP: {}", e))?;
 
         let mut cmd_id = 1u64;
+        // Janela minimizada deixa a aba "escondida" e o Gemini ignora o envio:
+        // a emulação de foco faz a aba contar como visível e ativa.
+        let _ = Self::cdp_send_cmd(&mut ws, cmd_id, "Emulation.setFocusEmulationEnabled", json!({ "enabled": true })).await;
+        cmd_id += 1;
+        let _ = Self::cdp_send_cmd(&mut ws, cmd_id, "Page.setWebLifecycleState", json!({ "state": "active" })).await;
+        cmd_id += 1;
         // Abre um chat novo em https://gemini.google.com/app
         let _ = Self::cdp_send_cmd(
             &mut ws,
@@ -1423,7 +1429,8 @@ impl AiEngine {
             if ('value' in el) {
                 el.value = '';
             } else {
-                el.innerHTML = '';
+                // O Gemini exige Trusted Types: innerHTML dá erro, textContent não.
+                el.textContent = '';
             }
             el.dispatchEvent(new Event('input', { bubbles: true }));
             return true;
