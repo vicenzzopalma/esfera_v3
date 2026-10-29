@@ -3328,12 +3328,16 @@ pub async fn provision_device(
     _token: String,
     serial: String,
     server_url: Option<String>,
+    company_id: Option<i32>,
 ) -> Result<String, String> {
-    // A empresa vem da SESSÃO (token), nunca do cliente: assim ninguém provisiona
-    // um aparelho para dentro de outra empresa.
+    // A empresa vem da SESSÃO (token): ninguém provisiona para outra empresa.
+    // Só master/gestor sem empresa própria usa a empresa aberta na tela.
     let session = validate_session(&state.sessions, &_token)?;
     let company_id = match session.company_id {
         Some(cid) if cid > 0 => cid,
+        _ if (session.role == "master" || session.role == "gestor") && company_id.unwrap_or(0) > 0 => {
+            company_id.unwrap_or(0)
+        }
         _ => {
             return Err(
                 "Provisionamento exige um usuário vinculado a uma empresa.".to_string()
@@ -3366,11 +3370,15 @@ pub async fn provision_all_devices(
     state: State<'_, AppState>,
     _token: String,
     server_url: Option<String>,
+    company_id: Option<i32>,
 ) -> Result<Vec<String>, String> {
-    // Empresa vem da sessão, nunca do cliente (mesma regra do provision_device).
+    // Mesma regra do provision_device.
     let session = validate_session(&state.sessions, &_token)?;
     let company_id = match session.company_id {
         Some(cid) if cid > 0 => cid,
+        _ if (session.role == "master" || session.role == "gestor") && company_id.unwrap_or(0) > 0 => {
+            company_id.unwrap_or(0)
+        }
         _ => {
             return Err(
                 "Provisionamento exige um usuário vinculado a uma empresa.".to_string()
