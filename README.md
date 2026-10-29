@@ -325,3 +325,10 @@ cargo build --release
 ## 📜 Licença
 
 Propriedade exclusiva do ecossistema **Esfera**. Todos os direitos reservados. Uso restrito a ambientes autorizados.
+
+
+### Limites de disparo por chip
+
+O motor exige um único chip cadastrado por aparelho para identificar a linha usada. As tentativas e pausas são persistidas. Por padrão, o limite é 10 tentativas por hora e 60 por dia, limitado pelo aquecimento (15 no primeiro dia, mais 5 por dia). A cada 10 tentativas há uma pausa aleatória de 3 a 8 minutos. Na janela de 20 tentativas, mais de 10% de pedidos de SAIR ou mais de 15% de falhas pausam a campanha.
+
+Para ajustar ao iniciar o Esfera, defina `ESFERA_CHIP_HOURLY_LIMIT`, `ESFERA_CHIP_DAILY_LIMIT` e `ESFERA_CHIP_BREAK_EVERY` com inteiros positivos. Para um chip específico, use, por exemplo, `ESFERA_CHIP_12_HOURLY_LIMIT`, `ESFERA_CHIP_12_DAILY_LIMIT` e `ESFERA_CHIP_12_BREAK_EVERY`, substituindo 12 pelo ID do chip. Os valores específicos prevalecem sobre os gerais. A contagem começa quando esta versão registra a primeira tentativa, pois o histórico anterior não identifica o chip.

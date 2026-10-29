@@ -4362,6 +4362,9 @@ impl AdbManager {
         //    lista (o 1º "voltar" às vezes só fecha o teclado); nunca sai do WhatsApp.
         for _ in 0..4 {
             let focus_raw = Self::wa_focus(serial);
+            if focus_raw.contains(pkg) && Self::shows_restricted_account(&Self::ui_dump(serial)) {
+                return Err("CONTA_RESTRITA: WhatsApp indica conta restrita ou banida".to_string());
+            }
             if focus_raw.contains(pkg) && focus_raw.contains("HomeActivity") {
                 break;
             }
@@ -4452,6 +4455,15 @@ impl AdbManager {
     }
 
     /// Tela com o aviso do WhatsApp de que o número não tem conta (pt, en, es).
+    fn shows_restricted_account(xml: &str) -> bool {
+        let text = xml.to_lowercase().replace("&apos;", "'").replace('’', "'");
+        ["esta conta não pode mais usar o whatsapp", "esta conta não pode usar o whatsapp",
+         "sua conta está impedida de usar o whatsapp", "conta temporariamente banida",
+         "this account can no longer use whatsapp", "this account is not allowed to use whatsapp",
+         "your account is banned", "temporarily banned from whatsapp"]
+            .iter().any(|s| text.contains(s))
+    }
+
     fn shows_no_whatsapp(xml: &str) -> bool {
         let lower = xml.to_lowercase().replace('\u{2019}', "'").replace("&apos;", "'");
         [
@@ -5440,5 +5452,16 @@ mod search_match_tests {
         assert_eq!(Database::opt_out_key("557588052539"), want); // como o WhatsApp mostra
         assert_eq!(Database::opt_out_key("5575988052539"), want); // contato "Esfera 55759..."
         assert_ne!(Database::opt_out_key("551188052539"), want); // mesmo final, outro DDD
+    }
+}
+
+#[cfg(test)]
+mod antiban_screen_tests {
+    use super::AdbManager;
+    #[test]
+    fn reconhece_restricao_em_portugues_e_ingles() {
+        assert!(AdbManager::shows_restricted_account("Esta conta não pode mais usar o WhatsApp"));
+        assert!(AdbManager::shows_restricted_account("This account can no longer use WhatsApp"));
+        assert!(!AdbManager::shows_restricted_account("Conversas do WhatsApp"));
     }
 }
