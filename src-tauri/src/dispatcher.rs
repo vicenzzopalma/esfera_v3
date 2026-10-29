@@ -36,13 +36,21 @@ static TEMP_CONTACTS: std::sync::LazyLock<Mutex<std::collections::HashSet<String
 // ============================================================
 
 /// Uma importação de "SAIR" por vez (o laço de 30 s e as checagens antes do envio não se atropelam).
-static OPT_OUT_IMPORT_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
+static OPT_OUT_IMPORT_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static DEVICE_UNAVAILABLE_UNTIL: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn opt_out_device_lock(serial: &str) -> Arc<Mutex<()>> {
+    let mut locks = OPT_OUT_IMPORT_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    locks.entry(serial.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+}
 
 /// Importa os pedidos de descadastro gravados pelo agente em cada aparelho online.
 pub fn import_opt_out_requests(db: &Database) {
     for dev in db.get_all_devices().into_iter().filter(|d| d.status == "online") {
         let serial = dev.current_adb_address.clone().filter(|a| !a.trim().is_empty()).unwrap_or(dev.serial.clone());
-        import_opt_out_from_device(db, &serial, dev.company_id);
+        sync_opt_out_from_device(db, &serial, dev.company_id);
     }
 }
 
@@ -50,28 +58,35 @@ pub fn import_opt_out_requests(db: &Database) {
 /// caem num arquivo novo) e só é apagado depois que todas as linhas foram gravadas no banco. Se a
 /// conexão cair no meio, o `.reading` fica e é lido de novo na próxima vez (o registro não duplica).
 pub fn import_opt_out_from_device(db: &Database, serial: &str, company_id: i32) -> bool {
-    let _guard = OPT_OUT_IMPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    {
-        let out = match AdbManager::execute_shell(
-            serial,
-            "if [ ! -s /sdcard/esfera_optout.reading ] && [ -s /sdcard/esfera_optout.jsonl ]; then mv /sdcard/esfera_optout.jsonl /sdcard/esfera_optout.reading; fi; if [ -f /sdcard/esfera_optout.reading ]; then cat /sdcard/esfera_optout.reading; fi",
-            6,
-        ) {
-            Ok(o) => o,
-            Err(_) => return false,
-        };
-        // Mesmo com um lote antigo retido para sincronização, examina as novas respostas.
-        let newer = match AdbManager::execute_shell(serial, "if [ -f /sdcard/esfera_optout.jsonl ]; then cat /sdcard/esfera_optout.jsonl; fi", 6) {
-            Ok(o) => o, Err(_) => return false,
-        };
-        if !process_opt_out_jsonl(db, serial, company_id, &out, None)
-            || !process_opt_out_jsonl(db, serial, company_id, &newer, None) { return false; }
-        if !out.trim().is_empty() && forward_device_messages(db, serial, company_id, &out) {
-            // Só apaga o lote após o VEXOR reconhecer todas as respostas.
-            let _ = AdbManager::execute_shell(serial, "rm -f /sdcard/esfera_optout.reading", 4);
-        }
-        true
+    let lock = opt_out_device_lock(serial);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    read_device_opt_out(db, serial, company_id).is_ok()
+}
+
+/// A sincronização HTTP ocorre fora do bloqueio usado pela verificação anterior a cada envio.
+fn sync_opt_out_from_device(db: &Database, serial: &str, company_id: i32) {
+    let lock = opt_out_device_lock(serial);
+    let batch = {
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        match read_device_opt_out(db, serial, company_id) { Ok(batch) => batch, Err(_) => return }
+    };
+    if batch.trim().is_empty() || !forward_device_messages(db, serial, company_id, &batch) { return; }
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // O arquivo só é removido se ainda for o mesmo lote que recebeu ACK do VEXOR.
+    let current = AdbManager::execute_shell(serial, "if [ -f /sdcard/esfera_optout.reading ]; then cat /sdcard/esfera_optout.reading; fi", 6);
+    if current.as_deref() == Ok(batch.as_str()) {
+        let _ = AdbManager::execute_shell(serial, "rm -f /sdcard/esfera_optout.reading", 4);
     }
+}
+
+fn read_device_opt_out(db: &Database, serial: &str, company_id: i32) -> Result<String, String> {
+    let out = AdbManager::execute_shell(serial,
+        "if [ ! -s /sdcard/esfera_optout.reading ] && [ -s /sdcard/esfera_optout.jsonl ]; then mv /sdcard/esfera_optout.jsonl /sdcard/esfera_optout.reading; fi; if [ -f /sdcard/esfera_optout.reading ]; then cat /sdcard/esfera_optout.reading; fi", 6)?;
+    let newer = AdbManager::execute_shell(serial, "if [ -f /sdcard/esfera_optout.jsonl ]; then cat /sdcard/esfera_optout.jsonl; fi", 6)?;
+    if !process_opt_out_jsonl(db, serial, company_id, &out, None) || !process_opt_out_jsonl(db, serial, company_id, &newer, None) {
+        return Err("Não foi possível registrar os pedidos de descadastro".into());
+    }
+    Ok(out)
 }
 
 /// Texto aprovado, mantido íntegro para revisões que chegam depois pelo endpoint do Esfera.
@@ -280,8 +295,8 @@ static TEMP_CONTACTS_INFLIGHT: std::sync::LazyLock<Mutex<std::collections::HashS
 /// Aparelhos cuja conta `esfera_temp` já foi consultada nesta execução do app.
 static TEMP_CONTACTS_LOADED_DEVICES: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
-static TEMP_CONTACTS_LOAD_LOCK: std::sync::LazyLock<Mutex<()>> =
-    std::sync::LazyLock::new(|| Mutex::new(()));
+static TEMP_CONTACTS_LOAD_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Tempo que o WhatsApp leva para achar na busca um contato recém-salvo.
 const TEMP_CONTACT_INDEX_MS: u64 = 2500;
@@ -299,7 +314,11 @@ where
     if TEMP_CONTACTS_LOADED_DEVICES.lock().map(|s| s.contains(serial)).unwrap_or(false) {
         return;
     }
-    let _guard = TEMP_CONTACTS_LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let lock = {
+        let mut locks = TEMP_CONTACTS_LOAD_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        locks.entry(serial.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+    };
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     if TEMP_CONTACTS_LOADED_DEVICES.lock().map(|s| s.contains(serial)).unwrap_or(false) {
         return;
     }
@@ -993,7 +1012,9 @@ impl Dispatcher {
                         Err(_) => return,
                     };
                     let online_devices: Vec<_> = active_devices.into_iter().filter(|d| {
-                        d.status == "online" && campaign.device_ids.iter().any(|id| {
+                        let serial = d.current_adb_address.as_deref().filter(|a| !a.trim().is_empty()).unwrap_or(&d.serial);
+                        let cooling_down = DEVICE_UNAVAILABLE_UNTIL.lock().map(|m| m.get(serial).map(|t| *t > Instant::now()).unwrap_or(false)).unwrap_or(true);
+                        !cooling_down && d.status == "online" && campaign.device_ids.iter().any(|id| {
                             d.esfera_device_id.as_deref() == Some(id.as_str()) || d.serial == *id
                         })
                     }).collect();
@@ -1018,6 +1039,7 @@ impl Dispatcher {
                                 .unwrap_or_else(|| target_dev.serial.clone()), target_dev.id)
                         };
 
+                        let failed_serial = serial.clone();
                         let msg = message_to_send.clone();
                         let phone2 = phone.clone();
                         let contact_name = next_contact.contact_name.clone();
@@ -1033,6 +1055,7 @@ impl Dispatcher {
                         let campaign_last = campaign.id;
                         let contact_id_for_safety = next_contact.id;
                         let send_res = spawn_blocking(move || {
+                            AdbManager::ensure_dispatch_target(&serial).map_err(|e| format!("APARELHO: {}", e))?;
                             // Traz os "SAIR" capturados pelo agente agora, e revalida o descadastro no último instante.
                             if !import_opt_out_from_device(&db_last, &serial, company_last) {
                                 return Err("TRAVA: Não foi possível ler ou registrar as respostas do aparelho; verifique a conexão e o banco.".into());
@@ -1095,6 +1118,9 @@ impl Dispatcher {
                                 SendOutcome::Sent
                             }
                             Ok(Err(e)) => {
+                                if e.starts_with("APARELHO:") {
+                                    if let Ok(mut unavailable) = DEVICE_UNAVAILABLE_UNTIL.lock() { unavailable.insert(failed_serial, Instant::now() + std::time::Duration::from_secs(60)); }
+                                }
                                 eprintln!("[DISPATCHER] Erro no envio para {}: {}", phone, e);
                                 SendOutcome::SendFailed(e)
                             }
@@ -1105,6 +1131,16 @@ impl Dispatcher {
                         }
                     };
                     if let SendOutcome::SendFailed(ref error) = outcome {
+                        if error.starts_with("APARELHO:") {
+                            if let Some(ref handle) = app_handle {
+                                let _ = handle.emit("campaign-progress", CampaignProgressEvent {
+                                    campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
+                                    total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
+                                    status: format!("Aparelho temporariamente indisponível: {}. Tentando outro aparelho; o contato continua pendente.", error.trim_start_matches("APARELHO: ")),
+                                });
+                            }
+                            return;
+                        }
                         if error.starts_with("TRAVA:") || error.starts_with("CONTA_RESTRITA:") {
                             let _ = db_arc.set_campaign_status(campaign.id, "paused");
                             if let Some(ref handle) = app_handle {

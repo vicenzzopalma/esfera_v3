@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 // Comandos do protocolo ADB (little-endian)
@@ -38,8 +38,6 @@ const ID_STDIN: u8 = 0;
 const ID_STDOUT: u8 = 1;
 const ID_STDERR: u8 = 2;
 const ID_EXIT: u8 = 3;
-const POOL_IDLE_SECS: u64 = 60;
-const POOL_MAX_ENTRIES: usize = 32;
 
 #[derive(Debug, Default)]
 struct AdbMessage {
@@ -158,11 +156,12 @@ fn ssh_rsa_pubkey(key: &RsaPrivateKey) -> String {
 
 // ------------------------- Handshake -------------------------
 
-fn handshake(stream: &mut TcpStream, key: Option<&RsaPrivateKey>) -> io::Result<()> {
+fn handshake(stream: &mut TcpStream, key: Option<&RsaPrivateKey>, deadline: Instant) -> io::Result<()> {
     let ident = b"device::esfera_v3\0";
     write_msg(stream, A_CNXN, A_VERSION, MAX_PAYLOAD as u32, ident)?;
 
     loop {
+        apply_deadline(stream, deadline)?;
         let msg = read_msg(stream)?;
         match msg.cmd {
             A_CNXN => return Ok(()),
@@ -208,10 +207,18 @@ struct AdbConn {
     remote_id: u32,
 }
 
-fn open_shell(mut stream: TcpStream) -> io::Result<AdbConn> {
+fn apply_deadline(stream: &TcpStream, deadline: Instant) -> io::Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() { return Err(io::Error::new(io::ErrorKind::TimedOut, "tempo esgotado no ADB")); }
+    stream.set_read_timeout(Some(remaining))?;
+    stream.set_write_timeout(Some(remaining))
+}
+
+fn open_shell(mut stream: TcpStream, deadline: Instant) -> io::Result<AdbConn> {
     let local_id = rand::random::<u32>().max(1);
     write_msg(&mut stream, A_OPEN, local_id, 0, b"shell,v2\0")?;
     let remote_id = loop {
+        apply_deadline(&stream, deadline)?;
         let msg = read_msg(&mut stream)?;
         match msg.cmd {
             A_OKAY => {
@@ -243,7 +250,7 @@ impl AdbConn {
         write_msg(&mut self.stream, A_WRTE, self.local_id, self.remote_id, &frame(id, data))
     }
 
-    fn exec(&mut self, cmd: &str) -> io::Result<(Vec<u8>, Vec<u8>, bool)> {
+    fn exec(&mut self, cmd: &str, deadline: Instant) -> io::Result<(Vec<u8>, Vec<u8>, bool)> {
         self.write_frame(ID_STDIN, format!("{}\n", cmd).as_bytes())?;
         // Fecha o stdin para sinalizar fim do comando
         self.write_frame(ID_STDIN, &[])?;
@@ -253,6 +260,10 @@ impl AdbConn {
         let mut exited = false;
 
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { return Err(io::Error::new(io::ErrorKind::TimedOut, "tempo esgotado no ADB")); }
+            self.stream.set_read_timeout(Some(remaining))?;
+            self.stream.set_write_timeout(Some(remaining))?;
             let msg = read_msg(&mut self.stream)?;
             match msg.cmd {
                 A_WRTE => {
@@ -292,15 +303,7 @@ impl AdbConn {
     }
 }
 
-// ------------------------- Pool por serial -------------------------
-
-struct Pooled {
-    conn: AdbConn,
-    last_used: Instant,
-}
-
-static POOL: LazyLock<Mutex<HashMap<String, Arc<Mutex<Pooled>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+// ------------------------- Transporte por serial -------------------------
 
 fn is_tcp_serial(serial: &str) -> bool {
     serial.contains(':') && serial.contains('.')
@@ -351,19 +354,14 @@ pub fn is_tunnel_serial(serial: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Descarta a conexão nativa de um serial específico (ex.: ao desconectar o aparelho).
-pub fn evict(serial: &str) {
-    POOL.lock().unwrap().remove(serial);
-}
-
 /// Abre o transporte do protocolo ADB para o serial:
 /// Wi-Fi → TCP direto no IP:porta; túnel → ponte local criada pelo tunnel_server.
-fn connect_transport(serial: &str) -> Result<TcpStream, String> {
+fn connect_transport(serial: &str, budget: Duration) -> Result<TcpStream, String> {
     if is_tcp_serial(serial) {
         let addr = serial
             .parse::<std::net::SocketAddr>()
             .map_err(|e| format!("serial inválida para ADB nativo: {}", e))?;
-        return TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        return TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT.min(budget))
             .map_err(|e| format!("falha TCP em {}: {}", serial, e));
     }
     if is_tunnel_serial(serial) {
@@ -373,7 +371,8 @@ fn connect_transport(serial: &str) -> Result<TcpStream, String> {
             .clone()
             .ok_or_else(|| "runtime tokio não inicializado (adb_tcp::init)".to_string())?;
         return handle
-            .block_on(crate::tunnel_server::open_proxy(serial, 5555))
+            .block_on(tokio::time::timeout(budget, crate::tunnel_server::open_proxy(serial, 5555)))
+            .map_err(|_| format!("Tempo esgotado ao abrir túnel para {}", serial))?
             .map_err(|e| format!("falha ao abrir proxy de túnel para {}: {}", serial, e));
     }
     Err("serial USB não suporta protocolo nativo (use Wi-Fi ou túnel inverso)".to_string())
@@ -382,86 +381,64 @@ fn connect_transport(serial: &str) -> Result<TcpStream, String> {
 /// Executa um comando shell via protocolo ADB nativo.
 /// Retorna Err quando o aparelho não suporta (USB, sem rede) ou o comando falhou.
 pub fn exec_shell(serial: &str, cmd: &str) -> Result<String, String> {
-    let (stdout, _stderr, _exited) = exec_shell_bytes(serial, cmd)?;
+    exec_shell_with_timeout(serial, cmd, Duration::from_secs(12))
+}
+
+pub fn exec_shell_with_timeout(serial: &str, cmd: &str, timeout: Duration) -> Result<String, String> {
+    let (stdout, stderr, exited) = exec_shell_bytes_with_timeout(serial, cmd, timeout)?;
+    if !exited { return Err(format!("Comando ADB não terminou: {}", String::from_utf8_lossy(&stderr))); }
     Ok(String::from_utf8_lossy(&stdout).to_string())
 }
 
 pub fn exec_shell_bytes(serial: &str, cmd: &str) -> Result<(Vec<u8>, Vec<u8>, bool), String> {
+    exec_shell_bytes_with_timeout(serial, cmd, Duration::from_secs(12))
+}
+
+fn exec_shell_bytes_with_timeout(serial: &str, cmd: &str, timeout: Duration) -> Result<(Vec<u8>, Vec<u8>, bool), String> {
+    let deadline = Instant::now() + timeout;
     if !is_tcp_serial(serial) && !is_tunnel_serial(serial) {
         return Err("serial não suporta protocolo nativo".to_string());
     }
 
-    sweep();
-
-    let now = Instant::now();
-    {
-        let pool = POOL.lock().unwrap();
-        if let Some(existing) = pool.get(serial).cloned() {
-            drop(pool);
-            let mut guard = existing.lock().unwrap();
-            let result = run_with_conn(&mut guard.conn, cmd);
-            if result.is_ok() {
-                guard.last_used = now;
-                return result;
-            }
-            // Conexão morta: remove e reconecta do zero
-            let _ = POOL.lock().unwrap().remove(serial);
-            drop(guard);
-            drop(existing);
-        } else {
-            drop(pool);
-        }
-    }
+    // shell,v2 encerra depois de cada comando. Não reutilize uma sessão fechada nem
+    // reexecute comandos de entrada após uma falha com resultado incerto.
 
     // Conexão nova (Wi-Fi direto ou ponte do túnel inverso)
-    let stream = connect_transport(serial)?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() { return Err("Tempo esgotado antes da conexão ADB".into()); }
+    let stream = connect_transport(serial, remaining)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() { return Err("Tempo esgotado ao conectar ADB".into()); }
+    stream.set_read_timeout(Some(remaining)).map_err(|e| e.to_string())?;
+    stream.set_write_timeout(Some(remaining)).map_err(|e| e.to_string())?;
     let key = load_adb_key();
-    handshake(&mut stream.try_clone().unwrap(), key.as_ref())
+    let mut handshake_stream = stream.try_clone().map_err(|e| e.to_string())?;
+    handshake(&mut handshake_stream, key.as_ref(), deadline)
         .map_err(|e| format!("handshake ADB falhou: {}", e))?;
-    let mut conn = open_shell(stream).map_err(|e| format!("open shell falhou: {}", e))?;
+    apply_deadline(&stream, deadline).map_err(|e| e.to_string())?;
+    let mut conn = open_shell(stream, deadline).map_err(|e| format!("open shell falhou: {}", e))?;
 
-    let result = run_with_conn(&mut conn, cmd);
-    if result.is_ok() {
-        let mut pool = POOL.lock().unwrap();
-        if pool.len() >= POOL_MAX_ENTRIES {
-            if let Some(oldest) = pool
-                .iter()
-                .min_by_key(|(_, v)| v.lock().unwrap().last_used)
-                .map(|(k, _)| k.clone())
-            {
-                pool.remove(&oldest);
-            }
-        }
-        pool.insert(
-            serial.to_string(),
-            Arc::new(Mutex::new(Pooled { conn, last_used: now })),
-        );
-    }
+    let result = run_with_conn(&mut conn, cmd, deadline);
     result
 }
 
-fn run_with_conn(conn: &mut AdbConn, cmd: &str) -> Result<(Vec<u8>, Vec<u8>, bool), String> {
-    conn.exec(cmd)
+fn run_with_conn(conn: &mut AdbConn, cmd: &str, deadline: Instant) -> Result<(Vec<u8>, Vec<u8>, bool), String> {
+    conn.exec(cmd, deadline)
         .map_err(|e| format!("exec nativo falhou: {}", e))
 }
 
-fn sweep() {
-    let mut pool = POOL.lock().unwrap();
-    let cutoff = Instant::now() - Duration::from_secs(POOL_IDLE_SECS);
-    let stale: Vec<String> = pool
-        .iter()
-        .filter(|(_, v)| v.lock().unwrap().last_used < cutoff)
-        .map(|(k, _)| k.clone())
-        .collect();
-    for k in stale {
-        pool.remove(&k);
+#[cfg(test)]
+mod wifi_timeout_tests {
+    use super::*;
+    #[test]
+    fn aparelho_que_nao_responde_encerra_no_prazo() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || { let (_socket,_) = listener.accept().unwrap(); std::thread::sleep(Duration::from_millis(900)); });
+        let start = Instant::now();
+        let result = exec_shell_with_timeout(&address.to_string(), "true", Duration::from_millis(250));
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        server.join().unwrap();
     }
-}
-
-/// Descarta todas as conexões nativas (ex.: ao reiniciar o servidor ADB).
-pub fn reset_pool() {
-    POOL.lock().unwrap().clear();
 }
