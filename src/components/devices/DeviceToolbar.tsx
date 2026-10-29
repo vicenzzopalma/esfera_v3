@@ -179,7 +179,7 @@ export function DeviceHeaderActions({
     for (const d of unprovisioned) {
       try {
         const targetSerial = d.status === "online" && d.currentAdbAddress ? d.currentAdbAddress : d.serial;
-        await api<string>("provision_device", { serial: targetSerial, server_url: null });
+        await api<string>("provision_device", { serial: targetSerial, server_url: null, companyId: d.companyId });
       } catch (e: any) {
         console.warn(`Erro ao provisionar ${d.serial}:`, e);
       }

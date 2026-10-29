@@ -466,7 +466,7 @@ export function SystemTab({ device, serial, vpsUrl, displayName, onRemove, onClo
     setProvisioning(true);
     setMsg("Gravando a identidade e configurando o Agente Esfera...");
     try {
-      const res = await api<string>("provision_device", { serial, server_url: vpsUrl.trim() || null });
+      const res = await api<string>("provision_device", { serial, server_url: vpsUrl.trim() || null, companyId: device.companyId });
       setMsg(res);
     } catch (e: any) {
       setMsg(`Erro: ${errText(e, "Falha no provisionamento")}`);
@@ -600,13 +600,17 @@ export function DeviceConfigModal({ isOpen, onClose, device, onSave, onRemove }:
   const [sectorInput, setSectorInput] = useState<SectorType>((device.sector as SectorType) || "junior");
   const [vpsUrl, setVpsUrl] = useState("http://127.0.0.1:8080");
 
+  // Só recarrega os campos ao abrir ou trocar de aparelho: a atualização periódica da lista
+  // gera um objeto novo e apagava o que estava sendo digitado.
+  const deviceKey = device.esferaDeviceId || device.serial;
   useEffect(() => {
     if (isOpen) {
       setNameInput(device.name || device.model || "Aparelho");
       setModelInput(device.model || "");
       setSectorInput((device.sector as SectorType) || "junior");
     }
-  }, [isOpen, device]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, deviceKey]);
 
   const serial = device.status === "online" && device.currentAdbAddress ? device.currentAdbAddress : device.serial;
   const origin = getConnectionOrigin(device);
