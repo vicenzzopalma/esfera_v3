@@ -1,10 +1,37 @@
 // ============================================================
 // Esfera v3 — Configurações
-// Configurações: empresa, notificações, ADB, conexão, IA e segurança
+// Seções: Rede e ritmo, Inteligência artificial, Integrações (VEXOR) e Conexão e servidores.
+// Cada seção salva por conta própria e diz para quem vale: este computador ou a empresa.
+// Segredos (chaves de IA e tokens) nunca aparecem na tela; campo em branco mantém o salvo.
 // ============================================================
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import type { ReactNode } from "react";
+import { useSearchParams } from "react-router-dom";
+import type { LucideIcon } from "lucide-react";
+import {
+  AlertCircle,
+  CheckCircle2,
+  Copy,
+  Cpu,
+  Eye,
+  EyeOff,
+  Gauge,
+  Globe,
+  Info,
+  KeyRound,
+  Loader2,
+  Play,
+  Plug,
+  RefreshCw,
+  Save,
+  Settings,
+  Sparkles,
+  Trash2,
+  Wifi,
+} from "lucide-react";
 import { useAuth } from "../context/AuthContext";
+import { useCompanies } from "../hooks/useQueries";
 import Card from "../components/ui/Card";
 import Button from "../components/ui/Button";
 import Toggle from "../components/ui/Toggle";
@@ -17,38 +44,32 @@ import { api, setAppMode as setTauriAppMode, reloadConfig } from "../tauri";
 import type { AppConfig, AiConfig } from "../types";
 import {
   AI_PROVIDERS,
+  AI_RESERVE_CHAIN,
   DEFAULT_AI_MODEL,
   DEFAULT_AI_PROVIDER,
   DEFAULT_WHATSAPP_SYSTEM_PROMPT,
   getAiProviderInfo,
   normalizeAiProviderId,
 } from "../constants/aiProviders";
-import {
-  Save,
-  Globe,
-  Bell,
-  Shield,
-  Smartphone,
-  Database,
-  RefreshCw,
-  Wifi,
-  Sparkles,
-  Cpu,
-  CheckCircle2,
-  AlertCircle,
-  Play,
-  Settings,
-  Eye,
-  EyeOff,
-  Plug,
-  Copy,
-  KeyRound,
-  Loader2,
-  Info,
-} from "lucide-react";
 
-type SettingsSection = "geral" | "notificacoes" | "adb" | "hub" | "ia" | "integracoes" | "seguranca";
+// ---- Seções ----
+// Antes havia também Geral, Notificações, Aparelhos e ADB e Segurança e backup: nenhum daqueles
+// campos era salvo em lugar nenhum (e Exportar backup/Restaurar padrões não faziam nada).
+type SettingsSection = "rede" | "ia" | "integracoes" | "hub";
+
+const SECTIONS: { id: SettingsSection; label: string; hint: string; icon: LucideIcon }[] = [
+  { id: "rede", label: "Rede e ritmo", hint: "Limites de envio e freio dos chips", icon: Gauge },
+  { id: "ia", label: "Inteligência artificial", hint: "IA principal, reservas e IA própria", icon: Sparkles },
+  { id: "integracoes", label: "Integrações", hint: "VEXOR e descadastro (SAIR)", icon: Plug },
+  { id: "hub", label: "Conexão e servidores", hint: "Hub, modo e servidores locais", icon: Wifi },
+];
+
+const isSection = (value: string | null): value is SettingsSection => SECTIONS.some((s) => s.id === value);
+
 type LoadState = "loading" | "ready" | "error";
+// O que get_ai_provider_keys devolve por provedor. A chave vem vazia (mascarada) no backend novo;
+// hasApiKey é o indicador pedido ao backend (pedidos-L-SET.md) e é usado quando existir.
+type ProviderKeyInfo = { apiKey?: string; endpoint?: string; model?: string; hasApiKey?: boolean };
 type HubSnapshot = {
   hubEnabled: boolean;
   hubAddress: string;
@@ -60,13 +81,28 @@ type HubSnapshot = {
 };
 type AiSnapshot = { provider: string; model: string; temperature: string; systemPrompt: string; endpoint: string };
 
+interface VpsIaStatus {
+  configured: boolean;
+  endpoint: string;
+  model: string;
+}
+
+interface VpsIaTestResult {
+  text: string;
+  elapsedMs: number;
+}
+
+interface GeminiWebStatus {
+  connected: boolean;
+  browserOpen: boolean;
+  savedConnected?: boolean;
+  detail: string;
+}
+
 /** Compara dois retratos do formulário campo a campo. */
 function sameSnapshot<T extends Record<string, unknown>>(a: T, b: T): boolean {
   return (Object.keys(a) as (keyof T)[]).every((k) => a[k] === b[k]);
 }
-// O que get_ai_provider_keys devolve por provedor. A chave vem vazia (mascarada) no backend novo;
-// hasApiKey é o indicador pedido ao backend (pedidos-L-SET.md) e é usado quando existir.
-type ProviderKeyInfo = { apiKey?: string; endpoint?: string; model?: string; hasApiKey?: boolean };
 
 const DEFAULT_HUB_ADDRESS = "127.0.0.1:8555";
 const KNOWN_MODES = ["empresa", "local", "master"] as const;
@@ -77,6 +113,9 @@ const isKnownMode = (m: string): m is KnownMode => (KNOWN_MODES as readonly stri
 const AI_TEST_MESSAGE =
   "Olá {nome}, tudo bem? Aqui é da central de atendimento. Temos uma proposta para você regularizar a sua pendência. Responda esta mensagem para conversar com a gente.";
 const AI_TEST_CONTACT = "Maria";
+
+// Webhook de descadastro (SAIR): o VEXOR chama POST /api/optout/events no Esfera com o token da empresa.
+const OPTOUT_BASE_URL = "http://127.0.0.1:8080";
 
 /** Texto legível de um erro do backend (string), de um Error ou de um objeto com message. */
 function errText(e: unknown): string {
@@ -93,6 +132,11 @@ function errText(e: unknown): string {
 function parsePort(value: string): number | null {
   const n = Number(value.trim());
   return Number.isInteger(n) && n >= 1024 && n <= 65535 ? n : null;
+}
+
+/** Número decimal digitado com vírgula ou ponto (NaN se vazio ou inválido). */
+function parseDecimal(value: string): number {
+  return value.trim() === "" ? NaN : Number(value.trim().replace(",", "."));
 }
 
 /** Segundos com uma casa, no formato brasileiro (ex.: "2,4"). */
@@ -187,32 +231,27 @@ function fileToBase64(file: File): Promise<string> {
 }
 
 export default function SettingsTab() {
-  const { selectedCompanyId, user } = useAuth();
+  const { selectedCompanyId, user, hubConnected } = useAuth();
   const isMasterUser = user?.role === "master";
+  const canManage = isMasterUser || user?.role === "gestor";
+  const companiesQuery = useCompanies();
+  const companyName = companiesQuery.data?.find((c) => c.id === selectedCompanyId)?.name;
+  const companyLabel = companyName ? `“${companyName}”` : "selecionada";
 
-  // Controle de Navegação Interna
-  const [activeSection, setActiveSection] = useState<SettingsSection>("geral");
-
-  // General
-  const [companyName, setCompanyName] = useState("REALESS RM COBRANÇAS");
-  const [timezone, setTimezone] = useState("America/Sao_Paulo");
-
-  // Notifications
-  const [notifications, setNotifications] = useState(true);
-  const [batteryAlert, setBatteryAlert] = useState(true);
-  const [banAlert, setBanAlert] = useState(true);
-  const [dispatchAlert, setDispatchAlert] = useState(false);
-
-  // ADB
-  const [autoReconnect, setAutoReconnect] = useState(true);
-  const [pingInterval, setPingInterval] = useState(30);
-  const [maxRetries, setMaxRetries] = useState(3);
-  const [unlockPin, setUnlockPin] = useState("");
-
-  // Security
-  const [autoBackup, setAutoBackup] = useState(false);
-  const [logRetention, setLogRetention] = useState("30");
-  const [sessionTimeout, setSessionTimeout] = useState("60");
+  // Seção ativa fica na URL (?secao=ia): sobrevive a recarregar e permite link direto.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const sectionParam = searchParams.get("secao");
+  const activeSection: SettingsSection = isSection(sectionParam) ? sectionParam : "rede";
+  const goToSection = (id: SettingsSection) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set("secao", id);
+        return next;
+      },
+      { replace: true },
+    );
+  };
 
   // Hub config
   const [hubEnabled, setHubEnabled] = useState(false);
@@ -260,6 +299,10 @@ export default function SettingsTab() {
   // Último estado salvo (ou carregado): base de "Alterações não salvas" e do Desfazer.
   const [hubSaved, setHubSaved] = useState<HubSnapshot | null>(null);
   const [aiSaved, setAiSaved] = useState<AiSnapshot | null>(null);
+
+  // Situação das reservas para a lista da cadeia (os cartões IA própria e Gemini informam).
+  const [vpsInfo, setVpsInfo] = useState<VpsIaStatus | null>(null);
+  const [geminiConnected, setGeminiConnected] = useState<boolean | null>(null);
 
   // Põe um retrato no formulário e o guarda como "salvo" (carregar, salvar e Desfazer usam).
   const applyHubSnapshot = (s: HubSnapshot) => {
@@ -350,15 +393,20 @@ export default function SettingsTab() {
         loadedKeys.current = memo;
         setSavedProviderKeys(visible);
         const info = getAiProviderInfo(provider);
-        // IA própria: endereço e modelo valem os do cartão IA própria (atualizados também pelo hub).
-        const vps = provider === "vps_ia" ? visible.vps_ia : undefined;
         applyAiSnapshot({
           provider,
-          model: vps?.model || cfg?.model || info?.defaultModel || DEFAULT_AI_MODEL,
+          model: cfg?.model || info?.defaultModel || DEFAULT_AI_MODEL,
           temperature: String(cfg?.temperature ?? 0.7),
           systemPrompt: cfg?.systemPrompt || "",
-          endpoint: vps?.endpoint || cfg?.endpoint || info?.defaultEndpoint || "",
+          endpoint: cfg?.endpoint || info?.defaultEndpoint || "",
         });
+        // IA própria como principal: endereço e modelo valem os do cartão IA própria (o hub atualiza
+        // só o cartão). Se a principal gravada estiver diferente, aparece "Alterações não salvas".
+        const vps = provider === "vps_ia" ? visible.vps_ia : undefined;
+        if (vps && (vps.endpoint || vps.model)) {
+          if (vps.endpoint) setAiEndpoint(vps.endpoint);
+          if (vps.model) setAiModel(vps.model);
+        }
         setAiLoad("ready");
       })
       .catch((e) => {
@@ -380,11 +428,9 @@ export default function SettingsTab() {
   };
 
   // Validação do formulário de IA: devolve o erro de cada campo (vazio = ok).
-  const aiTemperatureValue = Number(aiTemperature.replace(",", "."));
+  const aiTemperatureValue = parseDecimal(aiTemperature);
   const aiTemperatureError =
-    aiTemperature.trim() === "" || !Number.isFinite(aiTemperatureValue) || aiTemperatureValue < 0 || aiTemperatureValue > 1
-      ? "Use um número de 0 a 1 (ex.: 0,7)."
-      : "";
+    !Number.isFinite(aiTemperatureValue) || aiTemperatureValue < 0 || aiTemperatureValue > 1 ? "Use um número de 0 a 1 (ex.: 0,7)." : "";
   const aiEndpointTrim = aiEndpoint.trim();
   const aiEndpointError =
     aiProvider === "custom" && !aiEndpointTrim
@@ -400,7 +446,13 @@ export default function SettingsTab() {
 
   const handleSaveAi = async () => {
     if (!selectedCompanyId || aiLoad !== "ready") return;
-    const problem = aiTemperatureError || aiEndpointError || aiModelError;
+    const problem =
+      aiTemperatureError ||
+      aiEndpointError ||
+      aiModelError ||
+      (aiProvider === "vps_ia" && vpsInfo && !vpsInfo.configured
+        ? "configure a IA própria no cartão abaixo antes de escolhê-la como principal."
+        : "");
     if (problem) {
       setAiStatus(`Falha ao salvar: ${problem}`);
       return;
@@ -476,6 +528,51 @@ export default function SettingsTab() {
         { provider: aiProvider, model: aiModel.trim(), temperature: aiTemperature.trim(), systemPrompt: aiSystemPrompt, endpoint: aiEndpointTrim },
         aiSaved,
       ));
+
+  // O cartão IA própria carregou, salvou ou removeu. Se a IA própria é a principal gravada,
+  // a principal passa a usar o endereço e o modelo novos (senão o disparo seguiria nos antigos).
+  const aiSavedRef = useRef(aiSaved);
+  const aiProviderRef = useRef(aiProvider);
+  useEffect(() => {
+    aiSavedRef.current = aiSaved;
+    aiProviderRef.current = aiProvider;
+  });
+  const handleVpsChange = useCallback(
+    async (status: VpsIaStatus, how: "load" | "save" | "remove") => {
+      setVpsInfo(status);
+      setSavedProviderKeys((prev) => ({
+        ...prev,
+        vps_ia: { endpoint: status.endpoint, model: status.model, hasApiKey: status.configured },
+      }));
+      if (how !== "save" || !status.configured) return;
+      if (aiProviderRef.current === "vps_ia") {
+        setAiEndpoint(status.endpoint);
+        setAiModel(status.model);
+      }
+      const saved = aiSavedRef.current;
+      if (!selectedCompanyId || !saved || saved.provider !== "vps_ia") return;
+      if (saved.endpoint === status.endpoint && saved.model === status.model) return;
+      const temperature = parseDecimal(saved.temperature);
+      try {
+        await api("save_ai_config", {
+          config: {
+            companyId: selectedCompanyId,
+            provider: "vps_ia",
+            model: status.model,
+            temperature: Number.isFinite(temperature) ? temperature : 0.7,
+            systemPrompt: saved.systemPrompt,
+            apiKey: loadedKeys.current.vps_ia || "",
+            endpoint: status.endpoint,
+          },
+        });
+        setAiSaved({ ...saved, endpoint: status.endpoint, model: status.model });
+        toast.success("IA principal atualizada", "A IA própria é a principal e já usa o endereço e o modelo novos.");
+      } catch (e) {
+        toast.error("A IA principal não foi atualizada", `Clique em Salvar IA para usar o endereço novo. ${errText(e)}`);
+      }
+    },
+    [selectedCompanyId],
+  );
 
   // Validação da conexão: endereço host:porta e portas dos servidores ligados.
   const hubAddressTrim = hubAddress.trim();
@@ -583,99 +680,290 @@ export default function SettingsTab() {
     }
   };
 
-
-  const menuItems: { id: SettingsSection; label: string; icon: React.ReactNode }[] = [
-    { id: "geral", label: "Geral", icon: <Globe size={16} /> },
-    { id: "notificacoes", label: "Notificações", icon: <Bell size={16} /> },
-    { id: "adb", label: "Aparelhos e ADB", icon: <Smartphone size={16} /> },
-    { id: "hub", label: "Conexão e servidores", icon: <Wifi size={16} /> },
-    { id: "ia", label: "Inteligência artificial", icon: <Sparkles size={16} /> },
-    { id: "integracoes", label: "Integrações", icon: <Plug size={16} /> },
-    { id: "seguranca", label: "Segurança e backup", icon: <Shield size={16} /> },
-  ];
-
   const hubStatusIsError = hubStatus.startsWith("Erro");
   const aiStatusIsError = aiStatus.startsWith("Falha");
   const providerInfo = getAiProviderInfo(aiProvider);
+  const keyState = savedProviderKeys[aiProvider]?.hasApiKey;
+  const hubUsesCloud = hubSaved?.appMode === "empresa" || hubSaved?.appMode === "master";
+  const sectionDirty: Partial<Record<SettingsSection, boolean>> = { ia: aiDirty, hub: hubDirty };
 
   return (
     <div className="space-y-6 animate-fade-in max-w-6xl mx-auto">
       <PageHeader
         title="Configurações"
-        description="Preferências da empresa, conexão, IA e segurança."
+        description="Ritmo da rede, inteligência artificial, integrações e conexão. Cada seção diz se vale para este computador ou para a empresa."
         icon={<Settings size={18} />}
       />
 
       <div className="flex flex-col md:flex-row gap-6 items-start">
-        <nav aria-label="Seções de configurações" className="w-full md:w-56 shrink-0 flex md:flex-col gap-1 overflow-x-auto">
-          {menuItems.map((item) => {
-            const active = activeSection === item.id;
+        <nav aria-label="Seções de configurações" className="w-full md:w-60 shrink-0 flex md:flex-col gap-1 overflow-x-auto pb-1 md:pb-0">
+          {SECTIONS.map(({ id, label, hint, icon: Icon }) => {
+            const active = activeSection === id;
             return (
               <button
-                key={item.id}
-                onClick={() => setActiveSection(item.id)}
+                key={id}
+                type="button"
+                onClick={() => goToSection(id)}
                 aria-current={active ? "page" : undefined}
-                className={`flex items-center gap-2.5 whitespace-nowrap rounded-lg px-3 py-2 text-[0.8125rem] font-medium transition-colors cursor-pointer text-left ${
+                className={`flex shrink-0 items-start gap-2.5 rounded-lg px-3 py-2 text-left transition-colors cursor-pointer ${
                   active ? "bg-secondary text-primary" : "text-secondary hover:bg-secondary hover:text-primary"
                 }`}
               >
-                <span className={active ? "text-[var(--color-accent-light)]" : "text-tertiary"}>{item.icon}</span>
-                {item.label}
+                <Icon size={16} className={`mt-0.5 shrink-0 ${active ? "text-[var(--color-accent-light)]" : "text-tertiary"}`} />
+                <span className="min-w-0">
+                  <span className="flex items-center gap-1.5 whitespace-nowrap text-[0.8125rem] font-medium">
+                    {label}
+                    {sectionDirty[id] && (
+                      <>
+                        <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--color-warning)]" />
+                        <span className="sr-only">(alterações não salvas)</span>
+                      </>
+                    )}
+                  </span>
+                  <span className="hidden text-xs leading-snug text-tertiary md:block">{hint}</span>
+                </span>
               </button>
             );
           })}
         </nav>
 
-        <main className="flex-1 w-full min-w-0">
+        <div className="flex-1 w-full min-w-0">
           <Card padding="lg">
-            {activeSection === "geral" && (
-              <FormSection title="Geral" description="Identificação da empresa e fuso horário.">
-                <div className="space-y-4 max-w-xl">
-                  <Field label="Nome da empresa" htmlFor="set-company">
-                    <input id="set-company" type="text" value={companyName} onChange={(e) => setCompanyName(e.target.value)} />
-                  </Field>
-                  <Field label="Fuso horário" htmlFor="set-tz">
-                    <select id="set-tz" value={timezone} onChange={(e) => setTimezone(e.target.value)}>
-                      <option value="America/Sao_Paulo">América/São Paulo (GMT-3)</option>
-                      <option value="America/Manaus">América/Manaus (GMT-4)</option>
-                      <option value="America/Fortaleza">América/Fortaleza (GMT-3)</option>
-                    </select>
-                  </Field>
-                </div>
-              </FormSection>
-            )}
+            {activeSection === "rede" && <NetworkSettings canEdit={canManage} />}
 
-            {activeSection === "geral" && <NetworkSettings canEdit={user?.role === "master" || user?.role === "gestor"} />}
+            {activeSection === "ia" && (
+              <div className="space-y-8">
+                <FormSection
+                  title="IA principal"
+                  description={`Primeira IA usada para reescrever as mensagens e variar o texto dos disparos. Vale para a empresa ${companyLabel}.`}
+                >
+                  <div className="space-y-4 max-w-xl">
+                    <LoadGate state={aiLoad} error={aiLoadError} what="a configuração de IA" onRetry={() => setAiReload((n) => n + 1)} />
+                    {aiLoad === "ready" && (
+                      <>
+                        <Field label="Provedor" htmlFor="set-ai-provider">
+                          <select id="set-ai-provider" value={aiProvider} onChange={(e) => changeAiProvider(e.target.value)}>
+                            {!providerInfo && <option value={aiProvider}>{`Atual: ${aiProvider}`}</option>}
+                            <optgroup label="Servidor próprio">
+                              {AI_PROVIDERS.filter((p) => p.category === "own_server").map((p) => (
+                                <option key={p.id} value={p.id}>{p.name}</option>
+                              ))}
+                            </optgroup>
+                            <optgroup label="Nuvem gratuita">
+                              {AI_PROVIDERS.filter((p) => p.category === "cloud_free").map((p) => (
+                                <option key={p.id} value={p.id}>{p.name}</option>
+                              ))}
+                            </optgroup>
+                            <optgroup label="Neste computador (offline)">
+                              {AI_PROVIDERS.filter((p) => p.category === "local_free").map((p) => (
+                                <option key={p.id} value={p.id}>{p.name}</option>
+                              ))}
+                            </optgroup>
+                            <optgroup label="Pagos e personalizados">
+                              {AI_PROVIDERS.filter((p) => p.category === "paid_custom").map((p) => (
+                                <option key={p.id} value={p.id}>{p.name}</option>
+                              ))}
+                            </optgroup>
+                          </select>
+                        </Field>
 
-            {activeSection === "notificacoes" && (
-              <FormSection title="Notificações" description="Escolha quais avisos o sistema deve exibir.">
-                <div className="max-w-xl divide-y divide-border">
-                  <ToggleRow label="Alertas do sistema" desc="Avisar quando aparelhos desconectarem ou apresentarem falhas." checked={notifications} onChange={setNotifications} />
-                  <ToggleRow label="Bateria baixa" desc="Avisar quando a bateria de um aparelho ficar abaixo de 20%." checked={batteryAlert} onChange={setBatteryAlert} />
-                  <ToggleRow label="Bloqueio de chip" desc="Avisar assim que um chip for bloqueado pela operadora." checked={banAlert} onChange={setBanAlert} />
-                  <ToggleRow label="Disparo concluído" desc="Avisar quando a fila de envios de uma campanha terminar." checked={dispatchAlert} onChange={setDispatchAlert} />
-                </div>
-              </FormSection>
-            )}
+                        <Field label="Modelo" htmlFor="set-ai-model" error={aiModelError || undefined}>
+                          <input
+                            id="set-ai-model"
+                            type="text"
+                            value={aiModel}
+                            onChange={(e) => setAiModel(e.target.value)}
+                            placeholder={providerInfo?.defaultModel || DEFAULT_AI_MODEL}
+                            spellCheck={false}
+                            className="font-mono"
+                          />
+                          {providerInfo && providerInfo.suggestedModels.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 pt-1">
+                              {providerInfo.suggestedModels.map((m) => (
+                                <button
+                                  key={m.id}
+                                  type="button"
+                                  onClick={() => setAiModel(m.id)}
+                                  aria-pressed={aiModel === m.id}
+                                  className={`rounded-md border px-2 py-1 text-xs transition-colors cursor-pointer ${
+                                    aiModel === m.id
+                                      ? "border-[var(--color-accent)] bg-[var(--color-accent-glow)] text-primary"
+                                      : "border-border text-secondary hover:border-border-strong hover:text-primary"
+                                  }`}
+                                >
+                                  {m.name} <span className="text-tertiary">({m.tag})</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </Field>
 
-            {activeSection === "adb" && (
-              <FormSection title="Aparelhos e ADB" description="Como o sistema se comunica com os celulares.">
-                <div className="space-y-5 max-w-xl">
-                  <ToggleRow label="Reconectar automaticamente" desc="Tenta reconectar aparelhos desconectados em segundo plano." checked={autoReconnect} onChange={setAutoReconnect} />
-                  <div className="grid grid-cols-2 gap-4">
-                    <Field label="Intervalo de verificação (s)" hint="Entre 5 e 300." htmlFor="set-ping">
-                      <input id="set-ping" type="number" value={pingInterval} onChange={(e) => setPingInterval(parseInt(e.target.value) || 30)} min={5} max={300} className="font-mono" />
-                    </Field>
-                    <Field label="Máximo de tentativas" hint="Entre 1 e 10." htmlFor="set-retries">
-                      <input id="set-retries" type="number" value={maxRetries} onChange={(e) => setMaxRetries(parseInt(e.target.value) || 3)} min={1} max={10} className="font-mono" />
-                    </Field>
+                        {aiProvider === "vps_ia" ? (
+                          <div className="rounded-lg border border-border bg-secondary px-3 py-2.5 text-[0.8125rem] text-secondary">
+                            <p className="font-medium text-primary">Endereço e token vêm do cartão “IA própria (VPS)”, logo abaixo</p>
+                            <p className="mt-0.5 break-all font-mono text-xs">{aiEndpointTrim || "Ainda não configurado"}</p>
+                            {vpsInfo && !vpsInfo.configured ? (
+                              <p className="mt-1 text-xs text-[var(--color-warning)]">A IA própria ainda não está configurada: preencha o cartão abaixo antes de salvar.</p>
+                            ) : (
+                              aiSaved?.provider === "vps_ia" &&
+                              (aiSaved.endpoint !== aiEndpointTrim || aiSaved.model !== aiModel.trim()) && (
+                                <p className="mt-1 text-xs text-[var(--color-warning)]">
+                                  A IA principal gravada usa outro endereço ou modelo. Clique em Salvar IA para usar os do cartão.
+                                </p>
+                              )
+                            )}
+                          </div>
+                        ) : (
+                          <>
+                            <Field
+                              label="Endereço da API"
+                              htmlFor="set-ai-endpoint"
+                              error={aiEndpointError || undefined}
+                              aside={
+                                providerInfo?.defaultEndpoint && aiEndpointTrim !== providerInfo.defaultEndpoint ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => setAiEndpoint(providerInfo.defaultEndpoint)}
+                                    className="cursor-pointer underline hover:text-primary"
+                                  >
+                                    Usar o padrão
+                                  </button>
+                                ) : undefined
+                              }
+                            >
+                              <input
+                                id="set-ai-endpoint"
+                                type="text"
+                                value={aiEndpoint}
+                                onChange={(e) => setAiEndpoint(e.target.value)}
+                                placeholder={providerInfo?.defaultEndpoint || "https://…/v1/chat/completions"}
+                                spellCheck={false}
+                                className="font-mono"
+                              />
+                            </Field>
+
+                            {aiProvider !== "ollama" && aiProvider !== "lmstudio" && (
+                              <Field
+                                label="Chave de API"
+                                hint={`${providerInfo?.keyHint ? `${providerInfo.keyHint} ` : ""}Por segurança a chave salva não aparece aqui; deixe em branco para manter a atual e cole outra só para trocar.`}
+                                htmlFor="set-ai-key"
+                                aside={
+                                  keyState === true ? (
+                                    <Badge variant="success">Chave salva</Badge>
+                                  ) : keyState === false ? (
+                                    <Badge variant="neutral">Sem chave salva</Badge>
+                                  ) : undefined
+                                }
+                              >
+                                <SecretInput
+                                  id="set-ai-key"
+                                  value={aiApiKey}
+                                  onChange={setAiApiKey}
+                                  placeholder={`Em branco = manter a chave salva (${providerInfo?.keyPlaceholder || "sk-..."})`}
+                                />
+                              </Field>
+                            )}
+                          </>
+                        )}
+
+                        <div className="w-48">
+                          <Field label="Criatividade" hint="De 0 (preciso) a 1 (criativo)." htmlFor="set-ai-temp" error={aiTemperatureError || undefined}>
+                            <input
+                              id="set-ai-temp"
+                              type="number"
+                              inputMode="decimal"
+                              step="0.05"
+                              min="0"
+                              max="1"
+                              value={aiTemperature}
+                              onChange={(e) => setAiTemperature(e.target.value)}
+                              className="font-mono"
+                            />
+                          </Field>
+                        </div>
+
+                        <Field
+                          label="Instruções para a IA"
+                          hint="Opcional: tom e cuidados da empresa. As regras legais e a proibição de valores valem sempre, mesmo em branco."
+                          htmlFor="set-ai-prompt"
+                          aside={
+                            aiSystemPrompt.trim() !== DEFAULT_WHATSAPP_SYSTEM_PROMPT ? (
+                              <button
+                                type="button"
+                                onClick={() => setAiSystemPrompt(DEFAULT_WHATSAPP_SYSTEM_PROMPT)}
+                                className="cursor-pointer underline hover:text-primary"
+                              >
+                                Usar o texto padrão
+                              </button>
+                            ) : undefined
+                          }
+                        >
+                          <textarea
+                            id="set-ai-prompt"
+                            value={aiSystemPrompt}
+                            onChange={(e) => setAiSystemPrompt(e.target.value)}
+                            rows={4}
+                            placeholder="Ex.: seja cordial e breve, convide o cliente a negociar pelo canal oficial, nunca pressione."
+                            className="resize-y"
+                          />
+                        </Field>
+
+                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                          <Button icon={<Save size={15} />} onClick={handleSaveAi} loading={savingAi} disabled={aiRun.running}>
+                            Salvar IA
+                          </Button>
+                          <Button variant="secondary" icon={<Play size={14} />} loading={aiRun.running} disabled={savingAi} onClick={handleTestAi}>
+                            {aiRun.running ? `Testando… ${aiRun.elapsed} s` : "Testar"}
+                          </Button>
+                          {aiRun.running && (
+                            <Button variant="ghost" onClick={aiRun.stop}>
+                              Parar
+                            </Button>
+                          )}
+                          {aiDirty && !savingAi && <UnsavedNote onUndo={() => aiSaved && applyAiSnapshot(aiSaved)} />}
+                        </div>
+
+                        {aiTestResult && <TestResult result={aiTestResult} />}
+
+                        {aiStatus && <StatusBanner error={aiStatusIsError} message={aiStatus} onClose={() => setAiStatus("")} />}
+
+                        <p className="text-xs text-tertiary">
+                          O teste usa os dados da tela, mesmo sem salvar, e um texto de exemplo para “{AI_TEST_CONTACT}”, sem valores e sem link.
+                          Desiste sozinho depois de {aiTestLimit} s.
+                        </p>
+                      </>
+                    )}
                   </div>
-                  <Field label="PIN de desbloqueio" hint="Opcional. Usado para desbloquear a tela dos aparelhos." htmlFor="set-pin">
-                    <SecretInput id="set-pin" value={unlockPin} onChange={setUnlockPin} placeholder="Ex.: 1234" />
-                  </Field>
-                </div>
-              </FormSection>
+                </FormSection>
+
+                {aiLoad === "ready" && (
+                  <AiReserveChain
+                    primary={aiSaved?.provider ?? aiProvider}
+                    keys={savedProviderKeys}
+                    vpsConfigured={vpsInfo ? vpsInfo.configured : null}
+                    geminiConnected={geminiConnected}
+                  />
+                )}
+
+                {canManage && selectedCompanyId !== null && (
+                  <VpsIaCard companyId={selectedCompanyId} primaryIsVps={aiSaved?.provider === "vps_ia"} onChange={handleVpsChange} />
+                )}
+
+                {selectedCompanyId !== null && <GeminiWebCard companyId={selectedCompanyId} onConnectedChange={setGeminiConnected} />}
+              </div>
             )}
+
+            {activeSection === "integracoes" &&
+              (selectedCompanyId !== null ? (
+                <IntegrationsSection
+                  companyId={selectedCompanyId}
+                  isMaster={isMasterUser}
+                  canManage={canManage}
+                  onGoToConnection={() => goToSection("hub")}
+                />
+              ) : (
+                <p className="text-[0.8125rem] text-secondary">Escolha uma empresa no topo para configurar as integrações.</p>
+              ))}
 
             {activeSection === "hub" && (
               <div className="space-y-8">
@@ -706,7 +994,23 @@ export default function SettingsTab() {
 
                     <FormSection title="Hub" description="Servidor central que liga os computadores e os aparelhos remotos.">
                       <div className="space-y-4 max-w-xl">
-                        <Field label="Endereço do hub" htmlFor="set-hub-addr" error={hubAddressError || undefined}>
+                        <Field
+                          label="Endereço do hub"
+                          htmlFor="set-hub-addr"
+                          error={hubAddressError || undefined}
+                          aside={
+                            hubConnected ? (
+                              <Badge variant="success" dot>
+                                Conectado
+                              </Badge>
+                            ) : (
+                              // Sem hub no modo Local/Autônomo é o esperado: aviso só nos modos que usam o hub.
+                              <Badge variant={hubUsesCloud ? "warning" : "neutral"} dot>
+                                Sem conexão
+                              </Badge>
+                            )
+                          }
+                        >
                           {!customIpOverride ? (
                             <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary px-3 py-2">
                               <span className="flex min-w-0 items-center gap-2 font-mono text-[0.8125rem] text-primary">
@@ -743,6 +1047,7 @@ export default function SettingsTab() {
                             </div>
                           )}
                         </Field>
+                        <p className="-mt-2 text-xs text-tertiary">“Conectado” é a conexão aberta no login; um endereço novo vale ao reabrir o Esfera.</p>
 
                         <ToggleRow
                           label="Conexão contínua"
@@ -880,233 +1185,8 @@ export default function SettingsTab() {
                 )}
               </div>
             )}
-
-            {activeSection === "ia" && (
-              <FormSection title="Inteligência artificial" description="Provedor usado para reescrever mensagens e variar o texto dos disparos.">
-                <div className="space-y-4 max-w-xl">
-                  <LoadGate
-                    state={aiLoad}
-                    error={aiLoadError}
-                    what="a configuração de IA"
-                    onRetry={() => setAiReload((n) => n + 1)}
-                  />
-                  {aiLoad === "ready" && (
-                    <>
-                      <Field label="Provedor" htmlFor="set-ai-provider">
-                        <select id="set-ai-provider" value={aiProvider} onChange={(e) => changeAiProvider(e.target.value)}>
-                          {!providerInfo && <option value={aiProvider}>{`Atual: ${aiProvider}`}</option>}
-                          <optgroup label="Servidor próprio">
-                            {AI_PROVIDERS.filter((p) => p.category === "own_server").map((p) => (
-                              <option key={p.id} value={p.id}>{p.name}</option>
-                            ))}
-                          </optgroup>
-                          <optgroup label="Nuvem gratuita">
-                            {AI_PROVIDERS.filter((p) => p.category === "cloud_free").map((p) => (
-                              <option key={p.id} value={p.id}>{p.name}</option>
-                            ))}
-                          </optgroup>
-                          <optgroup label="Neste computador (offline)">
-                            {AI_PROVIDERS.filter((p) => p.category === "local_free").map((p) => (
-                              <option key={p.id} value={p.id}>{p.name}</option>
-                            ))}
-                          </optgroup>
-                          <optgroup label="Pagos e personalizados">
-                            {AI_PROVIDERS.filter((p) => p.category === "paid_custom").map((p) => (
-                              <option key={p.id} value={p.id}>{p.name}</option>
-                            ))}
-                          </optgroup>
-                        </select>
-                      </Field>
-
-                      <Field label="Modelo" htmlFor="set-ai-model" error={aiModelError || undefined}>
-                        <input
-                          id="set-ai-model"
-                          type="text"
-                          value={aiModel}
-                          onChange={(e) => setAiModel(e.target.value)}
-                          placeholder={providerInfo?.defaultModel || DEFAULT_AI_MODEL}
-                          spellCheck={false}
-                          className="font-mono"
-                        />
-                        {providerInfo && providerInfo.suggestedModels.length > 0 && (
-                          <div className="flex flex-wrap gap-1.5 pt-1">
-                            {providerInfo.suggestedModels.map((m) => (
-                              <button
-                                key={m.id}
-                                type="button"
-                                onClick={() => setAiModel(m.id)}
-                                aria-pressed={aiModel === m.id}
-                                className={`rounded-md border px-2 py-1 text-xs transition-colors cursor-pointer ${
-                                  aiModel === m.id
-                                    ? "border-[var(--color-accent)] bg-[var(--color-accent-glow)] text-primary"
-                                    : "border-border text-secondary hover:border-border-strong hover:text-primary"
-                                }`}
-                              >
-                                {m.name} <span className="text-tertiary">({m.tag})</span>
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                      </Field>
-
-                      {aiProvider === "vps_ia" ? (
-                        <div className="rounded-lg border border-border bg-secondary px-3 py-2.5 text-[0.8125rem] text-secondary">
-                          <p className="font-medium text-primary">Endereço e token da IA própria</p>
-                          <p className="mt-0.5 break-all font-mono text-xs">{aiEndpointTrim || "Ainda não configurado"}</p>
-                          <p className="mt-1 text-xs text-tertiary">{providerInfo?.keyHint}</p>
-                        </div>
-                      ) : (
-                        <>
-                          <Field
-                            label="Endereço da API"
-                            htmlFor="set-ai-endpoint"
-                            error={aiEndpointError || undefined}
-                            aside={
-                              providerInfo?.defaultEndpoint && aiEndpointTrim !== providerInfo.defaultEndpoint ? (
-                                <button
-                                  type="button"
-                                  onClick={() => setAiEndpoint(providerInfo.defaultEndpoint)}
-                                  className="cursor-pointer underline hover:text-primary"
-                                >
-                                  Usar o padrão
-                                </button>
-                              ) : undefined
-                            }
-                          >
-                            <input
-                              id="set-ai-endpoint"
-                              type="text"
-                              value={aiEndpoint}
-                              onChange={(e) => setAiEndpoint(e.target.value)}
-                              placeholder={providerInfo?.defaultEndpoint || "https://…/v1/chat/completions"}
-                              spellCheck={false}
-                              className="font-mono"
-                            />
-                          </Field>
-
-                          {aiProvider !== "ollama" && aiProvider !== "lmstudio" && (
-                            <Field
-                              label="Chave de API"
-                              hint={`${providerInfo?.keyHint ? `${providerInfo.keyHint} ` : ""}Por segurança a chave salva não aparece aqui; deixe em branco para manter a atual e cole outra só para trocar.`}
-                              htmlFor="set-ai-key"
-                            >
-                              <SecretInput
-                                id="set-ai-key"
-                                value={aiApiKey}
-                                onChange={setAiApiKey}
-                                placeholder={`Em branco = manter a chave salva (${providerInfo?.keyPlaceholder || "sk-..."})`}
-                              />
-                            </Field>
-                          )}
-                        </>
-                      )}
-
-                      <div className="w-48">
-                        <Field label="Criatividade" hint="De 0 (preciso) a 1 (criativo)." htmlFor="set-ai-temp" error={aiTemperatureError || undefined}>
-                          <input
-                            id="set-ai-temp"
-                            type="number"
-                            inputMode="decimal"
-                            step="0.05"
-                            min="0"
-                            max="1"
-                            value={aiTemperature}
-                            onChange={(e) => setAiTemperature(e.target.value)}
-                            className="font-mono"
-                          />
-                        </Field>
-                      </div>
-
-                      <Field
-                        label="Instruções para a IA"
-                        hint="Opcional: tom e cuidados da empresa. As regras legais e a proibição de valores valem sempre, mesmo em branco."
-                        htmlFor="set-ai-prompt"
-                        aside={
-                          aiSystemPrompt.trim() !== DEFAULT_WHATSAPP_SYSTEM_PROMPT ? (
-                            <button
-                              type="button"
-                              onClick={() => setAiSystemPrompt(DEFAULT_WHATSAPP_SYSTEM_PROMPT)}
-                              className="cursor-pointer underline hover:text-primary"
-                            >
-                              Usar o texto padrão
-                            </button>
-                          ) : undefined
-                        }
-                      >
-                        <textarea
-                          id="set-ai-prompt"
-                          value={aiSystemPrompt}
-                          onChange={(e) => setAiSystemPrompt(e.target.value)}
-                          rows={4}
-                          placeholder="Ex.: seja cordial e breve, convide o cliente a negociar pelo canal oficial, nunca pressione."
-                          className="resize-y"
-                        />
-                      </Field>
-
-                      <div className="flex flex-wrap items-center gap-2 pt-1">
-                        <Button icon={<Save size={15} />} onClick={handleSaveAi} loading={savingAi} disabled={aiRun.running}>
-                          Salvar IA
-                        </Button>
-                        <Button variant="secondary" icon={<Play size={14} />} loading={aiRun.running} onClick={handleTestAi}>
-                          {aiRun.running ? `Testando… ${aiRun.elapsed} s` : "Testar"}
-                        </Button>
-                        {aiRun.running && (
-                          <Button variant="ghost" onClick={aiRun.stop}>
-                            Parar
-                          </Button>
-                        )}
-                        {aiDirty && !savingAi && (
-                          <UnsavedNote onUndo={() => aiSaved && applyAiSnapshot(aiSaved)} />
-                        )}
-                      </div>
-
-                      {aiTestResult && <TestResult result={aiTestResult} />}
-
-                      {aiStatus && <StatusBanner error={aiStatusIsError} message={aiStatus} onClose={() => setAiStatus("")} />}
-
-                      <p className="text-xs text-tertiary">
-                        O teste usa os dados da tela, mesmo sem salvar, e um texto de exemplo para “{AI_TEST_CONTACT}”, sem valores e sem link.
-                        Desiste sozinho depois de {aiTestLimit} s.
-                      </p>
-                    </>
-                  )}
-                </div>
-              </FormSection>
-            )}
-
-            {activeSection === "integracoes" && <IntegrationsSection companyId={selectedCompanyId ?? 1} isMaster={isMasterUser} canManage={isMasterUser || user?.role === "gestor"} />}
-
-            {activeSection === "seguranca" && (
-              <FormSection title="Segurança e backup" description="Proteção de dados e retenção de registros.">
-                <div className="space-y-5 max-w-xl">
-                  <ToggleRow label="Backup diário automático" desc="Salva uma cópia local do banco de dados ao fim de cada dia." checked={autoBackup} onChange={setAutoBackup} />
-                  <div className="grid grid-cols-2 gap-4">
-                    <Field label="Retenção de logs" htmlFor="set-retention">
-                      <select id="set-retention" value={logRetention} onChange={(e) => setLogRetention(e.target.value)}>
-                        <option value="7">7 dias</option>
-                        <option value="15">15 dias</option>
-                        <option value="30">30 dias (padrão)</option>
-                        <option value="90">90 dias</option>
-                      </select>
-                    </Field>
-                    <Field label="Expiração da sessão (min)" hint="Entre 15 e 480." htmlFor="set-session">
-                      <input id="set-session" type="number" value={sessionTimeout} onChange={(e) => setSessionTimeout(e.target.value)} min={15} max={480} className="font-mono" />
-                    </Field>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2 border-t border-border pt-4">
-                    <Button variant="secondary" icon={<Database size={15} />}>
-                      Exportar backup
-                    </Button>
-                    <Button variant="danger" icon={<RefreshCw size={15} />}>
-                      Restaurar padrões
-                    </Button>
-                  </div>
-                </div>
-              </FormSection>
-            )}
           </Card>
-        </main>
+        </div>
       </div>
     </div>
   );
@@ -1124,6 +1204,11 @@ function LoadGate({ state, error, what, onRetry }: { state: LoadState; error: st
       </p>
     );
   }
+  return <ErrorBox text={`Não foi possível carregar ${what}: ${error}`} onRetry={onRetry} />;
+}
+
+// Caixa de erro com botão de nova tentativa.
+function ErrorBox({ text, onRetry, retrying = false }: { text: string; onRetry: () => void; retrying?: boolean }) {
   return (
     <div
       role="alert"
@@ -1131,11 +1216,9 @@ function LoadGate({ state, error, what, onRetry }: { state: LoadState; error: st
     >
       <span className="flex min-w-0 items-start gap-2">
         <AlertCircle size={15} className="mt-0.5 shrink-0" />
-        <span className="break-words">
-          Não foi possível carregar {what}: {error}
-        </span>
+        <span className="break-words">{text}</span>
       </span>
-      <Button variant="secondary" size="sm" icon={<RefreshCw size={13} />} onClick={onRetry}>
+      <Button variant="secondary" size="sm" icon={<RefreshCw size={13} />} onClick={onRetry} loading={retrying}>
         Tentar de novo
       </Button>
     </div>
@@ -1178,6 +1261,19 @@ function UnsavedNote({ onUndo }: { onUndo: () => void }) {
   );
 }
 
+// Retorno curto de uma ação (salvar, testar): verde quando deu certo, vermelho quando falhou.
+function InlineMessage({ message }: { message: { ok: boolean; text: string } | null }) {
+  if (!message) return null;
+  return (
+    <p
+      role={message.ok ? "status" : "alert"}
+      className={`whitespace-pre-wrap break-words text-[0.8125rem] ${message.ok ? "text-[var(--color-success)]" : "text-[var(--color-danger)]"}`}
+    >
+      {message.text}
+    </p>
+  );
+}
+
 function StatusBanner({ error, message, onClose }: { error: boolean; message: string; onClose: () => void }) {
   return (
     <div
@@ -1197,7 +1293,8 @@ function StatusBanner({ error, message, onClose }: { error: boolean; message: st
   );
 }
 
-// Campo de segredo: mascarado por padrão, com botão para mostrar/ocultar.
+// Campo de segredo para DIGITAR um valor novo: mascarado por padrão, com botão para conferir o
+// que foi digitado. O valor já salvo nunca vem para cá.
 function SecretInput({
   id,
   value,
@@ -1218,13 +1315,14 @@ function SecretInput({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
-        autoComplete="off"
+        autoComplete="new-password"
+        spellCheck={false}
         className="w-full font-mono pr-10"
       />
       <button
         type="button"
         onClick={() => setVisible((v) => !v)}
-        aria-label={visible ? "Ocultar valor" : "Mostrar valor"}
+        aria-label={visible ? "Ocultar o que foi digitado" : "Mostrar o que foi digitado"}
         className="absolute right-2 flex h-7 w-7 items-center justify-center rounded-md text-tertiary hover:text-primary cursor-pointer"
       >
         {visible ? <EyeOff size={15} /> : <Eye size={15} />}
@@ -1251,201 +1349,579 @@ function ToggleRow({
         <p className="mt-0.5 text-xs text-tertiary leading-snug">{desc}</p>
       </div>
       <div className="shrink-0">
-        <Toggle checked={checked} onChange={onChange} size="sm" />
+        <Toggle checked={checked} onChange={onChange} size="sm" ariaLabel={label} />
       </div>
     </div>
   );
 }
 
-// ---------- Integrações ----------
-// Webhook de descadastro (SAIR): o VEXOR chama POST /api/optout/events no Esfera com o token da empresa.
-const OPTOUT_BASE_URL = "http://127.0.0.1:8080";
+// ---------- Inteligência artificial: reservas, IA própria e Gemini Web ----------
 
-interface VpsIaStatus {
-  configured: boolean;
-  endpoint: string;
-  model: string;
+// Ordem das reservas (fixa no disparo) com o que se sabe de cada uma.
+function AiReserveChain({
+  primary,
+  keys,
+  vpsConfigured,
+  geminiConnected,
+}: {
+  primary: string;
+  keys: Record<string, ProviderKeyInfo>;
+  vpsConfigured: boolean | null;
+  geminiConnected: boolean | null;
+}) {
+  const primaryId = normalizeAiProviderId(primary);
+  const primaryName = getAiProviderInfo(primaryId)?.name ?? primary;
+  const stateOf = (provider: string): ReactNode => {
+    if (provider === "vps_ia") {
+      if (vpsConfigured === null) return null;
+      return vpsConfigured ? <Badge variant="success">Configurada</Badge> : <Badge variant="neutral">Não configurada</Badge>;
+    }
+    if (provider === "gemini_web") {
+      if (geminiConnected === null) return null;
+      return geminiConnected ? <Badge variant="success">Conectado</Badge> : <Badge variant="neutral">Não conectado</Badge>;
+    }
+    const has = keys[provider]?.hasApiKey;
+    if (has === undefined) return null;
+    return has ? <Badge variant="success">Chave salva</Badge> : <Badge variant="neutral">Sem chave</Badge>;
+  };
+  return (
+    <FormSection title="Reservas automáticas" description="Se a IA principal falhar ou esgotar o limite grátis, o disparo tenta as reservas nesta ordem.">
+      <div className="max-w-xl space-y-2">
+        <ol className="divide-y divide-border rounded-lg border border-border">
+          <li className="flex items-center justify-between gap-3 px-3 py-2">
+            <span className="flex min-w-0 items-center gap-2.5">
+              <span className="w-5 shrink-0 text-center text-xs text-tertiary">1</span>
+              <span className="truncate text-[0.8125rem] font-medium text-primary">{primaryName}</span>
+            </span>
+            <Badge variant="purple">Principal</Badge>
+          </li>
+          {AI_RESERVE_CHAIN.map((step, i) => {
+            // O Groq 20B continua como reserva mesmo quando o Groq é o principal (outro limite diário).
+            const isPrimary = step.provider === primaryId && !step.alsoWhenPrimary;
+            return (
+              <li key={step.id} className={`flex items-center justify-between gap-3 px-3 py-2 ${isPrimary ? "opacity-60" : ""}`}>
+                <span className="flex min-w-0 items-center gap-2.5">
+                  <span className="w-5 shrink-0 text-center text-xs text-tertiary">{i + 2}</span>
+                  <span className="min-w-0">
+                    <span className="block text-[0.8125rem] text-primary">{step.label}</span>
+                    <span className="block text-xs text-tertiary">{isPrimary ? "já é a principal" : step.detail}</span>
+                  </span>
+                </span>
+                {!isPrimary && stateOf(step.provider)}
+              </li>
+            );
+          })}
+        </ol>
+        <p className="text-xs text-tertiary">
+          Para salvar a chave de uma reserva sem trocar a principal: escolha o provedor acima, cole a chave e clique em Salvar IA;
+          depois volte à principal e salve de novo.
+        </p>
+        <p className="text-xs text-tertiary">Se nenhuma responder a tempo, o envio usa o texto da campanha (com Spintax, se estiver ligado).</p>
+      </div>
+    </FormSection>
+  );
 }
 
-interface VpsIaTestResult {
-  text: string;
-  elapsedMs: number;
-}
+// IA própria (Ollama na VPS, com token): endereço, modelo e token por empresa. O hub também
+// distribui esta configuração para os computadores.
+function VpsIaCard({
+  companyId,
+  primaryIsVps,
+  onChange,
+}: {
+  companyId: number;
+  primaryIsVps: boolean;
+  onChange: (status: VpsIaStatus, how: "load" | "save" | "remove") => void;
+}) {
+  const [status, setStatus] = useState<VpsIaStatus | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const [reload, setReload] = useState(0);
+  const [endpoint, setEndpoint] = useState("");
+  const [model, setModel] = useState("");
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState<"" | "save" | "remove">("");
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  const run = useTimedRun();
+  const [testResult, setTestResult] = useState<TestResultData | null>(null);
+  const onChangeRef = useRef(onChange);
+  useEffect(() => {
+    onChangeRef.current = onChange;
+  });
 
-interface GeminiWebStatus {
-  connected: boolean;
-  browserOpen: boolean;
-  savedConnected?: boolean;
-  detail: string;
-}
-
-function IntegrationsSection({ companyId, isMaster, canManage }: { companyId: number; isMaster: boolean; canManage: boolean }) {
-  const [vexorToken, setVexorToken] = useState("");
-  const [vexorConfigured, setVexorConfigured] = useState<boolean | null>(null);
-  const [vexorBusy, setVexorBusy] = useState<"" | "save" | "test">("");
-  const [vexorResult, setVexorResult] = useState("");
   useEffect(() => {
     let active = true;
-    setVexorConfigured(null);
-    setVexorToken("");
-    setVexorResult("");
-    if (canManage) api<boolean>("get_vexor_token_status", { companyId }).then((v) => { if (active) setVexorConfigured(v); }).catch((e) => { if (active) setVexorResult(String(e)); });
+    setStatus(null);
+    setLoadError("");
+    setEndpoint("");
+    setModel("");
+    setToken("");
+    setMessage(null);
+    setTestResult(null);
+    api<VpsIaStatus>("vps_ia_status", { companyId })
+      .then((s) => {
+        if (!active) return;
+        setStatus(s);
+        setEndpoint(s.endpoint);
+        setModel(s.model);
+        onChangeRef.current(s, "load");
+      })
+      .catch((e) => {
+        if (active) setLoadError(errText(e));
+      });
     return () => { active = false; };
-  }, [companyId, canManage]);
-  const saveVexor = async () => {
-    setVexorBusy("save"); setVexorResult("");
+  }, [companyId, reload]);
+
+  const defaults = getAiProviderInfo("vps_ia");
+  const endpointTrim = endpoint.trim();
+  const endpointError = endpointTrim && !/^https?:\/\/\S+$/i.test(endpointTrim) ? "O endereço deve começar com http:// ou https://." : "";
+  const canSave =
+    busy === "" && !run.running && status !== null && !!endpointTrim && !!model.trim() && !endpointError && (status.configured || !!token.trim());
+
+  const save = async () => {
+    setBusy("save");
+    setMessage(null);
     try {
-      await api("save_vexor_token", { companyId, vexorToken });
+      const s = await api<VpsIaStatus>("vps_ia_save", { companyId, endpoint: endpointTrim, model: model.trim(), apiToken: token.trim() });
+      setStatus(s);
+      setEndpoint(s.endpoint);
+      setModel(s.model);
+      setToken("");
+      setMessage({ ok: true, text: "IA própria salva." });
+      toast.success("IA própria salva");
+      onChangeRef.current(s, "save");
+    } catch (e) {
+      setMessage({ ok: false, text: errText(e) });
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const test = async () => {
+    setMessage(null);
+    setTestResult(null);
+    const outcome = await run.run(() => api<VpsIaTestResult>("vps_ia_test", { companyId }), 150);
+    setTestResult(
+      outcomeToResult(
+        outcome,
+        (r) => ({ tone: "success", title: `Resposta em ${formatSeconds(r.elapsedMs)} s`, text: r.text }),
+        "A IA própria pode estar ocupada ou fora do ar; tente de novo em instantes.",
+      ),
+    );
+  };
+
+  const remove = async () => {
+    const confirmed = await confirmDialog({
+      title: "Remover a IA própria desta empresa?",
+      message: primaryIsVps
+        ? "Ela sai da cadeia de reserva, mas continua como IA principal com o endereço já gravado nela. Para deixar de usá-la, escolha outra IA principal e salve."
+        : "Ela sai da cadeia de reserva. Para usar de novo, salve o endereço, o modelo e o token outra vez.",
+      confirmLabel: "Remover",
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy("remove");
+    setMessage(null);
+    setTestResult(null);
+    try {
+      await api<void>("vps_ia_remove", { companyId });
+      const s: VpsIaStatus = { configured: false, endpoint: "", model: "" };
+      setStatus(s);
+      setEndpoint("");
+      setModel("");
+      setToken("");
+      setMessage({ ok: true, text: "IA própria removida desta empresa." });
+      onChangeRef.current(s, "remove");
+    } catch (e) {
+      setMessage({ ok: false, text: errText(e) });
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return (
+    <FormSection
+      title="IA própria (VPS)"
+      description="Servidor de IA da empresa, sem limite diário. Entra logo depois do Groq na cadeia de reserva. Os computadores recebem esta configuração pelo hub."
+    >
+      <div className="max-w-xl space-y-4 rounded-lg border border-border p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-xs text-tertiary">O token salvo não aparece aqui.</p>
+          {status === null ? (
+            loadError ? (
+              <Badge variant="danger">Não foi possível verificar</Badge>
+            ) : (
+              <Badge variant="neutral">Verificando…</Badge>
+            )
+          ) : status.configured ? (
+            <Badge variant="success" dot>
+              Configurada
+            </Badge>
+          ) : (
+            <Badge variant="neutral">Não configurada</Badge>
+          )}
+        </div>
+        {loadError && <ErrorBox text={`Não foi possível ler a IA própria: ${loadError}`} onRetry={() => setReload((n) => n + 1)} />}
+        <Field
+          label="Endereço"
+          htmlFor="ia-vps-endpoint"
+          error={endpointError || undefined}
+          aside={
+            !endpointTrim && defaults ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setEndpoint(defaults.defaultEndpoint);
+                  if (!model.trim()) setModel(defaults.defaultModel);
+                }}
+                className="cursor-pointer underline hover:text-primary"
+              >
+                Usar o padrão
+              </button>
+            ) : undefined
+          }
+        >
+          <input
+            id="ia-vps-endpoint"
+            type="url"
+            value={endpoint}
+            onChange={(e) => setEndpoint(e.target.value)}
+            placeholder={defaults?.defaultEndpoint}
+            spellCheck={false}
+            className="font-mono"
+          />
+        </Field>
+        <Field label="Modelo" htmlFor="ia-vps-model">
+          <input
+            id="ia-vps-model"
+            type="text"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder={defaults?.defaultModel}
+            spellCheck={false}
+            className="font-mono"
+          />
+        </Field>
+        <Field
+          label="Token"
+          htmlFor="ia-vps-token"
+          hint={status?.configured ? "Deixe em branco para manter o token salvo." : "Obrigatório na primeira vez."}
+        >
+          <SecretInput
+            id="ia-vps-token"
+            value={token}
+            onChange={setToken}
+            placeholder={status?.configured ? "Em branco = manter o token salvo" : "Cole o token"}
+          />
+        </Field>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button icon={<Save size={15} />} onClick={save} loading={busy === "save"} disabled={!canSave}>
+            Salvar IA própria
+          </Button>
+          <Button
+            variant="secondary"
+            icon={<Play size={14} />}
+            onClick={test}
+            loading={run.running}
+            disabled={busy !== "" || !status?.configured}
+          >
+            {run.running ? `Testando… ${run.elapsed} s` : "Testar IA própria"}
+          </Button>
+          {run.running && (
+            <Button variant="ghost" onClick={run.stop}>
+              Parar
+            </Button>
+          )}
+          <Button
+            variant="danger"
+            icon={<Trash2 size={14} />}
+            onClick={remove}
+            loading={busy === "remove"}
+            disabled={busy !== "" || run.running || !status?.configured}
+          >
+            Remover
+          </Button>
+        </div>
+        {status?.configured && <p className="text-xs text-tertiary">O teste usa a configuração salva e desiste sozinho depois de 150 s.</p>}
+        <InlineMessage message={message} />
+        {testResult && <TestResult result={testResult} />}
+      </div>
+    </FormSection>
+  );
+}
+
+// Gemini Web: reserva grátis pelo login da conta Google no Edge (perfil só do Esfera).
+// Nunca é a IA principal. A consulta de status abre conexão com o navegador: a cada 30 s,
+// só com a tela visível e sem outra ação em andamento.
+function GeminiWebCard({ companyId, onConnectedChange }: { companyId: number; onConnectedChange: (connected: boolean | null) => void }) {
+  const [status, setStatus] = useState<GeminiWebStatus | null>(null);
+  const [busy, setBusy] = useState<"" | "login" | "logout" | "refresh">("");
+  const [error, setError] = useState("");
+  const run = useTimedRun();
+  const [testResult, setTestResult] = useState<TestResultData | null>(null);
+  const busyRef = useRef(false);
+  const companyRef = useRef(companyId);
+  const onChangeRef = useRef(onConnectedChange);
+  useEffect(() => {
+    onChangeRef.current = onConnectedChange;
+  });
+
+  // Respostas atrasadas de outra empresa (troca rápida) são ignoradas.
+  const applyStatus = useCallback((s: GeminiWebStatus, forCompany: number) => {
+    if (companyRef.current !== forCompany) return;
+    setStatus(s);
+    onChangeRef.current(Boolean(s.connected || s.savedConnected));
+  }, []);
+
+  const readStatus = useCallback(async (forCompany: number): Promise<GeminiWebStatus> => {
+    try {
+      return await api<GeminiWebStatus>("gemini_web_status", { companyId: forCompany });
+    } catch (e) {
+      return { connected: false, browserOpen: false, detail: errText(e) };
+    }
+  }, []);
+
+  useEffect(() => {
+    companyRef.current = companyId;
+    let alive = true;
+    setStatus(null);
+    setError("");
+    setTestResult(null);
+    onChangeRef.current(null);
+    const load = async () => {
+      const s = await readStatus(companyId);
+      if (alive) applyStatus(s, companyId);
+    };
+    void load();
+    const tick = () => {
+      if (document.hidden || busyRef.current) return;
+      void load();
+    };
+    const timer = window.setInterval(tick, 30000);
+    const onVisible = () => {
+      if (!document.hidden) tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [companyId, readStatus, applyStatus]);
+
+  const withBusy = async (kind: "login" | "logout" | "refresh", action: () => Promise<void>) => {
+    busyRef.current = true;
+    setBusy(kind);
+    setError("");
+    try {
+      await action();
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      busyRef.current = false;
+      setBusy("");
+    }
+  };
+
+  const login = () =>
+    withBusy("login", async () => {
+      setTestResult(null);
+      applyStatus(await api<GeminiWebStatus>("gemini_web_login", { companyId }), companyId);
+    });
+  const refresh = () => withBusy("refresh", async () => applyStatus(await readStatus(companyId), companyId));
+  const logout = () =>
+    withBusy("logout", async () => {
+      setTestResult(null);
+      await api<void>("gemini_web_logout", { companyId });
+      applyStatus(await readStatus(companyId), companyId);
+    });
+
+  const test = async () => {
+    setError("");
+    setTestResult(null);
+    busyRef.current = true;
+    const outcome = await run.run(() => api<string>("gemini_web_test", { companyId }), 120);
+    busyRef.current = false;
+    setTestResult(
+      outcomeToResult(
+        outcome,
+        (text, ms) => ({ tone: "success", title: `Resposta em ${formatSeconds(ms)} s`, text }),
+        "Confira se o Edge abriu o Gemini com a conta conectada.",
+      ),
+    );
+    if (outcome.kind === "ok") applyStatus(await readStatus(companyId), companyId);
+  };
+
+  const connected = Boolean(status?.connected || status?.savedConnected);
+  const locked = busy !== "" || run.running;
+
+  return (
+    <FormSection
+      title="Gemini Web (reserva opcional)"
+      description="Grátis, pelo login da conta Google no Microsoft Edge, com um perfil só do Esfera. Entra na cadeia depois do Groq e da IA própria; nunca é a IA principal."
+    >
+      <div className="max-w-xl space-y-3 rounded-lg border border-border p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="min-w-0 text-[0.8125rem] text-secondary">{status ? status.detail || "Sem detalhes." : "Verificando a conexão…"}</p>
+          {status === null ? (
+            <Badge variant="neutral">Verificando…</Badge>
+          ) : connected ? (
+            <Badge variant="success" dot>
+              Conectado
+            </Badge>
+          ) : (
+            <Badge variant="warning" dot>
+              Não conectado
+            </Badge>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="secondary" icon={<Globe size={15} />} onClick={login} loading={busy === "login"} disabled={locked}>
+            {connected ? "Abrir o Gemini" : "Entrar com Google"}
+          </Button>
+          <Button variant="secondary" icon={<Play size={14} />} onClick={test} loading={run.running} disabled={busy !== ""}>
+            {run.running ? `Testando… ${run.elapsed} s` : "Testar"}
+          </Button>
+          {run.running && (
+            <Button variant="ghost" onClick={run.stop}>
+              Parar
+            </Button>
+          )}
+          <Button variant="ghost" icon={<RefreshCw size={14} />} onClick={refresh} loading={busy === "refresh"} disabled={locked}>
+            Atualizar status
+          </Button>
+          {(connected || status?.browserOpen) && (
+            <Button variant="ghost" onClick={logout} loading={busy === "logout"} disabled={locked}>
+              Desconectar conta Google
+            </Button>
+          )}
+        </div>
+        {error && (
+          <p role="alert" className="text-[0.8125rem] text-[var(--color-danger)]">
+            {error}
+          </p>
+        )}
+        {testResult && <TestResult result={testResult} />}
+      </div>
+    </FormSection>
+  );
+}
+
+// ---------- Integrações (VEXOR) ----------
+// Dois sentidos: o Esfera envia ao VEXOR as respostas dos aparelhos (token do VEXOR) e o VEXOR
+// registra descadastros no Esfera (token da integração, gerado pelo master).
+function IntegrationsSection({
+  companyId,
+  isMaster,
+  canManage,
+  onGoToConnection,
+}: {
+  companyId: number;
+  isMaster: boolean;
+  canManage: boolean;
+  onGoToConnection: () => void;
+}) {
+  // Recebimento de descadastros: só interessa saber se a porta 8080 responde (o status exige
+  // token; com no-cors qualquer resposta HTTP conta como "no ar").
+  const [online, setOnline] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const check = () =>
+      fetch(`${OPTOUT_BASE_URL}/api/optout/status`, { mode: "no-cors" })
+        .then(() => alive && setOnline(true))
+        .catch(() => alive && setOnline(false));
+    void check();
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void check();
+    }, 30000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  // Token do VEXOR (vale para este computador).
+  const [vexorConfigured, setVexorConfigured] = useState<boolean | null>(null);
+  const [vexorLoadError, setVexorLoadError] = useState("");
+  const [vexorReload, setVexorReload] = useState(0);
+  const [vexorToken, setVexorToken] = useState("");
+  const [vexorBusy, setVexorBusy] = useState<"" | "save" | "test">("");
+  const [vexorResult, setVexorResult] = useState<{ ok: boolean; text: string } | null>(null);
+  useEffect(() => {
+    if (!canManage) return;
+    let active = true;
+    setVexorConfigured(null);
+    setVexorLoadError("");
+    setVexorToken("");
+    setVexorResult(null);
+    api<boolean>("get_vexor_token_status", { companyId })
+      .then((v) => {
+        if (active) setVexorConfigured(v);
+      })
+      .catch((e) => {
+        if (active) setVexorLoadError(errText(e));
+      });
+    return () => { active = false; };
+  }, [companyId, canManage, vexorReload]);
+
+  const saveVexor = async () => {
+    setVexorBusy("save");
+    setVexorResult(null);
+    try {
+      await api("save_vexor_token", { companyId, vexorToken: vexorToken.trim() });
       setVexorToken("");
       setVexorConfigured(await api<boolean>("get_vexor_token_status", { companyId }));
-      setVexorResult("Token salvo.");
-    } catch (e) { setVexorResult(String(e)); } finally { setVexorBusy(""); }
+      setVexorResult({ ok: true, text: "Token do VEXOR salvo." });
+      toast.success("Token do VEXOR salvo");
+    } catch (e) {
+      setVexorResult({ ok: false, text: errText(e) });
+    } finally {
+      setVexorBusy("");
+    }
   };
   const testVexor = async () => {
-    setVexorBusy("test"); setVexorResult("");
-    try { setVexorResult(await api<string>("test_vexor_token", { companyId })); }
-    catch (e) { setVexorResult(String(e)); } finally { setVexorBusy(""); }
+    setVexorBusy("test");
+    setVexorResult(null);
+    try {
+      setVexorResult({ ok: true, text: await api<string>("test_vexor_token", { companyId }) });
+    } catch (e) {
+      setVexorResult({ ok: false, text: errText(e) });
+    } finally {
+      setVexorBusy("");
+    }
   };
-  const [online, setOnline] = useState<boolean | null>(null);
+
+  // Token da integração (master): aparece uma vez só; trocar de empresa o esconde.
   const [orgId, setOrgId] = useState("org-local");
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState("");
-
-  // Estado do cartão Gemini Web (Login Google sem chave de API)
-  const [vpsStatus, setVpsStatus] = useState<VpsIaStatus | null>(null);
-  const [vpsEndpoint, setVpsEndpoint] = useState("");
-  const [vpsModel, setVpsModel] = useState("");
-  const [vpsToken, setVpsToken] = useState("");
-  const [vpsBusy, setVpsBusy] = useState<"" | "save" | "test" | "remove">("");
-  const [vpsResult, setVpsResult] = useState("");
-  const [vpsError, setVpsError] = useState("");
-
+  const copiedTimer = useRef(0);
+  useEffect(() => () => window.clearTimeout(copiedTimer.current), []);
   useEffect(() => {
-    let active = true;
-    setVpsStatus(null); setVpsEndpoint(""); setVpsModel(""); setVpsToken("");
-    setVpsResult(""); setVpsError("");
-    if (canManage) {
-      api<VpsIaStatus>("vps_ia_status", { companyId }).then((status) => {
-        if (!active) return;
-        setVpsStatus(status); setVpsEndpoint(status.endpoint); setVpsModel(status.model);
-      }).catch((e) => { if (active) setVpsError(String(e)); });
-    }
-    return () => { active = false; };
-  }, [companyId, canManage]);
-
-  const saveVps = async () => {
-    setVpsBusy("save"); setVpsError(""); setVpsResult("");
-    try {
-      const status = await api<VpsIaStatus>("vps_ia_save", { companyId, endpoint: vpsEndpoint.trim(), model: vpsModel.trim(), apiToken: vpsToken });
-      setVpsStatus(status); setVpsEndpoint(status.endpoint); setVpsModel(status.model); setVpsToken("");
-      setVpsResult("Configura\u00e7\u00e3o salva.");
-    } catch (e) { setVpsError(String(e)); } finally { setVpsBusy(""); }
-  };
-  const testVps = async () => {
-    setVpsBusy("test"); setVpsError(""); setVpsResult("");
-    try {
-      const result = await api<VpsIaTestResult>("vps_ia_test", { companyId });
-      setVpsResult(`Resposta em ${(result.elapsedMs / 1000).toFixed(1)} s: ${result.text}`);
-    } catch (e) { setVpsError(String(e)); } finally { setVpsBusy(""); }
-  };
-  const removeVps = async () => {
-    setVpsBusy("remove"); setVpsError(""); setVpsResult("");
-    try {
-      await api<void>("vps_ia_remove", { companyId });
-      setVpsStatus({ configured: false, endpoint: "", model: "" });
-      setVpsEndpoint(""); setVpsModel(""); setVpsToken(""); setVpsResult("Configura\u00e7\u00e3o removida.");
-    } catch (e) { setVpsError(String(e)); } finally { setVpsBusy(""); }
-  };
-
-  const [geminiStatus, setGeminiStatus] = useState<GeminiWebStatus | null>(null);
-  const [geminiBusy, setGeminiBusy] = useState<"" | "login" | "test" | "logout">("");
-  const [geminiTestResult, setGeminiTestResult] = useState("");
-  const [geminiError, setGeminiError] = useState("");
-
-  const refreshGeminiStatus = async () => {
-    try {
-      const res = await api<GeminiWebStatus>("gemini_web_status", { companyId });
-      setGeminiStatus(res);
-    } catch (e) {
-      setGeminiStatus({ connected: false, browserOpen: false, detail: String(e) });
-    }
-  };
-
-  useEffect(() => {
-    let alive = true;
-    // no-cors: só interessa saber se a porta responde (o status exige token).
-    const check = () =>
-      fetch(`${OPTOUT_BASE_URL}/api/optout/status`, { mode: "no-cors" })
-        .then(() => alive && setOnline(true))
-        .catch(() => alive && setOnline(false));
-    check();
-    refreshGeminiStatus();
-    const timer = setInterval(() => {
-      check();
-      refreshGeminiStatus();
-    }, 6000);
-    return () => {
-      alive = false;
-      clearInterval(timer);
-    };
+    setToken("");
+    setError("");
   }, [companyId]);
-
-  const handleGeminiLogin = async () => {
-    setGeminiBusy("login");
-    setGeminiError("");
-    setGeminiTestResult("");
-    try {
-      const res = await api<GeminiWebStatus>("gemini_web_login", { companyId });
-      setGeminiStatus(res);
-    } catch (e) {
-      setGeminiError(String(e));
-    } finally {
-      setGeminiBusy("");
-    }
-  };
-
-  const handleGeminiTest = async () => {
-    setGeminiBusy("test");
-    setGeminiError("");
-    setGeminiTestResult("");
-    try {
-      const out = await api<string>("gemini_web_test", { companyId });
-      setGeminiTestResult(out);
-      await refreshGeminiStatus();
-    } catch (e) {
-      setGeminiError(String(e));
-    } finally {
-      setGeminiBusy("");
-    }
-  };
-
-  const handleGeminiLogout = async () => {
-    setGeminiBusy("logout");
-    setGeminiError("");
-    setGeminiTestResult("");
-    try {
-      await api<void>("gemini_web_logout", { companyId });
-      await refreshGeminiStatus();
-    } catch (e) {
-      setGeminiError(String(e));
-    } finally {
-      setGeminiBusy("");
-    }
-  };
 
   const envLine = token
     ? `ESFERA_OPTOUT_LINKS_JSON=${JSON.stringify({ [orgId.trim() || "org-local"]: { baseUrl: OPTOUT_BASE_URL, companyId, token } })}`
     : "";
 
   const generate = async () => {
+    const confirmed = await confirmDialog({
+      title: token ? "Gerar outro token da integração?" : "Gerar o token da integração?",
+      message:
+        "Um token novo invalida o anterior na hora: o VEXOR para de registrar descadastros neste computador até receber o novo.",
+      confirmLabel: "Gerar token",
+      danger: true,
+    });
+    if (!confirmed) return;
     setBusy(true);
     setError("");
     try {
       setToken(await api<string>("generate_company_token", { companyId }));
     } catch (e) {
-      setError(String(e));
+      setError(errText(e));
     } finally {
       setBusy(false);
     }
@@ -1455,170 +1931,107 @@ function IntegrationsSection({ companyId, isMaster, canManage }: { companyId: nu
     try {
       await navigator.clipboard.writeText(text);
       setCopied(what);
-      setTimeout(() => setCopied(""), 2000);
+      window.clearTimeout(copiedTimer.current);
+      copiedTimer.current = window.setTimeout(() => setCopied(""), 2000);
     } catch {
       setError("Não foi possível copiar. Selecione o texto e copie manualmente.");
     }
   };
 
-  const isGeminiConnected = Boolean(geminiStatus?.connected || geminiStatus?.savedConnected);
-
   return (
-    <FormSection title="Integrações" description="Conexão com Gemini Web (login Google sem chave de API) e webhook de descadastro (SAIR) do VEXOR.">
-      <div className="space-y-5 max-w-2xl">
-        {canManage && (
-          <div className="space-y-3 rounded-lg border border-border p-4">
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <p className="text-[0.8125rem] font-medium text-primary">IA pr&#243;pria (VPS)</p>
-                <p className="text-[0.75rem] text-tertiary">Configura&#231;&#227;o usada para reescrever mensagens.</p>
-              </div>
-              <span className="text-[0.75rem] text-secondary" role="status">
-                {vpsStatus === null ? (vpsError ? "N\u00e3o foi poss\u00edvel verificar" : "Verificando\u2026") : vpsStatus.configured ? "Configurada" : "N\u00e3o configurada"}
-              </span>
-            </div>
-            <Field label="Endere&#231;o" htmlFor="int-vps-endpoint">
-              <input id="int-vps-endpoint" type="url" value={vpsEndpoint} onChange={(e) => setVpsEndpoint(e.target.value)} placeholder="https://187.77.243.224:11435/v1/chat/completions" />
-            </Field>
-            <Field label="Modelo" htmlFor="int-vps-model">
-              <input id="int-vps-model" type="text" value={vpsModel} onChange={(e) => setVpsModel(e.target.value)} placeholder="Nome do modelo" />
-            </Field>
-            <Field label="Token" htmlFor="int-vps-token" hint={vpsStatus?.configured ? "Deixe em branco para manter o token salvo. O valor salvo n\u00e3o \u00e9 exibido." : "O valor salvo n\u00e3o \u00e9 exibido."}>
-              <input id="int-vps-token" type="password" autoComplete="new-password" value={vpsToken} onChange={(e) => setVpsToken(e.target.value)} placeholder="Cole o token" />
-            </Field>
-            <div className="flex flex-wrap gap-2">
-              <Button onClick={saveVps} loading={vpsBusy === "save"} disabled={vpsBusy !== "" || !vpsEndpoint.trim() || !vpsModel.trim() || (!vpsStatus?.configured && !vpsToken.trim())}>Salvar</Button>
-              <Button variant="secondary" onClick={testVps} loading={vpsBusy === "test"} disabled={vpsBusy !== "" || !vpsStatus?.configured}>Testar</Button>
-              <Button variant="secondary" onClick={removeVps} loading={vpsBusy === "remove"} disabled={vpsBusy !== "" || !vpsStatus?.configured}>Remover</Button>
-            </div>
-            {vpsError && <p className="text-[0.75rem] text-red-600 dark:text-red-400" role="alert">{vpsError}</p>}
-            {vpsResult && <p className="whitespace-pre-wrap text-[0.75rem] text-secondary" role="status">{vpsResult}</p>}
-          </div>
-        )}
-        {/* Cartão Gemini Web (Login Google) */}
-        <div className="space-y-3 rounded-lg border border-border p-4">
-          <div className="flex items-center justify-between gap-4">
+    <div className="space-y-8">
+      <FormSection title="Recebimento de descadastros (SAIR)" description="O VEXOR avisa o Esfera quando um cliente pede para sair; o número entra no descadastro na hora.">
+        <div className="max-w-2xl space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border px-4 py-3">
             <div className="min-w-0">
-              <p className="text-[0.8125rem] font-medium text-primary">Gemini Web (Conta Google — Sem Chave de API)</p>
-              <p className="text-[0.75rem] text-tertiary">
-                Reserva opcional e gratuita: usa o Microsoft Edge com um perfil só do Esfera para reescrever no site do Gemini. Entra na cadeia de reserva depois do Groq e da IA própria (VPS); nunca é a IA principal.
-              </p>
+              <p className="text-[0.8125rem] font-medium text-primary">Endereço que o VEXOR chama</p>
+              <p className="break-all font-mono text-[0.75rem] text-tertiary">POST {OPTOUT_BASE_URL}/api/optout/events</p>
             </div>
-            <span
-              className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[0.75rem] font-medium ${
-                geminiStatus === null
-                  ? "bg-secondary text-secondary"
-                  : isGeminiConnected
-                  ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                  : "bg-amber-500/10 text-amber-700 dark:text-amber-300"
-              }`}
-            >
-              {geminiStatus === null ? (
-                "Verificando…"
-              ) : isGeminiConnected ? (
-                <>
-                  <CheckCircle2 size={13} /> Conectado
-                </>
-              ) : (
-                <>
-                  <AlertCircle size={13} /> Não conectado
-                </>
-              )}
-            </span>
-          </div>
-
-          {geminiStatus?.detail && (
-            <p className="text-[0.75rem] text-secondary">{geminiStatus.detail}</p>
-          )}
-
-          <div className="flex flex-wrap items-center gap-2.5 pt-1">
-            <Button
-              icon={<Globe size={15} />}
-              onClick={handleGeminiLogin}
-              loading={geminiBusy === "login"}
-              disabled={geminiBusy !== ""}
-            >
-              Entrar com Google
-            </Button>
-            <Button
-              variant="secondary"
-              icon={<Play size={14} />}
-              onClick={handleGeminiTest}
-              loading={geminiBusy === "test"}
-              disabled={geminiBusy !== ""}
-            >
-              Testar
-            </Button>
-            <Button
-              variant="secondary"
-              icon={<RefreshCw size={14} />}
-              onClick={refreshGeminiStatus}
-              disabled={geminiBusy !== ""}
-            >
-              Atualizar status
-            </Button>
-            {(isGeminiConnected || geminiStatus?.browserOpen) && (
-              <Button
-                variant="secondary"
-                onClick={handleGeminiLogout}
-                loading={geminiBusy === "logout"}
-                disabled={geminiBusy !== ""}
-              >
-                Sair
-              </Button>
+            {online === null ? (
+              <Badge variant="neutral">Verificando…</Badge>
+            ) : online ? (
+              <Badge variant="success" dot>
+                No ar
+              </Badge>
+            ) : (
+              <Badge variant="danger" dot>
+                Fora do ar
+              </Badge>
             )}
           </div>
-
-          {geminiError && (
-            <p className="text-[0.75rem] text-red-600 dark:text-red-400">{geminiError}</p>
-          )}
-
-          {geminiTestResult && (
-            <div className="rounded border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-[0.75rem] text-primary">
-              <p className="font-medium text-emerald-600 dark:text-emerald-400 mb-1">Resposta de teste do Gemini Web:</p>
-              <p className="whitespace-pre-wrap">{geminiTestResult}</p>
+          {online === false && (
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-[0.75rem] text-[var(--color-danger)]">
+                A porta 8080 não respondeu. Salve a seção Conexão e servidores e reabra o Esfera para ligar o recebimento.
+              </p>
+              <Button variant="secondary" size="sm" onClick={onGoToConnection}>
+                Abrir Conexão e servidores
+              </Button>
             </div>
           )}
         </div>
-        <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
-          <div className="min-w-0">
-            <p className="text-[0.8125rem] font-medium text-primary">Webhook de descadastro</p>
-            <p className="font-mono text-[0.75rem] text-tertiary">POST {OPTOUT_BASE_URL}/api/optout/events</p>
-          </div>
-          <span
-            className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[0.75rem] font-medium ${
-              online === null ? "bg-secondary text-secondary" : online ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" : "bg-red-500/10 text-red-600 dark:text-red-400"
-            }`}
-          >
-            {online === null ? "Verificando…" : online ? <><CheckCircle2 size={13} /> Ativo</> : <><AlertCircle size={13} /> Fora do ar</>}
-          </span>
-        </div>
-        {online === false && (
-          <p className="text-[0.75rem] text-red-600 dark:text-red-400">
-            A porta 8080 não respondeu. Clique em “Salvar alterações” e reabra o Esfera para ligar o webhook.
-          </p>
-        )}
+      </FormSection>
 
-        {canManage && (
-          <div className="space-y-3 rounded-lg border border-border p-4">
-            <p className="text-[0.8125rem] font-medium text-primary">Token do VEXOR</p>
-            <p className="text-[0.75rem] text-secondary">{vexorConfigured === null ? "Verificando…" : vexorConfigured ? "Token configurado." : "Token não configurado."}</p>
-            <Field label="Token do VEXOR" htmlFor="int-vexor-token" hint="Use o mesmo token da integração SAIR configurada no VEXOR. O valor salvo não é exibido.">
-              <SecretInput id="int-vexor-token" value={vexorToken} onChange={setVexorToken} placeholder="Cole o token" />
+      {canManage && (
+        <FormSection
+          title="Token do VEXOR"
+          description="Usado para enviar ao VEXOR as respostas recebidas nos aparelhos. Use o mesmo token da integração SAIR configurada no VEXOR. Vale para este computador."
+        >
+          <div className="max-w-2xl space-y-3 rounded-lg border border-border p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs text-tertiary">O token salvo não aparece aqui.</p>
+              {vexorConfigured === null ? (
+                vexorLoadError ? (
+                  <Badge variant="danger">Não foi possível verificar</Badge>
+                ) : (
+                  <Badge variant="neutral">Verificando…</Badge>
+                )
+              ) : vexorConfigured ? (
+                <Badge variant="success" dot>
+                  Configurado
+                </Badge>
+              ) : (
+                <Badge variant="neutral">Não configurado</Badge>
+              )}
+            </div>
+            {vexorLoadError && <ErrorBox text={`Não foi possível ler o token do VEXOR: ${vexorLoadError}`} onRetry={() => setVexorReload((n) => n + 1)} />}
+            <Field label="Token do VEXOR" htmlFor="int-vexor-token" hint={vexorConfigured ? "Cole um token novo só para trocar o atual." : undefined}>
+              <SecretInput
+                id="int-vexor-token"
+                value={vexorToken}
+                onChange={setVexorToken}
+                placeholder={vexorConfigured ? "Em branco = manter o token salvo" : "Cole o token"}
+              />
             </Field>
             <div className="flex flex-wrap gap-2">
-              <Button onClick={saveVexor} loading={vexorBusy === "save"} disabled={vexorBusy !== "" || !vexorToken.trim()}>Salvar token</Button>
-              <Button variant="secondary" onClick={testVexor} loading={vexorBusy === "test"} disabled={vexorBusy !== "" || !vexorConfigured}>Testar</Button>
+              <Button icon={<Save size={15} />} onClick={saveVexor} loading={vexorBusy === "save"} disabled={vexorBusy !== "" || !vexorToken.trim()}>
+                Salvar token do VEXOR
+              </Button>
+              <Button
+                variant="secondary"
+                icon={<Play size={14} />}
+                onClick={testVexor}
+                loading={vexorBusy === "test"}
+                disabled={vexorBusy !== "" || !vexorConfigured}
+              >
+                Testar VEXOR
+              </Button>
             </div>
-            {vexorResult && <p className="text-[0.75rem] text-secondary" role="status">{vexorResult}</p>}
+            <InlineMessage message={vexorResult} />
           </div>
-        )}
+        </FormSection>
+      )}
+
+      <FormSection
+        title="Token da integração"
+        description="O VEXOR usa este token para registrar descadastros neste computador. Vale para a empresa selecionada."
+      >
         {!isMaster ? (
           <p className="text-[0.8125rem] text-secondary">Só o usuário Master gera o token da integração.</p>
         ) : (
-          <div className="space-y-4">
+          <div className="max-w-2xl space-y-4">
             <Field label="Organização no VEXOR" htmlFor="int-org" hint="ID da organização do VEXOR que recebe o SAIR (no ambiente local: org-local).">
-              <input id="int-org" type="text" value={orgId} onChange={(e) => setOrgId(e.target.value)} />
+              <input id="int-org" type="text" value={orgId} onChange={(e) => setOrgId(e.target.value)} spellCheck={false} />
             </Field>
             <div className="flex flex-wrap items-center gap-3">
               <Button icon={<KeyRound size={15} />} onClick={generate} loading={busy}>
@@ -1626,7 +2039,11 @@ function IntegrationsSection({ companyId, isMaster, canManage }: { companyId: nu
               </Button>
               <p className="text-[0.75rem] text-tertiary">Gerar de novo invalida o token anterior (o VEXOR precisa do novo).</p>
             </div>
-            {error && <p className="text-[0.75rem] text-red-600 dark:text-red-400">{error}</p>}
+            {error && (
+              <p role="alert" className="text-[0.75rem] text-[var(--color-danger)]">
+                {error}
+              </p>
+            )}
             {token && (
               <div className="space-y-3 rounded-lg border border-border p-4">
                 <p className="text-[0.75rem] text-amber-700 dark:text-amber-300">
@@ -1638,91 +2055,327 @@ function IntegrationsSection({ companyId, isMaster, canManage }: { companyId: nu
                     {copied === "env" ? "Copiado" : "Copiar"}
                   </Button>
                 </div>
-                <button type="button" onClick={() => copy("token", token)} className="text-[0.75rem] text-secondary underline cursor-pointer">
-                  {copied === "token" ? "Token copiado" : "Copiar só o token"}
-                </button>
+                <div className="flex flex-wrap items-center gap-4">
+                  <button type="button" onClick={() => copy("token", token)} className="text-[0.75rem] text-secondary underline cursor-pointer hover:text-primary">
+                    {copied === "token" ? "Token copiado" : "Copiar só o token"}
+                  </button>
+                  <button type="button" onClick={() => setToken("")} className="text-[0.75rem] text-secondary underline cursor-pointer hover:text-primary">
+                    Ocultar o token
+                  </button>
+                </div>
               </div>
             )}
           </div>
         )}
-      </div>
-    </FormSection>
+      </FormSection>
+    </div>
   );
 }
 
-
+// ---------- Rede e ritmo ----------
 type NetworkChipState = "normal" | "reduzido" | "pausado" | "indisponivel";
 type NetworkChip = { chipId: number; deviceId: number; deviceName: string; replyRate: number | null; sample: number; state: NetworkChipState; reason: string };
 // attempts* = o que o teto conta (tentativas, inclusive falhas; cada parte extra soma uma); sent* = só enviadas.
 type NetworkStatus = { hourly: number; daily: number; sentLastHour: number; sentToday: number; attemptsLastHour: number; attemptsToday: number; waitSeconds: number; chips: NetworkChip[] };
 const CHIP_STATE_LABEL: Record<NetworkChipState, string> = { normal: "Normal", reduzido: "Reduzido", pausado: "Pausado", indisponivel: "Indisponível" };
+const CHIP_STATE_BADGE: Record<NetworkChipState, "success" | "warning" | "danger" | "neutral"> = {
+  normal: "success",
+  reduzido: "warning",
+  pausado: "danger",
+  indisponivel: "neutral",
+};
+const DEFAULT_LIMITS = { hourly: 40, daily: 200 };
 
-// Linha curta do freio por resposta: estado, taxa com a amostra e motivo.
-function chipBrakeText(c: NetworkChip): string {
-  const rate = c.replyRate === null ? "" : `${c.replyRate.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% de resposta em ${c.sample} envios`;
-  return [CHIP_STATE_LABEL[c.state] ?? c.state, rate, c.reason].filter(Boolean).join(" · ");
+// Taxa de resposta do chip com a amostra (vazio enquanto não há taxa).
+function chipRateText(c: NetworkChip): string {
+  return c.replyRate === null ? "" : `${c.replyRate.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% de resposta em ${c.sample} envios`;
 }
 
 function NetworkSettings({ canEdit }: { canEdit: boolean }) {
-  const [hourly, setHourly] = useState("40");
-  const [daily, setDaily] = useState("200");
-  const [status, setStatus] = useState<NetworkStatus | null>(null);
-  // Retorno do Salvar e erro da consulta ficam separados: o erro some na próxima consulta que der certo.
-  const [message, setMessage] = useState("");
-  const [loadError, setLoadError] = useState("");
+  // Limites gravados. Sem eles carregados, Salvar gravaria números de exemplo por cima.
+  const [hourly, setHourly] = useState("");
+  const [daily, setDaily] = useState("");
+  const [savedLimits, setSavedLimits] = useState<{ hourly: number; daily: number } | null>(null);
+  const [limitsLoad, setLimitsLoad] = useState<LoadState>("loading");
+  const [limitsError, setLimitsError] = useState("");
+  const [limitsReload, setLimitsReload] = useState(0);
   const [saving, setSaving] = useState(false);
-  // Sem os limites reais carregados, Salvar gravaria os números de exemplo (40/200) por cima.
-  const [limitsReady, setLimitsReady] = useState(false);
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  // Situação da rede. O erro da consulta fica separado e some na próxima consulta que der certo.
+  const [status, setStatus] = useState<NetworkStatus | null>(null);
+  const [statusError, setStatusError] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
   useEffect(() => {
     let active = true;
-    const refresh = () => api<NetworkStatus>("get_network_status")
-      .then(v => { if (active) { setStatus(v); setLoadError(""); } })
-      .catch(e => { if (active) setLoadError(`Erro ao consultar a rede: ${String(e)}`); });
+    setLimitsLoad("loading");
+    setLimitsError("");
     api<{ hourly: number; daily: number }>("get_network_limits")
-      .then(v => { if (active) { setHourly(String(v.hourly)); setDaily(String(v.daily)); setLimitsReady(true); } })
-      .catch(e => { if (active) setMessage(`Erro ao carregar limites: ${String(e)}`); });
-    refresh();
-    const timer = window.setInterval(refresh, 30000);
-    return () => { active = false; window.clearInterval(timer); };
+      .then((v) => {
+        if (!active) return;
+        setHourly(String(v.hourly));
+        setDaily(String(v.daily));
+        setSavedLimits({ hourly: v.hourly, daily: v.daily });
+        setLimitsLoad("ready");
+      })
+      .catch((e) => {
+        if (!active) return;
+        setLimitsError(errText(e));
+        setLimitsLoad("error");
+      });
+    return () => { active = false; };
+  }, [limitsReload]);
+
+  const refreshStatus = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const v = await api<NetworkStatus>("get_network_status");
+      if (!mounted.current) return;
+      setStatus(v);
+      setStatusError("");
+      setUpdatedAt(new Date());
+    } catch (e) {
+      if (mounted.current) setStatusError(errText(e));
+    } finally {
+      if (mounted.current) setRefreshing(false);
+    }
   }, []);
+
+  useEffect(() => {
+    void refreshStatus();
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void refreshStatus();
+    }, 30000);
+    return () => window.clearInterval(timer);
+  }, [refreshStatus]);
+
+  const h = Number(hourly);
+  const d = Number(daily);
+  const hourlyError = hourly.trim() === "" || !Number.isSafeInteger(h) || h < 1 ? "Use um número inteiro maior que zero." : "";
+  const dailyError =
+    daily.trim() === "" || !Number.isSafeInteger(d) || d < 1
+      ? "Use um número inteiro maior que zero."
+      : !hourlyError && d < h
+      ? "Precisa ser igual ou maior que o limite por hora."
+      : "";
+  const limitsDirty = savedLimits !== null && (hourly.trim() !== String(savedLimits.hourly) || daily.trim() !== String(savedLimits.daily));
+
   const save = async () => {
-    const h = Number(hourly), d = Number(daily);
-    if (!Number.isSafeInteger(h) || !Number.isSafeInteger(d) || h < 1 || d < h) { setMessage("Informe números inteiros positivos; o limite diário deve ser maior ou igual ao horário."); return; }
+    if (limitsLoad !== "ready" || !canEdit) return;
+    const problem = hourlyError || dailyError;
+    if (problem) {
+      setMessage({ ok: false, text: `Não foi possível salvar: ${problem}` });
+      return;
+    }
     setSaving(true);
+    setMessage(null);
     try {
       await api("set_network_limits", { hourly: h, daily: d });
-      setMessage("Limites da rede salvos.");
+      setSavedLimits({ hourly: h, daily: d });
+      setHourly(String(h));
+      setDaily(String(d));
+      setMessage({ ok: true, text: "Limites da rede salvos." });
+      toast.success("Limites da rede salvos");
+      void refreshStatus();
     } catch (e) {
-      setMessage(`Erro ao salvar limites: ${String(e)}`);
+      setMessage({ ok: false, text: `Erro ao salvar limites: ${errText(e)}` });
     } finally {
       setSaving(false);
     }
-    try { setStatus(await api<NetworkStatus>("get_network_status")); setLoadError(""); }
-    catch (e) { setLoadError(`Erro ao consultar a rede: ${String(e)}`); }
   };
-  return <div className="mt-6 border-t border-border pt-6"><FormSection title="Rede e ritmo" description="Teto de tentativas compartilhado por todos os aparelhos desta instalação. Cada parte da mensagem conta como uma tentativa, mesmo quando o envio falha.">
-    <div className="space-y-4 max-w-xl">
-      <div className="grid grid-cols-2 gap-4">
-        <Field label="Tentativas por hora" hint="Padrão: 40." htmlFor="network-hour">
-          <input id="network-hour" type="number" min={1} value={hourly} disabled={!canEdit} onChange={e => setHourly(e.target.value)} className="font-mono" />
-        </Field>
-        <Field label="Tentativas por dia" hint="Padrão: 200. Igual ou maior que por hora." htmlFor="network-day">
-          <input id="network-day" type="number" min={1} value={daily} disabled={!canEdit} onChange={e => setDaily(e.target.value)} className="font-mono" />
-        </Field>
-      </div>
-      <Button onClick={save} loading={saving} disabled={!canEdit || !limitsReady}>Salvar limites</Button>
-      {message && <p role="status" className="text-sm text-secondary">{message}</p>}
-      {loadError && <p role="alert" className="text-sm text-red-500">{loadError}</p>}
-      {status && <div className="space-y-1 text-sm text-secondary">
-        <p>Tentativas na última hora: <span className="font-mono text-primary">{status.attemptsLastHour}</span> de {status.hourly}. Tentativas hoje: <span className="font-mono text-primary">{status.attemptsToday}</span> de {status.daily}.</p>
-        <p>{status.waitSeconds > 0 ? `Teto atingido: a rede volta a enviar em até ${Math.ceil(status.waitSeconds / 60)} min.` : "Rede disponível para enviar."}</p>
-      </div>}
-      {status && status.chips.length > 0 && <div className="space-y-1">
-        <p className="text-[0.8125rem] font-medium text-primary">Freio por resposta</p>
-        <ul className="space-y-1 text-sm text-secondary">
-          {status.chips.map(c => <li key={c.chipId}><span className="font-medium text-primary">{c.deviceName || `Aparelho ${c.deviceId}`}</span>: {chipBrakeText(c)}</li>)}
-        </ul>
-      </div>}
+
+  const chipsPerDevice = new Map<number, number>();
+  for (const c of status?.chips ?? []) chipsPerDevice.set(c.deviceId, (chipsPerDevice.get(c.deviceId) ?? 0) + 1);
+
+  return (
+    <div className="space-y-8">
+      <FormSection
+        title="Rede e ritmo"
+        description="Teto de tentativas somado de todos os aparelhos deste computador, de todas as empresas. Cada parte da mensagem conta como uma tentativa, mesmo quando o envio falha."
+      >
+        <div className="max-w-xl space-y-3">
+          {status === null && !statusError && (
+            <p role="status" className="flex items-center gap-2 text-[0.8125rem] text-secondary">
+              <Loader2 size={14} className="animate-spin" />
+              Consultando a rede…
+            </p>
+          )}
+          {statusError && <ErrorBox text={`Não foi possível consultar a rede: ${statusError}`} onRetry={() => void refreshStatus()} retrying={refreshing} />}
+          {status && (
+            <>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                {status.waitSeconds > 0 ? (
+                  <Badge variant="warning" dot>
+                    Teto atingido · volta a enviar em até {Math.ceil(status.waitSeconds / 60)} min
+                  </Badge>
+                ) : (
+                  <Badge variant="success" dot>
+                    Rede disponível para enviar
+                  </Badge>
+                )}
+                <span className="flex items-center gap-2">
+                  {updatedAt && (
+                    <span className="text-xs text-tertiary">
+                      Atualizado às {updatedAt.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}
+                    </span>
+                  )}
+                  <Button variant="ghost" size="sm" icon={<RefreshCw size={13} />} onClick={() => void refreshStatus()} loading={refreshing}>
+                    Atualizar
+                  </Button>
+                </span>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <UsageMeter label="Na última hora" attempts={status.attemptsLastHour} limit={status.hourly} sent={status.sentLastHour} />
+                <UsageMeter label="Hoje" attempts={status.attemptsToday} limit={status.daily} sent={status.sentToday} />
+              </div>
+            </>
+          )}
+          <p className="text-xs text-tertiary">
+            Janela de envio (horário deste computador): segunda a sexta, das 8h às 20h; sábado, das 8h às 14h; domingo, sem envios.
+            A situação de agora aparece na barra inferior.
+          </p>
+        </div>
+      </FormSection>
+
+      <FormSection title="Limites" description="Valem para este computador inteiro. Só master ou gestor altera.">
+        <div className="max-w-xl space-y-4">
+          {limitsLoad === "loading" && (
+            <p role="status" className="flex items-center gap-2 text-[0.8125rem] text-secondary">
+              <Loader2 size={14} className="animate-spin" />
+              Carregando os limites…
+            </p>
+          )}
+          {limitsLoad === "error" && <ErrorBox text={`Não foi possível carregar os limites: ${limitsError}`} onRetry={() => setLimitsReload((n) => n + 1)} />}
+          {limitsLoad === "ready" && (
+            <>
+              <div className="grid grid-cols-2 gap-4">
+                <Field label="Tentativas por hora" hint={`Padrão: ${DEFAULT_LIMITS.hourly}.`} htmlFor="network-hour" error={hourlyError || undefined}>
+                  <input
+                    id="network-hour"
+                    type="number"
+                    inputMode="numeric"
+                    min={1}
+                    step={1}
+                    value={hourly}
+                    disabled={!canEdit}
+                    onChange={(e) => setHourly(e.target.value)}
+                    className="font-mono"
+                  />
+                </Field>
+                <Field
+                  label="Tentativas por dia"
+                  hint={`Padrão: ${DEFAULT_LIMITS.daily}. Igual ou maior que por hora.`}
+                  htmlFor="network-day"
+                  error={dailyError || undefined}
+                >
+                  <input
+                    id="network-day"
+                    type="number"
+                    inputMode="numeric"
+                    min={1}
+                    step={1}
+                    value={daily}
+                    disabled={!canEdit}
+                    onChange={(e) => setDaily(e.target.value)}
+                    className="font-mono"
+                  />
+                </Field>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button icon={<Save size={15} />} onClick={save} loading={saving} disabled={!canEdit}>
+                  Salvar limites
+                </Button>
+                {limitsDirty && !saving && savedLimits && (
+                  <UnsavedNote
+                    onUndo={() => {
+                      setHourly(String(savedLimits.hourly));
+                      setDaily(String(savedLimits.daily));
+                    }}
+                  />
+                )}
+              </div>
+              <InlineMessage message={message} />
+            </>
+          )}
+        </div>
+      </FormSection>
+
+      <FormSection
+        title="Freio por resposta"
+        description="O Esfera acompanha quantos clientes respondem em cada chip. Com poucas respostas, primeiro reduz o ritmo; se continuar baixo, pausa o chip por 24 h para proteger o número."
+      >
+        <div className="max-w-xl">
+          {status === null ? (
+            statusError ? (
+              <p className="text-[0.8125rem] text-tertiary">Sem dados enquanto a consulta da rede falhar.</p>
+            ) : (
+              <p className="text-[0.8125rem] text-tertiary">Consultando os chips…</p>
+            )
+          ) : status.chips.length === 0 ? (
+            <p className="text-[0.8125rem] text-tertiary">Nenhum chip cadastrado nos aparelhos.</p>
+          ) : (
+            <ul className="divide-y divide-border rounded-lg border border-border">
+              {status.chips.map((c) => {
+                const rate = chipRateText(c);
+                return (
+                  <li key={c.chipId} className="flex items-start justify-between gap-3 px-3 py-2.5">
+                    <div className="min-w-0">
+                      <p className="truncate text-[0.8125rem] font-medium text-primary">
+                        {c.deviceName || `Aparelho ${c.deviceId}`}
+                        {(chipsPerDevice.get(c.deviceId) ?? 0) > 1 && <span className="ml-1.5 text-xs font-normal text-tertiary">chip {c.chipId}</span>}
+                      </p>
+                      {rate && <p className="text-xs text-secondary">{rate}</p>}
+                      {c.reason && <p className="text-xs text-tertiary">{c.reason}</p>}
+                    </div>
+                    <Badge variant={CHIP_STATE_BADGE[c.state] ?? "neutral"} dot>
+                      {CHIP_STATE_LABEL[c.state] ?? c.state}
+                    </Badge>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      </FormSection>
     </div>
-  </FormSection></div>;
+  );
+}
+
+// Uso do teto: número, enviadas e uma barra fina. A cor da barra diz o nível (accent; aviso a
+// partir de 80%; perigo no teto) e o texto diz o mesmo, para não depender só da cor.
+function UsageMeter({ label, attempts, limit, sent }: { label: string; attempts: number; limit: number; sent: number }) {
+  const ratio = limit > 0 ? attempts / limit : 0;
+  const level = ratio >= 1 ? "full" : ratio >= 0.8 ? "high" : "ok";
+  const fill = level === "full" ? "bg-[var(--color-danger)]" : level === "high" ? "bg-[var(--color-warning)]" : "bg-[var(--color-accent)]";
+  const track = level === "full" ? "bg-red-500/15" : level === "high" ? "bg-amber-500/15" : "bg-[var(--color-accent-glow)]";
+  return (
+    <div className="space-y-1.5 rounded-lg border border-border p-3">
+      <p className="text-xs text-tertiary">{label}</p>
+      <p className="text-[0.8125rem] text-secondary">
+        <span className="text-lg font-semibold text-primary">{attempts}</span> de {limit} tentativas
+      </p>
+      <div
+        role="meter"
+        aria-label={`${label}: ${attempts} de ${limit} tentativas`}
+        aria-valuemin={0}
+        aria-valuemax={limit}
+        aria-valuenow={Math.min(attempts, limit)}
+        className={`h-1.5 w-full overflow-hidden rounded-full ${track}`}
+      >
+        <div className={`h-full rounded-full ${fill}`} style={{ width: `${Math.min(100, Math.round(ratio * 100))}%` }} />
+      </div>
+      <p className="text-xs text-tertiary">
+        {sent} enviadas{level === "full" ? " · teto atingido" : level === "high" ? " · perto do teto" : ""}
+      </p>
+    </div>
+  );
 }
