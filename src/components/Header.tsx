@@ -5,22 +5,32 @@
 
 import { useState, useEffect, useRef } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
 import { api } from "../tauri";
-import type { Company, Device } from "../types";
+import type { Company, Device, Role } from "../types";
 import { Building2, ChevronDown, ChevronRight, Check, Sun, Moon, LogOut, Settings } from "lucide-react";
 
 const PAGE_TITLES: Record<string, { title: string; subtitle: string }> = {
   "/companies": { title: "Empresas", subtitle: "Empresas, cotas e limites" },
   "/permissions": { title: "Usuários e permissões", subtitle: "Acessos, solicitações e vínculos de aparelhos" },
   "/dashboard": { title: "Dashboard", subtitle: "Indicadores de desempenho" },
-  "/devices": { title: "Dispositivos", subtitle: "Conexões, espelhamento e status" },
+  "/devices": { title: "Aparelhos", subtitle: "Conexões, espelhamento e status" },
   "/campaigns": { title: "Campanhas", subtitle: "Disparos e fluxo de contatos" },
   "/automations": { title: "Automações", subtitle: "Respostas automáticas por palavra-chave" },
   "/logs": { title: "Logs", subtitle: "Histórico de eventos e execuções" },
   "/settings": { title: "Configurações", subtitle: "Preferências e infraestrutura" },
 };
+
+// A mesma rota tem nome diferente por função — igual ao menu lateral.
+const ROLE_PAGE_TITLES: Partial<Record<Role, Record<string, { title: string; subtitle: string }>>> = {
+  supervisor: { "/devices": { title: "Supervisão", subtitle: "Telas e uso dos aparelhos da equipe" } },
+  colaborador: { "/devices": { title: "Minha estação", subtitle: "Seus aparelhos e pedidos de acesso" } },
+};
+
+// Mesmo critério da tela de Aparelhos e do Dashboard.
+const ONLINE_STATUSES = new Set<string>(["online", "online_agent"]);
 
 const menuItem =
   "w-full flex items-center gap-2 px-2.5 h-8 rounded-md text-[0.8125rem] text-secondary hover:text-primary hover:bg-hover transition-colors cursor-pointer";
@@ -33,31 +43,32 @@ export default function Header() {
 
   const [companyDropdownOpen, setCompanyDropdownOpen] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
-  const [companies, setCompanies] = useState<Company[]>([]);
-  const [onlineDevicesCount, setOnlineDevicesCount] = useState(0);
 
   const companyDropdownRef = useRef<HTMLDivElement>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    let mounted = true;
-    api<Company[]>("get_companies")
-      .then((data) => { if (mounted) setCompanies(data || []); })
-      .catch(() => { if (mounted) setCompanies([]); });
-    return () => { mounted = false; };
-  }, []);
+  // Cache compartilhado com a StatusBar e as telas (mesmas chaves do useQueries.ts).
+  // Antes os números eram lidos uma vez só e ficavam parados até trocar de empresa.
+  const companiesQuery = useQuery({
+    queryKey: ["companies"],
+    queryFn: () => api<Company[]>("get_companies"),
+    staleTime: 60_000,
+  });
+  const devicesQuery = useQuery({
+    queryKey: ["devices", selectedCompanyId ?? 0],
+    queryFn: () => api<Device[]>("get_devices", { companyId: selectedCompanyId ?? 0 }),
+    enabled: selectedCompanyId !== null,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  });
+  const companies = companiesQuery.data || [];
+  const onlineDevicesCount = (devicesQuery.data || []).filter((d) => ONLINE_STATUSES.has(d.status)).length;
 
+  // Empresa criada agora aparece no seletor sem reiniciar o app.
+  const refetchCompanies = companiesQuery.refetch;
   useEffect(() => {
-    let mounted = true;
-    if (!selectedCompanyId) { if (mounted) setOnlineDevicesCount(0); return; }
-    api<Device[]>("get_devices", { companyId: selectedCompanyId })
-      .then((data) => {
-        const online = (data || []).filter((d) => d.status === "online").length;
-        if (mounted) setOnlineDevicesCount(online);
-      })
-      .catch(() => { if (mounted) setOnlineDevicesCount(0); });
-    return () => { mounted = false; };
-  }, [selectedCompanyId]);
+    if (companyDropdownOpen) refetchCompanies();
+  }, [companyDropdownOpen, refetchCompanies]);
 
   // Fechar menus ao clicar fora ou com Esc
   useEffect(() => {
@@ -85,10 +96,11 @@ export default function Header() {
 
   if (!user) return null;
 
-  const currentRoute = PAGE_TITLES[location.pathname] || {
-    title: "Esfera",
-    subtitle: "",
-  };
+  const currentRoute = ROLE_PAGE_TITLES[user.role]?.[location.pathname] ||
+    PAGE_TITLES[location.pathname] || {
+      title: "Esfera",
+      subtitle: "",
+    };
 
   const selectedCompany = companies.find((c) => c.id === selectedCompanyId);
   const canSwitch = user.role === "master";
@@ -165,25 +177,32 @@ export default function Header() {
             <ChevronRight size={14} className="text-tertiary shrink-0" />
           </>
         )}
-        <h1 className="font-semibold text-primary truncate" title={currentRoute.subtitle || undefined}>
+        {/* O título grande fica no cabeçalho de cada página; aqui é só o contexto. */}
+        <span className="font-semibold text-primary truncate" title={currentRoute.subtitle || undefined}>
           {currentRoute.title}
-        </h1>
+        </span>
       </div>
 
       {/* Ações */}
       <div className="flex items-center gap-2">
         {selectedCompanyId !== null && (
-          <div
-            className="hidden sm:flex items-center gap-1.5 h-7 px-2.5 rounded-md border border-border text-xs text-secondary"
-            title="Aparelhos online"
+          <button
+            type="button"
+            onClick={() => navigate("/devices")}
+            className="hidden sm:flex items-center gap-1.5 h-7 px-2.5 rounded-md border border-border text-xs text-secondary hover:text-primary hover:bg-hover transition-colors cursor-pointer"
+            title="Aparelhos online agora — clique para ver"
           >
             <span
               className={`w-1.5 h-1.5 rounded-full shrink-0 ${onlineDevicesCount > 0 ? "bg-emerald-500" : "bg-zinc-500"}`}
             />
             <span className="tabular-nums">
-              {onlineDevicesCount > 0 ? `${onlineDevicesCount} online` : "Nenhum online"}
+              {devicesQuery.isPending
+                ? "Aparelhos…"
+                : onlineDevicesCount > 0
+                  ? `${onlineDevicesCount} online`
+                  : "Nenhum online"}
             </span>
-          </div>
+          </button>
         )}
 
         <button

@@ -4,11 +4,11 @@
 // ============================================================
 
 import { useLocation, useNavigate } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "../context/AuthContext";
 import { usePermissions } from "../hooks/usePermissions";
 import { api } from "../tauri";
 import type { Company } from "../types";
-import { useState, useEffect } from "react";
 import {
   Smartphone,
   Megaphone,
@@ -52,7 +52,7 @@ const NAV_GROUPS: NavGroup[] = [
       {
         id: "devices",
         path: "/devices",
-        label: "Dispositivos",
+        label: "Aparelhos",
         icon: <Smartphone size={16} />,
         roles: ["master", "gestor"],
         requiresCompany: true,
@@ -141,29 +141,14 @@ export default function Sidebar() {
   const location = useLocation();
   const navigate = useNavigate();
 
-  const [companies, setCompanies] = useState<Company[]>([]);
-  const [loadingCompany, setLoadingCompany] = useState(true);
-
-  useEffect(() => {
-    let mounted = true;
-    setLoadingCompany(true);
-    api<Company[]>("get_companies")
-      .then((data) => {
-        if (mounted) {
-          setCompanies(data || []);
-          setLoadingCompany(false);
-        }
-      })
-      .catch(() => {
-        if (mounted) {
-          setCompanies([]);
-          setLoadingCompany(false);
-        }
-      });
-    return () => {
-      mounted = false;
-    };
-  }, []);
+  // Mesma consulta do Header e da StatusBar (cache compartilhado).
+  const companiesQuery = useQuery({
+    queryKey: ["companies"],
+    queryFn: () => api<Company[]>("get_companies"),
+    staleTime: 60_000,
+  });
+  const companies = companiesQuery.data || [];
+  const loadingCompany = companiesQuery.isPending;
 
   if (!user) return null;
 
