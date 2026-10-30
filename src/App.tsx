@@ -15,7 +15,9 @@ import CampaignsTab from "./pages/CampaignsTab";
 import AutomationsTab from "./pages/AutomationsTab";
 import LogsTab from "./pages/LogsTab";
 import SettingsTab from "./pages/SettingsTab";
-import type { ReactNode } from "react";
+import ToastContainer from "./components/ui/ToastContainer";
+import { ConfirmHost } from "./components/ui/Modal";
+import { useEffect, type ReactNode } from "react";
 
 // ---- Protected Route ----
 function ProtectedRoute({ children }: { children: ReactNode }) {
@@ -42,7 +44,15 @@ function RoleGate({ roles, children }: { roles: string[]; children: ReactNode })
 
 // ---- Company Gate (requer empresa selecionada) ----
 function CompanyGate({ children }: { children: ReactNode }) {
-  const { user, selectedCompanyId } = useAuth();
+  const { user, selectedCompanyId, enterCompany } = useAuth();
+
+  // Gestor/Supervisor/Colaborador sem empresa ativa: restaura a empresa do próprio usuário.
+  // (Antes redirecionava para "/", que mandava de volta para cá — laço infinito.)
+  const restoreCompanyId =
+    user && user.role !== "master" && selectedCompanyId === null && user.companyId ? user.companyId : null;
+  useEffect(() => {
+    if (restoreCompanyId !== null) enterCompany(restoreCompanyId);
+  }, [restoreCompanyId, enterCompany]);
 
   if (!user) return <Navigate to="/login" replace />;
 
@@ -51,12 +61,8 @@ function CompanyGate({ children }: { children: ReactNode }) {
     return <Navigate to="/companies" replace />;
   }
 
-  // Gestor ou Colaborador sem empresa → tenta restaurar do user.companyId ou redireciona ao login
   if (user.role !== "master" && selectedCompanyId === null) {
-    if (user.companyId) {
-      // Auto-restaura a empresa do usuário (não deveria chegar aqui, mas é safety net)
-      return <Navigate to="/" replace />;
-    }
+    if (restoreCompanyId !== null) return null; // restaurando no efeito acima
     return <Navigate to="/login" replace />;
   }
 
@@ -192,6 +198,9 @@ export default function App() {
   return (
     <BrowserRouter>
       <AppRoutes />
+      {/* Notificações (toast.*) e confirmações (confirmDialog) disponíveis em todas as telas */}
+      <ToastContainer />
+      <ConfirmHost />
     </BrowserRouter>
   );
 }
