@@ -598,6 +598,11 @@ export function ProviderOptions({ includeDefault }: { includeDefault?: boolean }
   return (
     <>
       {includeDefault && <option value="">Padrão da empresa</option>}
+      <optgroup label="Servidor próprio">
+        {AI_PROVIDERS.filter((p) => p.category === "own_server").map((p) => (
+          <option key={p.id} value={p.id}>{p.name}</option>
+        ))}
+      </optgroup>
       <optgroup label="Nuvem gratuita">
         {AI_PROVIDERS.filter((p) => p.category === "cloud_free").map((p) => (
           <option key={p.id} value={p.id}>{p.name}</option>
@@ -1112,6 +1117,14 @@ function AiFields({
 }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<{ success: boolean; text: string } | null>(null);
+  // Cada teste ganha um número; "Parar" troca o número e a resposta atrasada é descartada.
+  const testRun = useRef(0);
+
+  const stopTest = () => {
+    testRun.current += 1;
+    setTesting(false);
+    setResult({ success: false, text: "Reescrita interrompida." });
+  };
 
   const handleTest = async () => {
     const msg = messageForTest.trim();
@@ -1119,6 +1132,7 @@ function AiFields({
       setResult({ success: false, text: "Escreva a mensagem antes de testar a reescrita com IA." });
       return;
     }
+    const run = ++testRun.current;
     setTesting(true);
     setResult(null);
     try {
@@ -1130,11 +1144,13 @@ function AiFields({
         prompt: value.aiPrompt,
         provider: value.aiProvider,
       });
+      if (run !== testRun.current) return;
       setResult({ success: true, text: rewritten });
     } catch (error) {
+      if (run !== testRun.current) return;
       setResult({ success: false, text: String(error) });
     } finally {
-      setTesting(false);
+      if (run === testRun.current) setTesting(false);
     }
   };
 
@@ -1196,9 +1212,16 @@ function AiFields({
                 <p className="text-[0.8125rem] font-medium text-primary">Testar reescrita</p>
                 <p className="text-[0.75rem] text-tertiary">Gera uma versão da sua mensagem para o contato de exemplo "Maria".</p>
               </div>
-              <Button size="sm" variant="secondary" icon={<Sparkles size={13} />} onClick={handleTest} loading={testing}>
-                {testing ? "Gerando…" : "Testar"}
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button size="sm" variant="secondary" icon={<Sparkles size={13} />} onClick={handleTest} loading={testing}>
+                  {testing ? "Gerando…" : "Testar"}
+                </Button>
+                {testing && (
+                  <Button size="sm" variant="ghost" onClick={stopTest}>
+                    Parar
+                  </Button>
+                )}
+              </div>
             </div>
             {result &&
               (result.success ? (

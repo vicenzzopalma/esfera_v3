@@ -473,6 +473,11 @@ export default function SettingsTab() {
                         }
                       }}
                     >
+                      <optgroup label="Servidor próprio">
+                        {AI_PROVIDERS.filter((p) => p.category === "own_server").map((p) => (
+                          <option key={p.id} value={p.id}>{p.name}</option>
+                        ))}
+                      </optgroup>
                       <optgroup label="Nuvem gratuita">
                         {AI_PROVIDERS.filter((p) => p.category === "cloud_free").map((p) => (
                           <option key={p.id} value={p.id}>{p.name}</option>

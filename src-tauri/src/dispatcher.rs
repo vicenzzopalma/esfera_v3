@@ -757,6 +757,20 @@ pub fn build_ai_fallback_chain(
     config: &crate::db::AiConfig,
 ) -> Vec<crate::db::AiConfig> {
     let mut chain = vec![config.clone()];
+    // IA da VPS escolhida como principal: token/endereço vêm da configuração salva (Integrações/hub).
+    if config.provider.eq_ignore_ascii_case("vps_ia") {
+        if let Some((key, ep, model)) = db.get_ai_provider_key(company_id, "vps_ia") {
+            if chain[0].api_key.trim().is_empty() {
+                chain[0].api_key = key;
+            }
+            if chain[0].endpoint.trim().is_empty() && !ep.trim().is_empty() {
+                chain[0].endpoint = ep;
+            }
+            if chain[0].model.trim().is_empty() && !model.trim().is_empty() {
+                chain[0].model = model;
+            }
+        }
+    }
     for alt in ["groq", "cerebras", "openrouter"] {
         if alt == config.provider.to_lowercase() {
             continue;

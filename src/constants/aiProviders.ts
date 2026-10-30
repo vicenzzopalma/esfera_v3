@@ -7,7 +7,7 @@ export interface ModelSuggestion {
 export interface AiProviderInfo {
   id: string;
   name: string;
-  category: "cloud_free" | "local_free" | "paid_custom";
+  category: "own_server" | "cloud_free" | "local_free" | "paid_custom";
   defaultEndpoint: string;
   defaultModel: string;
   keyPlaceholder: string;
@@ -17,6 +17,16 @@ export interface AiProviderInfo {
 }
 
 export const AI_PROVIDERS: AiProviderInfo[] = [
+  {
+    id: "vps_ia",
+    name: "IA própria (VPS, sem limite)",
+    category: "own_server",
+    defaultEndpoint: "https://187.77.243.224:11435/v1/chat/completions",
+    defaultModel: "qwen3:4b-instruct",
+    keyPlaceholder: "Token da IA da VPS (preenchido pelo hub)",
+    keyHint: "Configurada em Integrações → IA própria (VPS); os PCs recebem pelo hub.",
+    suggestedModels: [{ id: "qwen3:4b-instruct", name: "Qwen 3 4B", tag: "Servidor próprio" }],
+  },
   {
     id: "openrouter",
     name: "OpenRouter (Modelos 100% Free)",
