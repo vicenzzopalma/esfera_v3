@@ -637,7 +637,8 @@ async fn pooled_ai_message(campaign: &crate::db::Campaign, chain: &[crate::db::A
     if need_more {
         let base = base_with_name_placeholder(campaign);
         let has_gemini_web = chain.iter().any(|c| c.provider.eq_ignore_ascii_case("gemini_web"));
-        let total_timeout_secs = if has_gemini_web { 180 } else { 45 };
+        let has_vps_ia = chain.iter().any(|c| c.provider.eq_ignore_ascii_case("vps_ia"));
+        let total_timeout_secs = if has_gemini_web || has_vps_ia { 180 } else { 45 };
         match timeout(Duration::from_secs(total_timeout_secs), AiEngine::rewrite_parts(chain, &base)).await {
             Ok(Ok(parts)) => fresh = Some(parts),
             Ok(Err(e)) => error = Some(e),
@@ -655,7 +656,7 @@ async fn pooled_ai_message(campaign: &crate::db::Campaign, chain: &[crate::db::A
 }
 
 /// Monta a cadeia de reserva de IA:
-/// Groq 120b -> Groq 20b -> gemini_web (quando conectado) -> Cerebras -> OpenRouter -> openrouter/free.
+/// Groq 120b -> Groq 20b -> IA própria da VPS -> gemini_web (quando conectado) -> Cerebras -> OpenRouter -> openrouter/free.
 pub fn build_ai_fallback_chain(
     db: &Database,
     company_id: i32,
@@ -714,6 +715,25 @@ pub fn build_ai_fallback_chain(
                 } else {
                     chain.push(gw_cfg);
                 }
+            }
+        }
+    }
+    // IA própria na VPS (Ollama atrás de token, compatível com OpenAI): logo depois do Groq,
+    // antes do Gemini Web. Sem limite diário e sem depender de navegador.
+    if !chain.iter().any(|c| c.provider.eq_ignore_ascii_case("vps_ia")) {
+        if let Some((key, ep, model)) = db.get_ai_provider_key(company_id, "vps_ia") {
+            if !key.trim().is_empty() && !ep.trim().is_empty() {
+                let mut vps_cfg = config.clone();
+                vps_cfg.provider = "vps_ia".to_string();
+                vps_cfg.api_key = key;
+                vps_cfg.endpoint = ep;
+                vps_cfg.model = if model.is_empty() { "qwen3:4b-instruct".to_string() } else { model };
+                let pos = chain
+                    .iter()
+                    .rposition(|c| c.provider.eq_ignore_ascii_case("groq"))
+                    .map(|p| p + 1)
+                    .unwrap_or(chain.len());
+                chain.insert(pos, vps_cfg);
             }
         }
     }

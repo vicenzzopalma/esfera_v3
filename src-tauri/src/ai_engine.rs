@@ -24,8 +24,10 @@ impl AiEngine {
         base_message: &str,
         contact_name: &str,
     ) -> Result<String, String> {
+        // IA própria na VPS (CPU, um pedido por vez): partes da mensagem esperam na fila.
+        let http_secs = if config.provider.eq_ignore_ascii_case("vps_ia") { 90 } else { 25 };
         let client = Client::builder()
-            .timeout(Duration::from_secs(25))
+            .timeout(Duration::from_secs(http_secs))
             .build()
             .map_err(|e| format!("Falha ao criar cliente HTTP IA: {}", e))?;
 
@@ -71,7 +73,7 @@ impl AiEngine {
             "cerebras" => Self::call_cerebras(&client, config, &prompt).await?,
             "lmstudio" | "lm_studio" => Self::call_lmstudio(&client, config, &prompt).await?,
             "ollama" | "ollama_local" => Self::call_ollama(&client, config, &prompt).await?,
-            "openai" => Self::call_openai(&client, config, &prompt).await?,
+            "openai" | "vps_ia" => Self::call_openai(&client, config, &prompt).await?,
             "anthropic" => Self::call_anthropic(&client, config, &prompt).await?,
             "custom" => Self::call_custom_endpoint(&client, config, &prompt).await?,
             _ => {
@@ -130,7 +132,13 @@ impl AiEngine {
     ) -> Result<String, String> {
         let mut errors = Vec::new();
         for cfg in chain {
-            let max_secs = if cfg.provider.eq_ignore_ascii_case("gemini_web") { 180 } else { 20 };
+            let max_secs = if cfg.provider.eq_ignore_ascii_case("gemini_web") {
+                180
+            } else if cfg.provider.eq_ignore_ascii_case("vps_ia") {
+                90
+            } else {
+                20
+            };
             let attempt = tokio::time::timeout(
                 Duration::from_secs(max_secs),
                 Self::generate_message(cfg, base_message, contact_name),
@@ -2207,6 +2215,28 @@ mod gemini_web_live_tests {
     async fn gemini_web_ao_vivo() {
         let out = AiEngine::call_gemini_web("Responda apenas com a palavra: pronto").await;
         println!("RESULTADO: {:?}", out);
+        assert!(out.is_ok());
+    }
+
+    /// Teste manual da IA própria na VPS (token em ESFERA_VPS_IA_TOKEN):
+    /// cargo test --lib vps_ia_ao_vivo -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn vps_ia_ao_vivo() {
+        let token = std::env::var("ESFERA_VPS_IA_TOKEN").expect("defina ESFERA_VPS_IA_TOKEN");
+        let cfg = crate::db::AiConfig {
+            company_id: 1,
+            provider: "vps_ia".to_string(),
+            model: "qwen3:4b-instruct".to_string(),
+            temperature: 0.8,
+            api_key: token,
+            endpoint: "http://187.77.243.224:11435/v1/chat/completions".to_string(),
+            system_prompt: String::new(),
+        };
+        let base = "Olá {nome}, tudo bem? Aqui é da Realess.\n\nTemos uma condição especial para regularizar sua pendência.\n\nPodemos conversar hoje?";
+        let t = std::time::Instant::now();
+        let out = AiEngine::rewrite_parts(&[cfg], base).await;
+        println!("RESULTADO em {:?}: {:?}", t.elapsed(), out);
         assert!(out.is_ok());
     }
 }
