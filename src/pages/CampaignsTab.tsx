@@ -4082,15 +4082,6 @@ function initialForm(c: Campaign | null): FormState {
 const autoName = () =>
   `Campanha ${new Date().toLocaleDateString("pt-BR")} ${new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}`;
 
-// Uma limpeza antiga do banco, que roda ao abrir o app, apaga campanhas com estes nomes. Até a correção no
-// backend, a tela não deixa salvar um nome assim.
-const RISKY_NAME = /julho|black\s*friday/i;
-export function nameError(name: string) {
-  return RISKY_NAME.test(name)
-    ? "Use outro nome: campanhas com “julho” ou “Black Friday” no nome são apagadas por uma limpeza automática antiga ao abrir o app."
-    : undefined;
-}
-
 function CampaignWizard({
   isOpen,
   onClose,
@@ -4155,7 +4146,6 @@ function CampaignWizard({
   const patch = (p: Partial<FormState>) => setForm((f) => ({ ...f, ...p }));
 
   const errors: Partial<Record<StepId, string>> = {
-    basics: nameError(form.name),
     message: messageError(form, partLimit),
     sending: delayError(form.delayMin, form.delayMax),
   };
@@ -4186,8 +4176,8 @@ function CampaignWizard({
 
   const save = async (mode: "draft" | "final") => {
     if (!selectedCompanyId) return;
-    // Rascunho só exige nome e intervalo válidos; criar/salvar exige mensagem também.
-    const required: StepId[] = mode === "draft" ? ["basics", "sending"] : ["basics", "message", "sending"];
+    // Rascunho só exige intervalo válido; criar/salvar exige mensagem também.
+    const required: StepId[] = mode === "draft" ? ["sending"] : ["message", "sending"];
     const firstInvalid = required.find((id) => errors[id]);
     if (firstInvalid) {
       setShowErrors((s) => ({ ...s, [firstInvalid]: true }));
@@ -4303,12 +4293,7 @@ function CampaignWizard({
 
         {step === "basics" && (
           <FormSection title="Como esta campanha vai se chamar?" description="Um nome que você reconheça na lista. Dá para mudar depois." className="max-w-xl">
-            <Field
-              label="Nome da campanha"
-              htmlFor="cmp-name"
-              error={errors.basics}
-              hint={`Se ficar em branco, usaremos "${autoName()}".`}
-            >
+            <Field label="Nome da campanha" htmlFor="cmp-name" hint={`Se ficar em branco, usaremos "${autoName()}".`}>
               <input
                 id="cmp-name"
                 type="text"
@@ -4317,7 +4302,6 @@ function CampaignWizard({
                 onChange={(e) => patch({ name: e.target.value })}
                 onKeyDown={(e) => e.key === "Enter" && next()}
                 placeholder="Carteira A – lote 3"
-                aria-invalid={Boolean(errors.basics)}
               />
             </Field>
           </FormSection>
@@ -4391,11 +4375,7 @@ function CampaignWizard({
             <div className="space-y-4">
               <dl className="divide-y divide-[var(--color-border)] overflow-hidden rounded-xl border border-border">
                 <ReviewRow label="Nome" onEdit={() => goTo("basics")}>
-                  {errors.basics ? (
-                    <span className="text-red-600 dark:text-red-400">{errors.basics}</span>
-                  ) : (
-                    form.name.trim() || <span className="text-tertiary">{autoName()} (automático)</span>
-                  )}
+                  {form.name.trim() || <span className="text-tertiary">{autoName()} (automático)</span>}
                 </ReviewRow>
                 <ReviewRow label="Mensagem" onEdit={() => goTo("message")}>
                   {errors.message ? (
