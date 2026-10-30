@@ -15,6 +15,7 @@ import { SegmentedControl } from "../components/ui/Tabs";
 import type { LogType, LogEntry } from "../types";
 import { api } from "../tauri";
 import { parseDbDate, apiErrorText } from "../hooks/useQueries";
+import { toast } from "../components/ui/ToastContainer";
 import {
   Search,
   Trash2,
@@ -224,6 +225,7 @@ export default function LogsTab() {
       seqRef.current++;
       setLogsList([]);
       setConfirmClear(false);
+      toast.success("Logs limpos.");
     } catch (err) {
       setClearError(apiErrorText(err, "Não foi possível limpar os logs."));
     } finally {

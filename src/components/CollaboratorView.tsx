@@ -18,16 +18,15 @@ import {
   Send,
   Power,
   RefreshCw,
-  CheckCircle2,
   AlertCircle,
   Monitor,
-  X,
 } from "lucide-react";
 import Button from "./ui/Button";
 import Card from "./ui/Card";
 import PageHeader from "./ui/PageHeader";
 import EmptyState from "./ui/EmptyState";
 import Field from "./ui/Field";
+import { toast } from "./ui/ToastContainer";
 import { StatusDot, BatteryMeter } from "./devices/deviceUi";
 
 const DATA_REFRESH_MS = 8000;
@@ -50,7 +49,6 @@ export default function CollaboratorView() {
   const [endingId, setEndingId] = useState<number | null>(null);
   const [launchingScrcpy, setLaunchingScrcpy] = useState<Record<string, boolean>>({});
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const seqRef = useRef(0);
 
   const companyId = selectedCompanyId ?? user?.companyId ?? null;
@@ -59,21 +57,16 @@ export default function CollaboratorView() {
     const devKey = dev.serial;
     const targetSerial = dev.currentAdbAddress || dev.serial || dev.esferaDeviceId || "";
     setLaunchingScrcpy((prev) => ({ ...prev, [devKey]: true }));
-    setMessage(null);
     try {
       await api<string>("launch_scrcpy_stream", {
         serial: targetSerial,
         turnScreenOff,
       });
-      setMessage({
-        type: "success",
-        text: `Espelhamento aberto para ${dev.name || dev.model || dev.serial}.`,
-      });
+      toast.success(`Espelhamento aberto para ${dev.name || dev.model || dev.serial}.`);
     } catch (err) {
       console.error("Erro ao abrir o espelhamento para o colaborador:", err);
-      setMessage({
-        type: "error",
-        text: `Não foi possível abrir o espelhamento. Confira se o aparelho está desbloqueado e conectado. (${apiErrorText(err, "erro desconhecido")})`,
+      toast.error("Não foi possível abrir o espelhamento.", {
+        description: `Confira se o aparelho está desbloqueado e conectado. (${apiErrorText(err, "erro desconhecido")})`,
       });
     } finally {
       setLaunchingScrcpy((prev) => ({ ...prev, [devKey]: false }));
@@ -124,18 +117,17 @@ export default function CollaboratorView() {
 
   const handleRequestAccess = async (serial: string) => {
     setSubmitting(true);
-    setMessage(null);
     try {
       await api("request_device_access", {
         deviceSerial: serial,
         reason: reasonInput.trim() || "Uso operacional do colaborador",
       });
-      setMessage({ type: "success", text: "Pedido enviado. Aguarde a aprovação do gestor ou do supervisor." });
+      toast.success("Pedido enviado. Aguarde a aprovação do gestor ou do supervisor.");
       setRequestingSerial(null);
       setReasonInput("");
       await loadData(false);
     } catch (err) {
-      setMessage({ type: "error", text: apiErrorText(err, "Não foi possível enviar o pedido.") });
+      toast.error(apiErrorText(err, "Não foi possível enviar o pedido."));
     } finally {
       setSubmitting(false);
     }
@@ -143,13 +135,12 @@ export default function CollaboratorView() {
 
   const handleEndSession = async (requestId: number) => {
     setEndingId(requestId);
-    setMessage(null);
     try {
       await api("end_device_access", { requestId });
-      setMessage({ type: "success", text: "Uso do aparelho encerrado." });
+      toast.success("Uso do aparelho encerrado.");
       await loadData(false);
     } catch (err) {
-      setMessage({ type: "error", text: apiErrorText(err, "Não foi possível encerrar o uso.") });
+      toast.error(apiErrorText(err, "Não foi possível encerrar o uso."));
     } finally {
       setEndingId(null);
     }
@@ -170,25 +161,6 @@ export default function CollaboratorView() {
           </Button>
         }
       />
-
-      {message && (
-        <div
-          role={message.type === "error" ? "alert" : "status"}
-          className={`flex items-center justify-between gap-2.5 rounded-lg border p-3 text-[0.8125rem] ${
-            message.type === "success"
-              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-              : "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400"
-          }`}
-        >
-          <span className="flex min-w-0 items-center gap-2.5">
-            {message.type === "success" ? <CheckCircle2 size={16} className="shrink-0" /> : <AlertCircle size={16} className="shrink-0" />}
-            <span className="min-w-0 break-words">{message.text}</span>
-          </span>
-          <button onClick={() => setMessage(null)} aria-label="Fechar aviso" className="shrink-0 cursor-pointer">
-            <X size={15} />
-          </button>
-        </div>
-      )}
 
       {loadError && assignedDevices.length > 0 && (
         <p role="alert" className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[0.8125rem] text-amber-700 dark:text-amber-400">

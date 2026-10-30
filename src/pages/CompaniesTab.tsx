@@ -17,6 +17,7 @@ import EmptyState from "../components/ui/EmptyState";
 import Field from "../components/ui/Field";
 import { api } from "../tauri";
 import { formatDbDate, apiErrorText } from "../hooks/useQueries";
+import { toast } from "../components/ui/ToastContainer";
 import type { Company } from "../types";
 import {
   Building2,
@@ -117,6 +118,7 @@ export default function CompaniesTab() {
     setSaving(true);
     setSaveError(null);
     let created = false;
+    const wasEditing = !!editingCompany;
     try {
       let target = editingCompany;
       if (!target) {
@@ -134,6 +136,7 @@ export default function CompaniesTab() {
         isActive: editActive,
       });
       setModalOpen(false);
+      toast.success(wasEditing ? `Empresa ${trimmedName} salva.` : `Empresa ${trimmedName} criada.`);
       await loadCompanies();
     } catch (err) {
       setSaveError(apiErrorText(err, "Não foi possível salvar a empresa."));

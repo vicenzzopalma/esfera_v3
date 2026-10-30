@@ -18,6 +18,7 @@ import type { Automation, AutomationTriggerType, AutomationActionType } from "..
 import { TRIGGER_LABELS, ACTION_LABELS } from "../types";
 import { api } from "../tauri";
 import { apiErrorText, useCampaigns } from "../hooks/useQueries";
+import { toast } from "../components/ui/ToastContainer";
 import { SECTOR_OPTIONS, sectorLabel } from "../components/devices/deviceUi";
 import {
   Bot,
@@ -125,7 +126,6 @@ export default function AutomationsTab() {
   const [automationsList, setAutomationsList] = useState<Automation[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [pageError, setPageError] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Automation | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -274,6 +274,7 @@ export default function AutomationsTab() {
       if (selectedAutomation) await api("update_automation", { automation: payload });
       else await api("create_automation", { automation: payload });
       setEditModalOpen(false);
+      toast.success(selectedAutomation ? "Automação salva." : "Automação criada.");
       await loadAutomations();
     } catch (err) {
       setSaveError(apiErrorText(err, "Não foi possível salvar a automação."));
@@ -297,14 +298,13 @@ export default function AutomationsTab() {
     if (togglingId !== null) return;
     const newActive = !automation.active;
     setTogglingId(automation.id);
-    setPageError(null);
     setAutomationsList((prev) => prev.map((a) => (a.id === automation.id ? { ...a, active: newActive } : a)));
     try {
       await api("update_automation", { automation: { ...automation, active: newActive } });
     } catch (err) {
       // Volta ao valor anterior e mostra o motivo.
       setAutomationsList((prev) => prev.map((a) => (a.id === automation.id ? { ...a, active: automation.active } : a)));
-      setPageError(apiErrorText(err, `Não foi possível ${newActive ? "ativar" : "desativar"} a automação.`));
+      toast.error(apiErrorText(err, `Não foi possível ${newActive ? "ativar" : "desativar"} a automação.`));
     } finally {
       setTogglingId(null);
     }
@@ -318,6 +318,7 @@ export default function AutomationsTab() {
       await api("soft_delete_automation", { automationId: deleteTarget.id });
       setAutomationsList((prev) => prev.filter((a) => a.id !== deleteTarget.id));
       setDeleteTarget(null);
+      toast.success("Automação excluída.");
     } catch (err) {
       setDeleteError(apiErrorText(err, "Não foi possível excluir a automação."));
     } finally {
@@ -418,17 +419,13 @@ export default function AutomationsTab() {
         />
       </div>
 
-      {(loadError || pageError) && (
+      {loadError && (
         <div role="alert" className="flex items-center justify-between gap-3 rounded-lg border border-red-500/25 bg-red-500/10 px-4 py-3">
           <span className="flex min-w-0 items-center gap-2 text-[0.8125rem] text-red-600 dark:text-red-400">
             <AlertTriangle size={15} className="shrink-0" />
-            <span className="break-words">{pageError || loadError}</span>
+            <span className="break-words">{loadError}</span>
           </span>
-          {pageError ? (
-            <Button variant="ghost" size="sm" onClick={() => setPageError(null)}>Fechar</Button>
-          ) : (
-            <Button variant="secondary" size="sm" icon={<RefreshCw size={13} />} onClick={loadAutomations}>Tentar de novo</Button>
-          )}
+          <Button variant="secondary" size="sm" icon={<RefreshCw size={13} />} onClick={loadAutomations}>Tentar de novo</Button>
         </div>
       )}
 
