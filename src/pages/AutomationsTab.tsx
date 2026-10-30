@@ -18,7 +18,6 @@ import type { Automation, AutomationTriggerType, AutomationActionType } from "..
 import { api } from "../tauri";
 import { apiErrorText, useCampaigns } from "../hooks/useQueries";
 import { SECTOR_OPTIONS, sectorLabel } from "../components/devices/deviceUi";
-import { moneyError } from "./CampaignsTab";
 import {
   Bot,
   Plus,
@@ -109,6 +108,17 @@ function daysOutsideWindow(days: number[], time: string): string[] {
       return minutes < 8 * 60 || minutes >= end;
     })
     .map((d) => DAY_CHIPS.find((c) => c.n === d)?.label ?? String(d));
+}
+
+// Regra da empresa: mensagens não podem citar valores. Mesma base do backend (AiEngine::has_money) e da tela de
+// campanhas: R$, reais, %, "R 350", "valor/saldo/parcela... 350", 350,00, 1.500, "2 mil" e "10x de 50".
+const MONEY_RE =
+  /R\$|RS\$|\bBRL\b|\breais\b|\bcentavos\b|\d+\s*%|\bpor\s*cento\b|\bR\s+\d|\b(valor|valores|saldo|parcelas?|d[ií]vida|d[ée]bito|total|quantia|montante|pre[çc]o|desconto|juros|multa|pague|pagar|pagamento|custa)\b[:\s]*(\S+\s+){0,2}?\d|\d[,.]\d{2}(?![\d./])|\b\d{1,3}(?:\.\d{3})+\b(?![.,/-]\d)|\b\d+(?:[.,]\d+)?\s*(?:mil|milh[õo]es|milh[ãa]o)\b|\b\d{1,2}\s*x\s*(?:de\s*)?\d{2,}/i;
+
+function moneyError(text: string): string | undefined {
+  return MONEY_RE.test(text)
+    ? "Não é permitido falar de valores. Remova as quantias (R$, reais, 350,00) e direcione o cliente ao canal de negociação."
+    : undefined;
 }
 
 function safeJson(text: string | undefined): Record<string, unknown> {
