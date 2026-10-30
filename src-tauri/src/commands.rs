@@ -34,10 +34,11 @@ use uuid::Uuid;
 pub struct AppState {
     pub db: Arc<Database>,
     pub sessions: Arc<Mutex<SessionManager>>,
-    pub hub_client: Arc<TokioMutex<Option<HubClient>>>,
+    pub hub_client: Arc<TokioMutex<Option<Arc<HubClient>>>>,
 }
 
 static CONNECT_LOG_MUTEX: Mutex<()> = Mutex::new(());
+static HUB_CONNECT_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub fn log_connect(msg: &str) {
     let _guard = CONNECT_LOG_MUTEX.lock().ok();
@@ -108,6 +109,55 @@ fn check_company_access(
         Some(cid) if cid == target_company_id || target_company_id <= 0 => Ok(()),
         _ => Err("Acesso Negado: fora da rede da sua empresa.".to_string()),
     }
+}
+
+fn authorize_campaign(state: &AppState, token: &str, campaign_id: i32) -> Result<(), String> {
+    let session = validate_session(&state.sessions, token)?;
+    let company = state.db.get_campaign_company_id(campaign_id).ok_or("Campanha nao encontrada.")?;
+    check_company_access(&session, company)
+}
+
+fn authorize_device_id(state: &AppState, token: &str, device_id: i32) -> Result<(), String> {
+    let session = validate_session(&state.sessions, token)?;
+    let device = state.db.get_all_devices().into_iter().find(|d| d.id == device_id).ok_or("Aparelho nao encontrado.")?;
+    check_company_access(&session, device.company_id)
+}
+
+fn authorize_device_serial(state: &AppState, token: &str, serial: &str) -> Result<(), String> {
+    let session = validate_session(&state.sessions, token)?;
+    let device = state.db.get_all_devices().into_iter().find(|d| d.serial == serial || d.esfera_device_id.as_deref() == Some(serial) || d.current_adb_address.as_deref() == Some(serial));
+    match device {
+        Some(device) => check_company_access(&session, device.company_id),
+        None if session.role == "master" || session.role == "gestor" => Ok(()),
+        None => Err("Aparelho nao encontrado.".into()),
+    }
+}
+
+fn authorize_chip(state: &AppState, token: &str, chip_id: i32) -> Result<(), String> {
+    let session = validate_session(&state.sessions, token)?;
+    for device in state.db.get_all_devices() {
+        if state.db.get_chips(device.id).iter().any(|c| c.id == chip_id) { return check_company_access(&session, device.company_id); }
+    }
+    Err("Chip nao encontrado.".into())
+}
+
+fn authorize_contact(state: &AppState, token: &str, contact_id: i32) -> Result<(), String> {
+    let session = validate_session(&state.sessions, token)?;
+    for company in state.db.get_companies() {
+        if check_company_access(&session, company.id).is_err() { continue; }
+        for campaign in state.db.get_campaigns(company.id) {
+            if state.db.get_contacts(campaign.id).iter().any(|c| c.id == contact_id) { return Ok(()); }
+        }
+    }
+    Err("Contato nao encontrado ou sem acesso.".into())
+}
+
+fn authorize_automation(state: &AppState, token: &str, id: i32) -> Result<(), String> {
+    let session = validate_session(&state.sessions, token)?;
+    for company in state.db.get_companies() {
+        if check_company_access(&session, company.id).is_ok() && state.db.get_automations(company.id).iter().any(|a| a.id == id) { return Ok(()); }
+    }
+    Err("Automacao nao encontrada ou sem acesso.".into())
 }
 
 // ============================================================
@@ -466,6 +516,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
         let hub_client_clone = hub_client.clone();
         if let Ok(creds) = get_hub_credentials(state.clone(), token.clone()) {
             tokio::spawn(async move {
+                let Ok(_gate) = HUB_CONNECT_GATE.try_lock() else { return; };
                 let is_connected = hub_client_clone.lock().await.is_some();
                 if !is_connected {
                     if let Ok(Ok(client)) = tokio::time::timeout(
@@ -475,7 +526,7 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                             creds.company_id, &creds.company_name,
                         ),
                     ).await {
-                        *hub_client_clone.lock().await = Some(client);
+                        *hub_client_clone.lock().await = Some(Arc::new(client));
                     }
                 }
             });
@@ -792,8 +843,8 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
             let rt = tokio::runtime::Handle::try_current();
             if let Ok(_h) = rt {
                 tauri::async_runtime::block_on(async {
-                    let guard = hub_client.lock().await;
-                    if let Some(client) = guard.as_ref() {
+                    let client = hub_client.lock().await.clone();
+                    if let Some(client) = client {
                         match tokio::time::timeout(
                             std::time::Duration::from_millis(400),
                             client.send_command(0, "get_live_devices", serde_json::json!({"companyId": target_company_id}))
@@ -1034,45 +1085,53 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
 }
 
 #[tauri::command]
-pub fn get_hpc_capabilities(_token: String) -> crate::adb_manager::EsferaHardwareCaps {
-    AdbManager::get_hardware_capabilities()
+pub fn get_hpc_capabilities(state: State<'_, AppState>, token: String) -> Result<crate::adb_manager::EsferaHardwareCaps, String> {
+    validate_session(&state.sessions, &token)?;
+    Ok(AdbManager::get_hardware_capabilities())
 }
 
 #[tauri::command]
-pub async fn run_adb_diagnostic(_token: String) -> Result<crate::adb_manager::EsferaAdbDiagnosticResult, String> {
+pub async fn run_adb_diagnostic(state: State<'_, AppState>, token: String) -> Result<crate::adb_manager::EsferaAdbDiagnosticResult, String> {
+    validate_session(&state.sessions, &token)?;
     tauri::async_runtime::spawn_blocking(move || {
         Ok(AdbManager::run_diagnostic())
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn restart_adb_server(_token: String) -> Result<String, String> {
+pub async fn restart_adb_server(state: State<'_, AppState>, token: String) -> Result<String, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" { return Err("Apenas gestores podem executar esta operacao.".into()); }
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::restart_server()
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn scan_adb_subnet(_token: String, subnet_prefix: String) -> Result<Vec<String>, String> {
+pub async fn scan_adb_subnet(state: State<'_, AppState>, token: String, subnet_prefix: String) -> Result<Vec<String>, String> {
+    validate_session(&state.sessions, &token)?;
     tauri::async_runtime::spawn_blocking(move || {
         Ok(AdbManager::scan_subnet(&subnet_prefix))
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn deploy_adb_keepalive(_token: String, serial: String) -> Result<String, String> {
+pub async fn deploy_adb_keepalive(state: State<'_, AppState>, token: String, serial: String) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::deploy_keepalive(&serial)
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn resolve_spintax(_token: String, text: String) -> Result<String, String> {
+pub fn resolve_spintax(state: State<'_, AppState>, token: String, text: String) -> Result<String, String> {
+    validate_session(&state.sessions, &token)?;
     Ok(crate::spintax::resolve_spintax(&text))
 }
 
 #[tauri::command]
-pub fn spintax_combinations(_token: String, text: String) -> Result<u64, String> {
+pub fn spintax_combinations(state: State<'_, AppState>, token: String, text: String) -> Result<u64, String> {
+    validate_session(&state.sessions, &token)?;
     Ok(crate::spintax::spintax_combinations(&text))
 }
 
@@ -1084,7 +1143,7 @@ pub fn install_kernel_agent(
     token: String,
     serial: String,
 ) -> Result<String, String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_device_serial(&state, &token, &serial)?;
     use std::path::PathBuf;
 
     // 1. Resolve o serial ADB ativo
@@ -1183,8 +1242,9 @@ pub fn install_kernel_agent(
 }
 
 #[tauri::command]
-pub fn get_hardware_uuid(_token: String) -> String {
-    AdbManager::get_hardware_uuid()
+pub fn get_hardware_uuid(state: State<'_, AppState>, token: String) -> Result<String, String> {
+    validate_session(&state.sessions, &token)?;
+    Ok(AdbManager::get_hardware_uuid())
 }
 
 #[tauri::command]
@@ -1500,7 +1560,7 @@ pub async fn pair_and_connect_adb_device(
 
 #[tauri::command]
 pub fn disconnect_adb_device(state: State<'_, AppState>, token: String, serial: String) -> Result<String, String> {
-    let _session = validate_session(&state.sessions, &token)?;
+    authorize_device_serial(&state, &token, &serial)?;
     let result = AdbManager::disconnect_device(&serial)?;
     let db = &state.db;
     db.queue_add_log(
@@ -1526,6 +1586,7 @@ pub fn delete_device(state: State<'_, AppState>, token: String, serial: String) 
 pub fn update_device(state: State<'_, AppState>, token: String, mut device: Device) -> Result<(), String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, device.company_id)?;
+    if device.id > 0 { authorize_device_id(&state, &token, device.id)?; }
     let db = &state.db;
 
     if let Ok(num) = device.name.trim().parse::<i32>() {
@@ -1570,8 +1631,8 @@ pub fn update_device(state: State<'_, AppState>, token: String, mut device: Devi
             let cid = device.company_id;
             tauri::async_runtime::spawn(async move {
                 // 1. Envia via Hub WebSocket se conectado
-                let guard = hub.lock().await;
-                if let Some(client) = guard.as_ref() {
+                let client = hub.lock().await.clone();
+                if let Some(client) = client {
                     let _ = client.send_command(
                         cid,
                         "rename_device",
@@ -1619,12 +1680,12 @@ pub async fn remote_update_agent(
     if apk_url.is_empty() || !(apk_url.starts_with("http://") || apk_url.starts_with("https://")) {
         return Err("URL do APK inválida (use http(s)://...).".to_string());
     }
-    let hub = state.hub_client.lock().await;
+    let hub = state.hub_client.lock().await.clone();
     if hub.is_none() {
         return Err("Hub não conectado. Verifique o Token do Hub em Configurações.".to_string());
     }
     match HubClient::send_command(
-        &hub.as_ref().unwrap(),
+        hub.as_ref().unwrap(),
         company_id,
         "send_device_command",
         serde_json::json!({
@@ -1667,7 +1728,8 @@ pub fn optimize_device(state: State<'_, AppState>, token: String, serial: String
 }
 
 #[tauri::command]
-pub fn get_device_ip(_token: String, serial: String) -> Result<String, String> {
+pub fn get_device_ip(state: State<'_, AppState>, token: String, serial: String) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     AdbManager::get_device_wifi_ip(&serial)
 }
 
@@ -1738,9 +1800,15 @@ pub fn set_campaign_status(
     campaign_id: i32,
     status: String,
 ) -> Result<(), String> {
-    let _session = validate_session(&state.sessions, &token)?;
-    let db = &state.db;
-    db.set_campaign_status(campaign_id, &status)
+    let session = validate_session(&state.sessions, &token)?;
+    let company_id = state.db.get_campaign_company_id(campaign_id).ok_or("Campanha nao encontrada.")?;
+    check_company_access(&session, company_id)?;
+    match status.as_str() {
+        "running" => start_campaign(state, token, campaign_id),
+        "paused" => pause_campaign(state, token, campaign_id),
+        "stopped" => stop_campaign(state, token, campaign_id),
+        _ => Err("Estado de campanha invalido.".into()),
+    }
 }
 
 // ============================================================
@@ -1784,7 +1852,7 @@ pub fn update_automation(
     token: String,
     automation: AutomationRule,
 ) -> Result<(), String> {
-    let _session = validate_session(&state.sessions, &token)?;
+    authorize_automation(&state, &token, automation.id)?;
     let db = &state.db;
     db.update_automation(&automation)
 }
@@ -1795,7 +1863,7 @@ pub fn soft_delete_automation(
     token: String,
     automation_id: i32,
 ) -> Result<(), String> {
-    let _session = validate_session(&state.sessions, &token)?;
+    authorize_automation(&state, &token, automation_id)?;
     let db = &state.db;
     db.soft_delete_automation(automation_id)
 }
@@ -1828,9 +1896,10 @@ pub fn add_log(
 
 #[tauri::command]
 pub fn clear_logs(state: State<'_, AppState>, token: String, company_id: i32) -> Result<(), String> {
-    let _session = validate_session(&state.sessions, &token)?;
-    let db = &state.db;
-    db.clear_logs(company_id)
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" { return Err("Apenas master ou gestor pode limpar os logs.".into()); }
+    check_company_access(&session, company_id)?;
+    state.db.clear_logs(company_id)
 }
 
 // ============================================================
@@ -1838,7 +1907,8 @@ pub fn clear_logs(state: State<'_, AppState>, token: String, company_id: i32) ->
 // ============================================================
 
 #[tauri::command]
-pub async fn capture_device_screen(state: State<'_, AppState>, _token: String, serial: String) -> Result<String, String> {
+pub async fn capture_device_screen(state: State<'_, AppState>, token: String, serial: String) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     // Device remoto (via_tunnel): roteia a captura pelo túnel VPS, que empurra até
     // o agente Kotlin executar o screencap localmente. Sem isso, o capture tentava
     // ADB local (inexistente para remoto) e falhava com "não foi possível capturar".
@@ -1856,7 +1926,8 @@ pub async fn capture_device_screen(state: State<'_, AppState>, _token: String, s
 }
 
 #[tauri::command]
-pub async fn send_adb_tap(state: State<'_, AppState>, _token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
+pub async fn send_adb_tap(state: State<'_, AppState>, token: String, serial: String, x: u32, y: u32) -> Result<(), String> {
+    authorize_device_serial(&state, &token, &serial)?;
     // Bifurcação A: device remoto (via_tunnel) roteia comando para o VPS, que
     // empurra pelo túnel até o agente Kotlin executar localmente (sem root).
     if let Some(company_id) = resolve_remote_target(&state, &serial) {
@@ -1870,7 +1941,8 @@ pub async fn send_adb_tap(state: State<'_, AppState>, _token: String, serial: St
 }
 
 #[tauri::command]
-pub async fn send_adb_keyevent(state: State<'_, AppState>, _token: String, serial: String, keycode: u32) -> Result<(), String> {
+pub async fn send_adb_keyevent(state: State<'_, AppState>, token: String, serial: String, keycode: u32) -> Result<(), String> {
+    authorize_device_serial(&state, &token, &serial)?;
     if let Some(company_id) = resolve_remote_target(&state, &serial) {
         let cmd = format!("input keyevent {}", keycode);
         send_remote_adb_command(&state, company_id, &serial, &cmd).await?;
@@ -1883,7 +1955,7 @@ pub async fn send_adb_keyevent(state: State<'_, AppState>, _token: String, seria
 
 #[tauri::command]
 pub async fn send_adb_input_text(state: State<'_, AppState>, token: String, serial: String, text: String) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_device_serial(&state, &token, &serial)?;
     if let Some(company_id) = resolve_remote_target(&state, &serial) {
         let escaped = text.replace(' ', "%s").replace('\'', "\\'");
         let cmd = format!("input text '{}'", escaped);
@@ -1906,7 +1978,7 @@ pub async fn apply_device_settings(
     animation_scale: Option<f32>,
     dpi: Option<i32>,
 ) -> Result<String, String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::apply_advanced_settings(&serial, stay_awake, dark_mode, show_touches, animation_scale, dpi)
     }).await.map_err(|e| e.to_string())?
@@ -1918,7 +1990,7 @@ pub async fn reboot_adb_device(
     token: String,
     serial: String,
 ) -> Result<String, String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::reboot_device(&serial)
     }).await.map_err(|e| e.to_string())?
@@ -1938,8 +2010,7 @@ fn resolve_remote_target(state: &AppState, serial: &str) -> Option<i32> {
 
 /// Envia um comando para execução local no agente Kotlin via túnel VPS e devolve a saída.
 pub async fn send_remote_adb_command(state: &AppState, company_id: i32, esfera_device_id: &str, command: &str) -> Result<String, String> {
-    let guard = state.hub_client.lock().await;
-    let client = guard.as_ref().ok_or_else(|| "Hub não conectado. Faça login novamente.".to_string())?;
+    let client = state.hub_client.lock().await.clone().ok_or_else(|| "Hub não conectado. Faça login novamente.".to_string())?;
     let resp = client.send_command(company_id, "send_device_command", serde_json::json!({
         "esferaDeviceId": esfera_device_id,
         "command": command,
@@ -1955,7 +2026,7 @@ pub async fn send_remote_adb_command(state: &AppState, company_id: i32, esfera_d
 
 #[tauri::command]
 pub fn get_device_chips(state: State<'_, AppState>, token: String, device_id: i32) -> Result<Vec<Chip>, String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_device_id(&state, &token, device_id)?;
     let db = &state.db;
     Ok(db.get_chips(device_id))
 }
@@ -1968,7 +2039,7 @@ pub fn add_device_chip(
     phone: String,
     name: String,
 ) -> Result<i32, String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_device_id(&state, &token, device_id)?;
     let db = &state.db;
     db.add_chip(device_id, &phone, &name)
 }
@@ -1980,7 +2051,7 @@ pub fn update_chip_status(
     chip_id: i32,
     status: String,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_chip(&state, &token, chip_id)?;
     let db = &state.db;
     db.update_chip_status(chip_id, &status)
 }
@@ -1993,7 +2064,7 @@ pub fn set_chip_restriction(
     restriction_type: String,
     days: Option<i32>,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_chip(&state, &token, chip_id)?;
     let db = &state.db;
     let restricted_until = if restriction_type == "restrito_custom" {
         let d = days.unwrap_or(1).max(1);
@@ -2008,7 +2079,7 @@ pub fn set_chip_restriction(
 
 #[tauri::command]
 pub fn confirm_chip_release(state: State<'_, AppState>, token: String, chip_id: i32) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_chip(&state, &token, chip_id)?;
     let db = &state.db;
     db.confirm_chip_release(chip_id)
 }
@@ -2020,7 +2091,8 @@ pub fn move_chip(
     chip_id: i32,
     target_device_id: i32,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_chip(&state, &token, chip_id)?;
+    authorize_device_id(&state, &token, target_device_id)?;
     let db = &state.db;
     db.move_chip(chip_id, target_device_id)
 }
@@ -2032,7 +2104,7 @@ pub fn set_chip_holder(
     chip_id: i32,
     holder: String,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_chip(&state, &token, chip_id)?;
     let db = &state.db;
     db.set_chip_holder(chip_id, &holder)
 }
@@ -2044,7 +2116,7 @@ pub fn mark_chip_reserve(
     chip_id: i32,
     is_reserve: bool,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_chip(&state, &token, chip_id)?;
     let db = &state.db;
     db.mark_chip_reserve(chip_id, is_reserve)
 }
@@ -2071,7 +2143,7 @@ pub fn get_campaign_contacts(
     token: String,
     campaign_id: i32,
 ) -> Result<Vec<Contact>, String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_campaign(&state, &token, campaign_id)?;
     let db = &state.db;
     Ok(db.get_contacts(campaign_id))
 }
@@ -2083,7 +2155,7 @@ pub fn import_campaign_contacts(
     campaign_id: i32,
     contacts: Vec<(String, String)>,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_campaign(&state, &token, campaign_id)?;
     let db = &state.db;
     db.import_contacts(campaign_id, contacts)
 }
@@ -2095,7 +2167,7 @@ pub fn get_pending_contacts(
     campaign_id: i32,
     limit: i32,
 ) -> Result<Vec<Contact>, String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_campaign(&state, &token, campaign_id)?;
     let db = &state.db;
     Ok(db.get_pending_contacts(campaign_id, limit))
 }
@@ -2107,7 +2179,7 @@ pub fn update_contact_status(
     contact_id: i32,
     status: String,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_contact(&state, &token, contact_id)?;
     let db = &state.db;
     db.update_contact_status(contact_id, &status)
 }
@@ -2119,7 +2191,7 @@ pub fn set_contact_custom_message(
     contact_id: i32,
     message: String,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_contact(&state, &token, contact_id)?;
     let db = &state.db;
     db.set_contact_custom_message(contact_id, &message)
 }
@@ -2130,7 +2202,7 @@ pub fn get_next_pending_contact(
     token: String,
     campaign_id: i32,
 ) -> Result<Option<Contact>, String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_campaign(&state, &token, campaign_id)?;
     let db = &state.db;
     Ok(db.get_next_pending_contact(campaign_id))
 }
@@ -2146,7 +2218,7 @@ pub fn was_already_sent(
     phone: String,
     campaign_id: i32,
 ) -> Result<bool, String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_campaign(&state, &token, campaign_id)?;
     let db = &state.db;
     Ok(db.was_already_sent(&phone, campaign_id))
 }
@@ -2163,7 +2235,8 @@ pub fn is_device_banned(
     package_name: String,
     campaign_id: i32,
 ) -> Result<bool, String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_campaign(&state, &token, campaign_id)?;
+    authorize_device_serial(&state, &token, &device_id)?;
     let db = &state.db;
     Ok(db.is_device_banned(&device_id, &package_name, campaign_id))
 }
@@ -2176,7 +2249,8 @@ pub fn set_device_banned(
     package_name: String,
     campaign_id: i32,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_campaign(&state, &token, campaign_id)?;
+    authorize_device_serial(&state, &token, &device_id)?;
     let db = &state.db;
     db.set_device_banned(&device_id, &package_name, campaign_id)
 }
@@ -2188,7 +2262,8 @@ pub fn get_device_prefs(
     device_id: String,
     campaign_id: i32,
 ) -> Result<Option<crate::db::DevicePrefs>, String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_campaign(&state, &token, campaign_id)?;
+    authorize_device_serial(&state, &token, &device_id)?;
     let db = &state.db;
     Ok(db.get_device_prefs(&device_id, campaign_id))
 }
@@ -2202,7 +2277,8 @@ pub fn set_device_prefs(
     preferred_package: String,
     unlock_pin: String,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_campaign(&state, &token, campaign_id)?;
+    authorize_device_serial(&state, &token, &device_id)?;
     let db = &state.db;
     db.set_device_prefs(&device_id, campaign_id, &preferred_package, &unlock_pin)
 }
@@ -2217,7 +2293,7 @@ pub fn get_device_package_statuses(
     token: String,
     device_id: i32,
 ) -> Result<Vec<DevicePackage>, String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_device_id(&state, &token, device_id)?;
     let db = &state.db;
     Ok(db.get_package_statuses(device_id))
 }
@@ -2230,7 +2306,7 @@ pub fn update_device_package_status(
     pkg_name: String,
     status: String,
 ) -> Result<(), String> {
-    validate_session(&state.sessions, &token)?;
+    authorize_device_id(&state, &token, device_id)?;
     let db = &state.db;
     db.update_package_status(device_id, &pkg_name, &status)
 }
@@ -2240,7 +2316,8 @@ pub fn update_device_package_status(
 // ============================================================
 
 #[tauri::command]
-pub async fn list_usb_devices(_token: String) -> Result<Vec<AdbDeviceInfo>, String> {
+pub async fn list_usb_devices(state: State<'_, AppState>, token: String) -> Result<Vec<AdbDeviceInfo>, String> {
+    validate_session(&state.sessions, &token)?;
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::list_devices()
     }).await.map_err(|e| e.to_string())?
@@ -2309,7 +2386,9 @@ pub async fn link_usb_to_wireless(
 }
 
 #[tauri::command]
-pub async fn force_reconnect_all_adb(_token: String, state: State<'_, AppState>) -> Result<String, String> {
+pub async fn force_reconnect_all_adb(token: String, state: State<'_, AppState>) -> Result<String, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" { return Err("Apenas gestores podem executar esta operacao.".into()); }
     let state_db = state.db.clone();
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::force_reconnect_all_adb(&state_db)
@@ -2317,7 +2396,9 @@ pub async fn force_reconnect_all_adb(_token: String, state: State<'_, AppState>)
 }
 
 #[tauri::command]
-pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -> Result<String, String> {
+pub fn inject_all_devices_immunity(token: String, state: State<'_, AppState>) -> Result<String, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" { return Err("Apenas gestores podem executar esta operacao.".into()); }
     let active_devices = AdbManager::list_devices()?;
     let online_devices: Vec<_> = active_devices.into_iter().filter(|d| d.state == "device").collect();
     let count = online_devices.len();
@@ -2389,7 +2470,8 @@ pub fn inject_all_devices_immunity(_token: String, state: State<'_, AppState>) -
 }
 
 #[tauri::command]
-pub fn inject_single_device_immunity(_token: String, serial: String) -> Result<String, String> {
+pub fn inject_single_device_immunity(state: State<'_, AppState>, token: String, serial: String) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     let s = serial.clone();
     std::thread::spawn(move || {
         let existing_id = AdbManager::get_persistent_device_id(&s);
@@ -2668,7 +2750,7 @@ pub fn get_ai_config(
     let db = &state.db;
     let mut config = db.get_ai_config(company_id);
     if let Some(ref mut config) = config {
-        if config.provider.eq_ignore_ascii_case("vps_ia") { config.api_key.clear(); }
+        config.api_key.clear();
     }
     Ok(config)
 }
@@ -2678,8 +2760,8 @@ pub fn save_ai_config(state: State<'_, AppState>, token: String, mut config: AiC
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, config.company_id)?;
     let db = &state.db;
-    if config.provider.eq_ignore_ascii_case("vps_ia") && config.api_key.trim().is_empty() {
-        config.api_key = db.get_ai_provider_key(config.company_id, "vps_ia").map(|v| v.0).unwrap_or_default();
+    if config.api_key.trim().is_empty() {
+        config.api_key = db.get_ai_provider_key(config.company_id, &config.provider).map(|v| v.0).unwrap_or_default();
     }
     db.save_ai_config(&config)
 }
@@ -2716,6 +2798,8 @@ pub fn update_user_permission(
     enabled: bool,
 ) -> Result<(), String> {
     let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" { return Err("Apenas gestores podem alterar permissoes.".into()); }
+    if session.user_id == user_id { return Err("Nao e permitido alterar as proprias permissoes.".into()); }
     // Isolamento: só master ou usuário da mesma empresa pode alterar permissões.
     if session.role != "master" {
         if let Some(target_cid) = state.db.user_company_id(user_id) {
@@ -2756,6 +2840,8 @@ pub fn update_sector_permission(
     can_configure: bool,
 ) -> Result<(), String> {
     let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" { return Err("Apenas gestores podem alterar permissoes.".into()); }
+    if session.user_id == user_id { return Err("Nao e permitido alterar as proprias permissoes.".into()); }
     if session.role != "master" {
         if let Some(target_cid) = state.db.user_company_id(user_id) {
             check_company_access(&session, target_cid)?;
@@ -3274,7 +3360,7 @@ pub fn get_ai_provider_keys(
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
     let mut keys = state.db.get_all_ai_provider_keys(company_id);
-    if let Some(value) = keys.get_mut("vps_ia") { value["apiKey"] = serde_json::Value::String(String::new()); }
+    for value in keys.values_mut() { value["apiKey"] = serde_json::Value::String(String::new()); }
     Ok(keys)
 }
 
@@ -3332,7 +3418,8 @@ pub async fn rewrite_message_ai(
 }
 
 #[tauri::command]
-pub async fn launch_scrcpy_stream(_token: String, serial: String, turn_screen_off: Option<bool>) -> Result<String, String> {
+pub async fn launch_scrcpy_stream(state: State<'_, AppState>, token: String, serial: String, turn_screen_off: Option<bool>) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         let turn_off = turn_screen_off.unwrap_or(false);
         AdbManager::launch_scrcpy(&serial, turn_off)
@@ -3341,12 +3428,13 @@ pub async fn launch_scrcpy_stream(_token: String, serial: String, turn_screen_of
 
 #[tauri::command]
 pub async fn launch_virtual_display_stream(
-    _token: String,
+    state: State<'_, AppState>, token: String,
     serial: String,
     width: Option<u32>,
     height: Option<u32>,
     dpi: Option<u32>,
 ) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         let w = width.unwrap_or(1080);
         let h = height.unwrap_or(1920);
@@ -3357,11 +3445,12 @@ pub async fn launch_virtual_display_stream(
 
 #[tauri::command]
 pub async fn send_intent_to_display(
-    _token: String,
+    state: State<'_, AppState>, token: String,
     serial: String,
     url: String,
     display_id: Option<u32>,
 ) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         let disp = display_id.unwrap_or(1);
         AdbManager::launch_intent_on_display(&serial, &url, disp)
@@ -3369,7 +3458,8 @@ pub async fn send_intent_to_display(
 }
 
 #[tauri::command]
-pub async fn launch_camera_stream(_token: String, serial: String, facing: Option<String>) -> Result<String, String> {
+pub async fn launch_camera_stream(state: State<'_, AppState>, token: String, serial: String, facing: Option<String>) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         let camera_facing = facing.unwrap_or_else(|| "back".to_string());
         AdbManager::launch_scrcpy_camera(&serial, &camera_facing)
@@ -3377,37 +3467,41 @@ pub async fn launch_camera_stream(_token: String, serial: String, facing: Option
 }
 
 #[tauri::command]
-pub async fn inject_virtual_camera(_token: String, serial: String, target_type: String) -> Result<String, String> {
+pub async fn inject_virtual_camera(state: State<'_, AppState>, token: String, serial: String, target_type: String) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::inject_virtual_camera_feed(&serial, &target_type)
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn inject_virtual_camera_region(
+pub async fn inject_virtual_camera_region(state: State<'_, AppState>, token: String,
     serial: String,
     x: i32,
     y: i32,
     width: u32,
     height: u32,
 ) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::inject_virtual_camera_region(&serial, x, y, width, height)
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn inject_base64_frame(
+pub async fn inject_base64_frame(state: State<'_, AppState>, token: String,
     serial: String,
     frame_data: String,
 ) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::inject_base64_frame(&serial, &frame_data)
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn optimize_device_hpc(_token: String, serial: String) -> Result<String, String> {
+pub async fn optimize_device_hpc(state: State<'_, AppState>, token: String, serial: String) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::optimize_device_performance(&serial)
     }).await.map_err(|e| e.to_string())?
@@ -3423,7 +3517,8 @@ pub fn get_agent_update_status(state: State<'_, AppState>, token: String, compan
 }
 
 #[tauri::command]
-pub async fn install_agent_apk(_token: String, serial: String) -> Result<String, String> {
+pub async fn install_agent_apk(state: State<'_, AppState>, token: String, serial: String) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::install_agent_apk(&serial)
     }).await.map_err(|e| e.to_string())?
@@ -3522,34 +3617,41 @@ pub async fn provision_all_devices(
 }
 
 #[tauri::command]
-pub fn get_device_by_esfera_id(state: State<'_, AppState>, _token: String, esfera_device_id: String) -> Result<Option<Device>, String> {
-    let db = &state.db;
-    Ok(db.get_device_by_esfera_id(&esfera_device_id))
+pub fn get_device_by_esfera_id(state: State<'_, AppState>, token: String, esfera_device_id: String) -> Result<Option<Device>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let device = state.db.get_device_by_esfera_id(&esfera_device_id);
+    if let Some(ref device) = device { check_company_access(&session, device.company_id)?; }
+    Ok(device)
 }
 
 #[tauri::command]
-pub async fn debloat_device(_token: String, serial: String) -> Result<String, String> {
+pub async fn debloat_device(state: State<'_, AppState>, token: String, serial: String) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::debloat_device(&serial)
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn debloat_device_profile(_token: String, serial: String, profile: String) -> Result<String, String> {
+pub async fn debloat_device_profile(state: State<'_, AppState>, token: String, serial: String, profile: String) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::debloat_device_profile(&serial, &profile)
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn apply_hardware_profile(_token: String, serial: String, profile: String) -> Result<String, String> {
+pub async fn apply_hardware_profile(state: State<'_, AppState>, token: String, serial: String, profile: String) -> Result<String, String> {
+    authorize_device_serial(&state, &token, &serial)?;
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::apply_hardware_profile(&serial, &profile)
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub async fn debloat_all_devices(_token: String) -> Result<Vec<String>, String> {
+pub async fn debloat_all_devices(state: State<'_, AppState>, token: String) -> Result<Vec<String>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" { return Err("Apenas gestores podem executar esta operacao.".into()); }
     let results = tauri::async_runtime::spawn_blocking(move || {
         AdbManager::debloat_all_devices()
     }).await.map_err(|e| e.to_string())?;
@@ -3569,15 +3671,18 @@ pub async fn debloat_all_devices(_token: String) -> Result<Vec<String>, String> 
 // ============================================================
 
 #[tauri::command]
-pub fn get_app_config(_token: Option<String>) -> AppConfig {
+pub fn get_app_config(state: State<'_, AppState>, token: Option<String>) -> Result<AppConfig, String> {
+    let _ = (state, token);
     let mut cfg = config::load_config();
+    cfg.hub_token.clear();
     cfg.vexor_token.clear(); // a consulta geral de configuração não revela o segredo
-    cfg
+    Ok(cfg)
 }
 
 #[tauri::command]
 pub fn save_app_config(
-    _token: Option<String>,
+    state: State<'_, AppState>,
+    token: Option<String>,
     config: Option<AppConfig>,
     hub_enabled: Option<bool>,
     hub_address: Option<String>,
@@ -3590,15 +3695,19 @@ pub fn save_app_config(
     tunnel_server_port: Option<u16>,
     mode: Option<String>,
 ) -> Result<(), String> {
+    let session = validate_session(&state.sessions, token.as_deref().unwrap_or(""))?;
+    if session.role != "master" && session.role != "gestor" { return Err("Apenas gestores podem alterar as configuracoes.".into()); }
     let mut final_cfg = config::load_config();
     if let Some(c) = config {
         let existing_vexor_token = final_cfg.vexor_token.clone();
+        let existing_hub_token = final_cfg.hub_token.clone();
         final_cfg = c;
         final_cfg.vexor_token = existing_vexor_token;
+        if final_cfg.hub_token.trim().is_empty() { final_cfg.hub_token = existing_hub_token; }
     } else {
         if let Some(v) = hub_enabled { final_cfg.hub_enabled = v; }
         if let Some(v) = hub_address { final_cfg.hub_address = v; }
-        if let Some(v) = hub_token { final_cfg.hub_token = v; }
+        if let Some(v) = hub_token.filter(|v| !v.trim().is_empty()) { final_cfg.hub_token = v; }
         if let Some(v) = empresa_server_enabled { final_cfg.empresa_server_enabled = v; }
         if let Some(v) = empresa_server_port { final_cfg.empresa_server_port = v; }
         if let Some(v) = checkin_server_enabled { final_cfg.checkin_server_enabled = v; }
@@ -3699,8 +3808,7 @@ pub async fn hub_invoke(
     company_id: i32,
 ) -> Result<serde_json::Value, String> {
     validate_session(&state.sessions, &token)?;
-    let guard = state.hub_client.lock().await;
-    let client = guard.as_ref().ok_or_else(|| "Hub não conectado. Faça login novamente.".to_string())?;
+    let client = state.hub_client.lock().await.clone().ok_or_else(|| "Hub não conectado. Faça login novamente.".to_string())?;
     // Empresa só pode comandar a própria company; master comanda qualquer uma.
     let session = state.sessions.lock().ok().and_then(|s| s.validate_token(&token));
     let target = match session {
@@ -3777,15 +3885,15 @@ pub async fn connect_hub(
 ) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
     let creds = get_hub_credentials(state.clone(), token.clone())?;
-    let client = HubClient::connect(
+    let _gate = HUB_CONNECT_GATE.lock().await;
+    let client = tokio::time::timeout(std::time::Duration::from_secs(5), HubClient::connect(
         &creds.hub_address,
         &creds.hub_token,
         &creds.role,
         creds.company_id,
         &creds.company_name,
-    )
-    .await?;
-    *state.hub_client.lock().await = Some(client);
+    )).await.map_err(|_| "O hub demorou para conectar.")??;
+    *state.hub_client.lock().await = Some(Arc::new(client));
     Ok(())
 }
 
@@ -3793,7 +3901,8 @@ pub async fn connect_hub(
 /// Recebe o binario em base64. O VPS faz swap + self-restart (sem SSH).
 #[tauri::command]
 pub async fn update_vps_hub(state: State<'_, AppState>, token: String, base64_bin: String) -> Result<String, String> {
-    let _session = validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" { return Err("Apenas master pode atualizar o hub.".into()); }
     use base64::Engine as _;
     let bin = base64::engine::general_purpose::STANDARD
         .decode(&base64_bin)
@@ -3858,6 +3967,9 @@ pub fn create_user(
     if session.role != "master" && session.role != "gestor" {
         return Err("Acesso Negado: apenas Gestores ou Master podem criar usuários.".to_string());
     }
+    if role.eq_ignore_ascii_case("master") && session.role != "master" {
+        return Err("Somente master pode criar outro master.".into());
+    }
     let target_company = if session.role == "master" { company_id } else { session.company_id.unwrap_or(company_id) };
     state.db.create_user_with_role(&username, &password, &display_name, &role, target_company)
 }
@@ -3877,6 +3989,12 @@ pub fn assign_device_to_user(
     if session.role != "master" && session.role != "gestor" {
         return Err("Acesso Negado: apenas Gestores podem vincular celulares.".to_string());
     }
+    if session.role != "master" {
+        let company = session.company_id.ok_or("Empresa nao informada.")?;
+        if state.db.user_company_id(user_id) != Some(company) { return Err("Usuario de outra empresa.".into()); }
+        let device = state.db.get_all_devices().into_iter().find(|d| d.serial == device_serial || d.esfera_device_id.as_deref() == Some(device_serial.as_str()) || d.current_adb_address.as_deref() == Some(device_serial.as_str())).ok_or("Aparelho nao encontrado.")?;
+        if device.company_id != company { return Err("Aparelho de outra empresa.".into()); }
+    }
     state.db.assign_device_to_user(&device_serial, user_id)
 }
 
@@ -3890,6 +4008,12 @@ pub fn unassign_device_from_user(
     let session = validate_session(&state.sessions, &token)?;
     if session.role != "master" && session.role != "gestor" {
         return Err("Acesso Negado: apenas Gestores podem desvincular celulares.".to_string());
+    }
+    if session.role != "master" {
+        let company = session.company_id.ok_or("Empresa nao informada.")?;
+        if state.db.user_company_id(user_id) != Some(company) { return Err("Usuario de outra empresa.".into()); }
+        let device = state.db.get_all_devices().into_iter().find(|d| d.serial == device_serial || d.esfera_device_id.as_deref() == Some(device_serial.as_str()) || d.current_adb_address.as_deref() == Some(device_serial.as_str())).ok_or("Aparelho nao encontrado.")?;
+        if device.company_id != company { return Err("Aparelho de outra empresa.".into()); }
     }
     state.db.unassign_device_from_user(&device_serial, user_id)
 }
@@ -3918,6 +4042,17 @@ pub fn get_all_device_assignments(
     Ok(state.db.get_all_device_assignments(target_company))
 }
 
+fn authorize_request(state: &AppState, session: &crate::session::UserSession, request_id: i32, owner_allowed: bool) -> Result<(), String> {
+    for company in state.db.get_companies() {
+        if let Some(request) = state.db.get_permission_requests(company.id).into_iter().find(|r| r.request_id == request_id) {
+            if owner_allowed && request.user_id == session.user_id { return Ok(()); }
+            if session.role == "master" || ((session.role == "gestor" || session.role == "supervisor") && session.company_id == Some(company.id)) { return Ok(()); }
+            return Err("Acesso negado ao pedido.".into());
+        }
+    }
+    Err("Pedido nao encontrado.".into())
+}
+
 #[tauri::command]
 pub fn request_device_access(
     state: State<'_, AppState>,
@@ -3926,6 +4061,11 @@ pub fn request_device_access(
     reason: String,
 ) -> Result<i32, String> {
     let session = validate_session(&state.sessions, &token)?;
+    authorize_device_serial(&state, &token, &device_serial)?;
+    if session.role == "colaborador" {
+        let company = session.company_id.ok_or("Empresa nao informada.")?;
+        if !state.db.get_assigned_devices_for_user(session.user_id, company).iter().any(|d| d.serial == device_serial || d.esfera_device_id.as_deref() == Some(device_serial.as_str()) || d.current_adb_address.as_deref() == Some(device_serial.as_str())) { return Err("Aparelho nao vinculado ao usuario.".into()); }
+    }
     state.db.request_device_permission(session.user_id, &device_serial, &reason)
 }
 
@@ -3937,7 +4077,9 @@ pub fn get_device_permission_requests(
 ) -> Result<Vec<crate::db::DevicePermissionRequest>, String> {
     let session = validate_session(&state.sessions, &token)?;
     let target_company = session.company_id.unwrap_or(company_id);
-    Ok(state.db.get_permission_requests(target_company))
+    let mut requests = state.db.get_permission_requests(target_company);
+    if session.role == "colaborador" { requests.retain(|r| r.user_id == session.user_id); }
+    Ok(requests)
 }
 
 #[tauri::command]
@@ -3950,6 +4092,7 @@ pub fn approve_device_access(
     if session.role != "master" && session.role != "gestor" && session.role != "supervisor" {
         return Err("Acesso Negado: apenas Gestores e Supervisores podem aprovar solicitações.".to_string());
     }
+    authorize_request(&state, &session, request_id, false)?;
     state.db.approve_permission_request(request_id, session.user_id)
 }
 
@@ -3963,6 +4106,7 @@ pub fn reject_device_access(
     if session.role != "master" && session.role != "gestor" && session.role != "supervisor" {
         return Err("Acesso Negado: apenas Gestores e Supervisores podem rejeitar solicitações.".to_string());
     }
+    authorize_request(&state, &session, request_id, false)?;
     state.db.reject_permission_request(request_id)
 }
 
@@ -3972,7 +4116,8 @@ pub fn end_device_access(
     token: String,
     request_id: i32,
 ) -> Result<(), String> {
-    let _session = validate_session(&state.sessions, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
+    authorize_request(&state, &session, request_id, true)?;
     state.db.end_permission_session(request_id)
 }
 

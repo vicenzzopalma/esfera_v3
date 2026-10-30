@@ -87,7 +87,7 @@ pub fn run() {
 
     let db_arc_clone = Arc::clone(&db_arc);
     let sessions = Arc::new(Mutex::new(SessionManager::new()));
-    let hub_client: Arc<TokioMutex<Option<HubClient>>> = Arc::new(TokioMutex::new(None));
+    let hub_client: Arc<TokioMutex<Option<Arc<HubClient>>>> = Arc::new(TokioMutex::new(None));
 
     let app_config = config::load_config();
 
