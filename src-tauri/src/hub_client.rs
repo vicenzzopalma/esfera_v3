@@ -160,3 +160,37 @@ impl HubClient {
         }
     }
 }
+
+/// Obtem a configuracao da IA pelo canal HTTPS autenticado do hub.
+/// Nunca aceita redirecionamentos, para nao encaminhar a credencial a terceiros.
+pub async fn fetch_vps_ia(hub_address: &str, hub_token: &str, company_id: i32) -> Result<Option<(String, String, String)>, String> {
+    if hub_token.trim().is_empty() || company_id <= 0 {
+        return Err("Credenciais ou empresa do Hub ausentes.".into());
+    }
+    let addr: std::net::SocketAddr = hub_address.parse()
+        .map_err(|_| "Endereco do Hub deve ser IP:porta.".to_string())?;
+    let host = match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{}]", ip),
+    };
+    let url = format!("https://{}:8443/api/desktop/vps-ia?companyId={}", host, company_id);
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build().map_err(|_| "Falha ao preparar conexao HTTPS com o Hub.".to_string())?;
+    let response = client.get(url).bearer_auth(hub_token).send().await
+        .map_err(|_| "Falha na conexao HTTPS com o Hub de IA.".to_string())?;
+    if !response.status().is_success() { return Err(format!("Hub de IA retornou HTTP {}.", response.status())); }
+    #[derive(serde::Deserialize)]
+    struct Config { enabled: bool, token: Option<String>, endpoint: Option<String>, model: Option<String> }
+    let cfg: Config = response.json().await.map_err(|_| "Resposta invalida do Hub de IA.".to_string())?;
+    if !cfg.enabled { return Ok(None); }
+    let (token, endpoint, model) = match (cfg.token, cfg.endpoint, cfg.model) {
+        (Some(t), Some(e), Some(m)) => (t, e, m),
+        _ => return Err("Configuracao de IA incompleta no Hub.".into()),
+    };
+    if token.trim().is_empty() || endpoint.trim().is_empty() || model.trim().is_empty() {
+        return Err("Configuracao de IA incompleta no Hub.".into());
+    }
+    Ok(Some((token, endpoint, model)))
+}

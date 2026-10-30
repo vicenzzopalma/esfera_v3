@@ -3264,6 +3264,46 @@ impl Database {
         Ok(())
     }
 
+    pub fn delete_ai_provider_key(&self, company_id: i32, provider: &str) -> Result<(), String> {
+        self.conn().execute("DELETE FROM ESF_AiProviderKey WHERE CompanyId = ?1 AND Provider = ?2", params![company_id, provider.to_lowercase()]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Aplica atualizacoes do hub somente enquanto a configuracao local coincide
+    /// com a ultima versao importada. Edicoes ou remocoes locais prevalecem.
+    pub fn sync_vps_ia_from_hub(&self, company_id: i32, incoming: Option<(&str, &str, &str)>) -> Result<bool, String> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute("CREATE TABLE IF NOT EXISTS ESF_VpsIaSync (CompanyId INTEGER PRIMARY KEY, ConfigHash TEXT NOT NULL)", []).map_err(|e| e.to_string())?;
+        let local: Option<(String, String, String)> = tx.query_row(
+            "SELECT ApiKey, Endpoint, Model FROM ESF_AiProviderKey WHERE CompanyId=?1 AND Provider='vps_ia'", params![company_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(|e| e.to_string())?;
+        let previous: Option<String> = tx.query_row("SELECT ConfigHash FROM ESF_VpsIaSync WHERE CompanyId=?1", params![company_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        let hash = |value: Option<(&str, &str, &str)>| -> String {
+            match value {
+                None => String::new(),
+                Some((key, endpoint, model)) => {
+                    let mut h = Sha256::new();
+                    for part in [key, endpoint, model] { h.update((part.len() as u64).to_be_bytes()); h.update(part.as_bytes()); }
+                    hex::encode(h.finalize())
+                }
+            }
+        };
+        let local_hash = hash(local.as_ref().map(|(k,e,m)| (k.as_str(),e.as_str(),m.as_str())));
+        if match previous { Some(ref prior) => *prior != local_hash, None => local.is_some() } {
+            return Ok(false);
+        }
+        match incoming {
+            Some((key, endpoint, model)) => { tx.execute(
+                "INSERT INTO ESF_AiProviderKey (CompanyId,Provider,ApiKey,Endpoint,Model) VALUES (?1,'vps_ia',?2,?3,?4) ON CONFLICT(CompanyId,Provider) DO UPDATE SET ApiKey=excluded.ApiKey,Endpoint=excluded.Endpoint,Model=excluded.Model,UpdatedAt=datetime('now')",
+                params![company_id,key,endpoint,model]).map_err(|e| e.to_string())?; },
+            None => { tx.execute("DELETE FROM ESF_AiProviderKey WHERE CompanyId=?1 AND Provider='vps_ia'",params![company_id]).map_err(|e| e.to_string())?; }
+        }
+        tx.execute("INSERT INTO ESF_VpsIaSync (CompanyId,ConfigHash) VALUES (?1,?2) ON CONFLICT(CompanyId) DO UPDATE SET ConfigHash=excluded.ConfigHash", params![company_id,hash(incoming)]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
     pub fn get_all_ai_provider_keys(&self, company_id: i32) -> std::collections::HashMap<String, serde_json::Value> {
         let mut map = std::collections::HashMap::new();
         let conn = self.conn();
@@ -4106,5 +4146,32 @@ mod agent_restore_tests {
         assert!(!db.agent_restore_pending(18).unwrap());
         db.set_agent_restore_pending(17,false).unwrap();
         assert!(!db.agent_restore_pending(17).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod vps_ia_sync_tests {
+    use super::Database;
+    #[test]
+    fn sincroniza_rotacao_e_remocao_preservando_edicao_local() {
+        let path = std::env::temp_dir().join(format!("esfera_vps_sync_{}.db", uuid::Uuid::new_v4()));
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let first = ("secret1", "https://one", "model1");
+        let second = ("secret2", "https://two", "model2");
+        assert!(db.sync_vps_ia_from_hub(1, Some(first)).unwrap());
+        assert_eq!(db.get_ai_provider_key(1, "vps_ia").unwrap().0, "secret1");
+        assert!(db.sync_vps_ia_from_hub(1, Some(second)).unwrap());
+        assert_eq!(db.get_ai_provider_key(1, "vps_ia").unwrap().0, "secret2");
+        assert!(db.sync_vps_ia_from_hub(1, None).unwrap());
+        assert!(db.get_ai_provider_key(1, "vps_ia").is_none());
+        assert!(db.sync_vps_ia_from_hub(1, Some(first)).unwrap());
+        db.save_ai_provider_key(1, "vps_ia", "manual", "https://local", "local").unwrap();
+        assert!(!db.sync_vps_ia_from_hub(1, Some(second)).unwrap());
+        assert!(!db.sync_vps_ia_from_hub(1, None).unwrap());
+        assert_eq!(db.get_ai_provider_key(1, "vps_ia").unwrap().0, "manual");
+        assert!(db.sync_vps_ia_from_hub(2, Some(second)).unwrap());
+        db.delete_ai_provider_key(2, "vps_ia").unwrap();
+        assert!(!db.sync_vps_ia_from_hub(2, Some(first)).unwrap());
+        assert!(db.get_ai_provider_key(2, "vps_ia").is_none());
     }
 }

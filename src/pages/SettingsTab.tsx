@@ -696,6 +696,17 @@ function ToggleRow({
 // Webhook de descadastro (SAIR): o VEXOR chama POST /api/optout/events no Esfera com o token da empresa.
 const OPTOUT_BASE_URL = "http://127.0.0.1:8080";
 
+interface VpsIaStatus {
+  configured: boolean;
+  endpoint: string;
+  model: string;
+}
+
+interface VpsIaTestResult {
+  text: string;
+  elapsedMs: number;
+}
+
 interface GeminiWebStatus {
   connected: boolean;
   browserOpen: boolean;
@@ -738,6 +749,51 @@ function IntegrationsSection({ companyId, isMaster, canManage }: { companyId: nu
   const [copied, setCopied] = useState("");
 
   // Estado do cartão Gemini Web (Login Google sem chave de API)
+  const [vpsStatus, setVpsStatus] = useState<VpsIaStatus | null>(null);
+  const [vpsEndpoint, setVpsEndpoint] = useState("");
+  const [vpsModel, setVpsModel] = useState("");
+  const [vpsToken, setVpsToken] = useState("");
+  const [vpsBusy, setVpsBusy] = useState<"" | "save" | "test" | "remove">("");
+  const [vpsResult, setVpsResult] = useState("");
+  const [vpsError, setVpsError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    setVpsStatus(null); setVpsEndpoint(""); setVpsModel(""); setVpsToken("");
+    setVpsResult(""); setVpsError("");
+    if (canManage) {
+      api<VpsIaStatus>("vps_ia_status", { companyId }).then((status) => {
+        if (!active) return;
+        setVpsStatus(status); setVpsEndpoint(status.endpoint); setVpsModel(status.model);
+      }).catch((e) => { if (active) setVpsError(String(e)); });
+    }
+    return () => { active = false; };
+  }, [companyId, canManage]);
+
+  const saveVps = async () => {
+    setVpsBusy("save"); setVpsError(""); setVpsResult("");
+    try {
+      const status = await api<VpsIaStatus>("vps_ia_save", { companyId, endpoint: vpsEndpoint.trim(), model: vpsModel.trim(), apiToken: vpsToken });
+      setVpsStatus(status); setVpsEndpoint(status.endpoint); setVpsModel(status.model); setVpsToken("");
+      setVpsResult("Configura\u00e7\u00e3o salva.");
+    } catch (e) { setVpsError(String(e)); } finally { setVpsBusy(""); }
+  };
+  const testVps = async () => {
+    setVpsBusy("test"); setVpsError(""); setVpsResult("");
+    try {
+      const result = await api<VpsIaTestResult>("vps_ia_test", { companyId });
+      setVpsResult(`Resposta em ${(result.elapsedMs / 1000).toFixed(1)} s: ${result.text}`);
+    } catch (e) { setVpsError(String(e)); } finally { setVpsBusy(""); }
+  };
+  const removeVps = async () => {
+    setVpsBusy("remove"); setVpsError(""); setVpsResult("");
+    try {
+      await api<void>("vps_ia_remove", { companyId });
+      setVpsStatus({ configured: false, endpoint: "", model: "" });
+      setVpsEndpoint(""); setVpsModel(""); setVpsToken(""); setVpsResult("Configura\u00e7\u00e3o removida.");
+    } catch (e) { setVpsError(String(e)); } finally { setVpsBusy(""); }
+  };
+
   const [geminiStatus, setGeminiStatus] = useState<GeminiWebStatus | null>(null);
   const [geminiBusy, setGeminiBusy] = useState<"" | "login" | "test" | "logout">("");
   const [geminiTestResult, setGeminiTestResult] = useState("");
@@ -845,6 +901,35 @@ function IntegrationsSection({ companyId, isMaster, canManage }: { companyId: nu
   return (
     <FormSection title="Integrações" description="Conexão com Gemini Web (login Google sem chave de API) e webhook de descadastro (SAIR) do VEXOR.">
       <div className="space-y-5 max-w-2xl">
+        {canManage && (
+          <div className="space-y-3 rounded-lg border border-border p-4">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-[0.8125rem] font-medium text-primary">IA pr&#243;pria (VPS)</p>
+                <p className="text-[0.75rem] text-tertiary">Configura&#231;&#227;o usada para reescrever mensagens.</p>
+              </div>
+              <span className="text-[0.75rem] text-secondary" role="status">
+                {vpsStatus === null ? (vpsError ? "N\u00e3o foi poss\u00edvel verificar" : "Verificando\u2026") : vpsStatus.configured ? "Configurada" : "N\u00e3o configurada"}
+              </span>
+            </div>
+            <Field label="Endere&#231;o" htmlFor="int-vps-endpoint">
+              <input id="int-vps-endpoint" type="url" value={vpsEndpoint} onChange={(e) => setVpsEndpoint(e.target.value)} placeholder="https://servidor/v1/chat/completions" />
+            </Field>
+            <Field label="Modelo" htmlFor="int-vps-model">
+              <input id="int-vps-model" type="text" value={vpsModel} onChange={(e) => setVpsModel(e.target.value)} placeholder="Nome do modelo" />
+            </Field>
+            <Field label="Token" htmlFor="int-vps-token" hint={vpsStatus?.configured ? "Deixe em branco para manter o token salvo. O valor salvo n\u00e3o \u00e9 exibido." : "O valor salvo n\u00e3o \u00e9 exibido."}>
+              <input id="int-vps-token" type="password" autoComplete="new-password" value={vpsToken} onChange={(e) => setVpsToken(e.target.value)} placeholder="Cole o token" />
+            </Field>
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={saveVps} loading={vpsBusy === "save"} disabled={vpsBusy !== "" || !vpsEndpoint.trim() || !vpsModel.trim() || (!vpsStatus?.configured && !vpsToken.trim())}>Salvar</Button>
+              <Button variant="secondary" onClick={testVps} loading={vpsBusy === "test"} disabled={vpsBusy !== "" || !vpsStatus?.configured}>Testar</Button>
+              <Button variant="secondary" onClick={removeVps} loading={vpsBusy === "remove"} disabled={vpsBusy !== "" || !vpsStatus?.configured}>Remover</Button>
+            </div>
+            {vpsError && <p className="text-[0.75rem] text-red-600 dark:text-red-400" role="alert">{vpsError}</p>}
+            {vpsResult && <p className="whitespace-pre-wrap text-[0.75rem] text-secondary" role="status">{vpsResult}</p>}
+          </div>
+        )}
         {/* Cartão Gemini Web (Login Google) */}
         <div className="space-y-3 rounded-lg border border-border p-4">
           <div className="flex items-center justify-between gap-4">
