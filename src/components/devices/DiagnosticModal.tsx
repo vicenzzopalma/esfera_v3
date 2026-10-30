@@ -7,6 +7,7 @@ import Modal from "../ui/Modal";
 import Button from "../ui/Button";
 import { api } from "../../tauri";
 import { CheckCircle2, XCircle, RefreshCw, AlertTriangle } from "lucide-react";
+import { errorText } from "./deviceUi";
 
 interface AdbDiagnosticResult {
   has_any_usb_device: boolean;
@@ -46,7 +47,7 @@ export function DiagnosticModal({ isOpen, onClose }: DiagnosticModalProps) {
       setDiagnostic(result);
     } catch (err: any) {
       console.error("Erro no diagnóstico ADB:", err);
-      setError(typeof err === "string" ? err : err?.message || "Não foi possível executar o diagnóstico.");
+      setError(errorText(err, "Não foi possível executar o diagnóstico."));
     } finally {
       setLoading(false);
     }
@@ -60,7 +61,7 @@ export function DiagnosticModal({ isOpen, onClose }: DiagnosticModalProps) {
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      title="Diagnóstico ADB"
+      title="Diagnóstico da conexão USB"
       size="md"
       footer={
         <>
@@ -76,7 +77,7 @@ export function DiagnosticModal({ isOpen, onClose }: DiagnosticModalProps) {
       {loading ? (
         <div className="flex flex-col items-center justify-center gap-2 py-10 text-[0.8125rem] text-secondary">
           <RefreshCw size={18} className="animate-spin" />
-          Verificando portas USB e o servidor ADB...
+          Verificando as portas USB e o serviço de conexão (ADB)...
         </div>
       ) : error ? (
         <div className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-[0.8125rem] text-red-600 dark:text-red-400">
@@ -89,13 +90,21 @@ export function DiagnosticModal({ isOpen, onClose }: DiagnosticModalProps) {
             <Item ok={diagnostic.has_any_usb_device} title="Portas USB" detail={diagnostic.diagnostic_msg} />
             <Item
               ok={diagnostic.is_adb_process_running}
-              title="Servidor ADB"
-              detail={diagnostic.is_adb_process_running ? "Em execução." : "Não está em execução."}
+              title="Serviço de conexão (ADB)"
+              detail={
+                diagnostic.is_adb_process_running
+                  ? "Em execução."
+                  : "Parado. Clique em Verificar novamente; se continuar parado, feche e abra o Esfera."
+              }
             />
             <Item
               ok={diagnostic.detected_usb_count > 0}
-              title="Dispositivos USB"
-              detail={`${diagnostic.detected_usb_count} detectado(s).`}
+              title="Aparelhos no USB"
+              detail={
+                diagnostic.detected_usb_count > 0
+                  ? `${diagnostic.detected_usb_count} ${diagnostic.detected_usb_count === 1 ? "aparelho detectado" : "aparelhos detectados"}.`
+                  : "Nenhum aparelho. Use um cabo de dados (não só de carga) e ative a depuração USB nas opções do desenvolvedor."
+              }
             />
           </div>
         )
