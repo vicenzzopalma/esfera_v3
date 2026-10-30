@@ -192,6 +192,10 @@ export default function DashboardTab() {
   );
   const chipsByState = (state: string) => chips.filter((c) => c.state === state);
   const brakedChips = [...chipsByState("pausado"), ...chipsByState("reduzido")];
+  // Taxa de resposta da empresa: média dos chips com leitura, ponderada pelo tamanho da amostra.
+  const ratedChips = chips.filter((c) => c.replyRate != null && c.sample > 0);
+  const replySample = ratedChips.reduce((acc, c) => acc + c.sample, 0);
+  const replyRate = replySample > 0 ? ratedChips.reduce((acc, c) => acc + (c.replyRate ?? 0) * c.sample, 0) / replySample : null;
   const sendWindow = sendWindowState(now);
   const kpis = kpisQ.data;
 
@@ -295,6 +299,15 @@ export default function DashboardTab() {
               </p>
 
               <div className="border-t border-border pt-3">
+                {replyRate !== null && (
+                  <p className="mb-2 text-[0.75rem] text-secondary">
+                    Taxa de resposta:{" "}
+                    <span className="font-semibold tabular-nums text-primary">
+                      {replyRate.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%
+                    </span>{" "}
+                    <span className="text-tertiary">em {replySample.toLocaleString("pt-BR")} envios avaliados</span>
+                  </p>
+                )}
                 <div className="mb-2 flex flex-wrap items-center gap-1.5 text-[0.75rem]">
                   <span className="mr-1 text-secondary">Chips:</span>
                   <Badge variant="success">{chipsByState("normal").length} normais</Badge>
