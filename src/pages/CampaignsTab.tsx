@@ -2441,40 +2441,40 @@ export interface LiveState {
   at: number;
 }
 
-// Ordem de importância do estado principal de uma campanha em andamento.
-const LIVE_PRIORITY: LiveKind[] = [
-  "parts_over",
+// Estado principal de uma campanha em andamento: vale o último que chegou. O motor avisa a espera só quando
+// ela muda (não repete a cada ciclo) e um envio feito encerra a espera, então o último evento é o atual.
+const LIVE_MAIN: LiveKind[] = [
+  "sending",
+  "send_error",
   "window",
+  "network_turn",
   "network_cap",
   "network_check",
+  "parts_over",
   "device_wait",
   "device_unavailable",
   "chip_rest",
-  "network_turn",
-  "send_error",
-  "sending",
 ];
 // Avisos de aparelho/chip que valem junto com o estado principal (a campanha segue pelos outros aparelhos).
 const LIVE_NOTES: LiveKind[] = ["reply_paused", "reply_reduced", "reply_unavailable", "ai_warning"];
-// Quanto tempo cada estado vale sem um evento novo (o motor repete os de espera a cada 30-60 s).
+// Validade de cada estado sem evento novo. As esperas duram até o próximo envio (teto da rede pode levar
+// uma hora); os avisos de chip voltam a cada tentativa.
 const LIVE_TTL: Partial<Record<LiveKind, number>> = {
-  window: 150_000,
-  network_cap: 100_000,
-  network_check: 100_000,
-  parts_over: 120_000,
-  device_wait: 150_000,
-  device_unavailable: 120_000,
-  chip_rest: 90_000,
-  network_turn: 60_000,
-  send_error: 15 * 60_000,
-  sending: 15 * 60_000,
+  sending: 30 * 60_000,
+  send_error: 30 * 60_000,
+  window: 6 * 3_600_000,
+  network_turn: 6 * 3_600_000,
+  network_cap: 6 * 3_600_000,
+  network_check: 6 * 3_600_000,
+  parts_over: 6 * 3_600_000,
+  device_wait: 6 * 3_600_000,
+  device_unavailable: 6 * 3_600_000,
+  chip_rest: 6 * 3_600_000,
   reply_paused: 20 * 60_000,
   reply_reduced: 20 * 60_000,
   reply_unavailable: 60 * 60_000,
   ai_warning: 20 * 60_000,
 };
-// Um envio feito encerra as esperas.
-const CLEARED_BY_SEND: LiveKind[] = ["window", "network_turn", "network_cap", "network_check", "parts_over", "device_wait", "device_unavailable", "chip_rest", "send_error", "auto_paused"];
 
 const stripCode = (s: string) => s.replace(/^(TRAVA|REDE|APARELHO|CONTA_RESTRITA|RITMO|CANCELADO):\s*/i, "").trim();
 
@@ -2589,7 +2589,7 @@ export function describeProgress(p: ProgressPayload): { level: LogLevel; text: s
       text: status,
       live: { kind: "reply_unavailable", short: "Taxa de resposta indisponível", text: `${status}: o freio por respostas não atua nele.`, tone: "info" },
     };
-  if (/descanso do chip|^ritmo:/i.test(status))
+  if (/descanso do chip|chip em descanso|^ritmo:/i.test(status))
     return {
       level: "info",
       text: stripCode(status),
@@ -2666,19 +2666,22 @@ export function clearLiveState(campaignId: number) {
 function setLiveState(campaignId: number, state: LiveState) {
   const a = activityOf(campaignId);
   const live = { ...a.live };
-  if (state.kind === "sending") for (const k of CLEARED_BY_SEND) delete live[k];
-  // Pausa automática: as esperas anteriores não valem mais.
-  if (state.kind === "auto_paused") for (const k of LIVE_PRIORITY) delete live[k];
+  // O estado principal novo substitui o anterior; pausa automática e conclusão encerram as esperas.
+  if (LIVE_MAIN.includes(state.kind) || state.kind === "auto_paused" || state.kind === "completed") for (const k of LIVE_MAIN) delete live[k];
+  // Um envio feito (ou a conclusão) encerra uma pausa automática antiga.
+  if (state.kind === "sending" || state.kind === "completed") delete live.auto_paused;
   live[state.kind] = state;
   a.live = live;
   notifyActivity();
 }
 
-function handleProgress(p: ProgressPayload) {
+export function handleProgress(p: ProgressPayload) {
   if (!p || typeof p.campaign_id !== "number" || typeof p.status !== "string") return;
   const d = describeProgress(p);
   const withDelay = p.status === "running" || p.status === "send_error";
-  appendCampaignLog(p.campaign_id, d.level, d.text, withDelay ? p.delay_used_ms || undefined : undefined);
+  // O motor pode avisar o mesmo envio duas vezes (ao gravar e depois da pausa): o console mostra uma linha só.
+  const repeatedSend = p.status === "running" && (activityStore.get(p.campaign_id)?.logs.slice(-6) ?? []).some((l) => l.level === "success" && l.text === d.text);
+  if (!repeatedSend) appendCampaignLog(p.campaign_id, d.level, d.text, withDelay ? p.delay_used_ms || undefined : undefined);
   if (d.live) setLiveState(p.campaign_id, { ...d.live, at: Date.now() });
   // Aviso no app inteiro: o operador pode estar em outra tela quando a campanha para.
   const who = p.campaign_name ? `${p.campaign_name}: ` : "";
@@ -2736,7 +2739,9 @@ export function liveSummary(c: Campaign, a: CampaignActivity | undefined, now: n
   const live = a?.live ?? {};
   const fresh = (s?: LiveState): s is LiveState => Boolean(s) && (LIVE_TTL[s!.kind] === undefined || now - s!.at < (LIVE_TTL[s!.kind] as number));
   if (c.status === "running") {
-    let main = LIVE_PRIORITY.map((k) => live[k]).find(fresh);
+    let main = LIVE_MAIN.map((k) => live[k]).find(fresh);
+    // "Fora do horário" antigo com a janela já aberta: o motor ainda não mandou o próximo evento.
+    if (main?.kind === "window" && withinSendWindow(new Date(now)) && now - main.at > 90_000) main = undefined;
     // Sem evento recente: o relógio local já diz se está fora do horário.
     if ((!main || main.kind === "sending" || main.kind === "send_error") && !withinSendWindow(new Date(now))) {
       const when = formatWhen(nextWindowOpen(new Date(now)), new Date(now));
