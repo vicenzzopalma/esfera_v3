@@ -3999,15 +3999,28 @@ pub fn configure_device_proxy_and_antiban(
 }
 
 #[tauri::command]
-pub fn trigger_manual_intent_bezier_dispatch(
+pub async fn trigger_manual_intent_bezier_dispatch(
     state: State<'_, AppState>,
     token: String,
     serial: String,
     phone: String,
     message: String,
 ) -> Result<(), String> {
-    let _session = validate_session(&state.sessions, &token)?;
-    AdbManager::send_whatsapp_intent_and_bezier_tap(&serial, &phone, &message)
+    let session = validate_session(&state.sessions, &token)?;
+    let device = state.db.get_all_devices().into_iter().find(|d| d.serial == serial || d.esfera_device_id.as_deref() == Some(serial.as_str()) || d.current_adb_address.as_deref() == Some(serial.as_str())).ok_or("Aparelho nao encontrado.")?;
+    check_company_access(&session, device.company_id)?;
+    if session.role == "colaborador" && !state.db.get_assigned_devices_for_user(session.user_id, device.company_id).iter().any(|d| d.id == device.id) {
+        return Err("Aparelho nao autorizado para este usuario.".into());
+    }
+    Database::validate_opt_out_phone(&phone)?;
+    if crate::ai_engine::AiEngine::has_money(&message) { return Err("Remova valores da mensagem antes de enviar.".into()); }
+    if !crate::dispatcher::within_send_window() { return Err("Fora do horario permitido para envio.".into()); }
+    let parts = AdbManager::split_human_parts(&message);
+    if message.trim().is_empty() || parts.is_empty() { return Err("Informe a mensagem.".into()); }
+    // Mesma fila da rede das campanhas: portão da rede → trava do aparelho (ocupado = recusa), intervalo na
+    // troca de aparelho, teto contando as partes e tentativa no chip. Horário e descadastro são conferidos
+    // de novo com o aparelho travado e antes de cada parte.
+    crate::dispatcher::send_manual_message(state.db.clone(), device, serial, phone, parts).await
 }
 
 #[tauri::command]
