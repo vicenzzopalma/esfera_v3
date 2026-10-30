@@ -5,8 +5,8 @@
 // Componentes em ./campaigns/
 // ============================================================
 
-import { type ReactNode, useEffect, useRef, useState, useMemo, useDeferredValue, useCallback, useId } from "react";
-import { Search, X, MoreHorizontal, Check, CheckCheck, ChevronLeft, ChevronRight, Shuffle, AlertCircle, Sparkles, ChevronDown, UserRound, Clock, AlertTriangle, Battery, RefreshCw, Smartphone, ArrowDown, Terminal, Upload, Users, FileUp, CheckCircle2, Eye, EyeOff, PlugZap, ArrowLeft, ArrowRight, Circle, LayoutDashboard, Pause, Pencil, Play, RotateCcw, Send, Settings2, Square, XCircle, Brain, Building2, Megaphone, Plus, Ban, Trash2 } from "lucide-react";
+import { type ReactNode, useEffect, useRef, useState, useMemo, useDeferredValue, useCallback, useId, useSyncExternalStore } from "react";
+import { Search, X, MoreHorizontal, Check, CheckCheck, ChevronLeft, ChevronRight, Shuffle, AlertCircle, Sparkles, ChevronDown, UserRound, Clock, AlertTriangle, Battery, RefreshCw, Smartphone, ArrowDown, Terminal, Upload, Users, FileUp, CheckCircle2, Eye, EyeOff, PlugZap, ArrowLeft, ArrowRight, Circle, LayoutDashboard, Pause, Pencil, Play, RotateCcw, Send, Settings2, Square, XCircle, Brain, Building2, Megaphone, Plus, Ban, Trash2, Download, Info } from "lucide-react";
 import type { Campaign, CampaignStatus, Contact, Device, AiConfig } from "../types";
 import { AI_PROVIDERS, DEFAULT_WHATSAPP_SYSTEM_PROMPT, getAiProviderInfo } from "../constants/aiProviders";
 import Modal from "../components/ui/Modal";
@@ -20,7 +20,6 @@ import Badge from "../components/ui/Badge";
 import { useAuth } from "../context/AuthContext";
 import { listen } from "@tauri-apps/api/event";
 import StatCard from "../components/ui/StatCard";
-import { MOCK_CAMPAIGNS } from "../mock-data";
 import PageHeader from "../components/ui/PageHeader";
 
 // ============================================================
@@ -56,26 +55,45 @@ export interface CampaignCounts {
   sent: number;
   failed: number;
   pending: number;
+  /** Pulados sem envio: descadastrados, sem WhatsApp e quem já recebeu. */
+  skipped: number;
+  /** Envio parcial: conferir no celular antes de qualquer reenvio. */
+  review: number;
+  /** Processados / total (pulados e parciais contam como processados). */
   progress: number;
 }
 
+// Da lista de campanhas: o banco guarda total, enviados e falhas. Na campanha concluída o resto não está
+// pendente: são os pulados (descadastrados, sem WhatsApp, já recebeu) e os parciais.
 export function countsFromCampaign(c: Campaign): CampaignCounts {
   const total = c.contactsCount || 0;
   const sent = c.sentCount || 0;
   const failed = c.failedCount || 0;
-  const pending = Math.max(0, total - sent - failed);
-  const progress = total > 0 ? Math.round(((sent + failed) / total) * 100) : 0;
-  return { total, sent, failed, pending, progress };
+  const rest = Math.max(0, total - sent - failed);
+  const done = c.status === "completed";
+  const pending = done ? 0 : rest;
+  const progress = total > 0 ? Math.min(100, Math.round(((total - pending) / total) * 100)) : 0;
+  return { total, sent, failed, pending, skipped: done ? rest : 0, review: 0, progress };
 }
 
-// Mesma regra da janela de execução original: prioriza a lista real de contatos.
+// Da fila real de contatos (detalhe): contagem exata por status.
 export function countsFromContacts(c: Campaign, contacts: Contact[]): CampaignCounts {
-  const total = contacts.length || c.contactsCount || 0;
-  const sent = contacts.filter((x) => x.status === "sent").length || c.sentCount || 0;
-  const failed = contacts.filter((x) => x.status === "failed").length || c.failedCount || 0;
-  const pending = contacts.length ? contacts.filter((x) => x.status === "pending").length : Math.max(0, total - sent - failed);
-  const progress = total > 0 ? Math.round(((sent + failed) / total) * 100) : 0;
-  return { total, sent, failed, pending, progress };
+  if (!contacts.length) return countsFromCampaign(c);
+  let sent = 0;
+  let failed = 0;
+  let pending = 0;
+  let skipped = 0;
+  let review = 0;
+  for (const x of contacts) {
+    const s = x.status as string;
+    if (s === "sent" || s === "replied") sent++;
+    else if (s === "failed") failed++;
+    else if (s === "partial") review++;
+    else if (s === "opt_out" || s === "no_whatsapp" || s === "already_sent") skipped++;
+    else pending++;
+  }
+  const total = contacts.length;
+  return { total, sent, failed, pending, skipped, review, progress: Math.min(100, Math.round(((total - pending) / total) * 100)) };
 }
 
 export function formatNumber(n: number) {
@@ -1020,34 +1038,40 @@ export function ProviderOptions({ includeDefault }: { includeDefault?: boolean }
 }
 
 // ---------- Peças visuais ----------
+// Barra: enviados (accent/verde), falhas (vermelho) e pulados ou parciais (cinza). O resto está pendente.
 export function ProgressBar({
   total,
   sent,
   failed,
+  skipped = 0,
   size = "sm",
   completed,
 }: {
   total: number;
   sent: number;
   failed: number;
+  skipped?: number;
   size?: "sm" | "lg";
   completed?: boolean;
 }) {
   const sentPct = total > 0 ? Math.min(100, (sent / total) * 100) : 0;
   const failPct = total > 0 ? Math.min(100 - sentPct, (failed / total) * 100) : 0;
+  const skipPct = total > 0 ? Math.min(100 - sentPct - failPct, (skipped / total) * 100) : 0;
   return (
     <div
       className={`flex w-full overflow-hidden rounded-full bg-secondary ${size === "lg" ? "h-2.5" : "h-1.5"}`}
       role="progressbar"
+      aria-label="Contatos processados"
       aria-valuemin={0}
       aria-valuemax={100}
-      aria-valuenow={Math.round(sentPct + failPct)}
+      aria-valuenow={Math.round(sentPct + failPct + skipPct)}
     >
       <div
         className={`h-full transition-[width] duration-500 ${completed ? "bg-emerald-500" : "bg-[var(--color-accent)]"}`}
         style={{ width: `${sentPct}%` }}
       />
       {failPct > 0 && <div className="h-full bg-red-500/80 transition-[width] duration-500" style={{ width: `${failPct}%` }} />}
+      {skipPct > 0 && <div className="h-full bg-[var(--color-border-strong)] transition-[width] duration-500" style={{ width: `${skipPct}%` }} />}
     </div>
   );
 }
@@ -1916,18 +1940,133 @@ function MessageFields({
 // DelayFields
 // ============================================================
 
-// Intervalo entre mensagens, com explicação em linguagem humana.
+// Intervalo entre mensagens, com o ritmo real: intervalo, teto da rede, limite dos chips e janela de envio.
+
+// Janela de envio (igual ao motor): seg–sex 8h–20h, sáb 8h–14h, domingo não.
+function sendWindowOf(d: Date): [number, number] | null {
+  const wd = d.getDay();
+  if (wd === 0) return null;
+  return wd === 6 ? [8, 14] : [8, 20];
+}
+
+export function withinSendWindow(now = new Date()) {
+  const w = sendWindowOf(now);
+  const h = now.getHours();
+  return Boolean(w) && h >= (w as [number, number])[0] && h < (w as [number, number])[1];
+}
+
+// Próxima abertura da janela (ou agora, se já está aberta).
+export function nextWindowOpen(now = new Date()): Date {
+  for (let i = 0; i < 8; i++) {
+    const day = new Date(now);
+    day.setDate(now.getDate() + i);
+    const w = sendWindowOf(day);
+    if (!w) continue;
+    const open = new Date(day);
+    open.setHours(w[0], 0, 0, 0);
+    const close = new Date(day);
+    close.setHours(w[1], 0, 0, 0);
+    if (now < open) return open;
+    if (now < close) return now;
+  }
+  return now;
+}
+
+const WEEKDAY = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
+
+// "hoje 15:00", "amanhã 08:00", "seg 08:00" ou "12/11 08:00".
+export function formatWhen(d: Date, now = new Date()) {
+  const time = d.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+  const day0 = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const dayD = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const diff = Math.round((dayD - day0) / 86_400_000);
+  if (diff <= 0) return `hoje ${time}`;
+  if (diff === 1) return `amanhã ${time}`;
+  if (diff < 7) return `${WEEKDAY[d.getDay()]} ${time}`;
+  return `${d.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" })} ${time}`;
+}
+
+// Limites padrão de cada chip no motor (ESF_ChipAttempt): 10 tentativas por hora e até 60 por dia, menos
+// nos primeiros dias (aquecimento: 15 no dia do cadastro, +5 por dia).
+const CHIP_HOURLY = 10;
+const CHIP_DAILY = 60;
+
+export interface PaceEstimate {
+  perHour: number;
+  perDay: number;
+  limit: "intervalo" | "teto" | "chips";
+  finish: Date | null;
+}
+
+// Ritmo real de UMA campanha: um contato por vez (o motor não envia em paralelo por aparelhos), com a
+// pausa sorteada entre o mínimo e max(máximo, 2× mínimo), o teto da rede contado por parte e o limite dos chips.
+export function estimatePace(o: {
+  pending: number;
+  delayMin: number;
+  delayMax: number;
+  parts: number;
+  devices: number;
+  limits: NetworkLimits | null;
+  observedCycleSec?: number;
+  now?: Date;
+}): PaceEstimate | null {
+  if (!(o.delayMin > 0) || !(o.delayMax > 0)) return null;
+  const low = Math.max(1, o.delayMin);
+  const high = Math.max(o.delayMax, low * 2);
+  // + ~20 s por contato para preparar e digitar tecla a tecla (estimativa).
+  const cycle = o.observedCycleSec && o.observedCycleSec > 0 ? o.observedCycleSec : (low + high) / 2 + 20;
+  const parts = Math.max(1, o.parts);
+  const byInterval = 3600 / cycle;
+  const byCap = o.limits ? o.limits.hourly / parts : Infinity;
+  const byChips = o.devices > 0 ? CHIP_HOURLY * o.devices : Infinity;
+  const perHour = Math.max(0.1, Math.min(byInterval, byCap, byChips));
+  const limit: PaceEstimate["limit"] = perHour === byCap ? "teto" : perHour === byChips ? "chips" : "intervalo";
+  const perDay = Math.min(o.limits ? o.limits.daily / parts : Infinity, o.devices > 0 ? CHIP_DAILY * o.devices : Infinity);
+  // Término: percorre os dias com janela aberta, respeitando o ritmo por hora e o teto do dia.
+  let finish: Date | null = null;
+  if (o.pending > 0) {
+    const now = o.now ?? new Date();
+    let left = o.pending;
+    for (let day = 0; day < 180 && !finish; day++) {
+      const d = new Date(now);
+      d.setDate(now.getDate() + day);
+      const w = sendWindowOf(d);
+      if (!w) continue;
+      const open = new Date(d);
+      open.setHours(w[0], 0, 0, 0);
+      const close = new Date(d);
+      close.setHours(w[1], 0, 0, 0);
+      const start = day === 0 ? new Date(Math.max(now.getTime(), open.getTime())) : open;
+      if (start >= close) continue;
+      const capacity = Math.min(perHour * ((close.getTime() - start.getTime()) / 3_600_000), perDay);
+      if (left <= capacity) finish = new Date(start.getTime() + (left / perHour) * 3_600_000);
+      else left -= capacity;
+    }
+  }
+  return { perHour, perDay, limit, finish };
+}
+
+export function paceLimitText(p: PaceEstimate, limits: NetworkLimits | null, parts: number) {
+  if (p.limit === "teto" && limits) return `limitado pelo teto da rede (${limits.hourly} mensagens por hora, ${parts} por contato)`;
+  if (p.limit === "chips") return `limitado pelo limite de cada chip (${CHIP_HOURLY} por hora)`;
+  return "limitado pelo intervalo configurado";
+}
+
+const perHourText = (n: number) => (n >= 10 ? formatNumber(Math.round(n)) : n.toLocaleString("pt-BR", { maximumFractionDigits: 1 }));
+
+// Abaixo de 15 s o chip bate o limite por hora em minutos e a campanha pausa.
+export const MIN_DELAY = 15;
 
 export function delayError(min: number, max: number): string | undefined {
-  if (!min || min < 1) return "O intervalo mínimo precisa ser de pelo menos 1 segundo.";
+  if (!min || min < MIN_DELAY) return `O intervalo mínimo é de ${MIN_DELAY} segundos: abaixo disso o chip bate o limite por hora em minutos e a campanha pausa.`;
   if (max < min) return "O intervalo máximo não pode ser menor que o mínimo.";
   return undefined;
 }
 
 const PRESETS = [
-  { label: "Cauteloso", min: 60, max: 180 },
-  { label: "Equilibrado", min: 30, max: 90 },
-  { label: "Rápido", min: 15, max: 45 },
+  { label: "Cauteloso", min: 60, max: 180, title: "Menor risco de bloqueio" },
+  { label: "Equilibrado", min: 30, max: 90, title: "Recomendado" },
+  { label: "Rápido", min: 15, max: 45, title: "Maior risco de bloqueio: use com chips aquecidos" },
 ];
 
 function DelayFields({
@@ -1935,15 +2074,23 @@ function DelayFields({
   max,
   onChange,
   pendingContacts,
+  parts = 3,
+  devices = 0,
 }: {
   min: number;
   max: number;
   onChange: (patch: { delayMin?: number; delayMax?: number }) => void;
   pendingContacts?: number;
+  /** Mensagens por contato (cada parte conta no teto da rede). */
+  parts?: number;
+  /** Aparelhos selecionados (cada chip tem limite por hora). */
+  devices?: number;
 }) {
+  const uid = useId();
+  const limits = useNetworkLimits();
   const err = delayError(min, max);
-  const avg = (min + max) / 2;
-  const perHour = avg > 0 ? Math.round(3600 / avg) : 0;
+  const high = Math.max(max, min * 2);
+  const pace = err ? null : estimatePace({ pending: pendingContacts ?? 0, delayMin: min, delayMax: max, parts, devices, limits });
 
   return (
     <div className="space-y-4">
@@ -1955,6 +2102,7 @@ function DelayFields({
               key={p.label}
               type="button"
               aria-pressed={active}
+              title={p.title}
               onClick={() => onChange({ delayMin: p.min, delayMax: p.max })}
               className={`rounded-lg border px-3 py-1.5 text-[0.8125rem] transition-colors cursor-pointer ${
                 active
@@ -1969,38 +2117,53 @@ function DelayFields({
       </div>
 
       <div className="grid grid-cols-2 gap-4">
-        <Field label="Mínimo (segundos)" htmlFor="cmp-delay-min">
+        <Field label="Mínimo (segundos)" htmlFor={`${uid}-min`}>
           <input
-            id="cmp-delay-min"
+            id={`${uid}-min`}
             type="number"
-            min={1}
-            value={min}
+            min={MIN_DELAY}
+            value={min || ""}
             onChange={(e) => onChange({ delayMin: parseInt(e.target.value, 10) || 0 })}
             className="tabular-nums"
+            aria-invalid={Boolean(err)}
           />
         </Field>
-        <Field label="Máximo (segundos)" htmlFor="cmp-delay-max">
+        <Field label="Máximo (segundos)" htmlFor={`${uid}-max`}>
           <input
-            id="cmp-delay-max"
+            id={`${uid}-max`}
             type="number"
-            min={1}
-            value={max}
+            min={MIN_DELAY}
+            value={max || ""}
             onChange={(e) => onChange({ delayMax: parseInt(e.target.value, 10) || 0 })}
             className="tabular-nums"
+            aria-invalid={Boolean(err)}
           />
         </Field>
       </div>
 
       {err ? (
-        <p className="text-[0.75rem] text-red-500 dark:text-red-400">{err}</p>
+        <p className="text-[0.75rem] text-red-600 dark:text-red-400">{err}</p>
       ) : (
         <div className="flex items-start gap-2.5 rounded-lg border border-border bg-[var(--color-bg-hover)] px-3.5 py-3 text-[0.8125rem] text-secondary">
           <Clock size={15} className="mt-0.5 shrink-0 text-tertiary" />
-          <p>
-            Cada mensagem sai {min === max ? <>a cada <strong className="text-primary">{min}s</strong></> : <>entre <strong className="text-primary">{min}s</strong> e <strong className="text-primary">{max}s</strong> depois da anterior</>}
-            , em intervalos aleatórios. Isso dá cerca de <strong className="text-primary tabular-nums">{perHour}</strong> mensagens por hora
-            {pendingContacts ? <>, ou aproximadamente <strong className="text-primary">{formatDuration(pendingContacts * avg)}</strong> para os {pendingContacts} contatos pendentes</> : null}.
-          </p>
+          <div className="space-y-1">
+            <p>
+              Cada contato sai entre <strong className="text-primary">{min}s</strong> e <strong className="text-primary">{high}s</strong> depois do anterior,
+              em intervalos aleatórios{high !== max ? ` (o motor usa no mínimo o dobro do mínimo como máximo)` : ""}, um contato por vez.
+            </p>
+            {pace && (
+              <p>
+                Na prática, cerca de <strong className="text-primary tabular-nums">{perHourText(pace.perHour)}</strong> contatos por hora,{" "}
+                {paceLimitText(pace, limits, parts)}
+                {pendingContacts && pace.finish ? (
+                  <>
+                    . Os {formatNumber(pendingContacts)} pendentes terminam por volta de <strong className="text-primary">{formatWhen(pace.finish)}</strong>, só no horário de envio
+                  </>
+                ) : null}
+                .
+              </p>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -2209,19 +2372,25 @@ function DevicePicker({
 }
 
 // ============================================================
-// LogConsole
+// LogConsole e estado ao vivo
 // ============================================================
 
-// Console de eventos do disparo, legível e com rolagem automática.
+// Console de eventos do disparo e o estado atual de cada campanha (enviando, fora do horário, teto da
+// rede, ritmo reduzido, pausada pelo sistema...). Fica no módulo: não some ao trocar de aba do app.
 
 export type LogLevel = "info" | "success" | "warning" | "error";
 
 export interface LogLine {
   id: number;
+  /** Hora legível da última ocorrência. */
   time: string;
+  /** Quando chegou (ms), para medir o ritmo real. */
+  at: number;
   level: LogLevel;
   text: string;
   delayMs?: number;
+  /** Mesma linha repetida em seguida (ex.: "Fora do horário" a cada minuto). */
+  count?: number;
 }
 
 const levelStyle: Record<LogLevel, { dot: string; label: string }> = {
@@ -2241,26 +2410,346 @@ export interface ProgressPayload {
   status: string;
 }
 
-// Traduz o evento do motor de disparo para uma linha legível.
-export function describeProgress(p: ProgressPayload): { level: LogLevel; text: string } {
-  const phone = p.last_contact_phone ? ` ${p.last_contact_phone}` : "";
-  const next = p.delay_used_ms ? ` · próximo envio em ~${Math.round(p.delay_used_ms / 1000)}s` : "";
-  switch (p.status) {
-    case "running":
-      return { level: "success", text: `Contato processado${phone}${next}` };
+export type LiveKind =
+  | "sending"
+  | "send_error"
+  | "completed"
+  | "window"
+  | "network_turn"
+  | "network_cap"
+  | "network_check"
+  | "parts_over"
+  | "device_wait"
+  | "device_unavailable"
+  | "chip_rest"
+  | "reply_reduced"
+  | "reply_paused"
+  | "reply_unavailable"
+  | "auto_paused"
+  | "ai_warning";
+
+export type LiveTone = "success" | "warning" | "danger" | "info";
+
+export interface LiveState {
+  kind: LiveKind;
+  /** Texto curto (selo da lista e do cabeçalho). */
+  short: string;
+  /** Explicação para o banner do detalhe. */
+  text: string;
+  tone: LiveTone;
+  at: number;
+}
+
+// Ordem de importância do estado principal de uma campanha em andamento.
+const LIVE_PRIORITY: LiveKind[] = [
+  "parts_over",
+  "window",
+  "network_cap",
+  "network_check",
+  "device_wait",
+  "device_unavailable",
+  "chip_rest",
+  "network_turn",
+  "send_error",
+  "sending",
+];
+// Avisos de aparelho/chip que valem junto com o estado principal (a campanha segue pelos outros aparelhos).
+const LIVE_NOTES: LiveKind[] = ["reply_paused", "reply_reduced", "reply_unavailable", "ai_warning"];
+// Quanto tempo cada estado vale sem um evento novo (o motor repete os de espera a cada 30-60 s).
+const LIVE_TTL: Partial<Record<LiveKind, number>> = {
+  window: 150_000,
+  network_cap: 100_000,
+  network_check: 100_000,
+  parts_over: 120_000,
+  device_wait: 150_000,
+  device_unavailable: 120_000,
+  chip_rest: 90_000,
+  network_turn: 60_000,
+  send_error: 15 * 60_000,
+  sending: 15 * 60_000,
+  reply_paused: 20 * 60_000,
+  reply_reduced: 20 * 60_000,
+  reply_unavailable: 60 * 60_000,
+  ai_warning: 20 * 60_000,
+};
+// Um envio feito encerra as esperas.
+const CLEARED_BY_SEND: LiveKind[] = ["window", "network_turn", "network_cap", "network_check", "parts_over", "device_wait", "device_unavailable", "chip_rest", "send_error", "auto_paused"];
+
+const stripCode = (s: string) => s.replace(/^(TRAVA|REDE|APARELHO|CONTA_RESTRITA|RITMO|CANCELADO):\s*/i, "").trim();
+
+// Motivo de pausa automática em linguagem de operador, com o que fazer.
+function pauseReasonText(raw: string) {
+  const r = raw.trim();
+  const base = stripCode(r);
+  if (/^CONTA_RESTRITA/i.test(r))
+    return `o WhatsApp de um dos aparelhos indica conta restrita ou banida (${base}). Confira os aparelhos e tire o afetado da campanha antes de retomar.`;
+  if (/limite do chip/i.test(r)) return `${base} Retome mais tarde ou inclua mais aparelhos.`;
+  if (/freio autom/i.test(r)) return `${base} Revise a lista e a mensagem antes de retomar.`;
+  if (/chip/i.test(r)) return `${base} Ajuste os chips em Dispositivos antes de retomar.`;
+  return base;
+}
+
+// Traduz o evento do motor de disparo para uma linha do console e o estado ao vivo da campanha.
+export function describeProgress(p: ProgressPayload): { level: LogLevel; text: string; live?: Omit<LiveState, "at"> } {
+  const phone = p.last_contact_phone ? ` ${formatPhoneBr(p.last_contact_phone)}` : "";
+  const status = (p.status || "").trim();
+  switch (status) {
+    case "running": {
+      const pause = p.delay_used_ms ? ` · intervalo de ~${Math.round(p.delay_used_ms / 1000)}s` : "";
+      return {
+        level: "success",
+        text: `Mensagem enviada para${phone || " o contato"}${pause}`,
+        live: { kind: "sending", short: "Enviando", text: "As mensagens estão saindo pelos aparelhos selecionados, uma de cada vez.", tone: "success" },
+      };
+    }
     case "send_error":
-      return { level: "error", text: `Falha ao enviar para${phone || " o contato"}${next}` };
+      return {
+        level: "error",
+        text: `Falha ao enviar para${phone || " o contato"}.`,
+        live: { kind: "send_error", short: "Falha no último envio", text: "O último envio falhou. O motor segue com os próximos contatos.", tone: "warning" },
+      };
     case "waiting_device":
-      return { level: "warning", text: "Nenhum aparelho selecionado está online. Aguardando conexão." };
+      return {
+        level: "warning",
+        text: "Nenhum aparelho disponível agora (offline, em descanso do chip ou pausado). O disparo continua quando um deles liberar.",
+        live: {
+          kind: "device_wait",
+          short: "Aguardando aparelho",
+          text: "Nenhum aparelho selecionado está disponível agora: pode estar offline, em descanso do chip ou pausado. O disparo continua sozinho quando um deles liberar.",
+          tone: "warning",
+        },
+      };
     case "completed":
-      return { level: "info", text: "Campanha concluída: não há mais contatos pendentes." };
-    case "waiting_window":
-      return { level: "warning", text: "Fora do horário de envio (seg-sex 8h-20h, sáb 8h-14h). O disparo continua sozinho no próximo horário." };
-    default:
-      if (p.status.startsWith("IA aviso")) return { level: "warning", text: `${p.status}${phone ? ` (${phone.trim()})` : ""}` };
-      return { level: "info", text: p.status };
+      return {
+        level: "success",
+        text: "Campanha concluída: não há mais contatos pendentes.",
+        live: { kind: "completed", short: "Concluída", text: "Não há mais contatos pendentes.", tone: "info" },
+      };
+    case "waiting_window": {
+      const when = formatWhen(nextWindowOpen());
+      return {
+        level: "warning",
+        text: `Fora do horário de envio (seg–sex 8h–20h, sáb 8h–14h). Volta sozinho ${when}.`,
+        live: {
+          kind: "window",
+          short: `Fora do horário · volta ${when}`,
+          text: `Fora do horário de envio (seg–sex 8h–20h, sáb 8h–14h). O disparo volta sozinho ${when}.`,
+          tone: "warning",
+        },
+      };
+    }
+  }
+  if (/^campanha pausada/i.test(status)) {
+    const reason = pauseReasonText(status.replace(/^campanha pausada:?\s*/i, ""));
+    return { level: "error", text: `Campanha pausada pelo sistema: ${reason}`, live: { kind: "auto_paused", short: "Pausada pelo sistema", text: reason, tone: "danger" } };
+  }
+  if (/mais partes que o teto|partes e o teto/i.test(status)) {
+    const text = `${stripCode(status)}.`.replace(/\.\.$/, ".");
+    return { level: "error", text, live: { kind: "parts_over", short: "Mensagem maior que o teto da rede", text, tone: "danger" } };
+  }
+  if (/aguardando vez na rede/i.test(status))
+    return {
+      level: "info",
+      text: "Aguardando a vez na rede: só um aparelho envia por vez.",
+      live: { kind: "network_turn", short: "Aguardando vez na rede", text: "Aguardando a vez na rede: só um aparelho da rede envia por vez.", tone: "info" },
+    };
+  if (/verificar (o teto|limites)|falha ao (verificar|registrar reserva)/i.test(status))
+    return {
+      level: "warning",
+      text: stripCode(status),
+      live: { kind: "network_check", short: "Conferindo o teto da rede", text: `${stripCode(status)} O motor tenta de novo sozinho.`, tone: "warning" },
+    };
+  if (/teto da rede/i.test(status))
+    return {
+      level: "warning",
+      text: stripCode(status),
+      live: {
+        kind: "network_cap",
+        short: "Teto da rede atingido",
+        text: "O teto de envios da rede (Configurações → Rede e ritmo) foi atingido. O disparo continua sozinho quando a janela liberar.",
+        tone: "warning",
+      },
+    };
+  if (/chip pausado/i.test(status))
+    return {
+      level: "warning",
+      text: status,
+      live: { kind: "reply_paused", short: "Chip pausado por poucas respostas", text: `${status}. Os outros aparelhos continuam.`.replace(/\.\./, "."), tone: "warning" },
+    };
+  if (/ritmo reduzido|nenhuma resposta captada/i.test(status))
+    return {
+      level: "warning",
+      text: status,
+      live: { kind: "reply_reduced", short: "Ritmo reduzido", text: `${status}: os intervalos desse chip dobram até as respostas voltarem.`, tone: "warning" },
+    };
+  if (/taxa de resposta indispon/i.test(status))
+    return {
+      level: "info",
+      text: status,
+      live: { kind: "reply_unavailable", short: "Taxa de resposta indisponível", text: `${status}: o freio por respostas não atua nele.`, tone: "info" },
+    };
+  if (/descanso do chip|^ritmo:/i.test(status))
+    return {
+      level: "info",
+      text: stripCode(status),
+      live: { kind: "chip_rest", short: "Chip em descanso", text: `${stripCode(status)}. O próximo envio sai quando o descanso terminar.`, tone: "info" },
+    };
+  if (/aparelho temporariamente indispon|aparelho ocupado/i.test(status))
+    return {
+      level: "warning",
+      text: status,
+      live: { kind: "device_unavailable", short: "Aparelho indisponível", text: status, tone: "warning" },
+    };
+  if (/^ia aviso/i.test(status))
+    return {
+      level: "warning",
+      text: `${status}${phone ? ` (${phone.trim()})` : ""}`,
+      live: { kind: "ai_warning", short: "Aviso da IA", text: status, tone: "warning" },
+    };
+  return { level: "info", text: status };
+}
+
+interface CampaignActivity {
+  logs: LogLine[];
+  live: Partial<Record<LiveKind, LiveState>>;
+}
+
+const activityStore = new Map<number, CampaignActivity>();
+const activitySubs = new Set<() => void>();
+let activityVersion = 0;
+const LOG_LIMIT = 300;
+let logSeq = 0;
+
+function activityOf(id: number) {
+  let a = activityStore.get(id);
+  if (!a) {
+    a = { logs: [], live: {} };
+    activityStore.set(id, a);
+  }
+  return a;
+}
+
+function notifyActivity() {
+  activityVersion++;
+  activitySubs.forEach((f) => f());
+}
+
+export function appendCampaignLog(campaignId: number, level: LogLevel, text: string, delayMs?: number) {
+  const a = activityOf(campaignId);
+  const last = a.logs[a.logs.length - 1];
+  const now = Date.now();
+  // Repetida em seguida: soma no contador em vez de encher o console.
+  if (last && last.level === level && last.text === text) {
+    a.logs = [...a.logs.slice(0, -1), { ...last, time: nowTime(), at: now, count: (last.count || 1) + 1, delayMs: delayMs ?? last.delayMs }];
+  } else {
+    a.logs = [...a.logs, { id: ++logSeq, time: nowTime(), at: now, level, text, delayMs }].slice(-LOG_LIMIT);
+  }
+  notifyActivity();
+}
+
+export function clearCampaignLogs(campaignId: number) {
+  const a = activityStore.get(campaignId);
+  if (!a) return;
+  a.logs = [];
+  notifyActivity();
+}
+
+// Estado ao vivo de volta ao zero (ex.: o operador retomou a campanha).
+export function clearLiveState(campaignId: number) {
+  const a = activityStore.get(campaignId);
+  if (!a) return;
+  a.live = {};
+  notifyActivity();
+}
+
+function setLiveState(campaignId: number, state: LiveState) {
+  const a = activityOf(campaignId);
+  const live = { ...a.live };
+  if (state.kind === "sending") for (const k of CLEARED_BY_SEND) delete live[k];
+  // Pausa automática: as esperas anteriores não valem mais.
+  if (state.kind === "auto_paused") for (const k of LIVE_PRIORITY) delete live[k];
+  live[state.kind] = state;
+  a.live = live;
+  notifyActivity();
+}
+
+function handleProgress(p: ProgressPayload) {
+  if (!p || typeof p.campaign_id !== "number" || typeof p.status !== "string") return;
+  const d = describeProgress(p);
+  const withDelay = p.status === "running" || p.status === "send_error";
+  appendCampaignLog(p.campaign_id, d.level, d.text, withDelay ? p.delay_used_ms || undefined : undefined);
+  if (d.live) setLiveState(p.campaign_id, { ...d.live, at: Date.now() });
+}
+
+// Um ouvinte só, para o app inteiro: a atividade continua chegando com a tela de Campanhas fechada.
+let progressListener: Promise<unknown> | null = null;
+export function ensureProgressListener() {
+  if (progressListener) return;
+  try {
+    progressListener = listen<ProgressPayload>("campaign-progress", (event) => handleProgress(event.payload)).catch(() => {
+      progressListener = null;
+    });
+  } catch {
+    progressListener = null;
   }
 }
+
+function subscribeActivity(cb: () => void) {
+  activitySubs.add(cb);
+  return () => {
+    activitySubs.delete(cb);
+  };
+}
+
+export function useActivityVersion() {
+  return useSyncExternalStore(subscribeActivity, () => activityVersion);
+}
+
+export function campaignActivity(id: number): CampaignActivity | undefined {
+  return activityStore.get(id);
+}
+
+// Relógio para os estados ao vivo expirarem na tela (só re-renderiza enquanto ativo).
+export function useNow(active: boolean, everyMs = 15_000) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const t = setInterval(() => setNow(Date.now()), everyMs);
+    return () => clearInterval(t);
+  }, [active, everyMs]);
+  return now;
+}
+
+// Estado principal e avisos de uma campanha agora.
+export function liveSummary(c: Campaign, a: CampaignActivity | undefined, now: number): { main?: LiveState; notes: LiveState[] } {
+  const live = a?.live ?? {};
+  const fresh = (s?: LiveState): s is LiveState => Boolean(s) && (LIVE_TTL[s!.kind] === undefined || now - s!.at < (LIVE_TTL[s!.kind] as number));
+  if (c.status === "running") {
+    let main = LIVE_PRIORITY.map((k) => live[k]).find(fresh);
+    // Sem evento recente: o relógio local já diz se está fora do horário.
+    if ((!main || main.kind === "sending" || main.kind === "send_error") && !withinSendWindow(new Date(now))) {
+      const when = formatWhen(nextWindowOpen(new Date(now)), new Date(now));
+      main = {
+        kind: "window",
+        short: `Fora do horário · volta ${when}`,
+        text: `Fora do horário de envio (seg–sex 8h–20h, sáb 8h–14h). O disparo volta sozinho ${when}.`,
+        tone: "warning",
+        at: now,
+      };
+    }
+    return { main, notes: LIVE_NOTES.map((k) => live[k]).filter(fresh) };
+  }
+  if (c.status === "paused" && live.auto_paused) return { main: live.auto_paused, notes: [] };
+  return { notes: [] };
+}
+
+const liveToneStyle: Record<LiveTone, string> = {
+  success: "text-emerald-700 dark:text-emerald-400",
+  warning: "text-amber-700 dark:text-amber-300",
+  danger: "text-red-600 dark:text-red-400",
+  info: "text-sky-700 dark:text-sky-300",
+};
 
 function LogConsole({ lines, onClear }: { lines: LogLine[]; onClear?: () => void }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -2315,7 +2804,7 @@ function LogConsole({ lines, onClear }: { lines: LogLine[]; onClear?: () => void
       >
         {lines.length === 0 ? (
           <p className="font-sans text-[0.8125rem] text-tertiary">
-            Nenhum evento nesta sessão. Ao iniciar o disparo, cada envio aparece aqui em tempo real.
+            Nenhum evento desde que o Esfera abriu. Ao iniciar o disparo, cada envio e cada espera (horário, teto da rede, descanso do chip) aparecem aqui.
           </p>
         ) : (
           lines.map((l) => (
@@ -2328,6 +2817,7 @@ function LogConsole({ lines, onClear }: { lines: LogLine[]; onClear?: () => void
                 }`}
               >
                 {l.text}
+                {l.count && l.count > 1 ? <span className="ml-1.5 rounded bg-card px-1 text-tertiary">×{l.count}</span> : null}
               </span>
             </div>
           ))
@@ -2341,10 +2831,10 @@ function LogConsole({ lines, onClear }: { lines: LogLine[]; onClear?: () => void
 // ContactsPanel
 // ============================================================
 
-// Lista de contatos (fila de disparo) de uma campanha, com busca e filtro de status.
+// Lista de contatos (fila de disparo) de uma campanha, com busca, filtro de status e exportação.
 
-type Filter = "all" | "pending" | "sent" | "failed";
-const RENDER_LIMIT = 500;
+export type ContactFilter = "all" | "pending" | "sent" | "failed" | "review" | "skipped";
+const RENDER_STEP = 500;
 
 const contactStatus: Record<string, { variant: "success" | "danger" | "neutral" | "info" | "warning"; label: string }> = {
   sent: { variant: "success", label: "Enviado" },
@@ -2358,39 +2848,70 @@ const contactStatus: Record<string, { variant: "success" | "danger" | "neutral" 
   no_whatsapp: { variant: "neutral", label: "Sem WhatsApp (não disparar)" },
 };
 
+const SKIPPED_STATUSES = new Set(["opt_out", "no_whatsapp", "already_sent"]);
+
+function contactBucket(status: string): Exclude<ContactFilter, "all"> {
+  if (status === "sent" || status === "replied") return "sent";
+  if (status === "failed") return "failed";
+  if (status === "partial") return "review";
+  if (SKIPPED_STATUSES.has(status)) return "skipped";
+  return "pending";
+}
+
+// Relatório da campanha para o Excel (devolver ao sistema de cobrança quem recebeu, quem saiu, etc.).
+export function exportCampaignContacts(campaign: Campaign, contacts: Contact[]) {
+  const stamp = new Date().toISOString().slice(0, 10);
+  const safe = campaign.name.replace(/[\\/:*?"<>|]+/g, " ").trim() || `campanha-${campaign.id}`;
+  downloadCsv(
+    `${safe} - ${stamp}.csv`,
+    ["Nome", "Telefone", "Situação", "Enviado em"],
+    contacts.map((c) => [
+      c.contactName || c.name || "",
+      formatPhoneBr(c.phone),
+      (contactStatus[c.status] || { label: c.status }).label,
+      c.sentAt && (c.status === "sent" || c.status === "replied" || (c.status as string) === "partial") ? formatDate(c.sentAt) : "",
+    ])
+  );
+}
+
 function ContactsPanel({
+  campaign,
   contacts,
   loading,
   onImport,
   onReload,
+  filter,
+  onFilterChange,
 }: {
+  campaign: Campaign;
   contacts: Contact[];
   loading: boolean;
   onImport: () => void;
   onReload: () => void;
+  filter: ContactFilter;
+  onFilterChange: (f: ContactFilter) => void;
 }) {
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<Filter>("all");
+  const [limit, setLimit] = useState(RENDER_STEP);
 
-  const counts = useMemo(
-    () => ({
-      pending: contacts.filter((c) => c.status === "pending").length,
-      sent: contacts.filter((c) => c.status === "sent").length,
-      failed: contacts.filter((c) => c.status === "failed").length,
-    }),
-    [contacts]
-  );
+  const counts = useMemo(() => {
+    const c = { pending: 0, sent: 0, failed: 0, review: 0, skipped: 0 };
+    for (const x of contacts) c[contactBucket(x.status as string)]++;
+    return c;
+  }, [contacts]);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
     const qDigits = q.replace(/\D/g, "");
     return contacts.filter((c) => {
-      if (filter !== "all" && c.status !== filter) return false;
+      if (filter !== "all" && contactBucket(c.status as string) !== filter) return false;
       if (!q) return true;
       const name = (c.contactName || c.name || "").toLowerCase();
       return name.includes(q) || (qDigits && c.phone.replace(/\D/g, "").includes(qDigits));
     });
   }, [contacts, filter, search]);
+
+  useEffect(() => setLimit(RENDER_STEP), [filter, search]);
 
   if (loading && contacts.length === 0) {
     return (
@@ -2407,7 +2928,7 @@ function ContactsPanel({
       <EmptyState
         icon={<Users size={18} />}
         title="Nenhum contato nesta campanha"
-        description="Importe uma planilha CSV ou cole uma lista de nomes e telefones para montar a fila de disparo."
+        description="Importe uma planilha (CSV, TXT ou .xlsx) ou cole uma lista de nomes e telefones para montar a fila de disparo."
         action={
           <Button icon={<Upload size={14} />} onClick={onImport}>
             Importar contatos
@@ -2417,21 +2938,23 @@ function ContactsPanel({
     );
   }
 
+  const items: { id: ContactFilter; label: string; count: number }[] = [
+    { id: "all", label: "Todos", count: contacts.length },
+    { id: "pending", label: "Pendentes", count: counts.pending },
+    { id: "sent", label: "Enviados", count: counts.sent },
+    { id: "failed", label: "Falhas", count: counts.failed },
+  ];
+  if (counts.review > 0 || filter === "review") items.push({ id: "review", label: "Revisar", count: counts.review });
+  if (counts.skipped > 0 || filter === "skipped") items.push({ id: "skipped", label: "Pulados", count: counts.skipped });
+
   return (
     <div className="space-y-3">
-      <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
-        <SearchInput value={search} onChange={setSearch} placeholder="Buscar por nome ou telefone" className="lg:w-72" />
-        <SegmentedControl<Filter>
-          value={filter}
-          onChange={setFilter}
-          items={[
-            { id: "all", label: "Todos", count: contacts.length },
-            { id: "pending", label: "Pendentes", count: counts.pending },
-            { id: "sent", label: "Enviados", count: counts.sent },
-            { id: "failed", label: "Falhas", count: counts.failed },
-          ]}
-        />
-        <div className="flex items-center gap-1.5 lg:ml-auto">
+      <div className="flex flex-col gap-2 xl:flex-row xl:items-center">
+        <SearchInput value={search} onChange={setSearch} placeholder="Buscar por nome ou telefone" className="xl:w-64" />
+        <div className="overflow-x-auto">
+          <SegmentedControl<ContactFilter> value={filter} onChange={onFilterChange} items={items} />
+        </div>
+        <div className="flex items-center gap-1.5 xl:ml-auto">
           <Button
             size="sm"
             variant="ghost"
@@ -2440,11 +2963,24 @@ function ContactsPanel({
             title="Atualizar"
             icon={<RefreshCw size={13} className={loading ? "animate-spin" : ""} />}
           />
+          <Button size="sm" variant="secondary" icon={<Download size={13} />} onClick={() => exportCampaignContacts(campaign, contacts)} title="Baixa a lista com a situação de cada contato (CSV para o Excel)">
+            Exportar
+          </Button>
           <Button size="sm" variant="secondary" icon={<Upload size={13} />} onClick={onImport}>
             Importar contatos
           </Button>
         </div>
       </div>
+
+      {filter === "review" && counts.review > 0 && (
+        <InlineAlert tone="warning" icon={<AlertTriangle size={15} />} title="Envio parcial: confira no celular">
+          Parte da mensagem pode ter chegado. Esses contatos não recebem de novo automaticamente, para não duplicar. Confira a conversa no aparelho antes de qualquer
+          novo contato com eles.
+        </InlineAlert>
+      )}
+      {filter === "skipped" && counts.skipped > 0 && (
+        <p className="text-[0.75rem] text-tertiary">Pulados não recebem: pediram para sair (descadastrados), não têm WhatsApp ou já receberam nesta campanha.</p>
+      )}
 
       {filtered.length === 0 ? (
         <EmptyState icon={<Users size={18} />} title="Nenhum contato encontrado" description="Ajuste a busca ou o filtro de status." className="py-8" />
@@ -2461,27 +2997,37 @@ function ContactsPanel({
                 </tr>
               </thead>
               <tbody className="divide-y divide-[var(--color-border)]">
-                {filtered.slice(0, RENDER_LIMIT).map((c) => {
+                {filtered.slice(0, limit).map((c) => {
                   const st = contactStatus[c.status] || contactStatus.pending;
+                  const s = c.status as string;
+                  // A data gravada vale como envio só para enviado e parcial; nos outros é a hora em que foi pulado.
+                  const showDate = Boolean(c.sentAt) && (s === "sent" || s === "replied" || s === "partial");
                   return (
                     <tr key={c.id} className="hover:bg-[var(--color-bg-hover)]">
-                      <td className="max-w-[16rem] truncate px-4 py-2 text-primary">{c.contactName || c.name || "Contato"}</td>
-                      <td className="px-4 py-2 font-mono text-[0.75rem] text-secondary">{c.phone}</td>
+                      <td className="max-w-[16rem] truncate px-4 py-2 text-primary" title={c.contactName || c.name || undefined}>
+                        {c.contactName || c.name || <span className="text-tertiary">(sem nome)</span>}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-2 font-mono text-[0.75rem] text-secondary">{formatPhoneBr(c.phone)}</td>
                       <td className="px-4 py-2">
                         <Badge variant={st.variant}>{st.label}</Badge>
                         {c.retryCount ? <span className="ml-2 text-[0.75rem] text-tertiary">{c.retryCount} tentativa{c.retryCount > 1 ? "s" : ""}</span> : null}
                       </td>
-                      <td className="hidden px-4 py-2 text-[0.75rem] text-tertiary md:table-cell">{c.sentAt ? formatDate(c.sentAt) : "—"}</td>
+                      <td className="hidden px-4 py-2 text-[0.75rem] text-tertiary md:table-cell">{showDate ? formatDate(c.sentAt) : "—"}</td>
                     </tr>
                   );
                 })}
               </tbody>
             </table>
           </div>
-          {filtered.length > RENDER_LIMIT && (
-            <p className="border-t border-border bg-secondary px-4 py-2 text-[0.75rem] text-tertiary">
-              Mostrando {RENDER_LIMIT} de {formatNumber(filtered.length)}. Use a busca para encontrar um contato específico.
-            </p>
+          {filtered.length > limit && (
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border bg-secondary px-4 py-2 text-[0.75rem] text-tertiary">
+              <span>
+                Mostrando {formatNumber(limit)} de {formatNumber(filtered.length)}. Use a busca para achar um contato específico.
+              </span>
+              <button type="button" onClick={() => setLimit((n) => n + RENDER_STEP)} className="text-[var(--color-accent-light)] hover:underline cursor-pointer">
+                Mostrar mais {formatNumber(Math.min(RENDER_STEP, filtered.length - limit))}
+              </button>
+            </div>
           )}
         </div>
       )}
@@ -3525,6 +4071,15 @@ function initialForm(c: Campaign | null): FormState {
 const autoName = () =>
   `Campanha ${new Date().toLocaleDateString("pt-BR")} ${new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}`;
 
+// Uma limpeza antiga do banco, que roda ao abrir o app, apaga campanhas com estes nomes. Até a correção no
+// backend, a tela não deixa salvar um nome assim.
+const RISKY_NAME = /julho|black\s*friday/i;
+export function nameError(name: string) {
+  return RISKY_NAME.test(name)
+    ? "Use outro nome: campanhas com “julho” ou “Black Friday” no nome são apagadas por uma limpeza automática antiga ao abrir o app."
+    : undefined;
+}
+
 function CampaignWizard({
   isOpen,
   onClose,
@@ -3551,6 +4106,8 @@ function CampaignWizard({
   const [devices, setDevices] = useState<Device[]>([]);
   const [devicesLoaded, setDevicesLoaded] = useState(false);
   const [devicesLoading, setDevicesLoading] = useState(false);
+  const [devicesError, setDevicesError] = useState("");
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -3559,6 +4116,7 @@ function CampaignWizard({
     setVisited(isEdit ? STEPS.length - 1 : STEPS.findIndex((s) => s.id === initialStep));
     setShowErrors({});
     setSaveError("");
+    setConfirmDiscard(false);
     // Reinicia só ao abrir ou trocar de campanha (a lista atualiza ao vivo durante o disparo).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, campaign?.id]);
@@ -3569,8 +4127,9 @@ function CampaignWizard({
     try {
       const data = await api<Device[]>("get_devices", { companyId: selectedCompanyId });
       setDevices(data || []);
-    } catch {
-      /* mantém lista */
+      setDevicesError("");
+    } catch (e) {
+      setDevicesError(String(e));
     } finally {
       setDevicesLoading(false);
       setDevicesLoaded(true);
@@ -3585,8 +4144,16 @@ function CampaignWizard({
   const patch = (p: Partial<FormState>) => setForm((f) => ({ ...f, ...p }));
 
   const errors: Partial<Record<StepId, string>> = {
+    basics: nameError(form.name),
     message: messageError(form, partLimit),
     sending: delayError(form.delayMin, form.delayMax),
+  };
+  // Fechar por Esc, clique fora ou Cancelar com alterações pede confirmação.
+  const dirty = JSON.stringify(form) !== JSON.stringify(initialForm(campaign));
+  const requestClose = () => {
+    if (saving) return;
+    if (dirty) setConfirmDiscard(true);
+    else onClose();
   };
 
   const stepIndex = STEPS.findIndex((s) => s.id === step);
@@ -3608,8 +4175,8 @@ function CampaignWizard({
 
   const save = async (mode: "draft" | "final") => {
     if (!selectedCompanyId) return;
-    // Rascunho só exige intervalo válido; criar/salvar exige mensagem também.
-    const required: StepId[] = mode === "draft" ? ["sending"] : ["message", "sending"];
+    // Rascunho só exige nome e intervalo válidos; criar/salvar exige mensagem também.
+    const required: StepId[] = mode === "draft" ? ["basics", "sending"] : ["basics", "message", "sending"];
     const firstInvalid = required.find((id) => errors[id]);
     if (firstInvalid) {
       setShowErrors((s) => ({ ...s, [firstInvalid]: true }));
@@ -3656,13 +4223,14 @@ function CampaignWizard({
   };
 
   const fullMessage = joinMessage(form.greeting, form.body, form.closing);
+  const partCount = messagePartCount(form);
   const invalidSteps = (Object.keys(showErrors) as StepId[]).filter((id) => showErrors[id] && errors[id]);
   const devStats = deviceSelectionStats(devices, form.deviceIds);
   const providerName = form.aiProvider ? getAiProviderInfo(form.aiProvider)?.name || form.aiProvider : "Padrão da empresa";
 
   const footer = (
     <div className="flex w-full items-center justify-between gap-2">
-      <Button variant="ghost" onClick={onClose} disabled={saving}>
+      <Button variant="ghost" onClick={requestClose} disabled={saving}>
         Cancelar
       </Button>
       <div className="flex items-center gap-2">
@@ -3701,16 +4269,20 @@ function CampaignWizard({
   );
 
   return (
+    <>
     <Modal
       isOpen={isOpen}
-      onClose={onClose}
+      onClose={requestClose}
       title={isEdit ? "Editar campanha" : "Nova campanha"}
       description={isEdit ? campaign?.name : undefined}
       size="2xl"
       footer={footer}
     >
       <div className="space-y-6">
-        <Stepper steps={STEPS} current={step} onSelect={goTo} invalid={invalidSteps} reachable={(_, i) => isEdit || i <= visited} />
+        {/* As etapas ficam visíveis ao rolar (janelas baixas, 1280x720). */}
+        <div className="sticky top-0 z-10 -mx-5 -mt-4 border-b border-border bg-card px-5 pb-2 pt-3">
+          <Stepper steps={STEPS} current={step} onSelect={goTo} invalid={invalidSteps} reachable={(_, i) => isEdit || i <= visited} />
+        </div>
 
         {saveError && (
           <InlineAlert tone="danger" icon={<AlertCircle size={15} />} title="Não foi possível salvar" onDismiss={() => setSaveError("")}>
@@ -3720,7 +4292,12 @@ function CampaignWizard({
 
         {step === "basics" && (
           <FormSection title="Como esta campanha vai se chamar?" description="Um nome que você reconheça na lista. Dá para mudar depois." className="max-w-xl">
-            <Field label="Nome da campanha" htmlFor="cmp-name" hint={`Se ficar em branco, usaremos "${autoName()}".`}>
+            <Field
+              label="Nome da campanha"
+              htmlFor="cmp-name"
+              error={errors.basics}
+              hint={`Se ficar em branco, usaremos "${autoName()}".`}
+            >
               <input
                 id="cmp-name"
                 type="text"
@@ -3728,7 +4305,8 @@ function CampaignWizard({
                 value={form.name}
                 onChange={(e) => patch({ name: e.target.value })}
                 onKeyDown={(e) => e.key === "Enter" && next()}
-                placeholder="Promoção de julho"
+                placeholder="Carteira A – lote 3"
+                aria-invalid={Boolean(errors.basics)}
               />
             </Field>
           </FormSection>
@@ -3744,7 +4322,7 @@ function CampaignWizard({
                 partLimit={partLimit}
               />
             </FormSection>
-            <div className="lg:sticky lg:top-0 lg:self-start">
+            <div className="lg:sticky lg:top-20 lg:self-start">
               <WhatsAppPreview greeting={form.greeting} body={form.body} closing={form.closing} useSpintax={form.useSpintax} aiNote={form.useAI} />
             </div>
           </div>
@@ -3763,21 +4341,36 @@ function CampaignWizard({
         {step === "sending" && (
           <div className="space-y-8">
             <FormSection title="Ritmo de envio" description="Intervalos aleatórios entre mensagens deixam o disparo mais natural." className="max-w-3xl">
-              <DelayFields min={form.delayMin} max={form.delayMax} onChange={(p) => patch(p)} />
+              <DelayFields min={form.delayMin} max={form.delayMax} onChange={(p) => patch(p)} parts={partCount} devices={form.deviceIds.length} />
             </FormSection>
             <FormSection
               title="Aparelhos"
               description="Quais celulares podem enviar esta campanha. Os envios são distribuídos entre os selecionados que estiverem online. Você também pode definir isso depois."
             >
-              <DevicePicker
-                devices={devices}
-                loading={devicesLoading && !devicesLoaded}
-                selected={form.deviceIds}
-                onChange={(ids) => patch({ deviceIds: ids })}
-                onRefresh={loadDevices}
-                refreshing={devicesLoading}
-                listClassName="max-h-[300px]"
-              />
+              {devicesError && devices.length === 0 ? (
+                <InlineAlert
+                  tone="danger"
+                  icon={<AlertCircle size={15} />}
+                  title="Não foi possível carregar os aparelhos"
+                  action={
+                    <Button size="sm" variant="secondary" icon={<RefreshCw size={13} />} onClick={loadDevices} loading={devicesLoading}>
+                      Tentar de novo
+                    </Button>
+                  }
+                >
+                  {devicesError}
+                </InlineAlert>
+              ) : (
+                <DevicePicker
+                  devices={devices}
+                  loading={devicesLoading && !devicesLoaded}
+                  selected={form.deviceIds}
+                  onChange={(ids) => patch({ deviceIds: ids })}
+                  onRefresh={loadDevices}
+                  refreshing={devicesLoading}
+                  listClassName="max-h-[300px]"
+                />
+              )}
             </FormSection>
           </div>
         )}
@@ -3787,15 +4380,19 @@ function CampaignWizard({
             <div className="space-y-4">
               <dl className="divide-y divide-[var(--color-border)] overflow-hidden rounded-xl border border-border">
                 <ReviewRow label="Nome" onEdit={() => goTo("basics")}>
-                  {form.name.trim() || <span className="text-tertiary">{autoName()} (automático)</span>}
+                  {errors.basics ? (
+                    <span className="text-red-600 dark:text-red-400">{errors.basics}</span>
+                  ) : (
+                    form.name.trim() || <span className="text-tertiary">{autoName()} (automático)</span>
+                  )}
                 </ReviewRow>
                 <ReviewRow label="Mensagem" onEdit={() => goTo("message")}>
-                  {form.body.trim() ? (
-                    <>
-                      {fullMessage.length} caracteres · {form.useSpintax ? "com variações" : "sem variações"}
-                    </>
+                  {errors.message ? (
+                    <span className="text-red-600 dark:text-red-400">{errors.message}</span>
                   ) : (
-                    <span className="text-red-600 dark:text-red-400">Mensagem vazia</span>
+                    <>
+                      {partCount} mensagens seguidas · {formatNumber(fullMessage.length)} caracteres · {form.useSpintax ? "com variações" : "sem variações"}
+                    </>
                   )}
                 </ReviewRow>
                 <ReviewRow label="IA" onEdit={() => goTo("ai")}>
@@ -3826,6 +4423,21 @@ function CampaignWizard({
         )}
       </div>
     </Modal>
+    <ConfirmDialog
+      isOpen={confirmDiscard}
+      title="Descartar alterações?"
+      confirmLabel="Descartar"
+      onConfirm={() => {
+        setConfirmDiscard(false);
+        onClose();
+      }}
+      onClose={() => setConfirmDiscard(false)}
+    >
+      {isEdit
+        ? "As alterações feitas nesta campanha ainda não foram salvas e serão perdidas."
+        : "A campanha ainda não foi criada. Para guardar o que já escreveu sem criar, use Salvar rascunho."}
+    </ConfirmDialog>
+    </>
   );
 }
 
@@ -3881,50 +4493,133 @@ function draftFrom(c: Campaign): Draft {
 
 const sameIds = (a: string[], b: string[]) => a.length === b.length && a.every((x) => b.includes(x));
 
+// Situação da rede (Configurações → Rede e ritmo) e do freio por respostas de cada chip.
+interface NetworkChipInfo {
+  chipId: number;
+  deviceId: number;
+  deviceName: string;
+  replyRate: number | null;
+  sample: number;
+  state: string;
+  reason: string;
+}
+
+interface NetworkStatusInfo {
+  hourly: number;
+  daily: number;
+  sentLastHour: number;
+  sentToday: number;
+  /** Tentativas contadas no teto (cada parte extra soma); versões antigas do backend não mandam. */
+  attemptsLastHour?: number;
+  attemptsToday?: number;
+  waitSeconds: number;
+  chips: NetworkChipInfo[];
+}
+
+// Tempo real entre envios desta sessão (mediana), para a estimativa seguir o ritmo de verdade.
+function observedCycleSeconds(logs: LogLine[]) {
+  const sends = logs.filter((l) => l.level === "success" && l.text.startsWith("Mensagem enviada")).slice(-21);
+  const gaps: number[] = [];
+  for (let i = 1; i < sends.length; i++) {
+    const gap = (sends[i].at - sends[i - 1].at) / 1000;
+    if (gap > 0 && gap < 2 * 3600) gaps.push(gap);
+  }
+  if (gaps.length < 3) return undefined;
+  gaps.sort((a, b) => a - b);
+  return gaps[Math.floor(gaps.length / 2)];
+}
+
+const liveToneIcon: Record<LiveTone, ReactNode> = {
+  success: <Send size={15} />,
+  warning: <Clock size={15} />,
+  danger: <AlertCircle size={15} />,
+  info: <Info size={15} />,
+};
+
 function CampaignDetail({
   campaign,
   syncRevision,
   importRevision,
   initialTab = "overview",
-  logs,
-  onLog,
-  onClearLogs,
   onBack,
   onEdit,
   onImport,
   onUpdateCampaign,
+  onRefresh,
 }: {
   campaign: Campaign;
   syncRevision: number;
   importRevision: number;
   initialTab?: DetailTab;
-  logs: LogLine[];
-  onLog: (level: LogLevel, text: string) => void;
-  onClearLogs: () => void;
   onBack: () => void;
-  onEdit: () => void;
+  /** Abre o assistente a partir do que está na tela (inclui alterações ainda não salvas). */
+  onEdit: (current: Campaign) => void;
   onImport: () => void;
   onUpdateCampaign: (updated: Campaign) => void;
+  onRefresh: () => void;
 }) {
   const [tab, setTab] = useState<DetailTab>(initialTab);
-  const partLimit = partLimitOf(useNetworkLimits());
+  const limits = useNetworkLimits();
+  const partLimit = partLimitOf(limits);
   const [draft, setDraft] = useState<Draft>(() => draftFrom(campaign));
   const [contacts, setContacts] = useState<Contact[]>([]);
-  const [confirmations, setConfirmations] = useState<{pending: number; sent: number; uncertain: number} | null>(null);
-  useEffect(() => {
-    let alive = true;
-    const refresh = () => api<{pending: number; sent: number; uncertain: number}>("get_confirmation_counts", { campaignId: campaign.id }).then((v) => { if (alive) setConfirmations(v); }).catch(() => { if (alive) setConfirmations(null); });
-    refresh();
-    const timer = setInterval(refresh, 5000);
-    return () => { alive = false; clearInterval(timer); };
-  }, [campaign.id]);
   const [contactsLoading, setContactsLoading] = useState(true);
+  const [contactsFilter, setContactsFilter] = useState<ContactFilter>("all");
+  const [confirmations, setConfirmations] = useState<{ pending: number; sent: number; uncertain: number } | null>(null);
+  const [network, setNetwork] = useState<NetworkStatusInfo | null>(null);
   const [devices, setDevices] = useState<Device[]>([]);
   const [devicesLoading, setDevicesLoading] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<"" | "start" | "pause" | "stop" | "retry" | "reset" | "save" | "saveDevices">("");
   const [savedFlash, setSavedFlash] = useState<"" | "settings" | "devices">("");
-  const [confirm, setConfirm] = useState<"" | "stop" | "reset">("");
+  const [confirm, setConfirm] = useState<"" | "stop" | "reset" | "retry" | "leave">("");
+  const isRunning = campaign.status === "running";
+
+  // Atividade ao vivo (fica no módulo, não some ao trocar de aba).
+  useActivityVersion();
+  const activity = campaignActivity(campaign.id);
+  const logs = activity?.logs ?? [];
+  const now = useNow(isRunning || campaign.status === "paused");
+  const live = liveSummary(campaign, activity, now);
+  const onLog = (level: LogLevel, text: string) => appendCampaignLog(campaign.id, level, text);
+
+  // Confirmações de SAIR: a cada 30 s com a campanha rodando; parada, uma vez.
+  useEffect(() => {
+    let alive = true;
+    const refresh = () =>
+      api<{ pending: number; sent: number; uncertain: number }>("get_confirmation_counts", { campaignId: campaign.id })
+        .then((v) => {
+          if (alive) setConfirmations(v);
+        })
+        .catch(() => {
+          if (alive) setConfirmations(null);
+        });
+    refresh();
+    const timer = isRunning ? setInterval(refresh, 30_000) : undefined;
+    return () => {
+      alive = false;
+      if (timer) clearInterval(timer);
+    };
+  }, [campaign.id, isRunning]);
+
+  // Teto da rede e estado dos chips: a cada 30 s com a campanha rodando.
+  useEffect(() => {
+    let alive = true;
+    const refresh = () =>
+      api<NetworkStatusInfo>("get_network_status")
+        .then((v) => {
+          if (alive) setNetwork(v);
+        })
+        .catch(() => {
+          if (alive) setNetwork(null);
+        });
+    refresh();
+    const timer = isRunning ? setInterval(refresh, 30_000) : undefined;
+    return () => {
+      alive = false;
+      if (timer) clearInterval(timer);
+    };
+  }, [campaign.id, isRunning]);
 
   // Ressincroniza o rascunho ao trocar de campanha ou após edição pelo assistente.
   useEffect(() => {
@@ -3966,23 +4661,71 @@ function CampaignDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [importRevision]);
 
-  // Atualiza a fila a cada evento do motor de disparo para esta campanha.
+  // Fila: recarrega quando um envio muda um contato, no máximo a cada 3 s (a lista pode ter milhares).
   useEffect(() => {
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
-    listen<{ campaign_id: number; status: string }>("campaign-progress", (event) => {
-      if (event.payload.campaign_id !== campaign.id) return;
-      api<Contact[]>("get_campaign_contacts", { campaignId: campaign.id }).then(setContacts).catch(() => {});
-    }).then((fn) => {
-      unlisten = fn;
-    });
+    let last = 0;
+    let trailing: ReturnType<typeof setTimeout> | undefined;
+    const reload = () => {
+      last = Date.now();
+      api<Contact[]>("get_campaign_contacts", { campaignId: campaign.id })
+        .then((data) => {
+          if (!cancelled) setContacts(data);
+        })
+        .catch(() => {});
+    };
+    listen<ProgressPayload>("campaign-progress", (event) => {
+      const p = event.payload;
+      if (!p || p.campaign_id !== campaign.id || !["running", "send_error", "completed"].includes(p.status)) return;
+      if (trailing) clearTimeout(trailing);
+      const wait = 3000 - (Date.now() - last);
+      if (wait <= 0) reload();
+      else trailing = setTimeout(reload, wait);
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
     return () => {
+      cancelled = true;
+      if (trailing) clearTimeout(trailing);
       unlisten?.();
     };
   }, [campaign.id]);
 
-  const { total, sent, failed, pending, progress } = countsFromContacts(campaign, contacts);
-  const isRunning = campaign.status === "running";
-  const status = statusInfo(campaign.status);
+  // Aparelhos: o check-in avisa quando um volta; a lista inteira é relida a cada 30 s (pega quem caiu).
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    listen<{ esferaDeviceId: string; status: string }>("device-updated", (event) => {
+      const { esferaDeviceId, status } = event.payload || ({} as { esferaDeviceId: string; status: string });
+      if (!esferaDeviceId) return;
+      setDevices((prev) => prev.map((d) => (d.esferaDeviceId === esferaDeviceId ? { ...d, status: status as Device["status"] } : d)));
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    const timer = setInterval(() => {
+      api<Device[]>("get_devices", { companyId: campaign.companyId })
+        .then((data) => {
+          if (!cancelled && data) setDevices(data);
+        })
+        .catch(() => {});
+    }, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+      unlisten?.();
+    };
+  }, [campaign.companyId]);
+
+  const { total, sent, failed, pending, skipped, review, progress } = countsFromContacts(campaign, contacts);
+  const autoPaused = campaign.status === "paused" && live.main?.kind === "auto_paused";
+  const status = autoPaused ? { variant: "danger" as BadgeVariant, label: "Pausada pelo sistema" } : statusInfo(campaign.status);
   const devStats = deviceSelectionStats(devices, draft.deviceIds);
 
   const base = draftFrom(campaign);
@@ -3998,14 +4741,44 @@ function CampaignDetail({
     draft.aiProvider !== base.aiProvider ||
     draft.aiModel !== base.aiModel ||
     draft.aiPrompt !== base.aiPrompt;
+  const msgError = messageError(draft, partLimit);
 
-  // Estimativa: média dos intervalos observados no log (se houver) ou do ritmo configurado.
-  const avgDelaySec = useMemo(() => {
-    const observed = logs.filter((l) => l.delayMs).slice(-20);
-    if (observed.length >= 3) return observed.reduce((a, l) => a + (l.delayMs || 0), 0) / observed.length / 1000;
-    return (draft.delayMin + draft.delayMax) / 2;
-  }, [logs, draft.delayMin, draft.delayMax]);
-  const etaSeconds = pending * avgDelaySec;
+  // Ritmo real: intervalo, teto da rede por parte, limite dos chips e janela de envio.
+  const parts = messagePartCount(draft);
+  const pace = estimatePace({
+    pending,
+    delayMin: draft.delayMin,
+    delayMax: draft.delayMax,
+    parts,
+    devices: Math.max(1, devStats.selectedOnline || draft.deviceIds.length),
+    limits,
+    observedCycleSec: observedCycleSeconds(logs),
+    now: new Date(now),
+  });
+
+  // Chips dos aparelhos selecionados: sem chip ou com dois, a campanha pausa quando chega a vez dele.
+  const selectedDevices = devices.filter((d) => draft.deviceIds.includes(deviceKey(d)));
+  const chipProblems = network
+    ? selectedDevices
+        .map((d) => {
+          const chips = network.chips.filter((c) => c.deviceId === d.id);
+          if (chips.length === 0) return `${deviceLabel(d)}: sem chip cadastrado`;
+          if (chips.length > 1) return `${deviceLabel(d)}: ${chips.length} chips cadastrados`;
+          return "";
+        })
+        .filter(Boolean)
+    : [];
+  const chipNotes = network
+    ? network.chips
+        .filter((c) => c.state !== "normal" && selectedDevices.some((d) => d.id === c.deviceId))
+        .map((c) => {
+          const d = selectedDevices.find((x) => x.id === c.deviceId);
+          return `${d ? deviceLabel(d) : c.deviceName}: ${c.reason || c.state}${c.replyRate !== null ? ` (respostas: ${c.replyRate.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%)` : ""}`;
+        })
+    : [];
+  const windowOpen = withinSendWindow(new Date(now));
+  const usedHour = network ? network.attemptsLastHour ?? network.sentLastHour : 0;
+  const usedDay = network ? network.attemptsToday ?? network.sentToday : 0;
 
   const patch = (p: Partial<Draft>) => setDraft((d) => ({ ...d, ...p }));
 
@@ -4035,14 +4808,14 @@ function CampaignDetail({
   };
 
   const saveConfiguration = async (): Promise<boolean> => {
-    const msgError = messageError(draft, partLimit);
     if (msgError) {
       setError(msgError);
       setTab("settings");
       return false;
     }
-    if (draft.delayMin < 1 || draft.delayMax < draft.delayMin) {
-      setError("Confira o intervalo de envio.");
+    const delayErr = delayError(draft.delayMin, draft.delayMax);
+    if (delayErr) {
+      setError(delayErr);
       setTab("settings");
       return false;
     }
@@ -4065,12 +4838,23 @@ function CampaignDetail({
     if (ok) flash("settings");
   };
 
+  // Salvar aparelhos grava só os aparelhos sobre a campanha salva: a mensagem em edição fica como está.
   const handleSaveDevices = async () => {
     setBusy("saveDevices");
-    const ok = await saveConfiguration();
-    setBusy("");
-    if (ok) flash("devices");
+    try {
+      const updated: Campaign = { ...campaign, deviceIds: draft.deviceIds };
+      await api("update_campaign", { campaign: updated });
+      onUpdateCampaign(updated);
+      setError("");
+      flash("devices");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy("");
+    }
   };
+
+  const resumed = campaign.status === "paused" || (campaign.status as string) === "stopped" || sent + failed + review > 0;
 
   const handleRunBatch = async () => {
     if (!draft.deviceIds.length) {
@@ -4079,7 +4863,7 @@ function CampaignDetail({
       return;
     }
     if (!pending) {
-      setError("Importe destinos pendentes antes de iniciar.");
+      setError("Não há contatos pendentes: importe uma lista antes de iniciar.");
       setTab("contacts");
       return;
     }
@@ -4087,10 +4871,13 @@ function CampaignDetail({
     try {
       if (!(await saveConfiguration())) return;
       await api("start_campaign", { campaignId: campaign.id });
+      clearLiveState(campaign.id);
       onUpdateCampaign(buildUpdated({ status: "running" }));
-      onLog("info", campaign.status === "paused" ? "Disparo retomado." : "Campanha iniciada no motor de disparo.");
+      onLog("info", resumed ? "Disparo retomado." : "Campanha iniciada no motor de disparo.");
+      if (!withinSendWindow()) onLog("warning", `Fora do horário de envio: o primeiro envio sai ${formatWhen(nextWindowOpen())}.`);
     } catch (e) {
       setError(String(e));
+      onRefresh();
     } finally {
       setBusy("");
     }
@@ -4101,7 +4888,7 @@ function CampaignDetail({
     try {
       await api("pause_campaign", { campaignId: campaign.id });
       onUpdateCampaign({ ...campaign, status: "paused" });
-      onLog("info", "Campanha pausada.");
+      onLog("info", "Campanha pausada pelo operador.");
     } catch (e) {
       setError(String(e));
     } finally {
@@ -4113,8 +4900,9 @@ function CampaignDetail({
     setBusy("stop");
     try {
       await api("stop_campaign", { campaignId: campaign.id });
-      onUpdateCampaign({ ...campaign, status: "paused" });
+      onUpdateCampaign({ ...campaign, status: "stopped" as CampaignStatus });
       onLog("warning", "Disparo interrompido pelo operador.");
+      onRefresh();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -4127,25 +4915,11 @@ function CampaignDetail({
     setBusy("retry");
     try {
       const count = await api<number>("retry_failed_campaign_contacts", { campaignId: campaign.id });
-      setContacts(await api<Contact[]>("get_campaign_contacts", { campaignId: campaign.id }));
+      await loadContacts();
       onUpdateCampaign({ ...campaign, failedCount: 0, status: "paused" });
-      onLog("info", `${count} falhas devolvidas à fila para nova tentativa.`);
+      onLog("info", `${formatNumber(count)} ${count === 1 ? "falha devolvida" : "falhas devolvidas"} à fila para nova tentativa.`);
       setError("");
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy("");
-    }
-  };
-
-  const handleResetQueue = async () => {
-    setBusy("reset");
-    try {
-      const count = await api<number>("reset_campaign_contacts", { campaignId: campaign.id });
-      setContacts(await api<Contact[]>("get_campaign_contacts", { campaignId: campaign.id }));
-      onUpdateCampaign({ ...campaign, sentCount: 0, failedCount: 0, status: "draft" });
-      onLog("info", `Fila reiniciada: ${count} contatos prontos para novo envio.`);
-      setError("");
+      onRefresh();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -4154,15 +4928,44 @@ function CampaignDetail({
     }
   };
 
+  const handleResetQueue = async () => {
+    setBusy("reset");
+    try {
+      const count = await api<number>("reset_campaign_contacts", { campaignId: campaign.id });
+      await loadContacts();
+      onUpdateCampaign({ ...campaign, sentCount: 0, failedCount: 0, status: "draft" });
+      onLog("info", `Fila reiniciada: ${formatNumber(count)} contatos de volta à fila.`);
+      setError("");
+      onRefresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy("");
+      setConfirm("");
+    }
+  };
+
+  const requestBack = () => {
+    if (settingsDirty || devicesDirty) setConfirm("leave");
+    else onBack();
+  };
+
+  const openContacts = (f: ContactFilter) => {
+    setContactsFilter(f);
+    setTab("contacts");
+  };
+
   const canReset = !isRunning && total > 0 && pending === 0;
   const canRetry = !isRunning && failed > 0;
-  const resumeLabel = campaign.status === "paused" || (campaign.status as string) === "stopped" ? "Retomar disparo" : "Iniciar disparo";
+  const resumeLabel = resumed ? "Retomar disparo" : "Iniciar disparo";
 
-  const checklist: { ok: boolean; label: string; detail?: string; action?: ReactNode }[] = [
+  type CheckItem = { ok: boolean; warn?: boolean; label: string; detail?: string; action?: ReactNode };
+  const checklist: CheckItem[] = [
     {
-      ok: Boolean(draft.body.trim()),
-      label: "Mensagem escrita",
-      action: !draft.body.trim() && <LinkButton onClick={() => setTab("settings")}>Escrever</LinkButton>,
+      ok: !msgError,
+      label: msgError ? "Mensagem com pendência" : "Mensagem pronta",
+      detail: msgError,
+      action: msgError && <LinkButton onClick={() => setTab("settings")}>Corrigir</LinkButton>,
     },
     {
       ok: pending > 0,
@@ -4172,7 +4975,7 @@ function CampaignDetail({
     },
     {
       ok: draft.deviceIds.length > 0,
-      label: draft.deviceIds.length > 0 ? `${draft.deviceIds.length} aparelhos selecionados` : "Aparelhos selecionados",
+      label: draft.deviceIds.length > 0 ? `${draft.deviceIds.length} ${draft.deviceIds.length === 1 ? "aparelho selecionado" : "aparelhos selecionados"}` : "Aparelhos selecionados",
       action: draft.deviceIds.length === 0 && <LinkButton onClick={() => setTab("devices")}>Selecionar</LinkButton>,
     },
     {
@@ -4182,11 +4985,25 @@ function CampaignDetail({
       action: draft.deviceIds.length > 0 && devStats.selectedOnline === 0 && <LinkButton onClick={() => setTab("devices")}>Ver aparelhos</LinkButton>,
     },
   ];
+  if (network && selectedDevices.length > 0) {
+    checklist.push({
+      ok: chipProblems.length === 0,
+      label: chipProblems.length ? "Chip com problema" : "Um chip em cada aparelho",
+      detail: chipProblems.length ? `${chipProblems.join(" · ")}. Ajuste em Dispositivos: sem isso a campanha pausa quando chegar a vez dele.` : undefined,
+    });
+  }
+  checklist.push({
+    ok: windowOpen,
+    warn: !windowOpen,
+    label: windowOpen ? "Dentro do horário de envio" : "Fora do horário de envio",
+    detail: windowOpen ? "Seg–sex 8h–20h, sáb 8h–14h." : `Pode iniciar: o primeiro envio sai ${formatWhen(nextWindowOpen(new Date(now)), new Date(now))}.`,
+  });
 
-  const menuActions = [
+  const menuActions: MenuAction[] = [
     { label: "Importar contatos", icon: <Upload size={14} />, onSelect: onImport },
-    { label: "Reprocessar falhas", icon: <RotateCcw size={14} />, onSelect: handleRetryFailures, disabled: !canRetry },
-    { label: "Reiniciar fila", icon: <RotateCcw size={14} />, onSelect: () => setConfirm("reset"), disabled: isRunning || total === 0 },
+    { label: "Exportar contatos (CSV)", icon: <Download size={14} />, onSelect: () => exportCampaignContacts(campaign, contacts), disabled: contacts.length === 0 },
+    { label: "Reprocessar falhas", icon: <RotateCcw size={14} />, onSelect: () => setConfirm("retry"), disabled: !canRetry },
+    { label: "Reiniciar fila", icon: <RotateCcw size={14} />, onSelect: () => setConfirm("reset"), disabled: !canReset },
   ];
 
   return (
@@ -4195,7 +5012,7 @@ function CampaignDetail({
       <div className="space-y-3">
         <button
           type="button"
-          onClick={onBack}
+          onClick={requestBack}
           className="inline-flex items-center gap-1.5 rounded-md text-[0.8125rem] text-secondary hover:text-[var(--color-text-primary)] cursor-pointer"
         >
           <ArrowLeft size={14} /> Campanhas
@@ -4204,9 +5021,12 @@ function CampaignDetail({
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2.5">
               <h1 className="truncate text-[1.25rem] font-semibold leading-tight tracking-tight text-primary">{campaign.name}</h1>
-              <Badge variant={status.variant} dot pulse={isRunning}>
+              <Badge variant={status.variant} dot pulse={isRunning && (!live.main || live.main.kind === "sending")}>
                 {status.label}
               </Badge>
+              {isRunning && live.main && live.main.kind !== "sending" && (
+                <span className={`inline-flex items-center gap-1 text-[0.75rem] font-medium ${liveToneStyle[live.main.tone]}`}>{live.main.short}</span>
+              )}
             </div>
             <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[0.8125rem] text-secondary">
               <span className="inline-flex items-center gap-1.5"><Users size={13} className="text-tertiary" />{formatNumber(total)} contatos</span>
@@ -4217,7 +5037,7 @@ function CampaignDetail({
             </p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center gap-2">
-            <Button variant="secondary" icon={<Pencil size={14} />} onClick={onEdit}>
+            <Button variant="secondary" icon={<Pencil size={14} />} onClick={() => onEdit(buildUpdated())}>
               Editar
             </Button>
             {isRunning ? (
@@ -4225,7 +5045,14 @@ function CampaignDetail({
                 <Button variant="secondary" icon={<Square size={13} />} onClick={() => setConfirm("stop")} disabled={!!busy}>
                   Parar
                 </Button>
-                <Button variant="primary" icon={<Pause size={14} />} onClick={handlePause} loading={busy === "pause"} disabled={!!busy && busy !== "pause"}>
+                <Button
+                  variant="primary"
+                  icon={<Pause size={14} />}
+                  onClick={handlePause}
+                  loading={busy === "pause"}
+                  disabled={!!busy && busy !== "pause"}
+                  title="Pausa os envios. Se um aparelho estiver digitando agora, essa mensagem é interrompida e o contato fica para revisão."
+                >
                   Pausar
                 </Button>
               </>
@@ -4245,6 +5072,21 @@ function CampaignDetail({
           </div>
         </div>
       </div>
+
+      {autoPaused && live.main && (
+        <InlineAlert
+          tone="danger"
+          icon={<AlertCircle size={15} />}
+          title="A campanha foi pausada pelo sistema"
+          action={
+            <Button size="sm" variant="secondary" icon={<Smartphone size={13} />} onClick={() => setTab("devices")}>
+              Ver aparelhos
+            </Button>
+          }
+        >
+          {live.main.text}
+        </InlineAlert>
+      )}
 
       {error && (
         <InlineAlert tone="danger" icon={<AlertCircle size={15} />} title="Não foi possível concluir a ação" onDismiss={() => setError("")}>
@@ -4273,33 +5115,67 @@ function CampaignDetail({
                   <p className="mt-1 text-[2rem] font-semibold leading-none tracking-tight text-primary tabular-nums">{progress}%</p>
                 </div>
                 <p className="text-right text-[0.8125rem] text-secondary tabular-nums">
-                  {formatNumber(sent + failed)} de {formatNumber(total)} processados
+                  {formatNumber(total - pending)} de {formatNumber(total)} processados
                 </p>
               </div>
               <div className="mt-4">
-                <ProgressBar total={total} sent={sent} failed={failed} size="lg" completed={campaign.status === "completed"} />
+                <ProgressBar total={total} sent={sent} failed={failed} skipped={skipped + review} size="lg" completed={campaign.status === "completed"} />
               </div>
-              <div className="mt-5 grid grid-cols-2 gap-3 md:grid-cols-4">
-                <StatCard label="Enviados" value={formatNumber(sent)} icon={<Send size={14} />} tone="success" />
+              <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-3 2xl:grid-cols-5">
+                <StatCard
+                  label="Enviados"
+                  value={formatNumber(sent)}
+                  icon={<Send size={14} />}
+                  tone="success"
+                  hint={
+                    review > 0 ? (
+                      <LinkButton onClick={() => openContacts("review")}>
+                        {formatNumber(review)} {review === 1 ? "parcial" : "parciais"}: revisar
+                      </LinkButton>
+                    ) : undefined
+                  }
+                />
                 <StatCard
                   label="Falhas"
                   value={formatNumber(failed)}
                   icon={<XCircle size={14} />}
                   tone={failed > 0 ? "danger" : "neutral"}
-                  hint={canRetry ? <LinkButton onClick={handleRetryFailures}>{busy === "retry" ? "Reprocessando…" : "Reprocessar"}</LinkButton> : undefined}
+                  hint={canRetry ? <LinkButton onClick={() => setConfirm("retry")}>{busy === "retry" ? "Reprocessando…" : "Reprocessar"}</LinkButton> : undefined}
+                />
+                <StatCard
+                  label="Pulados"
+                  value={formatNumber(skipped)}
+                  icon={<Ban size={14} />}
+                  hint={skipped > 0 ? <LinkButton onClick={() => openContacts("skipped")}>Ver quem</LinkButton> : "descadastro, sem WhatsApp"}
                 />
                 <StatCard label="Restantes" value={formatNumber(pending)} icon={<Users size={14} />} tone="info" />
                 <StatCard
-                  label="Tempo estimado"
-                  value={pending > 0 ? `~${formatDuration(etaSeconds)}` : "—"}
+                  label="Término estimado"
+                  value={pending > 0 && pace?.finish ? formatWhen(pace.finish, new Date(now)) : "—"}
                   icon={<Clock size={14} />}
-                  hint={pending > 0 ? (isRunning ? "no ritmo atual" : "se iniciar agora") : undefined}
+                  hint={
+                    pending > 0 && pace ? (
+                      <span title={paceLimitText(pace, limits, parts)}>
+                        ≈ {perHourText(pace.perHour)} por hora{isRunning ? "" : " · se iniciar agora"}
+                      </span>
+                    ) : undefined
+                  }
                 />
               </div>
-              {confirmations && <p className="mt-4 text-[0.8125rem] text-secondary">Confirmações de SAIR: {formatNumber(confirmations.pending)} aguardam envio · {formatNumber(confirmations.sent)} enviadas{confirmations.uncertain > 0 ? ` · ${formatNumber(confirmations.uncertain)} em revisão` : ""}</p>}
+              {pending > 0 && pace && (
+                <p className="mt-3 text-[0.75rem] text-tertiary">
+                  Estimativa só no horário de envio, {paceLimitText(pace, limits, parts)}. O teto da rede é dividido entre as campanhas em andamento.
+                </p>
+              )}
+              {confirmations && (confirmations.pending > 0 || confirmations.sent > 0 || confirmations.uncertain > 0) && (
+                <p className="mt-3 text-[0.8125rem] text-secondary">
+                  Confirmações de SAIR: {formatNumber(confirmations.pending)} aguardam envio · {formatNumber(confirmations.sent)} enviadas
+                  {confirmations.uncertain > 0 ? ` · ${formatNumber(confirmations.uncertain)} em revisão` : ""}
+                </p>
+              )}
               {canReset && (
                 <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border px-3.5 py-3">
-                  <p className="text-[0.8125rem] text-secondary">Todos os contatos já foram processados. Reinicie a fila para enviar de novo à mesma lista.</p>
+                  <p className="text-[0.8125rem] text-secondary">Todos os contatos já foram processados.</p>
                   <Button size="sm" variant="secondary" icon={<RotateCcw size={13} />} onClick={() => setConfirm("reset")}>
                     Reiniciar fila
                   </Button>
@@ -4309,14 +5185,53 @@ function CampaignDetail({
 
             <div className="rounded-xl border border-border bg-card p-5">
               <h3 className="text-sm font-semibold text-primary">{isRunning ? "Disparo em andamento" : "Antes de disparar"}</h3>
-              <p className="mt-0.5 text-[0.75rem] text-tertiary">
-                {isRunning ? "As mensagens estão saindo pelos aparelhos selecionados." : "Tudo marcado? Então é só iniciar."}
-              </p>
+              {isRunning ? (
+                <div
+                  role="status"
+                  className={`mt-3 flex items-start gap-2.5 rounded-lg border px-3 py-2.5 text-[0.8125rem] ${
+                    live.main?.tone === "danger"
+                      ? "border-red-500/25 bg-red-500/[0.07]"
+                      : live.main?.tone === "warning"
+                      ? "border-amber-500/25 bg-amber-500/[0.07]"
+                      : live.main?.tone === "info"
+                      ? "border-sky-500/25 bg-sky-500/[0.07]"
+                      : "border-emerald-500/25 bg-emerald-500/[0.07]"
+                  }`}
+                >
+                  <span className={`mt-0.5 shrink-0 ${liveToneStyle[live.main?.tone ?? "success"]}`}>{liveToneIcon[live.main?.tone ?? "success"]}</span>
+                  <div className="min-w-0">
+                    <p className={`font-medium ${liveToneStyle[live.main?.tone ?? "success"]}`}>{live.main ? live.main.short : "Em andamento"}</p>
+                    <p className="mt-0.5 text-secondary">
+                      {live.main ? live.main.text : "As mensagens saem uma de cada vez, no ritmo configurado. Cada envio e cada espera aparecem na atividade abaixo."}
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <p className="mt-0.5 text-[0.75rem] text-tertiary">Tudo marcado? Então é só iniciar.</p>
+              )}
+              {(live.notes.length > 0 || chipNotes.length > 0) && (
+                <ul className="mt-3 space-y-1.5">
+                  {chipNotes.map((n) => (
+                    <li key={n} className="flex items-start gap-2 text-[0.75rem] text-amber-700 dark:text-amber-300">
+                      <AlertTriangle size={13} className="mt-0.5 shrink-0" /> {n}
+                    </li>
+                  ))}
+                  {live.notes
+                    .filter((n) => chipNotes.length === 0 || n.kind === "ai_warning")
+                    .map((n) => (
+                      <li key={n.kind} className={`flex items-start gap-2 text-[0.75rem] ${liveToneStyle[n.tone]}`}>
+                        <AlertTriangle size={13} className="mt-0.5 shrink-0" /> {n.text}
+                      </li>
+                    ))}
+                </ul>
+              )}
               <ul className="mt-4 space-y-3">
                 {checklist.map((item) => (
                   <li key={item.label} className="flex items-start gap-2.5">
                     {item.ok ? (
                       <CheckCircle2 size={16} className="mt-0.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                    ) : item.warn ? (
+                      <AlertTriangle size={16} className="mt-0.5 shrink-0 text-amber-600 dark:text-amber-400" />
                     ) : (
                       <Circle size={16} className="mt-0.5 shrink-0 text-tertiary" />
                     )}
@@ -4328,23 +5243,52 @@ function CampaignDetail({
                   </li>
                 ))}
               </ul>
+              {network && (
+                <div className="mt-4 space-y-1 border-t border-border pt-3 text-[0.75rem] text-secondary">
+                  <p className="font-medium text-primary">Teto da rede</p>
+                  <p className="tabular-nums">
+                    {formatNumber(usedHour)} de {formatNumber(network.hourly)} nesta hora · {formatNumber(usedDay)} de {formatNumber(network.daily)} hoje
+                  </p>
+                  {network.waitSeconds > 0 && (
+                    <p className="text-amber-700 dark:text-amber-300">
+                      Teto atingido: libera por volta de {formatWhen(new Date(now + network.waitSeconds * 1000), new Date(now))}.
+                    </p>
+                  )}
+                  <p className="text-tertiary">Cada parte da mensagem conta uma vez ({parts} por contato).</p>
+                </div>
+              )}
             </div>
           </div>
 
-          <LogConsole lines={logs} onClear={onClearLogs} />
+          <LogConsole lines={logs} onClear={() => clearCampaignLogs(campaign.id)} />
         </div>
       )}
 
-      {tab === "contacts" && <ContactsPanel contacts={contacts} loading={contactsLoading} onImport={onImport} onReload={loadContacts} />}
+      {tab === "contacts" && (
+        <ContactsPanel
+          campaign={campaign}
+          contacts={contacts}
+          loading={contactsLoading}
+          onImport={onImport}
+          onReload={loadContacts}
+          filter={contactsFilter}
+          onFilterChange={setContactsFilter}
+        />
+      )}
 
       {tab === "devices" && (
         <div className="space-y-4">
           <div>
             <h2 className="text-sm font-semibold text-primary">Aparelhos autorizados</h2>
             <p className="mt-0.5 text-[0.8125rem] text-secondary">
-              O motor distribui as mensagens de forma balanceada entre os aparelhos selecionados que estiverem online.
+              O motor reveza os envios entre os aparelhos selecionados que estiverem online, um contato por vez.
             </p>
           </div>
+          {chipProblems.length > 0 && (
+            <InlineAlert tone="warning" icon={<AlertTriangle size={15} />} title="Aparelho sem chip ou com mais de um">
+              {chipProblems.join(" · ")}. Cadastre exatamente um chip em cada aparelho (Dispositivos); senão a campanha pausa quando chegar a vez dele.
+            </InlineAlert>
+          )}
           <DevicePicker
             devices={devices}
             loading={devicesLoading && devices.length === 0}
@@ -4386,22 +5330,20 @@ function CampaignDetail({
           <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,22rem)]">
             <div className="space-y-10">
               <FormSection title="Mensagem" description="Saudação, corpo e encerramento saem como mensagens seguidas, nesta ordem.">
-                <MessageFields
-                  value={draft}
-                  onChange={(p) => patch(p)}
-                  partLimit={partLimit}
-                />
+                <MessageFields value={draft} onChange={(p) => patch(p)} partLimit={partLimit} />
               </FormSection>
               <FormSection title="Personalização com IA" description="Opcional. Usa a configuração de IA da empresa quando o provedor fica no padrão.">
-                <AiFields
-                  value={draft}
-                  onChange={(p) => patch(p)}
-                  companyId={campaign.companyId}
-                  message={draft}
-                />
+                <AiFields value={draft} onChange={(p) => patch(p)} companyId={campaign.companyId} message={draft} />
               </FormSection>
               <FormSection title="Ritmo de envio" description="Intervalos aleatórios entre mensagens deixam o disparo mais natural.">
-                <DelayFields min={draft.delayMin} max={draft.delayMax} onChange={(p) => patch(p)} pendingContacts={pending} />
+                <DelayFields
+                  min={draft.delayMin}
+                  max={draft.delayMax}
+                  onChange={(p) => patch(p)}
+                  pendingContacts={pending}
+                  parts={parts}
+                  devices={Math.max(1, devStats.selectedOnline || draft.deviceIds.length)}
+                />
               </FormSection>
             </div>
             <div className="lg:sticky lg:top-4 lg:self-start">
@@ -4418,6 +5360,7 @@ function CampaignDetail({
                 "Tudo salvo"
               )}
               {isRunning && settingsDirty && <span className="ml-2 text-tertiary">As mudanças valem para os próximos envios.</span>}
+              {settingsDirty && msgError && <span className="ml-2 text-red-600 dark:text-red-400">Corrija a mensagem para salvar.</span>}
             </p>
             <div className="flex items-center gap-2">
               {settingsDirty && (
@@ -4425,7 +5368,7 @@ function CampaignDetail({
                   Descartar
                 </Button>
               )}
-              <Button onClick={handleSaveSettings} loading={busy === "save"} disabled={!settingsDirty || !!delayError(draft.delayMin, draft.delayMax) || !!messageError(draft, partLimit)}>
+              <Button onClick={handleSaveSettings} loading={busy === "save"} disabled={!settingsDirty || !!delayError(draft.delayMin, draft.delayMax) || !!msgError}>
                 Salvar configurações
               </Button>
             </div>
@@ -4441,7 +5384,25 @@ function CampaignDetail({
         onConfirm={handleStop}
         onClose={() => setConfirm("")}
       >
-        Os envios param imediatamente. Os contatos que ainda não receberam continuam na fila e você pode retomar depois.
+        <p>
+          Parar encerra o disparo e apaga dos celulares os contatos temporários desta campanha (ao retomar, eles são salvos de novo). Para um intervalo, como
+          o almoço, prefira <strong className="text-primary">Pausar</strong>.
+        </p>
+        <p className="mt-2">
+          Quem ainda não recebeu continua na fila. Se um aparelho estiver digitando agora, essa mensagem é interrompida e o contato fica para revisão.
+        </p>
+      </ConfirmDialog>
+      <ConfirmDialog
+        isOpen={confirm === "retry"}
+        title={`Reprocessar ${formatNumber(failed)} ${failed === 1 ? "falha" : "falhas"}?`}
+        confirmLabel="Reprocessar"
+        danger={false}
+        loading={busy === "retry"}
+        onConfirm={handleRetryFailures}
+        onClose={() => setConfirm("")}
+      >
+        Os contatos com falha voltam para a fila e são tentados de novo (até 3 vezes cada) quando você retomar. Falhas repetidas contam no freio automático do
+        chip e podem pausar a campanha: se o problema for do aparelho, resolva antes.
       </ConfirmDialog>
       <ConfirmDialog
         isOpen={confirm === "reset"}
@@ -4451,8 +5412,29 @@ function CampaignDetail({
         onConfirm={handleResetQueue}
         onClose={() => setConfirm("")}
       >
-        Todos os {formatNumber(total)} contatos voltam para "pendente" e os contadores de enviados e falhas são zerados. Ao iniciar de novo, a mesma lista
-        recebe a mensagem outra vez.
+        <p>
+          Os {formatNumber(total)} contatos voltam para “pendente”, os contadores de enviados e falhas voltam a zero e a campanha volta a rascunho. Quem já
+          recebeu nesta campanha não recebe de novo, e os descadastrados continuam fora.
+        </p>
+        {review > 0 && (
+          <p className="mt-2 text-amber-700 dark:text-amber-300">
+            Atenção: {formatNumber(review)} {review === 1 ? "contato com envio parcial volta" : "contatos com envio parcial voltam"} à fila e podem receber
+            partes repetidas. Confira esses contatos antes (Contatos → Revisar).
+          </p>
+        )}
+      </ConfirmDialog>
+      <ConfirmDialog
+        isOpen={confirm === "leave"}
+        title="Sair sem salvar?"
+        confirmLabel="Sair sem salvar"
+        onConfirm={() => {
+          setConfirm("");
+          onBack();
+        }}
+        onClose={() => setConfirm("")}
+      >
+        Há alterações não salvas em {settingsDirty && devicesDirty ? "Configurações e Aparelhos" : settingsDirty ? "Configurações" : "Aparelhos"}. Elas serão
+        perdidas.
       </ConfirmDialog>
     </div>
   );
@@ -4478,9 +5460,9 @@ function StickyBar({ children }: { children: ReactNode }) {
 // CampaignList
 // ============================================================
 
-// Lista densa de campanhas (linhas clicáveis com progresso e ações).
+// Lista densa de campanhas (linhas clicáveis com progresso, estado ao vivo e ações).
 
-const GRID = "lg:grid lg:grid-cols-[minmax(0,2.4fr)_8rem_minmax(0,1.7fr)_6rem_7rem_4.5rem] lg:items-center lg:gap-4";
+const GRID = "lg:grid lg:grid-cols-[minmax(0,2.3fr)_10rem_minmax(0,1.6fr)_5.5rem_7rem_6.5rem] lg:items-center lg:gap-4";
 
 export function CampaignListSkeleton() {
   return (
@@ -4498,12 +5480,31 @@ export function CampaignListSkeleton() {
   );
 }
 
+// Selo de status com o estado ao vivo embaixo ("Fora do horário · volta seg 08:00", "Teto da rede atingido"...).
+function CampaignStatusCell({ c, now }: { c: Campaign; now: number }) {
+  const live = liveSummary(c, campaignActivity(c.id), now);
+  const autoPaused = c.status === "paused" && live.main?.kind === "auto_paused";
+  const st = autoPaused ? { variant: "danger" as BadgeVariant, label: "Pausada pelo sistema" } : statusInfo(c.status);
+  const sub = live.main && live.main.kind !== "sending" && (c.status === "running" || autoPaused) ? live.main : undefined;
+  return (
+    <div className="min-w-0" title={sub?.text}>
+      <Badge variant={st.variant} dot pulse={c.status === "running" && !sub}>
+        {st.label}
+      </Badge>
+      {sub && !autoPaused && <p className={`mt-1 truncate text-[0.6875rem] font-medium ${liveToneStyle[sub.tone]}`}>{sub.short}</p>}
+    </div>
+  );
+}
+
 function CampaignList({
   campaigns,
   onOpen,
   onEdit,
   onImport,
   onDelete,
+  onQuickToggle,
+  quickBusyId,
+  now,
   selecting,
   selectedIds,
   onToggle,
@@ -4514,6 +5515,10 @@ function CampaignList({
   onEdit: (c: Campaign) => void;
   onImport: (c: Campaign) => void;
   onDelete: (c: Campaign) => void;
+  /** Pausar (em andamento) ou retomar (pausada/interrompida) sem abrir a campanha. */
+  onQuickToggle: (c: Campaign) => void;
+  quickBusyId: number | null;
+  now: number;
   selecting: boolean;
   selectedIds: Set<number>;
   onToggle: (id: number) => void;
@@ -4531,10 +5536,11 @@ function CampaignList({
       </div>
       <ul className="divide-y divide-[var(--color-border)]">
         {campaigns.map((c) => {
-          const st = statusInfo(c.status);
-          const { total, sent, failed, progress } = countsFromCampaign(c);
+          const { total, sent, failed, skipped, progress } = countsFromCampaign(c);
           const deviceCount = (c.deviceIds || []).length;
           const preview = [c.greeting, c.message].filter(Boolean).join(" ");
+          const running = c.status === "running";
+          const canResume = c.status === "paused" || (c.status as string) === "stopped";
           return (
             <li
               key={c.id}
@@ -4548,38 +5554,35 @@ function CampaignList({
             >
               {/* Nome */}
               <div className="flex min-w-0 items-start justify-between gap-3">
-                {selecting && <input type="checkbox" aria-label={`Selecionar ${c.name}`} checked={selectedIds.has(c.id)} disabled={c.status === "running"} onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()} onChange={() => onToggle(c.id)} className="mt-1 accent-[var(--color-accent)]" />}
-                <div className="min-w-0">
+                {selecting && <input type="checkbox" aria-label={`Selecionar ${c.name}`} checked={selectedIds.has(c.id)} disabled={running} onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()} onChange={() => onToggle(c.id)} className="mt-1 accent-[var(--color-accent)]" />}
+                <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <p className="truncate text-sm font-medium text-primary">{c.name}</p>
                     {campaignUsesAi(c) && <Badge variant="purple">IA</Badge>}
                   </div>
                   <p className="mt-0.5 truncate text-[0.75rem] text-tertiary">{preview || "Sem mensagem"}</p>
                 </div>
-                <div className="lg:hidden">
-                  <Badge variant={st.variant} dot pulse={c.status === "running"}>
-                    {st.label}
-                  </Badge>
+                <div className="shrink-0 lg:hidden">
+                  <CampaignStatusCell c={c} now={now} />
                 </div>
               </div>
 
               {/* Status */}
-              <div className="hidden lg:block">
-                <Badge variant={st.variant} dot pulse={c.status === "running"}>
-                  {st.label}
-                </Badge>
+              <div className="hidden min-w-0 lg:block">
+                <CampaignStatusCell c={c} now={now} />
               </div>
 
               {/* Progresso */}
               <div className="mt-3 min-w-0 lg:mt-0">
                 <div className="mb-1.5 flex items-baseline justify-between gap-2 text-[0.75rem]">
-                  <span className="tabular-nums text-secondary">
+                  <span className="truncate tabular-nums text-secondary">
                     <span className="text-primary">{formatNumber(sent)}</span> / {formatNumber(total)}
                     {failed > 0 && <span className="ml-1.5 text-red-600 dark:text-red-400">· {formatNumber(failed)} falhas</span>}
+                    {skipped > 0 && <span className="ml-1.5 text-tertiary">· {formatNumber(skipped)} sem envio</span>}
                   </span>
                   <span className="tabular-nums text-tertiary">{progress}%</span>
                 </div>
-                <ProgressBar total={total} sent={sent} failed={failed} completed={c.status === "completed"} />
+                <ProgressBar total={total} sent={sent} failed={failed} skipped={skipped} completed={c.status === "completed"} />
               </div>
 
               {/* Aparelhos + data (no mobile ficam numa linha) */}
@@ -4593,6 +5596,18 @@ function CampaignList({
 
               {/* Ações */}
               <div className="mt-2 flex items-center justify-end gap-0.5 lg:mt-0" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+                {(running || canResume) && (
+                  <button
+                    type="button"
+                    aria-label={running ? `Pausar ${c.name}` : `Retomar ${c.name}`}
+                    title={running ? "Pausar" : "Retomar"}
+                    disabled={quickBusyId === c.id}
+                    onClick={() => onQuickToggle(c)}
+                    className="flex h-8 w-8 items-center justify-center rounded-lg text-secondary transition-colors hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-text-primary)] disabled:opacity-40 disabled:cursor-wait cursor-pointer"
+                  >
+                    {quickBusyId === c.id ? <RefreshCw size={14} className="animate-spin" /> : running ? <Pause size={14} /> : <Play size={14} />}
+                  </button>
+                )}
                 <button
                   type="button"
                   aria-label={`Editar ${c.name}`}
@@ -4602,13 +5617,13 @@ function CampaignList({
                 >
                   <Pencil size={14} />
                 </button>
-                {canDelete && <button type="button" aria-label={`Excluir ${c.name}`} title={c.status === "running" ? "Pare a campanha antes de excluir" : "Excluir campanha"} disabled={c.status === "running"} onClick={() => onDelete(c)} className="flex h-8 w-8 items-center justify-center rounded-lg text-secondary hover:bg-red-500/10 hover:text-red-600 disabled:opacity-40 disabled:cursor-not-allowed">
+                {canDelete && <button type="button" aria-label={`Excluir ${c.name}`} title={running ? "Pare a campanha antes de excluir" : "Excluir campanha"} disabled={running} onClick={() => onDelete(c)} className="flex h-8 w-8 items-center justify-center rounded-lg text-secondary hover:bg-red-500/10 hover:text-red-600 disabled:opacity-40 disabled:cursor-not-allowed">
                   <Trash2 size={14} />
                 </button>}
                 <ActionMenu
                   label={`Mais ações para ${c.name}`}
                   actions={[
-                    { label: "Abrir campanha", icon: <Play size={14} />, onSelect: () => onOpen(c) },
+                    { label: "Abrir campanha", icon: <LayoutDashboard size={14} />, onSelect: () => onOpen(c) },
                     { label: "Importar contatos", icon: <Upload size={14} />, onSelect: () => onImport(c) },
                     { label: "Ver contatos", icon: <Users size={14} />, onSelect: () => onOpen(c, "contacts") },
                     { label: "Escolher aparelhos", icon: <Smartphone size={14} />, onSelect: () => onOpen(c, "devices") },
@@ -4630,8 +5645,14 @@ function CampaignList({
 // ============================================================
 
 type StatusFilter = "all" | "running" | "paused" | "completed" | "draft" | "error";
-const LOG_LIMIT = 300;
-let logSeq = 0;
+
+// Em andamento primeiro, depois pausadas, rascunhos e concluídas; dentro de cada grupo, a mais recente.
+const STATUS_ORDER: Record<string, number> = { running: 0, paused: 1, stopped: 1, error: 1, draft: 2, completed: 3 };
+function sortCampaigns(list: Campaign[]) {
+  return [...list].sort(
+    (a, b) => (STATUS_ORDER[a.status] ?? 4) - (STATUS_ORDER[b.status] ?? 4) || (b.updatedAt || "").localeCompare(a.updatedAt || "") || b.id - a.id
+  );
+}
 
 export default function CampaignsTab() {
   const { selectedCompanyId, user } = useAuth();
@@ -4649,20 +5670,24 @@ export default function CampaignsTab() {
   const [optOutOpen, setOptOutOpen] = useState(false);
   const [importRevision, setImportRevision] = useState(0);
   const [syncRevision, setSyncRevision] = useState(0);
-  const [logs, setLogs] = useState<Record<number, LogLine[]>>({});
   const [selecting, setSelecting] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [deleteTargets, setDeleteTargets] = useState<Campaign[] | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteError, setDeleteError] = useState("");
+  const [quickBusyId, setQuickBusyId] = useState<number | null>(null);
+  const [listError, setListError] = useState("");
+  const [reviewCount, setReviewCount] = useState(0);
   const canDelete = user?.role !== "colaborador";
+  const partLimit = partLimitOf(useNetworkLimits());
+  const appendLog = appendCampaignLog;
 
-  const appendLog = useCallback((campaignId: number, level: LogLevel, text: string, delayMs?: number) => {
-    setLogs((prev) => {
-      const list = [...(prev[campaignId] || []), { id: ++logSeq, time: nowTime(), level, text, delayMs }];
-      return { ...prev, [campaignId]: list.slice(-LOG_LIMIT) };
-    });
+  // A atividade ao vivo é ouvida uma vez para o app inteiro e guardada no módulo.
+  useEffect(() => {
+    ensureProgressListener();
   }, []);
+  useActivityVersion();
+  const now = useNow(campaignsList.some((c) => c.status === "running" || c.status === "paused"));
 
   const loadCampaigns = useCallback(() => {
     let mounted = true;
@@ -4678,10 +5703,10 @@ export default function CampaignsTab() {
         if (mounted) setCampaignsList(data);
       })
       .catch((err) => {
-        if (mounted) {
-          setCampaignsList(MOCK_CAMPAIGNS.filter((c) => c.companyId === selectedCompanyId));
-          setLoadError(String(err));
-        }
+        // Sem dados de exemplo: falha aparece como falha, com "Tentar de novo".
+        if (!mounted) return;
+        setCampaignsList([]);
+        setLoadError(String(err));
       })
       .finally(() => {
         if (mounted) setLoading(false);
@@ -4697,6 +5722,7 @@ export default function CampaignsTab() {
     setSelectedIds(new Set());
     setDeleteTargets(null);
     setDeleteError("");
+    setListError("");
     return loadCampaigns();
   }, [loadCampaigns]);
 
@@ -4715,35 +5741,52 @@ export default function CampaignsTab() {
 
   useEffect(() => {
     if (!selectedCompanyId) return;
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     let lastRefresh = 0;
     let trailing: ReturnType<typeof setTimeout> | undefined;
-    listen<ProgressPayload>("campaign-progress", (event) => {
-      const p = event.payload;
-      if (p && typeof p.campaign_id === "number" && typeof p.status === "string") {
-        const { level, text } = describeProgress(p);
-        appendLog(p.campaign_id, level, text, p.delay_used_ms || undefined);
-      }
+    listen<ProgressPayload>("campaign-progress", () => {
       // Atualiza no máximo a cada 2s, mas nunca perde o último evento (ex.: "completed").
-      const now = Date.now();
+      const t = Date.now();
       if (trailing) clearTimeout(trailing);
-      if (now - lastRefresh >= 2000) {
-        lastRefresh = now;
+      if (t - lastRefresh >= 2000) {
+        lastRefresh = t;
         refreshCampaigns();
       } else {
         trailing = setTimeout(() => {
           lastRefresh = Date.now();
           refreshCampaigns();
-        }, 2000 - (now - lastRefresh));
+        }, 2000 - (t - lastRefresh));
       }
-    }).then((fn) => {
-      unlisten = fn;
-    });
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
     return () => {
+      cancelled = true;
       if (trailing) clearTimeout(trailing);
-      if (unlisten) unlisten();
+      unlisten?.();
     };
-  }, [selectedCompanyId, refreshCampaigns, appendLog]);
+  }, [selectedCompanyId, refreshCampaigns]);
+
+  // Pedidos de SAIR sem número identificável: enquanto ninguém revisa, não bloqueiam envio nenhum.
+  const loadReviews = useCallback(() => {
+    if (!selectedCompanyId) {
+      setReviewCount(0);
+      return;
+    }
+    api<unknown[]>("list_opt_out_reviews", { companyId: selectedCompanyId })
+      .then((list) => setReviewCount(Array.isArray(list) ? list.length : 0))
+      .catch(() => setReviewCount(0));
+  }, [selectedCompanyId]);
+
+  useEffect(() => {
+    loadReviews();
+    const t = setInterval(loadReviews, 60_000);
+    return () => clearInterval(t);
+  }, [loadReviews]);
 
   const upsertCampaign = (c: Campaign) =>
     setCampaignsList((prev) => {
@@ -4767,6 +5810,39 @@ export default function CampaignsTab() {
       return next;
     });
 
+  // Pausar ou retomar direto da lista. Retomar confere a mensagem como o detalhe confere; com pendência, abre as configurações.
+  const quickToggle = async (c: Campaign) => {
+    setListError("");
+    if (c.status !== "running") {
+      const issue =
+        messageError({ greeting: c.greeting || "", body: c.message || "", closing: c.closing || "", useSpintax: c.useSpintax ?? true }, partLimit) ||
+        delayError(c.delayMin, c.delayMax);
+      if (issue) {
+        setListError(`${c.name}: ${issue}`);
+        setDetail({ id: c.id, tab: "settings" });
+        return;
+      }
+    }
+    setQuickBusyId(c.id);
+    try {
+      if (c.status === "running") {
+        await api("pause_campaign", { campaignId: c.id });
+        upsertCampaign({ ...c, status: "paused" });
+        appendLog(c.id, "info", "Campanha pausada pelo operador.");
+      } else {
+        await api("start_campaign", { campaignId: c.id });
+        clearLiveState(c.id);
+        upsertCampaign({ ...c, status: "running" });
+        appendLog(c.id, "info", "Disparo retomado.");
+      }
+    } catch (e) {
+      setListError(`${c.name}: ${String(e)}`);
+    } finally {
+      setQuickBusyId(null);
+      refreshCampaigns();
+    }
+  };
+
   // ---- Métricas e filtros ----
   const counts = useMemo(() => {
     const by = (s: string[]) => campaignsList.filter((c) => s.includes(c.status)).length;
@@ -4783,14 +5859,17 @@ export default function CampaignsTab() {
   const totalSent = campaignsList.reduce((acc, c) => acc + (c.sentCount || 0), 0);
   const totalFailed = campaignsList.reduce((acc, c) => acc + (c.failedCount || 0), 0);
   const totalContacts = campaignsList.reduce((acc, c) => acc + (c.contactsCount || 0), 0);
-  const totalPending = campaignsList.reduce((acc, c) => acc + Math.max(0, (c.contactsCount || 0) - (c.sentCount || 0) - (c.failedCount || 0)), 0);
+  const totalPending = campaignsList.reduce((acc, c) => acc + countsFromCampaign(c).pending, 0);
 
-  const filteredCampaigns = campaignsList.filter((c) => {
-    const matchesSearch = c.name.toLowerCase().includes(searchQuery.toLowerCase().trim());
-    const matchesStatus =
-      statusFilter === "all" || c.status === statusFilter || (statusFilter === "paused" && (c.status as string) === "stopped");
-    return matchesSearch && matchesStatus;
-  });
+  const query = plainText(searchQuery);
+  const filteredCampaigns = sortCampaigns(
+    campaignsList.filter((c) => {
+      const matchesSearch = !query || plainText(c.name).includes(query) || plainText(`${c.greeting} ${c.message} ${c.closing}`).includes(query);
+      const matchesStatus =
+        statusFilter === "all" || c.status === statusFilter || (statusFilter === "paused" && (c.status as string) === "stopped");
+      return matchesSearch && matchesStatus;
+    })
+  );
 
   const deleteCampaigns = async () => {
     if (!deleteTargets || deleteBusy) return;
@@ -4861,7 +5940,15 @@ export default function CampaignsTab() {
       />
 
       {aiGlobalModalOpen && <GlobalAiConfigModal isOpen={aiGlobalModalOpen} onClose={() => setAiGlobalModalOpen(false)} />}
-      {optOutOpen && selectedCompanyId && <OptOutModal companyId={selectedCompanyId} onClose={() => setOptOutOpen(false)} />}
+      {optOutOpen && selectedCompanyId && (
+        <OptOutModal
+          companyId={selectedCompanyId}
+          onClose={() => {
+            setOptOutOpen(false);
+            loadReviews();
+          }}
+        />
+      )}
       <ConfirmDialog isOpen={deleteTargets !== null} title={deleteTargets?.length === 1 ? "Excluir campanha" : "Excluir campanhas"} confirmLabel="Excluir" loading={deleteBusy} onClose={() => { if (!deleteBusy) setDeleteTargets(null); }} onConfirm={deleteCampaigns}>
         <p>Excluir {deleteTargets?.length === 1 ? `a campanha “${deleteTargets[0].name}”` : `${deleteTargets?.length ?? 0} campanhas selecionadas`} e seus contatos da lista?</p>
       </ConfirmDialog>
@@ -4877,13 +5964,11 @@ export default function CampaignsTab() {
           syncRevision={syncRevision}
           importRevision={importRevision}
           initialTab={detail.tab}
-          logs={logs[detailCampaign.id] || []}
-          onLog={(level, text) => appendLog(detailCampaign.id, level, text)}
-          onClearLogs={() => setLogs((prev) => ({ ...prev, [detailCampaign.id]: [] }))}
           onBack={() => setDetail(null)}
-          onEdit={() => setWizard({ campaign: detailCampaign })}
+          onEdit={(current) => setWizard({ campaign: current })}
           onImport={() => setImportForId(detailCampaign.id)}
           onUpdateCampaign={upsertCampaign}
+          onRefresh={refreshCampaigns}
         />
         {modals}
       </>
@@ -4909,6 +5994,11 @@ export default function CampaignsTab() {
           <>
             <Button variant="secondary" icon={<Ban size={15} />} onClick={() => setOptOutOpen(true)} disabled={!selectedCompanyId}>
               Descadastrados
+              {reviewCount > 0 && (
+                <span className="rounded-full bg-amber-500/15 px-1.5 text-[0.6875rem] tabular-nums text-amber-700 dark:text-amber-300" title="Pedidos de SAIR aguardando revisão">
+                  {reviewCount}
+                </span>
+              )}
             </Button>
             <Button variant="secondary" icon={<Brain size={15} />} onClick={() => setAiGlobalModalOpen(true)} disabled={!selectedCompanyId}>
               Configurar IA
@@ -4931,6 +6021,21 @@ export default function CampaignsTab() {
         />
       ) : (
         <>
+          {reviewCount > 0 && (
+            <InlineAlert
+              tone="warning"
+              icon={<AlertTriangle size={15} />}
+              title={`${formatNumber(reviewCount)} ${reviewCount === 1 ? "pedido de SAIR aguarda" : "pedidos de SAIR aguardam"} revisão`}
+              action={
+                <Button size="sm" variant="secondary" onClick={() => setOptOutOpen(true)}>
+                  Revisar
+                </Button>
+              }
+            >
+              Chegaram sem um número identificável. Enquanto ninguém informa o número, essas pessoas ainda podem receber mensagens.
+            </InlineAlert>
+          )}
+
           <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
             <StatCard
               label="Campanhas"
@@ -4962,11 +6067,16 @@ export default function CampaignsTab() {
           </div>
 
           <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-            <SearchInput value={searchQuery} onChange={setSearchQuery} placeholder="Buscar campanha" className="md:w-72" />
+            <SearchInput value={searchQuery} onChange={setSearchQuery} placeholder="Buscar por nome ou texto da mensagem" className="md:w-80" />
             <div className="overflow-x-auto">
               <SegmentedControl<StatusFilter> items={statusItems} value={statusFilter} onChange={setStatusFilter} />
             </div>
           </div>
+          {listError && (
+            <InlineAlert tone="danger" icon={<AlertCircle size={15} />} title="Não foi possível concluir a ação" onDismiss={() => setListError("")}>
+              {listError}
+            </InlineAlert>
+          )}
           {deleteError && <InlineAlert tone="danger" icon={<AlertCircle size={15} />} title="Não foi possível excluir todas as campanhas">{deleteError}</InlineAlert>}
           {selecting && <div className="flex flex-wrap items-center gap-3">
             <Button variant="secondary" size="sm" onClick={() => setSelectedIds((prev) => {
@@ -4977,7 +6087,7 @@ export default function CampaignsTab() {
               return next;
             })}>Selecionar visíveis</Button>
             <span className="text-xs text-secondary">{selectedIds.size} selecionada(s). Campanhas em andamento não podem ser excluídas.</span>
-            <Button variant="danger" size="sm" icon={<Trash2 size={14} />} disabled={selectedIds.size === 0} onClick={() => { setDeleteError(""); setDeleteTargets(campaignsList.filter((c) => selectedIds.has(c.id))); }}>Excluir selecionadas</Button>
+            <Button variant="danger" size="sm" icon={<Trash2 size={14} />} disabled={selectedIds.size === 0} onClick={() => { setDeleteError(""); setDeleteTargets(campaignsList.filter((c) => selectedIds.has(c.id) && c.status !== "running")); }}>Excluir selecionadas</Button>
           </div>}
 
           {loading && campaignsList.length === 0 ? (
@@ -5028,6 +6138,9 @@ export default function CampaignsTab() {
               onEdit={(c) => setWizard({ campaign: c })}
               onImport={(c) => setImportForId(c.id)}
               onDelete={(c) => { setDeleteError(""); setDeleteTargets([c]); }}
+              onQuickToggle={quickToggle}
+              quickBusyId={quickBusyId}
+              now={now}
               selecting={selecting}
               selectedIds={selectedIds}
               onToggle={(id) => setSelectedIds((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; })}
