@@ -29,7 +29,6 @@ use crate::session::{LoginResponse, SessionManager};
 use std::sync::{Arc, Mutex};
 use tauri::State;
 use tokio::sync::Mutex as TokioMutex;
-use uuid::Uuid;
 
 pub struct AppState {
     pub db: Arc<Database>,
@@ -1422,10 +1421,9 @@ pub async fn connect_adb_device(
 
             log_connect("[CONNECT] persistent_id_start");
             let persistent_id = if adb_conn_res.is_ok() {
-                AdbManager::get_persistent_device_id(&serial)
-                    .unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()))
+                AdbManager::identity_for_first_adoption(&serial)?
             } else {
-                format!("ESF-{}", target_ip.replace('.', "_"))
+                return Err("Não foi possível ler a identidade do aparelho; tente de novo".into());
             };
             log_connect(&format!("[CONNECT] persistent_id_end pid={}", persistent_id));
 
@@ -1525,8 +1523,7 @@ pub async fn pair_and_connect_adb_device(
             .args(["-s", &wireless_serial, "shell", "setprop", "persist.adb.tcp.port", "5555"])
             .output();
         let _ = AdbManager::deploy_keepalive(&wireless_serial);
-        let persistent_id = AdbManager::get_persistent_device_id(&wireless_serial)
-            .unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()));
+        let persistent_id = AdbManager::identity_for_first_adoption(&wireless_serial)?;
         let _ = AdbManager::inject_device_immunity(&wireless_serial, Some(&persistent_id));
 
         let (brand, model) = AdbManager::get_device_info(&wireless_serial);
@@ -2024,6 +2021,82 @@ pub async fn send_remote_adb_command(state: &AppState, company_id: i32, esfera_d
 // CHIPS
 // ============================================================
 
+// Comandos de chip usam a mesma trava do disparador e revalidam o vínculo sob a trava.
+fn chip_owner_for_change(state: &AppState, token: &str, chip_id: i32) -> Result<(i32,i32,String,Option<String>), String> {
+    authorize_chip(state, token, chip_id)?;
+    let session = validate_session(&state.sessions, token)?;
+    let owner = state.db.chip_owner(chip_id)?;
+    if session.role != "master" && session.company_id != Some(owner.1) { return Err("Acesso negado: chip de outra empresa.".into()); }
+    Ok(owner)
+}
+
+fn change_device_chip(state: &AppState, token: &str, chip_id: i32, replacement: Option<(&str,&str)>) -> Result<(), String> {
+    if let Some((phone, _)) = replacement {
+        let digits = phone.chars().filter(|c| c.is_ascii_digit()).count();
+        if !(10..=13).contains(&digits) { return Err("Informe o número do chip com DDD (10 a 13 dígitos).".into()); }
+    }
+    let owner = chip_owner_for_change(state, token, chip_id)?;
+    let lock = crate::dispatcher::device_operation_lock_for_id(owner.0);
+    let _guard = lock.try_lock().map_err(|_| "Aparelho ocupado em envio ou outra operação; tente novamente.".to_string())?;
+    let current = chip_owner_for_change(state, token, chip_id)?;
+    if current != owner { return Err("O chip mudou de aparelho; atualize a tela e tente novamente.".into()); }
+    if state.db.chip_device_has_running_campaign(current.1, &current.2, current.3.as_deref())? {
+        return Err("Pause a campanha deste aparelho antes de alterar o chip.".into());
+    }
+    match replacement {
+        Some((phone,name)) => state.db.update_device_chip(chip_id, owner.0, phone, name),
+        None => state.db.remove_device_chip(chip_id, owner.0),
+    }
+}
+
+#[tauri::command]
+pub fn remove_device_chip(state: State<'_, AppState>, token: String, chip_id: i32) -> Result<(), String> {
+    change_device_chip(&state, &token, chip_id, None)
+}
+
+#[tauri::command]
+pub fn update_device_chip(state: State<'_, AppState>, token: String, chip_id: i32, phone: String, name: String) -> Result<(), String> {
+    change_device_chip(&state, &token, chip_id, Some((&phone,&name)))
+}
+
+#[tauri::command]
+pub fn get_company_chips(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<Chip>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if company_id <= 0 || (session.role != "master" && session.company_id != Some(company_id)) { return Err("Acesso negado: empresa inválida ou não autorizada.".into()); }
+    state.db.get_company_chips(company_id)
+}
+
+#[cfg(test)]
+mod comandos_de_chip_tests {
+    use super::*;
+    #[test]
+    fn gerenciamento_de_chips_comandos_bloqueiam_outro_usuario_campanha_e_envio() {
+        let path=std::env::temp_dir().join(format!("esfera_cmd_chip_{}.db",std::process::id()));
+        let _=std::fs::remove_file(&path);
+        let db=Arc::new(Database::init(path.to_string_lossy().as_ref()).unwrap());
+        let other=db.create_company("Outra",5).unwrap();
+        db.pooled_conn().unwrap().execute("INSERT INTO ESF_Device(AdbDeviceId,DeviceName,CompanyId) VALUES('cmd-chip','Teste',1)",[]).unwrap();
+        let d=db.get_devices(1).into_iter().find(|d|d.serial=="cmd-chip").unwrap();
+        let id=db.add_chip(d.id,"11999990001","A").unwrap();
+        let mut sessions=SessionManager::new();
+        let allowed=sessions.create_session(1,"gestor","gestor",Some(1));
+        let denied=sessions.create_session(2,"gestor2","gestor",Some(other.id));
+        let state=AppState { db:db.clone(), sessions:Arc::new(Mutex::new(sessions)), hub_client:Arc::new(TokioMutex::new(None)) };
+        assert!(change_device_chip(&state,&denied,id,None).is_err());
+        let lock=crate::dispatcher::device_operation_lock_for_id(d.id);
+        let guard=lock.try_lock().unwrap();
+        assert!(change_device_chip(&state,&allowed,id,None).unwrap_err().contains("ocupado"));
+        drop(guard);
+        db.pooled_conn().unwrap().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId,Status,SelectedDevices) VALUES('C','Oi',1,'running',?1)",rusqlite::params![serde_json::json!(["cmd-chip"]).to_string()]).unwrap();
+        assert!(change_device_chip(&state,&allowed,id,None).unwrap_err().contains("Pause"));
+        db.pooled_conn().unwrap().execute("UPDATE ESF_Campaign SET Status='paused'",[]).unwrap();
+        change_device_chip(&state,&allowed,id,Some(("11999990002","B"))).unwrap();
+        assert_eq!(db.get_chips(d.id)[0].phone_number,"11999990002");
+        change_device_chip(&state,&allowed,id,None).unwrap();
+        assert!(db.get_chips(d.id).is_empty());
+    }
+}
+
 #[tauri::command]
 pub fn get_device_chips(state: State<'_, AppState>, token: String, device_id: i32) -> Result<Vec<Chip>, String> {
     authorize_device_id(&state, &token, device_id)?;
@@ -2348,8 +2421,7 @@ pub async fn link_usb_to_wireless(
         let final_name = device_name
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { ip.clone() });
-        let persistent_id = AdbManager::get_persistent_device_id(&wireless_serial)
-            .unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()));
+        let persistent_id = AdbManager::require_persistent_device_id(&wireless_serial)?;
         let device = Device {
             id: 0,
             serial: wireless_serial.clone(),
@@ -2407,17 +2479,13 @@ pub fn inject_all_devices_immunity(token: String, state: State<'_, AppState>) ->
         return Ok("Nenhum celular online detectado via ADB no momento. Conecte via cabo USB ou Wi-Fi e tente novamente.".to_string());
     }
 
+    for dev in &online_devices { AdbManager::require_persistent_device_id(&dev.serial)?; }
     let db_arc = state.db.clone();
     std::thread::spawn(move || {
         for (_idx, dev) in online_devices.iter().enumerate() {
-            let existing_id = AdbManager::get_persistent_device_id(&dev.serial);
-            let pid = match existing_id {
-                Some(id) => id,
-                None => {
-                    let new_id = format!("ESF-{}", Uuid::new_v4());
-                    let _ = AdbManager::inject_persistent_device_id(&dev.serial, &new_id);
-                    new_id
-                }
+            let pid = match AdbManager::require_persistent_device_id(&dev.serial) {
+                Ok(id) => id,
+                Err(e) => { eprintln!("{}", e); continue; }
             };
 
             if let Err(e) = AdbManager::inject_device_immunity(&dev.serial, Some(&pid)) {
@@ -2473,9 +2541,8 @@ pub fn inject_all_devices_immunity(token: String, state: State<'_, AppState>) ->
 pub fn inject_single_device_immunity(state: State<'_, AppState>, token: String, serial: String) -> Result<String, String> {
     authorize_device_serial(&state, &token, &serial)?;
     let s = serial.clone();
+    let pid = AdbManager::require_persistent_device_id(&s)?;
     std::thread::spawn(move || {
-        let existing_id = AdbManager::get_persistent_device_id(&s);
-        let pid = existing_id.unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()));
         if let Err(e) = AdbManager::inject_device_immunity(&s, Some(&pid)) {
             eprintln!("Falha ao injetar imunidade em {}: {}", s, e);
         }
@@ -2641,8 +2708,7 @@ pub async fn force_enable_wireless_adb(
             log_connect(&format!("[CONNECT] adb_connect_end ip={}", ip));
 
             log_connect("[CONNECT] persistent_id_start");
-            let persistent_id = AdbManager::get_persistent_device_id(&serial)
-                .unwrap_or_else(|| format!("ESF-{}", Uuid::new_v4()));
+            let persistent_id = AdbManager::require_persistent_device_id(&serial)?;
             let _ = AdbManager::inject_persistent_device_id(&serial, &persistent_id);
             log_connect(&format!("[CONNECT] persistent_id_end pid={}", persistent_id));
 
@@ -3508,12 +3574,29 @@ pub async fn optimize_device_hpc(state: State<'_, AppState>, token: String, seri
 }
 
 #[tauri::command]
-pub fn get_agent_update_status(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<crate::dispatcher::AgentUpdateStatus>, String> {
+pub async fn get_agent_update_status(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<serde_json::Value>, String> {
     let session = validate_session(&state.sessions, &token)?;
     if session.role != "master" && session.company_id != Some(company_id) {
         return Err("Acesso negado aos aparelhos de outra empresa.".into());
     }
-    Ok(crate::dispatcher::agent_update_statuses(company_id))
+    let statuses = crate::dispatcher::agent_update_statuses(company_id);
+    let devices = state.db.get_devices(company_id);
+    tauri::async_runtime::spawn_blocking(move || statuses.into_iter().map(|status| {
+        let device = devices.iter().find(|d| d.esfera_device_id.as_deref() == Some(status.device_id.as_str()) || d.serial == status.device_id);
+        let capabilities = device.and_then(|d| AdbManager::agent_capabilities(d.current_adb_address.as_deref().filter(|s| !s.is_empty()).unwrap_or(&d.serial)).ok());
+        let (notifications, accessibility, low_ram) = capabilities.unwrap_or(("unknown".into(), "unknown".into(), false));
+        let mut value = serde_json::to_value(&status).map_err(|_| "Não foi possível consultar o estado do agente".to_string())?;
+        value["notificationAccess"] = notifications.clone().into();
+        value["accessibility"] = accessibility.into();
+        value["androidGo"] = low_ram.into();
+        value["installed"] = status.version_code.is_some().into();
+        if notifications == "unsupported" && status.version_code.map(|v| v >= status.expected_code).unwrap_or(false)
+            && status.detail.contains("notificações") {
+            value["status"] = "current".into();
+            value["detail"] = "Agente atualizado; este aparelho não oferece acesso às notificações".into();
+        }
+        Ok(value)
+    }).collect()).await.map_err(|_| "Não foi possível consultar o estado do agente".to_string())?
 }
 
 #[tauri::command]

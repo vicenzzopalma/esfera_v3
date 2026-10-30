@@ -697,6 +697,13 @@ static CONTACT_PREPARED: std::sync::LazyLock<RwLock<HashMap<String, Instant>>> =
 
 pub struct AdbManager;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityProbe {
+    pub file: Option<String>,
+    pub prop: String,
+    pub hw_serial: String,
+}
+
 impl AdbManager {
     pub const DEFAULT_WHATSAPP_PACKAGE: &'static str = "com.whatsapp";
     #[allow(dead_code)]
@@ -2668,102 +2675,167 @@ impl AdbManager {
         }
     }
 
-    /// Lê a identificação persistente do celular (/sdcard/.esfera_device_id ou persist.esfera.device_id)
-    /// Prioriza sdcard porque setprop/getprop pode ser bloqueado por SELinux em dispositivos nao-root
-    pub fn get_persistent_device_id(serial: &str) -> Option<String> {
-        let is_native = Self::use_native_adb(serial);
-
-        // 1. Tenta sdcard primeiro (mais confiavel)
-        if is_native {
-            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "cat /sdcard/.esfera_device_id") {
-                let val = stdout.trim().to_string();
-                if !val.is_empty() && val.starts_with("ESF-") && !val.starts_with("ESF-192.") {
-                    return Some(val);
-                }
-            }
-        } else {
-            let mut cmd = create_cmd("adb");
-            cmd.args(["-s", serial, "shell", "cat", "/sdcard/.esfera_device_id"]);
-            if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
-                let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !val.is_empty() && val.starts_with("ESF-") && !val.starts_with("ESF-192.") {
-                    return Some(val);
-                }
-            }
-        }
-
-        // 2. Fallback: getprop (pode falhar em SELinux enforcing)
-        if is_native {
-            if let Ok(stdout) = crate::adb_tcp::exec_shell(serial, "getprop persist.esfera.device_id") {
-                let val = stdout.trim().to_string();
-                if !val.is_empty() && val.starts_with("ESF-") && !val.starts_with("ESF-192.") {
-                    return Some(val);
-                }
-            }
-        } else {
-            let mut cmd2 = create_cmd("adb");
-            cmd2.args(["-s", serial, "shell", "getprop", "persist.esfera.device_id"]);
-            if let Ok(out) = run_cmd_timeout(cmd2, Duration::from_secs(2)) {
-                let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !val.is_empty() && val.starts_with("ESF-") && !val.starts_with("ESF-192.") {
-                    return Some(val);
-                }
-            }
-        }
-
-        // 3. Fallback: ro.serialno (hardware serial da CPU/dispositivo)
-        let hw_serial = if is_native {
-            crate::adb_tcp::exec_shell(serial, "getprop ro.serialno").ok()
-        } else {
-            let mut cmd3 = create_cmd("adb");
-            cmd3.args(["-s", serial, "shell", "getprop", "ro.serialno"]);
-            run_cmd_timeout(cmd3, Duration::from_secs(2))
-                .ok()
-                .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
-        };
-
-        if let Some(s) = hw_serial {
-            let val = s.trim().to_uppercase();
-            if !val.is_empty() && val != "UNKNOWN" && !val.contains(' ') && !val.contains('.') && !val.contains(':') {
-                let prefix8 = if val.len() >= 8 { &val[0..8] } else { &val };
-                let derived = format!("ESF-{}", prefix8);
-                let _ = Self::inject_persistent_device_id(serial, &derived);
-                return Some(derived);
-            }
-        }
-
-        // 4. Fallback final: se o próprio serial ADB for um hardware serial (sem IP/porta)
-        let clean_serial = serial.trim().to_uppercase();
-        if !clean_serial.contains('.') && !clean_serial.contains(':') && !clean_serial.is_empty() {
-            let prefix8 = if clean_serial.len() >= 8 { &clean_serial[0..8] } else { &clean_serial };
-            let derived = format!("ESF-{}", prefix8);
-            let _ = Self::inject_persistent_device_id(serial, &derived);
-            return Some(derived);
-        }
-
-        None
+    /// Lê a identidade persistente do celular (/sdcard/.esfera_device_id; reserva: persist.esfera.device_id).
+    /// Sem efeitos colaterais no aparelho: erro, ausência confirmada e identidade são estados distintos.
+    /// Valor antigo ilegível (ex.: "ESFERA_DEV_001" gravado pelo monitor anterior) só vira a identidade
+    /// legada "ESF-<serial>" quando o banco já conhece ESTE aparelho por ela; senão é erro, nunca ID novo.
+    pub fn read_persistent_device_id(serial: &str) -> Result<Option<String>, String> {
+        let probe = Self::probe_identity(serial)?;
+        Self::resolve_identity(&probe, |candidate| Self::db_knows_identity(serial, &probe.hw_serial, candidate))
     }
 
-    /// Injeta permanentemente a identificação no Kernel/OS e Armazenamento do Celular
+    /// Uma leitura só: arquivo (ou ausência), propriedade e serial de hardware. `ESFERA_END` prova que a
+    /// saída chegou inteira; saída cortada ou estranha é erro de leitura, nunca "sem identidade".
+    const IDENTITY_PROBE: &'static str = "ls /sdcard >/dev/null 2>&1 || exit 1; if [ -e /sdcard/.esfera_device_id ]; then f=$(cat /sdcard/.esfera_device_id) || exit 1; printf 'ESFERA_FILE:%s\\n' \"$f\"; else echo ESFERA_FILE_ABSENT; fi; printf 'ESFERA_PROP:%s\\n' \"$(getprop persist.esfera.device_id)\"; printf 'ESFERA_HW:%s\\n' \"$(getprop ro.serialno)\"; echo ESFERA_END";
+
+    fn probe_identity(serial: &str) -> Result<IdentityProbe, String> {
+        Self::parse_identity_probe(&Self::execute_shell(serial, Self::IDENTITY_PROBE, 6)?)
+    }
+
+    fn parse_identity_probe(output: &str) -> Result<IdentityProbe, String> {
+        let fail = || "Não foi possível ler a identidade do aparelho; tente de novo".to_string();
+        let lines: Vec<&str> = output.lines().map(|l| l.trim_end_matches('\r')).collect();
+        if lines.last().map(|l| l.trim()) != Some("ESFERA_END") { return Err(fail()); }
+        let single = |prefix: &str| -> Result<Option<String>, String> {
+            let found: Vec<&str> = lines.iter().filter_map(|l| l.strip_prefix(prefix)).collect();
+            match found.as_slice() {
+                [] => Ok(None),
+                [value] => Ok(Some(value.trim().to_string())),
+                _ => Err(fail()),
+            }
+        };
+        let absent = lines.iter().filter(|l| l.trim() == "ESFERA_FILE_ABSENT").count();
+        let file = match (single("ESFERA_FILE:")?, absent) {
+            (Some(value), 0) => Some(value),
+            (None, 1) => None,
+            _ => return Err(fail()),
+        };
+        Ok(IdentityProbe {
+            file,
+            prop: single("ESFERA_PROP:")?.ok_or_else(fail)?,
+            hw_serial: single("ESFERA_HW:")?.ok_or_else(fail)?,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn parse_identity_read(output: &str) -> Result<Option<String>, String> {
+        let lines: Vec<&str> = output.lines().map(|l| l.trim_end_matches('\r').trim()).filter(|l| !l.is_empty()).collect();
+        let present: Vec<&str> = lines.iter().filter_map(|l| l.strip_prefix("ESFERA_ID_PRESENT:")).collect();
+        let absent = lines.iter().any(|l| *l == "ESFERA_ID_ABSENT");
+        match (present.as_slice(), absent) {
+            ([val], false) if !val.trim().is_empty() => Ok(Some(val.trim().to_string())),
+            ([], true) => Ok(None),
+            _ => Err("Não foi possível ler a identidade do aparelho".into()),
+        }
+    }
+
+    /// "ESF-…" com caracteres simples. "ESF-192.168.0.10" (derivada do IP por versão antiga) não vale.
+    fn valid_identity(value: &str) -> bool {
+        match value.strip_prefix("ESF-") {
+            Some(rest) => !rest.is_empty()
+                && rest.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                && !(rest.contains('.') && rest.chars().all(|c| c.is_ascii_digit() || c == '.')),
+            None => false,
+        }
+    }
+
+    /// Identidade que versões antigas derivavam do serial de hardware ("ESF-" + 8 primeiros caracteres).
+    fn legacy_identity(hw_serial: &str) -> Option<String> {
+        let value = hw_serial.trim().to_uppercase();
+        if value.is_empty() || value == "UNKNOWN" || value.contains(|c: char| c == ' ' || c == '.' || c == ':') {
+            return None;
+        }
+        Some(format!("ESF-{}", value.chars().take(8).collect::<String>()))
+    }
+
+    /// Arquivo válido > propriedade válida > identidade legada confirmada pelo banco > ausência confirmada.
+    /// Sobra ilegível sem confirmação do banco é erro: manter o vínculo atual e tentar de novo.
+    fn resolve_identity(probe: &IdentityProbe, known: impl FnOnce(&str) -> Result<bool, String>) -> Result<Option<String>, String> {
+        if let Some(file) = probe.file.as_deref().filter(|f| Self::valid_identity(f)) {
+            return Ok(Some(file.to_string()));
+        }
+        if Self::valid_identity(&probe.prop) { return Ok(Some(probe.prop.clone())); }
+        if let Some(legacy) = Self::legacy_identity(&probe.hw_serial) {
+            if known(&legacy)? { return Ok(Some(legacy)); }
+        }
+        if probe.file.as_deref().is_some_and(|f| !f.is_empty()) || !probe.prop.is_empty() {
+            return Err("A identidade gravada no aparelho está ilegível; nada foi alterado. Confira o cadastro do aparelho".into());
+        }
+        Ok(None)
+    }
+
+    /// O banco já conhece ESTE aparelho (mesmo endereço ou mesmo serial de hardware) por essa identidade?
+    fn db_knows_identity(serial: &str, hw_serial: &str, identity: &str) -> Result<bool, String> {
+        let fail = |_: rusqlite::Error| "Não foi possível conferir o vínculo atual do aparelho; tente de novo".to_string();
+        let connection = rusqlite::Connection::open_with_flags(crate::get_db_path(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(fail)?;
+        let _ = connection.busy_timeout(Duration::from_secs(2));
+        connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ESF_Device WHERE UPPER(EsferaDeviceId)=UPPER(?1) AND (AdbDeviceId=?2 OR CurrentAdbAddress=?2 OR (?3 <> '' AND UPPER(AdbDeviceId)=UPPER(?3))))",
+            rusqlite::params![identity, serial, hw_serial.trim()], |row| row.get(0)).map_err(fail)
+    }
+
+    /// Algum cadastro já usa este endereço ou este serial de hardware?
+    fn db_has_device(serial: &str, hw_serial: &str) -> Result<bool, String> {
+        let fail = |_: rusqlite::Error| "Não foi possível conferir o vínculo atual do aparelho; tente de novo".to_string();
+        let connection = rusqlite::Connection::open_with_flags(crate::get_db_path(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(fail)?;
+        let _ = connection.busy_timeout(Duration::from_secs(2));
+        connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ESF_Device WHERE AdbDeviceId=?1 OR CurrentAdbAddress=?1 OR EsferaDeviceId=?1 OR (?2 <> '' AND UPPER(AdbDeviceId)=UPPER(?2)))",
+            rusqlite::params![serial, hw_serial.trim()], |row| row.get(0)).map_err(fail)
+    }
+
+    /// Primeira adoção: só cria "ESF-<uuid>" quando a leitura CONFIRMA ausência e nenhum cadastro usa este
+    /// aparelho. Leitura falha ou aparelho já cadastrado: erro, mantém o vínculo atual (nome soberano).
+    pub fn identity_for_first_adoption(serial: &str) -> Result<String, String> {
+        let probe = Self::probe_identity(serial)?;
+        let read = Self::resolve_identity(&probe, |candidate| Self::db_knows_identity(serial, &probe.hw_serial, candidate));
+        Self::decide_first_adoption(read, || Self::db_has_device(serial, &probe.hw_serial))
+    }
+
+    fn decide_first_adoption(read: Result<Option<String>, String>, registered: impl FnOnce() -> Result<bool, String>) -> Result<String, String> {
+        if let Some(identity) = read? { return Ok(identity); }
+        if registered()? {
+            return Err("Não foi possível ler a identidade de um aparelho já cadastrado; nada foi alterado. Tente de novo".into());
+        }
+        Ok(format!("ESF-{}", uuid::Uuid::new_v4()))
+    }
+
+    pub fn require_persistent_device_id(serial: &str) -> Result<String, String> {
+        Self::read_persistent_device_id(serial)?.ok_or_else(|| "Não foi possível ler a identidade do aparelho; tente de novo ou faça o primeiro provisionamento".into())
+    }
+
+    pub fn get_persistent_device_id(serial: &str) -> Option<String> {
+        Self::read_persistent_device_id(serial).ok().flatten()
+    }
+
+    /// A identidade é a chave do nome dado pelo operador: trocá-la faria o aparelho voltar como
+    /// "Celular XXXX". Só grava quando o aparelho não tem OUTRA identidade válida (reparar valor
+    /// antigo ilegível é permitido).
+    fn identity_write_allowed(probe: &IdentityProbe, identity: &str) -> Result<(), String> {
+        if !Self::valid_identity(identity) { return Err("Identidade inválida; nada foi gravado no aparelho".into()); }
+        let current = probe.file.as_deref().filter(|f| Self::valid_identity(f))
+            .or_else(|| Some(probe.prop.as_str()).filter(|p| Self::valid_identity(p)));
+        match current {
+            Some(current) if current != identity => Err(format!(
+                "O aparelho já tem a identidade {}; nada foi alterado, para preservar o nome do aparelho", current)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Grava a identidade no aparelho (arquivo e propriedade), nunca por cima de outra identidade válida.
     pub fn inject_persistent_device_id(
         serial: &str,
         persistent_id: &str,
     ) -> Result<String, String> {
+        let probe = Self::probe_identity(serial)?;
+        Self::identity_write_allowed(&probe, persistent_id)?;
         let batch_cmd = format!(
-            "setprop persist.esfera.device_id {}; echo '{}' > /sdcard/.esfera_device_id",
-            persistent_id, persistent_id
+            "setprop persist.esfera.device_id '{0}' 2>/dev/null; echo '{0}' > /sdcard/.esfera_device_id",
+            persistent_id
         );
-
-        let mut cmd = create_cmd("adb");
-        cmd.args(["-s", serial, "shell", &batch_cmd]);
-
-        match run_cmd_timeout(cmd, Duration::from_secs(8)) {
-            Ok(_) => Ok(format!(
-                "🏷️ ID permanente '{}' injetada no celular {}",
-                persistent_id, serial
-            )),
-            Err(e) => Err(format!("Falha ao injetar ID no celular {}: {}", serial, e)),
-        }
+        Self::execute_shell(serial, &batch_cmd, 8)
+            .map(|_| format!("🏷️ ID permanente '{}' injetada no celular {}", persistent_id, serial))
+            .map_err(|e| format!("Falha ao injetar ID no celular {}: {}", serial, e))
     }
 
     /// Injeta regras de Imunidade, Fixação de MAC Físico, Persistência ADB TCP 5555 e ID permanente no Kernel
@@ -2879,38 +2951,7 @@ impl AdbManager {
         company_id: i32,
         server_url: &str,
     ) -> Result<String, String> {
-        let is_network = serial.contains(':') || serial.contains('.');
-        let existing_id = Self::get_persistent_device_id(serial);
-        let actual_serial = if let Some(ref id) = existing_id { id.clone() } else if is_network {
-            let mut cmd = create_cmd("adb");
-            cmd.args(["-s", serial, "shell", "getprop", "ro.serialno"]);
-            if let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(3)) {
-                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !stdout.is_empty() && stdout != "unknown" && !stdout.contains(' ') && !stdout.contains('.') {
-                    stdout
-                } else if let Some(pid) = Self::get_persistent_device_id(serial) {
-                    pid.trim_start_matches("ESF-").to_string()
-                } else {
-                    return Err(format!("Não foi possível obter hardware serial do Wi-Fi {}", serial));
-                }
-            } else if let Some(pid) = Self::get_persistent_device_id(serial) {
-                pid.trim_start_matches("ESF-").to_string()
-            } else {
-                return Err(format!("Não foi possível obter hardware serial do Wi-Fi {}", serial));
-            }
-        } else {
-            serial.to_string()
-        };
-
-        let serial_upper = actual_serial.to_uppercase();
-        let prefix8: &str = if serial_upper.len() >= 8 {
-            &serial_upper[0..8]
-        } else if !serial_upper.is_empty() {
-            &serial_upper
-        } else {
-            return Err("Serial ADB vazio: não foi possível derivar ESF-xxxx".to_string());
-        };
-        let device_id = existing_id.unwrap_or_else(|| format!("ESF-{}", prefix8));
+        let device_id = Self::require_persistent_device_id(serial)?;
 
         // PROGRAMA DESKTOP ATUAL É O PRIMÁRIO: o agente aponta para 127.0.0.1
         // (presença 7779 e túnel via `adb reverse`) e usa a VPS/host recebido
@@ -3244,13 +3285,7 @@ impl AdbManager {
         let lock = crate::dispatcher::device_operation_lock(&target_serial)?;
         let _guard = lock.blocking_lock();
 
-        let device_id = Self::get_persistent_device_id(&target_serial)
-            .unwrap_or_else(|| {
-                let s = target_serial.to_uppercase();
-                let clean = s.split(':').next().unwrap_or(&s);
-                let p8 = if clean.len() >= 8 { &clean[..8] } else { clean };
-                format!("ESF-{}", p8)
-            });
+        let device_id = Self::identity_for_first_adoption(&target_serial)?;
         let config = crate::config::load_config();
 
         let url = match server_url {
@@ -3304,7 +3339,7 @@ impl AdbManager {
         animation_scale: Option<f32>,
         dpi: Option<i32>,
     ) -> Result<String, String> {
-        let target = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
+        let target = Self::resolve_target_serial(serial)?;
         let mut cmds = Vec::new();
 
         if let Some(sa) = stay_awake {
@@ -3330,8 +3365,8 @@ impl AdbManager {
         }
 
         if !cmds.is_empty() {
-            let full_cmd = cmds.join("; ");
-            let _ = create_cmd("adb").args(["-s", &target, "shell", &full_cmd]).output_timeout(Duration::from_secs(8));
+            let full_cmd = cmds.join(" && ");
+            Self::execute_shell(&target, &full_cmd, 8)?;
         }
 
         Ok("Configurações aplicadas no dispositivo com sucesso!".to_string())
@@ -3656,6 +3691,25 @@ impl AdbManager {
     }
 
     /// Versão instalada consultada no aparelho; erro de ADB nunca significa "não instalado".
+    pub fn agent_capabilities(serial: &str) -> Result<(String, String, bool), String> {
+        let out = Self::execute_shell(serial,
+            "printf 'GO='; getprop ro.config.low_ram; printf 'ACCESS='; settings get secure enabled_accessibility_services; printf 'ENABLED='; settings get secure accessibility_enabled; printf 'LISTENER='; settings get secure enabled_notification_listeners", 8)?;
+        let field = |key: &str| out.lines().find_map(|line| line.strip_prefix(key));
+        let low_ram = field("GO=").map(|v| v.trim() == "true").unwrap_or(false);
+        let accessibility = match (field("ACCESS="), field("ENABLED=")) {
+            (Some(services), Some(enabled)) if services.contains(Self::AGENT_ACCESSIBILITY_COMPONENT) && enabled.trim() == "1" => "ok",
+            (Some(_), Some(_)) => "missing",
+            _ => "unknown",
+        };
+        let notifications = match field("LISTENER=") {
+            Some(value) if value.contains("com.esfera.agent/com.esfera.agent.EsferaOptOutNotificationListener") => "ok",
+            _ if low_ram => "unsupported",
+            Some(_) => "denied",
+            None => "unknown",
+        };
+        Ok((notifications.into(), accessibility.into(), low_ram))
+    }
+
     pub fn installed_agent_version(serial: &str) -> Result<Option<(u32,String)>, String> {
         let out = Self::execute_shell(serial, "result=$(pm list packages com.esfera.agent) || exit 1; if echo \"$result\" | grep -qx 'package:com.esfera.agent'; then dumpsys package com.esfera.agent; else echo ESFERA_AGENT_NOT_INSTALLED; fi", 8)?;
         parse_installed_agent_version(&out)
@@ -5712,5 +5766,18 @@ mod agent_installed_version_tests {
         assert_eq!(parse_installed_agent_version("Unable to find package: com.esfera.agent").unwrap(),None);
         assert_eq!(parse_installed_agent_version("ESFERA_AGENT_NOT_INSTALLED").unwrap(),None);
         assert!(parse_installed_agent_version("dispositivo offline").is_err());
+    }
+}
+
+#[cfg(test)]
+mod identity_read_tests {
+    use super::AdbManager;
+    #[test]
+    fn falha_de_leitura_nunca_vira_primeira_adocao() {
+        for output in ["", "device offline", "Permission denied", "ESFERA_ID_PRESENT:", "ESFERA_ID_PRESENT:ESF-antigo\nESFERA_ID_ABSENT"] {
+            assert!(AdbManager::parse_identity_read(output).is_err());
+        }
+        assert_eq!(AdbManager::parse_identity_read("ESFERA_ID_PRESENT:ESF-identidade-antiga\n").unwrap(), Some("ESF-identidade-antiga".into()));
+        assert_eq!(AdbManager::parse_identity_read("ESFERA_ID_ABSENT\n").unwrap(), None);
     }
 }
