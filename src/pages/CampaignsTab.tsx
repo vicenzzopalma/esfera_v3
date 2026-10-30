@@ -5,7 +5,7 @@
 // Componentes em ./campaigns/
 // ============================================================
 
-import { type ReactNode, useEffect, useRef, useState, useMemo, useDeferredValue, useCallback } from "react";
+import { type ReactNode, useEffect, useRef, useState, useMemo, useDeferredValue, useCallback, useId } from "react";
 import { Search, X, MoreHorizontal, Check, CheckCheck, ChevronLeft, ChevronRight, Shuffle, AlertCircle, Sparkles, ChevronDown, UserRound, Clock, AlertTriangle, Battery, RefreshCw, Smartphone, ArrowDown, Terminal, Upload, Users, FileUp, CheckCircle2, Eye, EyeOff, PlugZap, ArrowLeft, ArrowRight, Circle, LayoutDashboard, Pause, Pencil, Play, RotateCcw, Send, Settings2, Square, XCircle, Brain, Building2, Megaphone, Plus, Ban, Trash2 } from "lucide-react";
 import type { Campaign, CampaignStatus, Contact, Device, AiConfig } from "../types";
 import { AI_PROVIDERS, DEFAULT_WHATSAPP_SYSTEM_PROMPT, getAiProviderInfo } from "../constants/aiProviders";
@@ -107,22 +107,113 @@ export function formatDate(value?: string): string {
     : d.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric" });
 }
 
+// Telefone legível ("+5575988052539" -> "(75) 98805-2539"). Fica como texto no Excel.
+export function formatPhoneBr(phone: string) {
+  let d = phone.replace(/\D/g, "");
+  if ((d.length === 12 || d.length === 13) && d.startsWith("55")) d = d.slice(2);
+  if (d.length === 11) return `(${d.slice(0, 2)}) ${d.slice(2, 7)}-${d.slice(7)}`;
+  if (d.length === 10) return `(${d.slice(0, 2)}) ${d.slice(2, 6)}-${d.slice(6)}`;
+  return phone;
+}
+
+// CSV para o Excel brasileiro: separador ";", BOM UTF-8 e todas as células entre aspas. Célula que
+// começa com = + - @ ganha um apóstrofo, para o Excel não tratar como fórmula.
+export function downloadCsv(fileName: string, header: string[], rows: (string | number)[][]) {
+  const cell = (v: string | number) => {
+    const s = String(v ?? "");
+    return `"${(/^[=+\-@]/.test(s) ? `'${s}` : s).replace(/"/g, '""')}"`;
+  };
+  const csv = [header, ...rows].map((r) => r.map(cell).join(";")).join("\r\n");
+  const url = URL.createObjectURL(new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export function delaySummary(min: number, max: number) {
   return min === max ? `${min}s entre mensagens` : `entre ${min}s e ${max}s por mensagem`;
 }
 
 // ---------- Contatos (importação) ----------
-// Higieniza números no padrão REALESS / Esfera v3 (Brasil, DDI +55).
-// NÃO inventa DDD: apenas normaliza o que o usuário informou.
-//  - já com DDI 55 (12-13 dígitos) -> mantém
-//  - com DDD (10-11 dígitos)         -> prefixa +55
-//  - só número local (8-9 dígitos)   -> não infere DDD, retorna limpo
-export function sanitizePhoneNumber(raw: string) {
-  const clean = raw.replace(/\D/g, "");
-  if (clean.length === 0) return "";
-  if (clean.startsWith("55") && (clean.length === 12 || clean.length === 13)) return "+" + clean;
-  if (clean.length === 10 || clean.length === 11) return "+55" + clean;
-  return "+" + clean;
+// Números no padrão Brasil (DDI +55). NÃO inventa DDD: com DDD (10-11 dígitos) recebe +55; já com
+// 55 (12-13 dígitos) fica como está; sem DDD (8-9 dígitos) não entra, a não ser que o operador informe o DDD.
+
+// DDDs em uso no Brasil (Anatel). Número que não começa por DDD válido (ex.: nº de processo) não é telefone.
+const BR_DDD = new Set([
+  11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 24, 27, 28, 31, 32, 33, 34, 35, 37, 38, 41, 42, 43, 44, 45, 46, 47, 48, 49, 51, 53, 54, 55,
+  61, 62, 63, 64, 65, 66, 67, 68, 69, 71, 73, 74, 75, 77, 79, 81, 82, 83, 84, 85, 86, 87, 88, 89, 91, 92, 93, 94, 95, 96, 97, 98, 99,
+]);
+
+export function isValidDdd(ddd: string) {
+  return /^\d{2}$/.test(ddd) && BR_DDD.has(Number(ddd));
+}
+
+export type PhoneKind = "mobile" | "landline" | "local" | "invalid";
+
+// Celular: DDD + 9 + 8 dígitos (ou 8 dígitos antigos começando em 6-9). Fixo: DDD + 8 dígitos começando em 2-5.
+// "local": 8-9 dígitos sem DDD. NÃO entra na fila: sem DDD o número viraria um DDI estrangeiro
+// (98805-2539 -> +98...). Só vira telefone se o operador informar o DDD para completar.
+export function classifyPhone(raw: string, ddd?: string): { phone: string; kind: PhoneKind } {
+  let clean = raw.replace(/\D/g, "").replace(/^0+/, "");
+  if (ddd && isValidDdd(ddd) && (clean.length === 8 || clean.length === 9)) clean = ddd + clean;
+  const d = (clean.length === 12 || clean.length === 13) && clean.startsWith("55") ? clean.slice(2) : clean;
+  if (d.length === 10 || d.length === 11) {
+    const local = d.slice(2);
+    if (!BR_DDD.has(Number(d.slice(0, 2)))) return { phone: "", kind: "invalid" };
+    if (local.length === 9) return local[0] === "9" ? { phone: "+55" + d, kind: "mobile" } : { phone: "", kind: "invalid" };
+    if ("2345".includes(local[0])) return { phone: "+55" + d, kind: "landline" };
+    if ("6789".includes(local[0])) return { phone: "+55" + d, kind: "mobile" };
+    return { phone: "", kind: "invalid" };
+  }
+  if (clean.length === 8 || clean.length === 9) return { phone: "", kind: "local" };
+  return { phone: "", kind: "invalid" };
+}
+
+// Célula com mais de um telefone ("(75) 98805-2539 / (75) 3221-1234"): separa antes de classificar.
+function phoneCandidates(cell: string, ddd?: string): string[] {
+  if (cell.replace(/\D/g, "").length <= 13) return [cell];
+  const strong = (v: string) => {
+    const k = classifyPhone(v, ddd).kind;
+    return k === "mobile" || k === "landline";
+  };
+  const out: string[] = [];
+  for (const piece of cell.split(/\s*(?:[;,/|]|\s+e\s+|\s{2,})\s*/i)) {
+    if (piece.replace(/\D/g, "").length <= 13) {
+      out.push(piece);
+      continue;
+    }
+    // Sem separador ("75988052539 7532211234"): junta os pedaços até formar um telefone completo.
+    let acc = "";
+    for (const tok of piece.split(/\s+/)) {
+      const next = acc ? `${acc} ${tok}` : tok;
+      if (acc && strong(acc) && !strong(next)) {
+        out.push(acc);
+        acc = tok;
+      } else acc = next;
+    }
+    if (acc) out.push(acc);
+  }
+  const phones = out.map((p) => p.trim()).filter((p) => p.replace(/\D/g, "").length >= 8);
+  return phones.length ? phones : [cell];
+}
+
+export type PhoneMode = "all" | "one";
+
+export interface ImportOptions {
+  phoneMode: PhoneMode;
+  includeLandlines: boolean;
+  /** DDD (2 dígitos) para completar números sem DDD. Só quando o operador informa. */
+  ddd?: string;
+  /** Coluna do nome escolhida pelo operador (-1 = sem nome). Sem valor: automático. */
+  nameCol?: number;
+  /** Colunas de telefone escolhidas pelo operador. Sem valor: automático. */
+  phoneCols?: number[];
+  /** Separador já conhecido (planilha .xlsx vira texto com tabulação). */
+  delimiter?: string;
 }
 
 export interface ParsedRow {
@@ -133,38 +224,14 @@ export interface ParsedRow {
   valid: boolean;
   warning?: string;
   reason?: string;
+  /** Pulado por regra (outro número do devedor, repetido, fixo), não por erro na lista. */
+  skipped?: boolean;
 }
 
-// DDDs em uso no Brasil (Anatel). Número que não começa por DDD válido (ex.: nº de processo) não é telefone.
-const BR_DDD = new Set([
-  11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 24, 27, 28, 31, 32, 33, 34, 35, 37, 38, 41, 42, 43, 44, 45, 46, 47, 48, 49, 51, 53, 54, 55,
-  61, 62, 63, 64, 65, 66, 67, 68, 69, 71, 73, 74, 75, 77, 79, 81, 82, 83, 84, 85, 86, 87, 88, 89, 91, 92, 93, 94, 95, 96, 97, 98, 99,
-]);
-
-export type PhoneKind = "mobile" | "landline" | "local" | "invalid";
-
-// Celular: DDD + 9 + 8 dígitos (ou 8 dígitos antigos começando em 6-9). Fixo: DDD + 8 dígitos começando em 2-5.
-// "local": 8-9 dígitos sem DDD, mantido como no importador original (com aviso).
-export function classifyPhone(raw: string): { phone: string; kind: PhoneKind } {
-  const clean = raw.replace(/\D/g, "").replace(/^0+/, "");
-  const d = (clean.length === 12 || clean.length === 13) && clean.startsWith("55") ? clean.slice(2) : clean;
-  if (d.length === 10 || d.length === 11) {
-    const local = d.slice(2);
-    if (!BR_DDD.has(Number(d.slice(0, 2)))) return { phone: "", kind: "invalid" };
-    if (local.length === 9) return local[0] === "9" ? { phone: "+55" + d, kind: "mobile" } : { phone: "", kind: "invalid" };
-    if ("2345".includes(local[0])) return { phone: "+55" + d, kind: "landline" };
-    if ("6789".includes(local[0])) return { phone: "+55" + d, kind: "mobile" };
-    return { phone: "", kind: "invalid" };
-  }
-  if (clean.length === 8 || clean.length === 9) return { phone: "+" + clean, kind: "local" };
-  return { phone: "", kind: "invalid" };
-}
-
-export type PhoneMode = "all" | "one";
-
-export interface ImportOptions {
-  phoneMode: PhoneMode;
-  includeLandlines: boolean;
+export interface ParsedColumn {
+  index: number;
+  label: string;
+  sample: string;
 }
 
 export interface ParsedImport {
@@ -173,14 +240,41 @@ export interface ParsedImport {
   columns: string;
   multiPhone: boolean;
   landlines: number;
+  /** Números com 8-9 dígitos (sem DDD) nas colunas de telefone. */
+  localCount: number;
+  allColumns: ParsedColumn[];
+  nameCol: number;
+  phoneCols: number[];
+  hasHeader: boolean;
 }
 
-const PHONE_HEADER = /tel|fone|cel|whats|numero|^contato\s*\d/;
-const NAME_HEADER = /nome|name|devedor|razao|cliente|contato|destinat|empresa|sacado/;
-const HEADER_WORD = /\b(nome|name|devedor|razao|cliente|contato|telefone|fone|tel|celular|cel|whatsapp|whats|numero|processo|codigo|cpf|cnpj|documento|email)\b/;
+// Cabeçalho comparado sem acento, caixa, "_" ou "-", e com espaço entre letra e número ("TEL1" -> "tel 1").
+function headerKey(s: string) {
+  return plainText(s)
+    .replace(/[_\-./]+/g, " ")
+    .replace(/([a-z])(\d)/g, "$1 $2")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const PHONE_HEADER = /\b(telefones?|tel|fones?|celular(es)?|cel|whatsapp|whats|zap)\b|^(numero|contato \d+)$/;
+// Telefone de terceiro (referência, recado, cônjuge, trabalho...) ou número que não é telefone: cobrar
+// por ele expõe o devedor (CDC art. 42). O operador ainda pode marcar a coluna à mão na prévia.
+const PHONE_HEADER_EXCLUDE = /\b(refer\w*|recado|conjuge|pai|mae|avalista|fiador|parente|comercial|trabalho|empresa|contrato|processo|parcela|cpf|cnpj|cep)\b/;
+const NAME_EXCLUDE = /\b(mae|pai|conjuge|refer\w*|credor|avalista|fiador|parente|vendedor|operador|cobrador|endereco|logradouro|rua|bairro|cidade|uf|estado|cep|email|observ\w*|obs|situacao|status|produto|carteira)\b/;
+const HEADER_WORD = /\b(nome|name|devedor|razao|cliente|contato|telefones?|fones?|tel|celular|cel|whatsapp|whats|numero|processo|codigo|cpf|cnpj|documento|email|sacado|destinatario|titular|cidade|uf|endereco)\b/;
+
+// Prioridade da coluna de nome: devedor/sacado/razão social > nome > cliente/contato (que pode ser o credor).
+function nameScore(h: string) {
+  if (!h || NAME_EXCLUDE.test(h) || PHONE_HEADER.test(h)) return 0;
+  if (/\b(devedor|sacado|razao|titular|consumidor)\b/.test(h)) return 3;
+  if (/\b(nome|name)\b/.test(h)) return 2;
+  if (/\b(cliente|contato|destinatario|empresa)\b/.test(h)) return 1;
+  return 0;
+}
 
 function plainText(s: string) {
-  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+  return s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().trim();
 }
 
 function detectDelimiter(lines: string[]) {
@@ -196,9 +290,15 @@ function detectDelimiter(lines: string[]) {
   return best;
 }
 
+// Linha sem separador no formato "Maria Silva 75 98805-2539": nome e telefone.
+const NAME_THEN_PHONE = /^(.*?[A-Za-zÀ-ÿ][^\d]*?)[\s:;,.\-–]*(\+?\(?\d[\d\s().-]{7,})$/;
+
 // Divide a linha pelo separador, respeitando campos entre aspas ("SILVA, JOÃO";...).
 function splitCells(line: string, delim: string | null): string[] {
-  if (!delim) return [line.trim()];
+  if (!delim) {
+    const m = /[A-Za-zÀ-ÿ]/.test(line) ? line.match(NAME_THEN_PHONE) : null;
+    return m ? [m[1].trim(), m[2].trim()] : [line.trim()];
+  }
   const out: string[] = [];
   let cur = "";
   let quoted = false;
@@ -232,66 +332,106 @@ function listLabels(labels: string[]) {
 // Cada telefone vira um contato; fixo só entra se pedido; número repetido entra uma vez.
 export function parseContactsText(text: string, opts: ImportOptions = { phoneMode: "all", includeLandlines: false }): ParsedImport {
   const source = text
-    .replace(/^\uFEFF/, "")
+    .replace(/^﻿/, "")
     .split(/\r?\n/)
     .map((l, i) => ({ line: i + 1, raw: l.trim() }))
     .filter((l) => l.raw !== "");
-  if (!source.length) return { rows: [], lines: 0, columns: "", multiPhone: false, landlines: 0 };
+  if (!source.length) {
+    return { rows: [], lines: 0, columns: "", multiPhone: false, landlines: 0, localCount: 0, allColumns: [], nameCol: -1, phoneCols: [], hasHeader: false };
+  }
 
-  const delim = detectDelimiter(source.map((l) => l.raw));
+  const ddd = opts.ddd && isValidDdd(opts.ddd) ? opts.ddd : undefined;
+  const classify = (v: string) => classifyPhone(v, ddd);
+  const isStrongPhone = (v: string) => phoneCandidates(v, ddd).some((p) => {
+    const k = classify(p).kind;
+    return k === "mobile" || k === "landline";
+  });
+
+  const delim = opts.delimiter ?? detectDelimiter(source.map((l) => l.raw));
   const table = source.map((l) => ({ ...l, cells: splitCells(l.raw, delim) }));
   const width = table.reduce((w, r) => Math.max(w, r.cells.length), 0);
-  const isStrongPhone = (v: string) => {
-    const k = classifyPhone(v).kind;
-    return k === "mobile" || k === "landline";
-  };
   const firstCells = table[0].cells;
-  const hasHeader = !firstCells.some(isStrongPhone) && firstCells.filter((c) => HEADER_WORD.test(plainText(c))).length >= 2;
-  const header = hasHeader ? firstCells.map(plainText) : null;
+  const hasHeader = !firstCells.some(isStrongPhone) && firstCells.filter((c) => HEADER_WORD.test(headerKey(c))).length >= 2;
+  const header = hasHeader ? Array.from({ length: width }, (_, j) => headerKey(firstCells[j] ?? "")) : null;
   const data = hasHeader ? table.slice(1) : table;
 
-  const stats = Array.from({ length: width }, () => ({ filled: 0, letters: 0, strong: 0, local: 0 }));
+  const stats = Array.from({ length: width }, () => ({ filled: 0, letters: 0, strong: 0, mobile: 0, local: 0, local9: 0, sample: "" }));
   for (const r of data) {
     r.cells.forEach((c, j) => {
       if (!c) return;
       const st = stats[j];
       st.filled++;
+      if (!st.sample) st.sample = c;
       if (/[a-zA-ZÀ-ÿ]/.test(c)) st.letters++;
       else {
-        const k = classifyPhone(c).kind;
-        if (k === "mobile" || k === "landline") st.strong++;
-        else if (k === "local") st.local++;
+        const kinds = phoneCandidates(c, ddd).map((p) => classify(p).kind);
+        if (kinds.includes("mobile")) st.mobile++;
+        if (kinds.includes("mobile") || kinds.includes("landline")) st.strong++;
+        else if (kinds.includes("local")) {
+          st.local++;
+          // 9 dígitos começando em 9: celular sem DDD (CEP e outros códigos têm 8).
+          if (/^9\d{8}$/.test(c.replace(/\D/g, "").replace(/^0+/, ""))) st.local9++;
+        }
       }
     });
   }
   const textual = (j: number) => stats[j].filled > 0 && stats[j].letters * 2 >= stats[j].filled;
 
-  let nameCol = header ? header.findIndex((h, j) => NAME_HEADER.test(h) && !PHONE_HEADER.test(h) && textual(j)) : -1;
-  if (nameCol < 0) {
+  let autoName = -1;
+  if (header) {
     let best = 0;
-    stats.forEach((st, j) => {
-      if (st.letters > best && textual(j)) {
-        best = st.letters;
-        nameCol = j;
+    header.forEach((h, j) => {
+      const s = nameScore(h);
+      if (s > best && textual(j)) {
+        best = s;
+        autoName = j;
       }
     });
   }
-  let phoneCols = header ? header.map((h, j) => (PHONE_HEADER.test(h) && j !== nameCol ? j : -1)).filter((j) => j >= 0) : [];
-  if (!phoneCols.length) {
-    phoneCols = stats
+  if (autoName < 0) {
+    let best = 0;
+    stats.forEach((st, j) => {
+      if (header && (PHONE_HEADER.test(header[j]) || NAME_EXCLUDE.test(header[j]))) return;
+      if (st.letters > best && textual(j)) {
+        best = st.letters;
+        autoName = j;
+      }
+    });
+  }
+  const nameCol = opts.nameCol !== undefined ? (opts.nameCol < width ? opts.nameCol : -1) : autoName;
+
+  let autoPhones: number[] = [];
+  if (header) {
+    // Coluna com nome de telefone ainda precisa ter telefones no conteúdo.
+    autoPhones = header
+      .map((h, j) => {
+        if (j === nameCol || !PHONE_HEADER.test(h) || PHONE_HEADER_EXCLUDE.test(h)) return -1;
+        const st = stats[j];
+        return !st.filled || (st.strong + st.local) / st.filled >= 0.3 ? j : -1;
+      })
+      .filter((j) => j >= 0);
+  }
+  if (!autoPhones.length) {
+    autoPhones = stats
       .map((st, j) => {
         if (j === nameCol || !st.filled) return -1;
-        // Antes da coluna de nome (ex.: código/processo) só conta se for telefone com DDD na maioria.
-        const share = (nameCol >= 0 && j < nameCol ? st.strong : st.strong + st.local) / st.filled;
+        if (header && PHONE_HEADER_EXCLUDE.test(header[j])) return -1;
+        // Antes da coluna de nome (ex.: código/processo) só conta celular com DDD na maioria. Depois dela,
+        // celular sem DDD também conta, para a prévia pedir o DDD em vez de dizer "sem telefone".
+        const share = (nameCol >= 0 && j < nameCol ? st.mobile : st.strong + st.local9) / st.filled;
         return share >= 0.6 ? j : -1;
       })
       .filter((j) => j >= 0);
   }
+  const phoneCols = opts.phoneCols !== undefined ? opts.phoneCols.filter((j) => j < width && j !== nameCol) : autoPhones;
 
-  const label = (j: number) => (hasHeader && firstCells[j]?.trim()) || `coluna ${j + 1}`;
+  const label = (j: number) => (hasHeader && firstCells[j]?.trim()) || `Coluna ${j + 1}`;
+  const allColumns = stats
+    .map((st, j) => ({ index: j, label: label(j), sample: st.sample }))
+    .filter((c) => stats[c.index].filled > 0);
   const ignored = stats.map((st, j) => (st.filled && j !== nameCol && !phoneCols.includes(j) ? label(j) : "")).filter(Boolean);
   const columns = [
-    nameCol >= 0 ? `Nome: ${label(nameCol)}` : "Nome: “Cliente” (sem coluna de nome)",
+    nameCol >= 0 ? `Nome: ${label(nameCol)}` : "Nome: nenhuma coluna (a mensagem sai sem o nome)",
     phoneCols.length ? `Telefone: ${listLabels(phoneCols.map(label))}` : "Telefone: nenhuma coluna reconhecida",
     ignored.length ? `Ignorada: ${listLabels(ignored)}` : "",
   ]
@@ -300,22 +440,40 @@ export function parseContactsText(text: string, opts: ImportOptions = { phoneMod
 
   const rows: ParsedRow[] = [];
   const seen = new Map<string, number>();
+  // "Só 1": números de cada devedor já lido, para reconhecer a mesma pessoa em outra linha.
+  const debtorOf = new Map<string, { line: number; name: string }>();
   let multiPhone = false;
   let landlines = 0;
+  let localCount = 0;
   for (const r of data) {
-    // Linha só com o telefone (sem separador) numa lista "Nome, Telefone": nome "Cliente".
+    // Linha só com o telefone (sem separador) numa lista "Nome, Telefone": sem nome.
     const single = r.cells.length === 1;
-    const name = (!single && nameCol >= 0 ? r.cells[nameCol] ?? "" : "").trim() || "Cliente";
-    const values = (single ? [r.cells[0]] : phoneCols.map((j) => (r.cells[j] ?? "").trim())).filter(Boolean);
+    const name = (!single && nameCol >= 0 ? r.cells[nameCol] ?? "" : "").trim();
+    const values = (single ? [r.cells[0]] : phoneCols.map((j) => (r.cells[j] ?? "").trim()))
+      .filter(Boolean)
+      .flatMap((v) => phoneCandidates(v, ddd));
     if (!values.length) {
       rows.push({ line: r.line, raw: r.raw, name, phone: "", valid: false, reason: "Sem telefone" });
       continue;
     }
-    const found = values.map((v) => ({ v, ...classifyPhone(v) }));
-    if (found.filter((c) => c.kind !== "invalid").length > 1) multiPhone = true;
+    const found = values.map((v) => ({ v, ...classify(v) }));
+    const usable = found.filter((c) => c.kind === "mobile" || c.kind === "landline");
+    if (usable.length > 1) multiPhone = true;
     landlines += found.filter((c) => c.kind === "landline").length;
+    localCount += found.filter((c) => c.kind === "local").length;
+    const nameKey = plainText(name).replace(/\s+/g, " ");
+    if (opts.phoneMode === "one") {
+      // Mesma pessoa em outra linha (mesmo nome e um número em comum): não recebe de novo por outro número.
+      const same = usable.map((c) => debtorOf.get(optOutKey(c.phone))).find((d) => d !== undefined && d.name === nameKey);
+      if (same) {
+        for (const c of found) {
+          rows.push({ line: r.line, raw: r.raw, name, phone: c.phone || c.v, valid: false, skipped: true, reason: `Mesmo devedor da linha ${same.line}` });
+        }
+        continue;
+      }
+    }
     // "Só 1": o 1º celular ainda não usado; sem celular, o 1º número aceito.
-    const pool = found.filter((c) => c.kind !== "invalid" && (c.kind !== "landline" || opts.includeLandlines) && !seen.has(optOutKey(c.phone)));
+    const pool = usable.filter((c) => (c.kind !== "landline" || opts.includeLandlines) && !seen.has(optOutKey(c.phone)));
     const chosen = opts.phoneMode === "one" ? pool.find((c) => c.kind === "mobile") ?? pool[0] : undefined;
     for (const c of found) {
       const base = { line: r.line, raw: r.raw, name, phone: c.phone || c.v };
@@ -323,25 +481,58 @@ export function parseContactsText(text: string, opts: ImportOptions = { phoneMod
         rows.push({ ...base, valid: false, reason: "Número inválido" });
         continue;
       }
+      if (c.kind === "local") {
+        rows.push({ ...base, valid: false, reason: "Sem DDD" });
+        continue;
+      }
       if (c.kind === "landline" && !opts.includeLandlines) {
-        rows.push({ ...base, valid: false, reason: "Fixo (ignorado)" });
+        rows.push({ ...base, valid: false, skipped: true, reason: "Fixo (ignorado)" });
         continue;
       }
       const key = optOutKey(c.phone);
       const firstLine = seen.get(key);
       if (firstLine !== undefined) {
-        rows.push({ ...base, valid: false, reason: firstLine === r.line ? "Repetido na mesma linha" : `Repetido (linha ${firstLine})` });
+        rows.push({ ...base, valid: false, skipped: true, reason: firstLine === r.line ? "Repetido na mesma linha" : `Repetido (linha ${firstLine})` });
         continue;
       }
       if (opts.phoneMode === "one" && c !== chosen) {
-        rows.push({ ...base, valid: false, reason: "Outro número do devedor" });
+        rows.push({ ...base, valid: false, skipped: true, reason: "Outro número do devedor" });
         continue;
       }
       seen.set(key, r.line);
-      rows.push({ ...base, valid: true, warning: c.kind === "local" ? "Sem DDD" : c.kind === "landline" ? "Fixo" : undefined });
+      rows.push({ ...base, valid: true, warning: c.kind === "landline" ? "Fixo" : undefined });
+    }
+    if (opts.phoneMode === "one") {
+      for (const c of usable) {
+        const k = optOutKey(c.phone);
+        if (!debtorOf.has(k)) debtorOf.set(k, { line: r.line, name: nameKey });
+      }
     }
   }
-  return { rows, lines: data.length, columns, multiPhone, landlines };
+  return { rows, lines: data.length, columns, multiPhone, landlines, localCount, allColumns, nameCol, phoneCols, hasHeader };
+}
+
+// Nome em CAIXA ALTA vira "Maria da Silva" (siglas de empresa como LTDA, ME e S/A ficam como estão).
+const NAME_PARTICLES = new Set(["da", "das", "de", "do", "dos", "e"]);
+const COMPANY_TOKENS = new Set(["LTDA", "LTDA.", "ME", "MEI", "EPP", "EIRELI", "S/A", "S.A.", "SA", "S.A", "CIA", "CIA."]);
+export function tidyName(name: string) {
+  const letters = name.replace(/[^A-Za-zÀ-ÿ]/g, "");
+  if (!letters || letters !== letters.toUpperCase()) return name;
+  return name
+    .toLowerCase()
+    .split(/(\s+)/)
+    .map((w, i) => {
+      if (/^\s+$/.test(w) || !w) return w;
+      if (COMPANY_TOKENS.has(w.toUpperCase())) return w.toUpperCase();
+      if (i > 0 && NAME_PARTICLES.has(w)) return w;
+      return w.charAt(0).toUpperCase() + w.slice(1);
+    })
+    .join("");
+}
+
+export function isShoutedName(name: string) {
+  const letters = name.replace(/[^A-Za-zÀ-ÿ]/g, "");
+  return letters.length > 1 && letters === letters.toUpperCase();
 }
 
 // ---------- Planilha .xlsx ----------
@@ -482,8 +673,19 @@ export function rowsToText(rows: string[][]) {
     .join("\n");
 }
 
-// UTF-8 (com ou sem BOM); se não for UTF-8 válido, Windows-1252 (CSV salvo pelo Excel no Windows).
+// UTF-16 ("Texto Unicode" do Excel, Export-Csv do PowerShell), UTF-8 (com ou sem BOM) ou, se não for
+// UTF-8 válido, Windows-1252 (CSV salvo pelo Excel no Windows).
 export function decodeTextFile(buf: ArrayBuffer) {
+  const b = new Uint8Array(buf);
+  const utf16 = (le: boolean) => new TextDecoder(le ? "utf-16le" : "utf-16be").decode(buf).replace(/\u0000/g, "");
+  if (b.length >= 2 && b[0] === 0xff && b[1] === 0xfe) return utf16(true);
+  if (b.length >= 2 && b[0] === 0xfe && b[1] === 0xff) return utf16(false);
+  // Sem BOM, mas com um byte nulo a cada dois: também é UTF-16.
+  const sample = b.subarray(0, Math.min(b.length, 4096));
+  let evenZeros = 0;
+  let oddZeros = 0;
+  for (let i = 0; i < sample.length; i++) if (sample[i] === 0) i % 2 ? oddZeros++ : evenZeros++;
+  if (sample.length >= 4 && Math.max(evenZeros, oddZeros) > sample.length / 4) return utf16(oddZeros > evenZeros);
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(buf);
   } catch {
@@ -1965,8 +2167,20 @@ function ContactsPanel({
 
 // Importação de contatos: arquivo CSV/TXT (arrastar ou selecionar) ou colar texto, com prévia validada.
 
-type PreviewFilter = "all" | "valid" | "invalid";
+type PreviewFilter = "all" | "valid" | "skipped" | "invalid";
 const PREVIEW_LIMIT = 300;
+// Texto maior que isso não vai para a caixa de edição (o campo fica lento); a prévia continua completa.
+const LARGE_TEXT = 200_000;
+
+export interface ImportSummary {
+  imported: number;
+  mode: "add" | "replace";
+  optedOut: number;
+  alreadyInCampaign: number;
+  replacedPending: number;
+}
+
+const shortSample = (s: string) => (s.length > 18 ? `${s.slice(0, 17)}…` : s);
 
 function ContactImportModal({
   isOpen,
@@ -1977,308 +2191,708 @@ function ContactImportModal({
   isOpen: boolean;
   onClose: () => void;
   campaign: Campaign | null;
-  onImported: () => void;
+  onImported: (summary: ImportSummary) => void;
 }) {
   const [raw, setRaw] = useState("");
   const [fileName, setFileName] = useState("");
+  const [fileKind, setFileKind] = useState<"" | "xlsx" | "text">("");
+  const [reading, setReading] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const dragDepth = useRef(0);
+  // Cada leitura de arquivo ganha um número; abrir/fechar ou ler outro arquivo descarta a anterior.
+  const readSeq = useRef(0);
   const [importError, setImportError] = useState("");
   const [importing, setImporting] = useState(false);
   const [filter, setFilter] = useState<PreviewFilter>("all");
-  const [phoneMode, setPhoneMode] = useState<PhoneMode>("all");
+  const [phoneMode, setPhoneMode] = useState<PhoneMode>("one");
   const [includeLandlines, setIncludeLandlines] = useState(false);
+  const [ddd, setDdd] = useState("");
+  const [columns, setColumns] = useState<{ nameCol?: number; phoneCols?: number[] }>({});
+  const [tidy, setTidy] = useState(true);
+  const [mode, setMode] = useState<"add" | "replace">("add");
+  const [confirmReplace, setConfirmReplace] = useState(false);
+  const [confirmClose, setConfirmClose] = useState(false);
+  const [existing, setExisting] = useState<Contact[] | null>(null);
+  const [existingError, setExistingError] = useState("");
+  const [existingReload, setExistingReload] = useState(0);
+  const [optOutKeys, setOptOutKeys] = useState<Set<string>>(new Set());
+  const [optOutError, setOptOutError] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dddId = useId();
+  const nameColId = useId();
 
   useEffect(() => {
+    readSeq.current++;
     if (isOpen) {
       setRaw("");
       setFileName("");
+      setFileKind("");
+      setReading(false);
+      setDragging(false);
+      dragDepth.current = 0;
       setImportError("");
       setFilter("all");
-      setPhoneMode("all");
+      setPhoneMode("one");
       setIncludeLandlines(false);
+      setDdd("");
+      setColumns({});
+      setTidy(true);
+      setMode("add");
+      setConfirmReplace(false);
+      setConfirmClose(false);
     }
   }, [isOpen, campaign?.id]);
 
-  const deferred = useDeferredValue(raw);
-  const parsed = useMemo(() => parseContactsText(deferred, { phoneMode, includeLandlines }), [deferred, phoneMode, includeLandlines]);
-  const rows = parsed.rows;
-  const validRows = rows.filter((r) => r.valid);
-  const invalidCount = rows.length - validRows.length;
-  const warningCount = validRows.filter((r) => r.warning).length;
-  const visible = rows.filter((r) => (filter === "valid" ? r.valid : filter === "invalid" ? !r.valid : true));
-  const [optOutKeys, setOptOutKeys] = useState<Set<string>>(new Set());
+  // Fila atual: decide entre somar e substituir, e evita repetir quem já está na campanha.
+  useEffect(() => {
+    if (!isOpen || !campaign) return;
+    let alive = true;
+    setExisting(null);
+    setExistingError("");
+    api<Contact[]>("get_campaign_contacts", { campaignId: campaign.id })
+      .then((list) => {
+        if (alive) setExisting(list);
+      })
+      .catch((e) => {
+        if (alive) setExistingError(String(e));
+      });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, campaign?.id, existingReload]);
+
   useEffect(() => {
     if (!isOpen || !campaign?.companyId) return;
+    let alive = true;
+    setOptOutError(false);
     api<{ phone: string }[]>("list_opt_outs", { companyId: campaign.companyId })
-      .then((l) => setOptOutKeys(new Set(l.map((x) => x.phone))))
-      .catch(() => setOptOutKeys(new Set()));
+      .then((l) => {
+        if (alive) setOptOutKeys(new Set(l.map((x) => x.phone)));
+      })
+      .catch(() => {
+        if (!alive) return;
+        setOptOutKeys(new Set());
+        setOptOutError(true);
+      });
+    return () => {
+      alive = false;
+    };
   }, [isOpen, campaign?.companyId]);
-  const optedOutCount = validRows.filter((r) => optOutKeys.has(optOutKey(r.phone))).length;
 
-  // CSV/TXT (UTF-8 ou Windows-1252) ou planilha .xlsx (1ª aba), tudo pelo mesmo leitor de colunas.
+  const deferred = useDeferredValue(raw);
+  const stale = deferred !== raw;
+  const dddValid = ddd === "" || isValidDdd(ddd);
+  const effectiveDdd = ddd && dddValid ? ddd : undefined;
+  const delimiter = fileKind === "xlsx" ? "\t" : undefined;
+  const parsed = useMemo(
+    () => parseContactsText(deferred, { phoneMode, includeLandlines, ddd: effectiveDdd, nameCol: columns.nameCol, phoneCols: columns.phoneCols, delimiter }),
+    [deferred, phoneMode, includeLandlines, effectiveDdd, columns, delimiter]
+  );
+  const otherMode: PhoneMode = phoneMode === "one" ? "all" : "one";
+  // Com mais de um telefone por linha, conta as duas opções para o operador comparar.
+  const other = useMemo(
+    () =>
+      parsed.multiPhone
+        ? parseContactsText(deferred, { phoneMode: otherMode, includeLandlines, ddd: effectiveDdd, nameCol: columns.nameCol, phoneCols: columns.phoneCols, delimiter })
+        : null,
+    [parsed.multiPhone, deferred, otherMode, includeLandlines, effectiveDdd, columns, delimiter]
+  );
+
+  const existingByKey = useMemo(() => {
+    const m = new Map<string, Contact>();
+    for (const c of existing ?? []) m.set(optOutKey(c.phone), c);
+    return m;
+  }, [existing]);
+  const pendingExisting = useMemo(() => (existing ?? []).filter((c) => c.status === "pending"), [existing]);
+
+  const view = useMemo(() => {
+    const rows = parsed.rows;
+    const validRows = rows.filter((r) => r.valid);
+    // Já na campanha: com "somar", qualquer status; com "substituir", só quem não está pendente.
+    const inCampaign = (r: ParsedRow) => {
+      const c = existingByKey.get(optOutKey(r.phone));
+      return Boolean(c) && (mode === "add" || c?.status !== "pending");
+    };
+    const toImport = validRows.filter((r) => !inCampaign(r));
+    const names = validRows.map((r) => r.name).filter(Boolean);
+    return {
+      rows,
+      validRows,
+      toImport,
+      alreadyIn: validRows.length - toImport.length,
+      optedOut: toImport.filter((r) => optOutKeys.has(optOutKey(r.phone))).length,
+      skipped: rows.filter((r) => !r.valid && r.skipped).length,
+      problems: rows.filter((r) => !r.valid && !r.skipped).length,
+      shouted: names.length > 0 && names.filter(isShoutedName).length * 2 >= names.length,
+      inCampaign,
+    };
+  }, [parsed, existingByKey, mode, optOutKeys]);
+  const { rows, validRows, toImport } = view;
+  const sendable = toImport.length - view.optedOut;
+  const visible = rows.filter((r) =>
+    filter === "valid" ? r.valid : filter === "skipped" ? !r.valid && r.skipped : filter === "invalid" ? !r.valid && !r.skipped : true
+  );
+  const showName = (n: string) => (tidy && view.shouted ? tidyName(n) : n);
+
+  const blockedByRunning = campaign?.status === "running";
+  const large = raw.length > LARGE_TEXT && Boolean(fileName);
+  const canImport = Boolean(campaign) && !blockedByRunning && !reading && !stale && existing !== null && dddValid && toImport.length > 0;
+
+  const clearSource = () => {
+    readSeq.current++;
+    setReading(false);
+    setRaw("");
+    setFileName("");
+    setFileKind("");
+    setColumns({});
+  };
+
+  // CSV/TXT (UTF-8, Windows-1252 ou UTF-16) ou planilha .xlsx (1ª aba), tudo pelo mesmo leitor de colunas.
   const readFile = async (file: File) => {
+    const seq = ++readSeq.current;
     const ext = file.name.toLowerCase().split(".").pop() ?? "";
+    setReading(true);
+    setImportError("");
     try {
       let text: string;
       if (ext === "xlsx" || ext === "xlsm") text = rowsToText(await parseXlsx(new Uint8Array(await file.arrayBuffer())));
       else if (ext === "xls" || ext === "ods")
         throw new Error("Este formato de planilha não é lido aqui. No Excel, use Salvar como → Pasta de Trabalho do Excel (.xlsx) ou CSV.");
       else text = decodeTextFile(await file.arrayBuffer());
+      if (seq !== readSeq.current) return;
       setRaw(text);
       setFileName(file.name);
-      setImportError("");
+      setFileKind(ext === "xlsx" || ext === "xlsm" ? "xlsx" : "text");
+      setColumns({});
+      setFilter("all");
     } catch (error) {
+      if (seq !== readSeq.current) return;
       setImportError(error instanceof Error ? error.message : "Não foi possível ler o arquivo selecionado.");
+    } finally {
+      if (seq === readSeq.current) setReading(false);
     }
   };
 
-  const handleConfirm = async () => {
-    if (!campaign || validRows.length === 0) return;
+  const doImport = async () => {
+    if (!campaign || !canImport) return;
     setImporting(true);
+    setImportError("");
     try {
-      await api("import_campaign_contacts", {
-        campaignId: campaign.id,
-        contacts: validRows.map((c) => [c.name, c.phone]),
+      // A importação do sistema troca os pendentes pela lista enviada: para somar, a fila atual vai junto.
+      let keep: [string, string][] = [];
+      if (mode === "add") {
+        const current = await api<Contact[]>("get_campaign_contacts", { campaignId: campaign.id });
+        const freshKeys = new Set(toImport.map((r) => optOutKey(r.phone)));
+        keep = current
+          .filter((c) => c.status === "pending" && !freshKeys.has(optOutKey(c.phone)))
+          .map((c) => [c.contactName || c.name || "", c.phone]);
+      }
+      const fresh = toImport.map((r) => [showName(r.name), r.phone] as [string, string]);
+      await api("import_campaign_contacts", { campaignId: campaign.id, contacts: [...keep, ...fresh] });
+      onImported({
+        imported: fresh.length,
+        mode,
+        optedOut: view.optedOut,
+        alreadyInCampaign: view.alreadyIn,
+        replacedPending: mode === "replace" ? pendingExisting.length : 0,
       });
+      onClose();
     } catch (error) {
       console.error("Falha ao importar contatos:", error);
       setImportError(String(error));
+    } finally {
       setImporting(false);
-      return;
     }
-    setImporting(false);
-    setImportError("");
-    setRaw("");
-    setFileName("");
-    onImported();
-    onClose();
   };
 
+  const handleConfirm = () => {
+    if (!canImport) return;
+    if (mode === "replace" && pendingExisting.length > 0) setConfirmReplace(true);
+    else doImport();
+  };
+
+  const requestClose = () => {
+    if (importing) return;
+    if (raw.trim()) setConfirmClose(true);
+    else onClose();
+  };
+
+  const downloadProblems = () => {
+    const list = rows.filter((r) => !r.valid);
+    const base = (fileName || "lista").replace(/\.[^.]+$/, "");
+    downloadCsv(
+      `${base}_problemas.csv`,
+      ["Linha", "Nome", "Telefone", "Motivo", "Linha original"],
+      list.map((r) => [r.line, r.name, formatPhoneBr(r.phone), r.reason || "", r.raw])
+    );
+  };
+
+  const statusLabel = existing === null && !existingError ? "Lendo a fila atual…" : "";
+
   return (
-    <Modal
-      isOpen={isOpen}
-      onClose={onClose}
-      title="Importar contatos"
-      description={campaign ? `Campanha: ${campaign.name}` : undefined}
-      size="xl"
-      footer={
-        <div className="flex w-full flex-col-reverse gap-2 sm:flex-row sm:items-center sm:justify-between">
-          {optedOutCount > 0 && (
-            <p className="text-[0.75rem] text-amber-700 dark:text-amber-400">
-              {optedOutCount} número(s) desta lista pediram para não receber mensagens (Descadastrados) e serão pulados no disparo.
-            </p>
+    <>
+      <Modal
+        isOpen={isOpen}
+        onClose={requestClose}
+        title="Importar contatos"
+        description={campaign ? `Campanha: ${campaign.name}` : undefined}
+        size="xl"
+        footer={
+          <div className="flex w-full flex-col-reverse gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0 space-y-0.5 text-[0.75rem]">
+              {view.optedOut > 0 && (
+                <p className="text-amber-700 dark:text-amber-300">
+                  {formatNumber(view.optedOut)} {view.optedOut === 1 ? "número pediu" : "números pediram"} para não receber (descadastrados) e não {view.optedOut === 1 ? "recebe" : "recebem"}.
+                </p>
+              )}
+              {view.alreadyIn > 0 && (
+                <p className="text-tertiary">
+                  {formatNumber(view.alreadyIn)} {view.alreadyIn === 1 ? "número já está" : "números já estão"} nesta campanha e não {view.alreadyIn === 1 ? "entra" : "entram"} de novo.
+                </p>
+              )}
+              {statusLabel && <p className="text-tertiary">{statusLabel}</p>}
+            </div>
+            <div className="flex shrink-0 items-center justify-end gap-2">
+              <Button variant="secondary" onClick={requestClose} disabled={importing}>
+                Cancelar
+              </Button>
+              <Button onClick={handleConfirm} disabled={!canImport} loading={importing || reading} icon={<Upload size={14} />}>
+                {reading
+                  ? "Lendo arquivo…"
+                  : toImport.length
+                  ? `${mode === "replace" && pendingExisting.length ? "Substituir por" : "Importar"} ${formatNumber(toImport.length)} ${toImport.length === 1 ? "contato" : "contatos"}`
+                  : "Importar"}
+              </Button>
+            </div>
+          </div>
+        }
+      >
+        <div className="space-y-5">
+          {blockedByRunning && (
+            <InlineAlert tone="warning" icon={<Pause size={15} />} title="Pause a campanha para importar">
+              A fila não pode mudar enquanto as mensagens estão saindo. Pause a campanha, importe a lista e depois retome.
+            </InlineAlert>
           )}
-          <p className="text-[0.75rem] text-tertiary">A importação substitui os contatos ainda pendentes desta campanha.</p>
-          <div className="flex items-center justify-end gap-2">
-            <Button variant="secondary" onClick={onClose} disabled={importing}>
-              Cancelar
-            </Button>
-            <Button onClick={handleConfirm} disabled={validRows.length === 0} loading={importing} icon={<Upload size={14} />}>
-              {validRows.length ? `Importar ${formatNumber(validRows.length)} ${validRows.length === 1 ? "contato" : "contatos"}` : "Importar"}
-            </Button>
-          </div>
-        </div>
-      }
-    >
-      <div className="space-y-5">
-        {importError && (
-          <InlineAlert tone="danger" icon={<AlertCircle size={15} />} title="A importação falhou" onDismiss={() => setImportError("")}>
-            {importError}
-          </InlineAlert>
-        )}
-
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".csv,.txt,.tsv,.xlsx,.xlsm,.xls,.ods"
-          className="hidden"
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) readFile(f);
-            e.target.value = "";
-          }}
-        />
-
-        <div className="grid gap-4 lg:grid-cols-2">
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={() => fileInputRef.current?.click()}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                fileInputRef.current?.click();
+          {importError && (
+            <InlineAlert tone="danger" icon={<AlertCircle size={15} />} title="A importação falhou" onDismiss={() => setImportError("")}>
+              {importError}
+            </InlineAlert>
+          )}
+          {existingError && (
+            <InlineAlert
+              tone="danger"
+              icon={<AlertCircle size={15} />}
+              title="Não foi possível ler a fila atual da campanha"
+              action={
+                <Button size="sm" variant="secondary" icon={<RefreshCw size={13} />} onClick={() => setExistingReload((n) => n + 1)}>
+                  Tentar de novo
+                </Button>
               }
-            }}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragging(true);
-            }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setDragging(false);
-              const f = e.dataTransfer.files?.[0];
+            >
+              Sem ela a importação fica bloqueada, para não apagar contatos pendentes por engano.
+            </InlineAlert>
+          )}
+          {optOutError && (
+            <InlineAlert tone="warning" icon={<AlertTriangle size={15} />} title="Não foi possível conferir os descadastrados agora">
+              A prévia não marca quem pediu SAIR. O disparo confere de novo antes de cada envio, e quem pediu para sair não recebe.
+            </InlineAlert>
+          )}
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".csv,.txt,.tsv,.xlsx,.xlsm,.xls,.ods"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
               if (f) readFile(f);
+              e.target.value = "";
             }}
-            className={`flex min-h-[11rem] cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed px-4 py-6 text-center transition-colors focus-visible:outline-2 focus-visible:outline-[var(--color-accent)] ${
-              dragging ? "border-[var(--color-accent)] bg-[var(--color-accent-glow)]" : "border-[var(--color-border-strong)] hover:bg-[var(--color-bg-hover)]"
-            }`}
-          >
-            <span className="flex h-10 w-10 items-center justify-center rounded-full bg-secondary text-secondary">
-              <FileUp size={18} />
-            </span>
-            {fileName ? (
-              <>
-                <p className="text-[0.8125rem] font-medium text-primary">{fileName}</p>
-                <p className="text-[0.75rem] text-tertiary">Clique para trocar o arquivo</p>
-              </>
-            ) : (
-              <>
-                <p className="text-[0.8125rem] font-medium text-primary">Arraste um arquivo CSV, TXT ou planilha (.xlsx)</p>
-                <p className="text-[0.75rem] text-tertiary">ou clique para selecionar</p>
-              </>
-            )}
-          </div>
+          />
 
-          <Field
-            label="Ou cole a lista"
-            htmlFor="import-raw"
-            hint="Um contato por linha: Nome, Telefone. Também aceita planilha com cabeçalho (ex.: PROCESSO, NOME DEVEDOR, TELEFONE 1…), ; ou tabulação, ou só o telefone."
-            aside={
-              raw ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRaw("");
-                    setFileName("");
-                  }}
-                  className="inline-flex items-center gap-1 text-[0.75rem] text-secondary hover:text-[var(--color-text-primary)] cursor-pointer"
-                >
-                  <X size={12} /> Limpar
-                </button>
-              ) : null
-            }
-          >
-            <textarea
-              id="import-raw"
-              rows={7}
-              value={raw}
-              onChange={(e) => {
-                setRaw(e.target.value);
-                if (fileName) setFileName("");
-              }}
-              placeholder={"Maria Silva, 11999991111\nJoão Souza, 5511988882222\n5511977773333"}
-              className="resize-none font-mono text-[0.75rem]"
-            />
-          </Field>
-        </div>
-
-        <p className="text-[0.75rem] text-tertiary">
-          Os números são limpos automaticamente e recebem o DDI +55 quando têm DDD. Cada telefone válido vira um contato; número repetido entra uma vez.
-        </p>
-
-        {rows.length > 0 && (
-          <section className="space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[0.8125rem]">
-                <span className="text-secondary">
-                  <strong className="tabular-nums text-primary">{formatNumber(parsed.lines)}</strong> {parsed.lines === 1 ? "linha" : "linhas"}
-                </span>
-                <span className="text-primary">
-                  <strong className="tabular-nums">{formatNumber(validRows.length)}</strong> {validRows.length === 1 ? "número válido" : "números válidos"}
-                </span>
-                <span className={invalidCount ? "text-red-600 dark:text-red-400" : "text-tertiary"}>
-                  <strong className="tabular-nums">{formatNumber(invalidCount)}</strong> ignorados
-                </span>
-                {warningCount > 0 && (
-                  <span className="text-amber-700 dark:text-amber-300">
-                    <strong className="tabular-nums">{formatNumber(warningCount)}</strong> com aviso
-                  </span>
-                )}
-              </div>
-              <SegmentedControl<PreviewFilter>
-                value={filter}
-                onChange={setFilter}
+          {pendingExisting.length > 0 && (
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-border px-3.5 py-2.5">
+              <p className="min-w-0 flex-1 text-[0.8125rem] text-secondary">
+                Esta campanha já tem <strong className="tabular-nums text-primary">{formatNumber(pendingExisting.length)}</strong>{" "}
+                {pendingExisting.length === 1 ? "contato aguardando" : "contatos aguardando"} envio.
+              </p>
+              <SegmentedControl<"add" | "replace">
+                value={mode}
+                onChange={setMode}
                 items={[
-                  { id: "all", label: "Todos", count: rows.length },
-                  { id: "valid", label: "Válidos", count: validRows.length },
-                  { id: "invalid", label: "Ignorados", count: invalidCount },
+                  { id: "add", label: "Somar à fila" },
+                  { id: "replace", label: "Substituir pendentes" },
                 ]}
               />
             </div>
+          )}
 
-            {parsed.columns && <p className="text-[0.75rem] text-tertiary">Colunas lidas: {parsed.columns}</p>}
-
-            {(parsed.multiPhone || parsed.landlines > 0) && (
-              <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-border px-3 py-2">
-                <span className="text-[0.75rem] text-secondary">Telefones de cada linha</span>
-                <SegmentedControl<PhoneMode>
-                  value={phoneMode}
-                  onChange={setPhoneMode}
-                  items={[
-                    { id: "all", label: "Todos" },
-                    { id: "one", label: "Só 1 (celular primeiro)" },
-                  ]}
-                />
-                {parsed.landlines > 0 && (
-                  <Toggle size="sm" checked={includeLandlines} onChange={setIncludeLandlines} label={`Incluir fixos (${formatNumber(parsed.landlines)})`} />
-                )}
-              </div>
-            )}
-
-            {validRows.length === 0 && (
-              <InlineAlert tone="danger" icon={<AlertCircle size={15} />} title="Nenhum telefone válido encontrado">
-                Confira se há uma coluna de telefone com DDD. Aceita “Nome, Telefone”, planilha com cabeçalho ou só o telefone.
-              </InlineAlert>
-            )}
-
-            <div className="overflow-hidden rounded-lg border border-border">
-              <div className="max-h-64 overflow-y-auto custom-scrollbar">
-                <table className="w-full text-left text-[0.8125rem]">
-                  <thead className="sticky top-0 bg-secondary text-[0.75rem] text-secondary">
-                    <tr>
-                      <th className="w-14 px-3 py-2 font-medium">Linha</th>
-                      <th className="px-3 py-2 font-medium">Nome</th>
-                      <th className="px-3 py-2 font-medium">Telefone</th>
-                      <th className="px-3 py-2 font-medium">Situação</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-[var(--color-border)]">
-                    {visible.slice(0, PREVIEW_LIMIT).map((r, i) => (
-                      <tr key={`${r.line}-${i}`} className={r.valid ? "" : "bg-red-500/[0.05]"}>
-                        <td className="px-3 py-1.5 tabular-nums text-tertiary">{r.line}</td>
-                        <td className="max-w-[14rem] truncate px-3 py-1.5 text-primary">
-                          {r.valid || r.name !== "Cliente" ? r.name : <span className="text-tertiary">{r.raw}</span>}
-                        </td>
-                        <td className="px-3 py-1.5 font-mono text-[0.75rem] text-secondary">{r.phone || "—"}</td>
-                        <td className="px-3 py-1.5 text-[0.75rem]">
-                          {!r.valid ? (
-                            <span className="text-red-600 dark:text-red-400">{r.reason}</span>
-                          ) : r.warning ? (
-                            <span className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-300">
-                              <AlertTriangle size={12} /> {r.warning}
-                            </span>
-                          ) : (
-                            <span className="text-emerald-600 dark:text-emerald-400">Ok</span>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              {visible.length > PREVIEW_LIMIT && (
-                <p className="border-t border-border bg-secondary px-3 py-2 text-[0.75rem] text-tertiary">
-                  Mostrando {PREVIEW_LIMIT} de {formatNumber(visible.length)} linhas. Todas serão consideradas na importação.
-                </p>
+          <div className="grid gap-4 lg:grid-cols-2">
+            <div
+              role="button"
+              tabIndex={0}
+              aria-busy={reading}
+              onClick={() => fileInputRef.current?.click()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  fileInputRef.current?.click();
+                }
+              }}
+              onDragEnter={(e) => {
+                e.preventDefault();
+                dragDepth.current++;
+                setDragging(true);
+              }}
+              onDragOver={(e) => e.preventDefault()}
+              onDragLeave={() => {
+                dragDepth.current = Math.max(0, dragDepth.current - 1);
+                if (dragDepth.current === 0) setDragging(false);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                dragDepth.current = 0;
+                setDragging(false);
+                const f = e.dataTransfer.files?.[0];
+                if (f) readFile(f);
+              }}
+              className={`flex min-h-[11rem] cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed px-4 py-6 text-center transition-colors focus-visible:outline-2 focus-visible:outline-[var(--color-accent)] ${
+                dragging ? "border-[var(--color-accent)] bg-[var(--color-accent-glow)]" : "border-[var(--color-border-strong)] hover:bg-[var(--color-bg-hover)]"
+              }`}
+            >
+              <span className="pointer-events-none flex h-10 w-10 items-center justify-center rounded-full bg-secondary text-secondary">
+                {reading ? <RefreshCw size={18} className="animate-spin" /> : <FileUp size={18} />}
+              </span>
+              {reading ? (
+                <p className="pointer-events-none text-[0.8125rem] font-medium text-primary">Lendo o arquivo…</p>
+              ) : fileName ? (
+                <>
+                  <p className="pointer-events-none break-all text-[0.8125rem] font-medium text-primary">{fileName}</p>
+                  <p className="pointer-events-none text-[0.75rem] text-tertiary">Clique para trocar o arquivo</p>
+                </>
+              ) : (
+                <>
+                  <p className="pointer-events-none text-[0.8125rem] font-medium text-primary">Arraste um arquivo CSV, TXT ou planilha (.xlsx)</p>
+                  <p className="pointer-events-none text-[0.75rem] text-tertiary">ou clique para selecionar</p>
+                </>
               )}
             </div>
-          </section>
-        )}
-      </div>
-    </Modal>
+
+            {large ? (
+              <div className="flex min-h-[11rem] flex-col justify-between gap-3 rounded-xl border border-border px-4 py-3.5">
+                <div>
+                  <p className="text-[0.8125rem] font-medium text-primary">Conteúdo do arquivo</p>
+                  <p className="mt-1 text-[0.75rem] text-tertiary">
+                    {formatNumber(parsed.lines)} linhas carregadas. O arquivo é grande demais para editar aqui; confira as linhas na prévia abaixo.
+                  </p>
+                </div>
+                <div>
+                  <Button size="sm" variant="secondary" icon={<X size={13} />} onClick={clearSource}>
+                    Remover arquivo
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <Field
+                label="Ou cole a lista"
+                htmlFor="import-raw"
+                hint="Um contato por linha: Nome, Telefone. Também aceita planilha com cabeçalho (ex.: PROCESSO, NOME DEVEDOR, TELEFONE 1…), ; ou tabulação, ou só o telefone."
+                aside={
+                  raw ? (
+                    <button
+                      type="button"
+                      onClick={clearSource}
+                      className="inline-flex items-center gap-1 text-[0.75rem] text-secondary hover:text-[var(--color-text-primary)] cursor-pointer"
+                    >
+                      <X size={12} /> Limpar
+                    </button>
+                  ) : null
+                }
+              >
+                <textarea
+                  id="import-raw"
+                  rows={7}
+                  value={raw}
+                  onChange={(e) => {
+                    readSeq.current++;
+                    setReading(false);
+                    setRaw(e.target.value);
+                    if (fileName) {
+                      setFileName("");
+                      setFileKind("");
+                    }
+                  }}
+                  placeholder={"Maria Silva, 11999991111\nJoão Souza, 5511988882222\n5511977773333"}
+                  className="resize-none font-mono text-[0.75rem]"
+                />
+              </Field>
+            )}
+          </div>
+
+          <p className="text-[0.75rem] text-tertiary">
+            Os números são limpos automaticamente e recebem o DDI +55 quando têm DDD. Número sem DDD não entra (viraria um número de outro
+            país). Cada telefone válido vira um contato; número repetido entra uma vez.
+          </p>
+
+          {rows.length > 0 && (
+            <section className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[0.8125rem]">
+                  <span className="text-secondary">
+                    <strong className="tabular-nums text-primary">{formatNumber(parsed.lines)}</strong> {parsed.lines === 1 ? "linha" : "linhas"}
+                  </span>
+                  <span className="text-primary">
+                    <strong className="tabular-nums">{formatNumber(Math.max(0, sendable))}</strong> para envio
+                  </span>
+                  {view.skipped > 0 && (
+                    <span className="text-secondary">
+                      <strong className="tabular-nums">{formatNumber(view.skipped)}</strong> {view.skipped === 1 ? "pulado" : "pulados"}
+                    </span>
+                  )}
+                  {view.problems > 0 && (
+                    <span className="text-red-600 dark:text-red-400">
+                      <strong className="tabular-nums">{formatNumber(view.problems)}</strong> com problema
+                    </span>
+                  )}
+                </div>
+                <SegmentedControl<PreviewFilter>
+                  value={filter}
+                  onChange={setFilter}
+                  items={[
+                    { id: "all", label: "Todos", count: rows.length },
+                    { id: "valid", label: "Válidos", count: validRows.length },
+                    { id: "skipped", label: "Pulados", count: view.skipped },
+                    { id: "invalid", label: "Com problema", count: view.problems },
+                  ]}
+                />
+              </div>
+
+              {parsed.allColumns.length > 2 || (parsed.hasHeader && parsed.allColumns.length > 1) ? (
+                <div className="space-y-2 rounded-lg border border-border px-3 py-2.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label htmlFor={nameColId} className="!mb-0 text-[0.75rem] text-secondary">
+                      Coluna do nome
+                    </label>
+                    <select
+                      id={nameColId}
+                      value={parsed.nameCol}
+                      onChange={(e) => setColumns((c) => ({ ...c, nameCol: Number(e.target.value) }))}
+                      className="!h-8 !w-auto max-w-[18rem] !py-0 text-[0.75rem]"
+                    >
+                      <option value={-1}>Sem nome</option>
+                      {parsed.allColumns.map((c) => (
+                        <option key={c.index} value={c.index}>
+                          {c.label}
+                          {c.sample ? ` (ex.: ${shortSample(c.sample)})` : ""}
+                        </option>
+                      ))}
+                    </select>
+                    {(columns.nameCol !== undefined || columns.phoneCols !== undefined) && (
+                      <button
+                        type="button"
+                        onClick={() => setColumns({})}
+                        className="text-[0.75rem] text-[var(--color-accent-light)] hover:underline cursor-pointer"
+                      >
+                        Voltar à escolha automática
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="mr-1 text-[0.75rem] text-secondary">Telefones do devedor</span>
+                    {parsed.allColumns
+                      .filter((c) => c.index !== parsed.nameCol)
+                      .map((c) => {
+                        const on = parsed.phoneCols.includes(c.index);
+                        return (
+                          <button
+                            key={c.index}
+                            type="button"
+                            aria-pressed={on}
+                            title={c.sample ? `Ex.: ${c.sample}` : undefined}
+                            onClick={() =>
+                              setColumns((s) => ({
+                                ...s,
+                                phoneCols: on ? parsed.phoneCols.filter((j) => j !== c.index) : [...parsed.phoneCols, c.index].sort((a, b) => a - b),
+                              }))
+                            }
+                            className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[0.75rem] transition-colors cursor-pointer ${
+                              on
+                                ? "border-[var(--color-border-accent)] bg-[var(--color-accent-glow)] text-primary"
+                                : "border-border text-tertiary hover:border-[var(--color-border-strong)] hover:text-[var(--color-text-primary)]"
+                            }`}
+                          >
+                            {on && <Check size={11} />}
+                            {c.label}
+                          </button>
+                        );
+                      })}
+                  </div>
+                  <p className="text-[0.6875rem] text-tertiary">
+                    Telefone de referência, recado, cônjuge ou trabalho não deve ser usado para cobrar o devedor.
+                  </p>
+                </div>
+              ) : (
+                parsed.columns && <p className="text-[0.75rem] text-tertiary">Colunas lidas: {parsed.columns}</p>
+              )}
+
+              {parsed.nameCol < 0 && validRows.length > 0 && (
+                <p className="text-[0.75rem] text-tertiary">Sem coluna de nome: a variável {"{nome}"} fica em branco (“Olá, tudo bem?”).</p>
+              )}
+
+              {(parsed.multiPhone || parsed.landlines > 0 || view.shouted) && (
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-border px-3 py-2">
+                  {parsed.multiPhone && (
+                    <>
+                      <span className="text-[0.75rem] text-secondary">Telefones de cada devedor</span>
+                      <SegmentedControl<PhoneMode>
+                        value={phoneMode}
+                        onChange={setPhoneMode}
+                        items={[
+                          { id: "one", label: "Só 1 (celular primeiro)", count: phoneMode === "one" ? validRows.length : other?.rows.filter((r) => r.valid).length },
+                          { id: "all", label: "Todos", count: phoneMode === "all" ? validRows.length : other?.rows.filter((r) => r.valid).length },
+                        ]}
+                      />
+                    </>
+                  )}
+                  {parsed.landlines > 0 && (
+                    <Toggle size="sm" checked={includeLandlines} onChange={setIncludeLandlines} label={`Incluir fixos (${formatNumber(parsed.landlines)})`} />
+                  )}
+                  {view.shouted && (
+                    <Toggle size="sm" checked={tidy} onChange={setTidy} label="Ajustar maiúsculas dos nomes (MARIA SILVA → Maria Silva)" />
+                  )}
+                </div>
+              )}
+              {parsed.multiPhone && phoneMode === "all" && (
+                <p className="text-[0.75rem] text-amber-700 dark:text-amber-300">
+                  Com “Todos”, o mesmo devedor recebe uma mensagem em cada número: mais denúncias e mais consumo do teto da rede.
+                </p>
+              )}
+
+              {(parsed.localCount > 0 || ddd) && (
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/25 bg-amber-500/[0.06] px-3 py-2">
+                  <AlertTriangle size={14} className="shrink-0 text-amber-600 dark:text-amber-400" />
+                  <span className="text-[0.75rem] text-secondary">
+                    {parsed.localCount > 0
+                      ? `${formatNumber(parsed.localCount)} ${parsed.localCount === 1 ? "número está" : "números estão"} sem DDD e não ${parsed.localCount === 1 ? "entra" : "entram"}.`
+                      : "Números sem DDD completados."}{" "}
+                    Se todos forem da mesma região, informe o DDD:
+                  </span>
+                  <label htmlFor={dddId} className="sr-only">
+                    DDD para completar os números
+                  </label>
+                  <input
+                    id={dddId}
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={2}
+                    value={ddd}
+                    onChange={(e) => setDdd(e.target.value.replace(/\D/g, "").slice(0, 2))}
+                    placeholder="75"
+                    aria-invalid={!dddValid}
+                    className="!h-7 !w-14 !px-2 text-center font-mono text-[0.75rem]"
+                  />
+                  {!dddValid && <span className="text-[0.75rem] text-red-600 dark:text-red-400">DDD inválido</span>}
+                </div>
+              )}
+
+              {validRows.length === 0 && (
+                <InlineAlert tone="danger" icon={<AlertCircle size={15} />} title="Nenhum telefone válido encontrado">
+                  Confira se há uma coluna de telefone com DDD. Aceita “Nome, Telefone”, planilha com cabeçalho ou só o telefone.
+                </InlineAlert>
+              )}
+
+              <div className="overflow-hidden rounded-lg border border-border">
+                <div className="max-h-64 overflow-y-auto custom-scrollbar">
+                  <table className="w-full text-left text-[0.8125rem]">
+                    <thead className="sticky top-0 bg-secondary text-[0.75rem] text-secondary">
+                      <tr>
+                        <th className="w-14 px-3 py-2 font-medium">Linha</th>
+                        <th className="px-3 py-2 font-medium">Nome</th>
+                        <th className="px-3 py-2 font-medium">Telefone</th>
+                        <th className="px-3 py-2 font-medium">Situação</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[var(--color-border)]">
+                      {visible.slice(0, PREVIEW_LIMIT).map((r, i) => {
+                        const optedOut = r.valid && optOutKeys.has(optOutKey(r.phone));
+                        const already = r.valid && view.inCampaign(r);
+                        return (
+                          <tr key={`${r.line}-${i}`} className={!r.valid && !r.skipped ? "bg-red-500/[0.05]" : ""}>
+                            <td className="px-3 py-1.5 tabular-nums text-tertiary">{r.line}</td>
+                            <td className="max-w-[14rem] truncate px-3 py-1.5 text-primary" title={r.name || r.raw}>
+                              {r.name ? showName(r.name) : r.valid ? <span className="text-tertiary">(sem nome)</span> : <span className="text-tertiary">{r.raw}</span>}
+                            </td>
+                            <td className="px-3 py-1.5 font-mono text-[0.75rem] text-secondary">{r.phone || "—"}</td>
+                            <td className="px-3 py-1.5 text-[0.75rem]">
+                              {!r.valid ? (
+                                <span className={r.skipped ? "text-tertiary" : "text-red-600 dark:text-red-400"}>{r.reason}</span>
+                              ) : optedOut ? (
+                                <span className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-300">
+                                  <Ban size={12} /> Descadastrado (não recebe)
+                                </span>
+                              ) : already ? (
+                                <span className="text-tertiary">Já está nesta campanha</span>
+                              ) : r.warning ? (
+                                <span className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-300">
+                                  <AlertTriangle size={12} /> {r.warning}
+                                </span>
+                              ) : (
+                                <span className="text-emerald-600 dark:text-emerald-400">Ok</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border bg-secondary px-3 py-2 text-[0.75rem] text-tertiary">
+                  <span>
+                    {visible.length > PREVIEW_LIMIT
+                      ? `Mostrando ${PREVIEW_LIMIT} de ${formatNumber(visible.length)} linhas. Todas são consideradas na importação.`
+                      : `${formatNumber(visible.length)} ${visible.length === 1 ? "linha" : "linhas"} no filtro.`}
+                  </span>
+                  {view.skipped + view.problems > 0 && (
+                    <button type="button" onClick={downloadProblems} className="text-[var(--color-accent-light)] hover:underline cursor-pointer">
+                      Baixar números não importados (.csv)
+                    </button>
+                  )}
+                </div>
+              </div>
+            </section>
+          )}
+        </div>
+      </Modal>
+
+      <ConfirmDialog
+        isOpen={confirmReplace}
+        title="Substituir os contatos pendentes?"
+        confirmLabel="Substituir pendentes"
+        loading={importing}
+        onConfirm={() => {
+          setConfirmReplace(false);
+          doImport();
+        }}
+        onClose={() => setConfirmReplace(false)}
+      >
+        Os <strong className="text-primary">{formatNumber(pendingExisting.length)}</strong> contatos que ainda aguardam envio saem da fila, e entram os{" "}
+        <strong className="text-primary">{formatNumber(toImport.length)}</strong> desta lista. Quem já recebeu continua no relatório. Para manter a fila
+        atual, escolha “Somar à fila”.
+      </ConfirmDialog>
+      <ConfirmDialog
+        isOpen={confirmClose}
+        title="Fechar sem importar?"
+        confirmLabel="Fechar sem importar"
+        onConfirm={() => {
+          setConfirmClose(false);
+          onClose();
+        }}
+        onClose={() => setConfirmClose(false)}
+      >
+        A lista carregada e as opções escolhidas serão descartadas.
+      </ConfirmDialog>
+    </>
   );
 }
 
@@ -3705,7 +4319,7 @@ export default function CampaignsTab() {
   // Navegação interna: lista ou detalhe de uma campanha
   const [detail, setDetail] = useState<{ id: number; tab: DetailTab } | null>(null);
   const [wizard, setWizard] = useState<{ campaign: Campaign | null } | null>(null);
-  const [importFor, setImportFor] = useState<Campaign | null>(null);
+  const [importForId, setImportForId] = useState<number | null>(null);
   const [aiGlobalModalOpen, setAiGlobalModalOpen] = useState(false);
   const [optOutOpen, setOptOutOpen] = useState(false);
   const [importRevision, setImportRevision] = useState(0);
@@ -3817,6 +4431,17 @@ export default function CampaignsTab() {
       return [c, ...prev];
     });
 
+  // Salvar pelo assistente não traz contadores antigos: mantém status e números ao vivo da lista.
+  const mergeSavedCampaign = (saved: Campaign) =>
+    setCampaignsList((prev) => {
+      const idx = prev.findIndex((x) => x.id === saved.id);
+      if (idx < 0) return [saved, ...prev];
+      const cur = prev[idx];
+      const next = [...prev];
+      next[idx] = { ...saved, status: cur.status, contactsCount: cur.contactsCount, sentCount: cur.sentCount, failedCount: cur.failedCount };
+      return next;
+    });
+
   // ---- Métricas e filtros ----
   const counts = useMemo(() => {
     const by = (s: string[]) => campaignsList.filter((c) => s.includes(c.status)).length;
@@ -3866,6 +4491,8 @@ export default function CampaignsTab() {
 
   const openDetail = (c: Campaign, tab: DetailTab = "overview") => setDetail({ id: c.id, tab });
   const detailCampaign = detail ? campaignsList.find((c) => c.id === detail.id) || null : null;
+  // A importação lê a campanha ao vivo (status muda durante o disparo).
+  const importCampaign = importForId !== null ? campaignsList.find((c) => c.id === importForId) ?? null : null;
 
   // ---- Modais compartilhados (lista e detalhe) ----
   const modals = (
@@ -3876,22 +4503,35 @@ export default function CampaignsTab() {
           onClose={() => setWizard(null)}
           campaign={wizard.campaign}
           onSaved={(saved, meta) => {
-            upsertCampaign(saved);
+            mergeSavedCampaign(saved);
             setSyncRevision((r) => r + 1);
-            if (meta.openAfter) setDetail({ id: saved.id, tab: "contacts" });
+            if (meta.openAfter) {
+              // Campanha nova: abre a importação direto, que é o próximo passo.
+              setDetail({ id: saved.id, tab: "contacts" });
+              setImportForId(saved.id);
+            }
+            appendLog(saved.id, "info", meta.created ? "Campanha criada." : "Alterações da campanha salvas.");
             refreshCampaigns();
           }}
         />
       )}
 
       <ContactImportModal
-        isOpen={importFor !== null}
-        onClose={() => setImportFor(null)}
-        campaign={importFor}
-        onImported={() => {
+        isOpen={importCampaign !== null}
+        onClose={() => setImportForId(null)}
+        campaign={importCampaign}
+        onImported={(s) => {
+          if (!importCampaign) return;
           setImportRevision((r) => r + 1);
           refreshCampaigns();
-          if (importFor) appendLog(importFor.id, "info", "Lista de contatos importada.");
+          const parts = [
+            s.mode === "replace"
+              ? `${formatNumber(s.imported)} na fila (substituíram ${formatNumber(s.replacedPending)} pendentes)`
+              : `${formatNumber(s.imported)} ${s.imported === 1 ? "contato somado" : "contatos somados"} à fila`,
+          ];
+          if (s.optedOut) parts.push(`${formatNumber(s.optedOut)} descadastrados não recebem`);
+          if (s.alreadyInCampaign) parts.push(`${formatNumber(s.alreadyInCampaign)} já estavam na campanha`);
+          appendLog(importCampaign.id, "info", `Lista importada: ${parts.join(" · ")}.`);
         }}
       />
 
@@ -3917,7 +4557,7 @@ export default function CampaignsTab() {
           onClearLogs={() => setLogs((prev) => ({ ...prev, [detailCampaign.id]: [] }))}
           onBack={() => setDetail(null)}
           onEdit={() => setWizard({ campaign: detailCampaign })}
-          onImport={() => setImportFor(detailCampaign)}
+          onImport={() => setImportForId(detailCampaign.id)}
           onUpdateCampaign={upsertCampaign}
         />
         {modals}
@@ -4061,7 +4701,7 @@ export default function CampaignsTab() {
               campaigns={filteredCampaigns}
               onOpen={openDetail}
               onEdit={(c) => setWizard({ campaign: c })}
-              onImport={(c) => setImportFor(c)}
+              onImport={(c) => setImportForId(c.id)}
               onDelete={(c) => { setDeleteError(""); setDeleteTargets([c]); }}
               selecting={selecting}
               selectedIds={selectedIds}
