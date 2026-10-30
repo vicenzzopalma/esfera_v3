@@ -4,9 +4,10 @@
 // permissão de uso do celular ao Gestor e acompanhar aprovação.
 // ============================================================
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useAuth } from "../context/AuthContext";
 import { api } from "../tauri";
+import { apiErrorText, formatDbDate } from "../hooks/useQueries";
 import type { Device, DevicePermissionRequest } from "../types";
 import {
   Smartphone,
@@ -20,13 +21,23 @@ import {
   CheckCircle2,
   AlertCircle,
   Monitor,
+  X,
 } from "lucide-react";
 import Button from "./ui/Button";
 import Card from "./ui/Card";
 import PageHeader from "./ui/PageHeader";
 import EmptyState from "./ui/EmptyState";
 import Field from "./ui/Field";
-import { inputCls, StatusDot, BatteryMeter } from "./devices/deviceUi";
+import { StatusDot, BatteryMeter } from "./devices/deviceUi";
+
+const DATA_REFRESH_MS = 8000;
+
+/** Pedido pertence a este aparelho? Compara serial, id Esfera, endereço ou o mesmo IP (sem casar prefixo). */
+function requestMatchesDevice(req: DevicePermissionRequest, dev: Device) {
+  if (req.adbDeviceId === dev.serial || req.adbDeviceId === dev.esferaDeviceId || req.adbDeviceId === dev.currentAdbAddress) return true;
+  if (!dev.currentAdbAddress) return false;
+  return req.adbDeviceId.split(":")[0] === dev.currentAdbAddress.split(":")[0];
+}
 
 export default function CollaboratorView() {
   const { user, selectedCompanyId } = useAuth();
@@ -36,11 +47,13 @@ export default function CollaboratorView() {
   const [requestingSerial, setRequestingSerial] = useState<string | null>(null);
   const [reasonInput, setReasonInput] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [endingId, setEndingId] = useState<number | null>(null);
   const [launchingScrcpy, setLaunchingScrcpy] = useState<Record<string, boolean>>({});
   const [loadError, setLoadError] = useState<string | null>(null);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const seqRef = useRef(0);
 
-  const companyId = selectedCompanyId || user?.companyId || 1;
+  const companyId = selectedCompanyId ?? user?.companyId ?? null;
 
   const handleLaunchScrcpy = async (dev: Device, turnScreenOff: boolean = false) => {
     const devKey = dev.serial;
@@ -48,29 +61,32 @@ export default function CollaboratorView() {
     setLaunchingScrcpy((prev) => ({ ...prev, [devKey]: true }));
     setMessage(null);
     try {
-      const res = await api<string>("launch_scrcpy_stream", {
+      await api<string>("launch_scrcpy_stream", {
         serial: targetSerial,
         turnScreenOff,
       });
       setMessage({
         type: "success",
-        text: `Espelhamento aberto para ${dev.name || dev.model || dev.serial}. (${res})`,
+        text: `Espelhamento aberto para ${dev.name || dev.model || dev.serial}.`,
       });
-    } catch (err: any) {
-      console.error("Erro ao iniciar Scrcpy para o colaborador:", err);
-      const errMsg = typeof err === "string" ? err : err?.message || JSON.stringify(err);
+    } catch (err) {
+      console.error("Erro ao abrir o espelhamento para o colaborador:", err);
       setMessage({
         type: "error",
-        text: `Falha ao abrir o espelhamento: ${errMsg}`,
+        text: `Não foi possível abrir o espelhamento. Confira se o aparelho está desbloqueado e conectado. (${apiErrorText(err, "erro desconhecido")})`,
       });
     } finally {
       setLaunchingScrcpy((prev) => ({ ...prev, [devKey]: false }));
     }
   };
 
-  const loadData = useCallback(async () => {
-    if (!user) return;
-    setLoading(true);
+  const loadData = useCallback(async (showSpinner = false) => {
+    if (!user || !companyId) {
+      setLoading(false);
+      return;
+    }
+    const seq = ++seqRef.current;
+    if (showSpinner) setLoading(true);
     try {
       const [devices, requests] = await Promise.all([
         api<Device[]>("get_assigned_devices_for_user", {
@@ -81,21 +97,29 @@ export default function CollaboratorView() {
           companyId,
         }),
       ]);
+      if (seq !== seqRef.current) return;
       setAssignedDevices(devices || []);
-      setPermissionRequests(requests || []);
+      // Só os pedidos do próprio colaborador interessam aqui.
+      setPermissionRequests((requests || []).filter((r) => r.userId === user.id));
       setLoadError(null);
-    } catch (err: any) {
+    } catch (err) {
+      if (seq !== seqRef.current) return;
       console.error("Erro ao carregar dados do colaborador:", err);
-      setLoadError(typeof err === "string" ? err : err?.message || "Falha ao buscar os dados.");
+      setLoadError(apiErrorText(err, "Não foi possível buscar os seus aparelhos."));
     } finally {
-      setLoading(false);
+      if (seq === seqRef.current) setLoading(false);
     }
   }, [user, companyId]);
 
   useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 5000);
-    return () => clearInterval(interval);
+    loadData(true);
+    const interval = setInterval(() => {
+      if (!document.hidden) loadData(false);
+    }, DATA_REFRESH_MS);
+    return () => {
+      seqRef.current++;
+      clearInterval(interval);
+    };
   }, [loadData]);
 
   const handleRequestAccess = async (serial: string) => {
@@ -104,50 +128,44 @@ export default function CollaboratorView() {
     try {
       await api("request_device_access", {
         deviceSerial: serial,
-        reason: reasonInput || "Uso operacional do colaborador",
+        reason: reasonInput.trim() || "Uso operacional do colaborador",
       });
-      setMessage({ type: "success", text: "Solicitação enviada com sucesso ao Gestor!" });
+      setMessage({ type: "success", text: "Pedido enviado. Aguarde a aprovação do gestor ou do supervisor." });
       setRequestingSerial(null);
       setReasonInput("");
-      await loadData();
-    } catch (err: any) {
-      setMessage({ type: "error", text: err.toString() || "Falha ao solicitar permissão." });
+      await loadData(false);
+    } catch (err) {
+      setMessage({ type: "error", text: apiErrorText(err, "Não foi possível enviar o pedido.") });
     } finally {
       setSubmitting(false);
     }
   };
 
   const handleEndSession = async (requestId: number) => {
+    setEndingId(requestId);
+    setMessage(null);
     try {
       await api("end_device_access", { requestId });
-      setMessage({ type: "success", text: "Sessão encerrada com sucesso." });
-      await loadData();
-    } catch (err: any) {
-      setMessage({ type: "error", text: err.toString() || "Erro ao encerrar sessão." });
+      setMessage({ type: "success", text: "Uso do aparelho encerrado." });
+      await loadData(false);
+    } catch (err) {
+      setMessage({ type: "error", text: apiErrorText(err, "Não foi possível encerrar o uso.") });
+    } finally {
+      setEndingId(null);
     }
   };
 
-  const getDeviceRequestStatus = (dev: Device) => {
-    const userReqs = permissionRequests.filter(
-      (r) =>
-        r.userId === user?.id &&
-        (r.adbDeviceId === dev.serial ||
-          r.adbDeviceId === dev.esferaDeviceId ||
-          r.adbDeviceId === dev.currentAdbAddress ||
-          (dev.currentAdbAddress && r.adbDeviceId.includes(dev.currentAdbAddress.split(":")[0])))
-    );
-    if (userReqs.length === 0) return null;
-    return userReqs[0];
-  };
+  // O backend devolve os pedidos do mais novo para o mais antigo: o primeiro é o atual.
+  const getDeviceRequestStatus = (dev: Device) => permissionRequests.find((r) => requestMatchesDevice(r, dev)) ?? null;
 
   return (
     <div className="space-y-6 animate-fade-in pb-8">
       <PageHeader
-        title="Meus celulares"
-        description="Peça permissão ao gestor para usar o celular pelo qual você é responsável."
+        title="Meus aparelhos"
+        description="Peça ao gestor ou ao supervisor para usar os aparelhos pelos quais você é responsável."
         icon={<Smartphone size={18} />}
         actions={
-          <Button variant="secondary" onClick={loadData} loading={loading} icon={<RefreshCw size={14} />}>
+          <Button variant="secondary" onClick={() => loadData(true)} loading={loading} icon={<RefreshCw size={14} />}>
             Atualizar
           </Button>
         }
@@ -156,30 +174,42 @@ export default function CollaboratorView() {
       {message && (
         <div
           role={message.type === "error" ? "alert" : "status"}
-          className={`flex items-center gap-2.5 rounded-lg border p-3 text-[0.8125rem] ${
+          className={`flex items-center justify-between gap-2.5 rounded-lg border p-3 text-[0.8125rem] ${
             message.type === "success"
               ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
               : "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400"
           }`}
         >
-          {message.type === "success" ? <CheckCircle2 size={16} className="shrink-0" /> : <AlertCircle size={16} className="shrink-0" />}
-          <span className="min-w-0 break-words">{message.text}</span>
+          <span className="flex min-w-0 items-center gap-2.5">
+            {message.type === "success" ? <CheckCircle2 size={16} className="shrink-0" /> : <AlertCircle size={16} className="shrink-0" />}
+            <span className="min-w-0 break-words">{message.text}</span>
+          </span>
+          <button onClick={() => setMessage(null)} aria-label="Fechar aviso" className="shrink-0 cursor-pointer">
+            <X size={15} />
+          </button>
         </div>
+      )}
+
+      {loadError && assignedDevices.length > 0 && (
+        <p role="alert" className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[0.8125rem] text-amber-700 dark:text-amber-400">
+          <AlertCircle size={15} className="shrink-0" />
+          A última atualização falhou; os dados abaixo podem estar desatualizados.
+        </p>
       )}
 
       {loading && assignedDevices.length === 0 ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
           {Array.from({ length: 3 }).map((_, i) => (
-            <div key={i} className="h-56 animate-pulse rounded-xl border border-border bg-card" />
+            <div key={i} className="h-56 rounded-xl border border-border bg-card skeleton" />
           ))}
         </div>
       ) : loadError && assignedDevices.length === 0 ? (
         <EmptyState
           icon={<AlertCircle size={18} />}
-          title="Não foi possível carregar seus celulares"
+          title="Não foi possível carregar seus aparelhos"
           description={loadError}
           action={
-            <Button variant="secondary" size="sm" onClick={loadData} icon={<RefreshCw size={13} />}>
+            <Button variant="secondary" size="sm" onClick={() => loadData(true)} icon={<RefreshCw size={13} />}>
               Tentar novamente
             </Button>
           }
@@ -187,16 +217,16 @@ export default function CollaboratorView() {
       ) : assignedDevices.length === 0 ? (
         <EmptyState
           icon={<Smartphone size={18} />}
-          title="Nenhum celular vinculado"
-          description="Você ainda não tem aparelhos atribuídos. Peça ao gestor para vincular um celular à sua conta."
+          title="Nenhum aparelho vinculado"
+          description="Você ainda não tem aparelhos atribuídos. Peça ao gestor para vincular um aparelho à sua conta."
         />
       ) : (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
           {assignedDevices.map((dev) => {
             const req = getDeviceRequestStatus(dev);
-            const isApproved = req && req.status === "approved";
-            const isPending = req && req.status === "pending";
-            const isRejected = req && req.status === "rejected";
+            const isApproved = req?.status === "approved" || req?.status === "active";
+            const isPending = req?.status === "pending";
+            const isRejected = req?.status === "rejected";
 
             return (
               <Card
@@ -208,7 +238,8 @@ export default function CollaboratorView() {
                     <div className="min-w-0">
                       <h3 className="truncate text-sm font-semibold text-primary">{dev.name || dev.model}</h3>
                       <p className="truncate text-[0.75rem] text-secondary">
-                        #{dev.deviceNumber || 1} · {dev.brand} {dev.model}
+                        {dev.deviceNumber ? `#${dev.deviceNumber} · ` : ""}
+                        {dev.brand} {dev.model}
                       </p>
                       <p className="truncate font-mono text-[0.6875rem] text-tertiary">{dev.serial}</p>
                     </div>
@@ -218,11 +249,11 @@ export default function CollaboratorView() {
                     </div>
                   </div>
 
-                  <div className="space-y-1 rounded-lg bg-secondary/60 p-3">
+                  <div className="space-y-1 rounded-lg bg-secondary p-3">
                     <p className="text-[0.75rem] text-secondary">Permissão de uso</p>
                     {isApproved ? (
                       <p className="flex items-center gap-2 text-[0.8125rem] font-medium text-emerald-600 dark:text-emerald-400">
-                        <ShieldCheck size={16} /> Concedida pelo gestor
+                        <ShieldCheck size={16} /> Liberada{req?.approvedByName ? ` por ${req.approvedByName}` : ""}
                       </p>
                     ) : isPending ? (
                       <p className="flex items-center gap-2 text-[0.8125rem] font-medium text-amber-600 dark:text-amber-400">
@@ -230,19 +261,19 @@ export default function CollaboratorView() {
                       </p>
                     ) : isRejected ? (
                       <p className="flex items-center gap-2 text-[0.8125rem] font-medium text-red-600 dark:text-red-400">
-                        <ShieldAlert size={16} /> Recusada pelo gestor
+                        <ShieldAlert size={16} /> Pedido recusado
                       </p>
                     ) : (
                       <p className="flex items-center gap-2 text-[0.8125rem] text-secondary">
-                        <ShieldAlert size={16} /> Não solicitada
+                        <ShieldAlert size={16} /> {req?.status === "ended" ? "Uso encerrado" : "Não solicitada"}
                       </p>
                     )}
                     {req?.requestedAt && (
-                      <p className="text-[0.75rem] text-tertiary">Última solicitação: {new Date(req.requestedAt).toLocaleString("pt-BR")}</p>
+                      <p className="text-[0.75rem] text-tertiary">Último pedido: {formatDbDate(req.requestedAt)}</p>
                     )}
                   </div>
 
-                  {isApproved ? (
+                  {isApproved && req ? (
                     <div className="space-y-2">
                       <p className="text-[0.75rem] text-secondary">Acesso restrito: apenas visualização da tela. Câmeras e processamento em segundo plano ficam desativados.</p>
                       <Button
@@ -262,31 +293,41 @@ export default function CollaboratorView() {
                         onClick={() => handleLaunchScrcpy(dev, true)}
                         icon={<Smartphone size={13} />}
                         className="w-full"
-                        title="Abre o espelhamento no computador com a tela física do celular apagada"
+                        title="Abre o espelhamento no computador com a tela física do aparelho apagada"
                       >
-                        Espelhar com a tela do celular apagada
+                        Espelhar com a tela do aparelho apagada
                       </Button>
-                      <Button variant="danger" size="sm" onClick={() => handleEndSession(req.requestId)} icon={<Power size={13} />} className="w-full">
-                        Encerrar uso do celular
+                      <Button
+                        variant="danger"
+                        size="sm"
+                        loading={endingId === req.requestId}
+                        onClick={() => handleEndSession(req.requestId)}
+                        icon={<Power size={13} />}
+                        className="w-full"
+                      >
+                        Encerrar uso do aparelho
                       </Button>
                     </div>
                   ) : requestingSerial === dev.serial ? (
                     <div className="space-y-3">
-                      <Field label="Motivo do pedido" htmlFor={`reason-${dev.serial}`}>
+                      <Field label="Motivo do pedido" htmlFor={`reason-${dev.serial}`} hint="Opcional. Ajuda o gestor a decidir.">
                         <input
                           id={`reason-${dev.serial}`}
                           type="text"
                           value={reasonInput}
                           onChange={(e) => setReasonInput(e.target.value)}
-                          placeholder="Ex.: Testes de campanha no WhatsApp"
-                          className={inputCls}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && !submitting) handleRequestAccess(dev.serial);
+                          }}
+                          placeholder="Ex.: Atendimento dos retornos de hoje"
+                          autoFocus
                         />
                       </Field>
                       <div className="flex items-center gap-2">
                         <Button variant="primary" size="sm" onClick={() => handleRequestAccess(dev.serial)} loading={submitting} icon={<Send size={13} />} className="flex-1">
                           {submitting ? "Enviando..." : "Enviar pedido"}
                         </Button>
-                        <Button variant="ghost" size="sm" onClick={() => setRequestingSerial(null)}>
+                        <Button variant="ghost" size="sm" onClick={() => setRequestingSerial(null)} disabled={submitting}>
                           Cancelar
                         </Button>
                       </div>
@@ -303,7 +344,7 @@ export default function CollaboratorView() {
                       icon={<Zap size={14} />}
                       className="w-full"
                     >
-                      {isPending ? "Aguardando gestor" : "Pedir permissão de uso"}
+                      {isPending ? "Aguardando aprovação" : isRejected ? "Pedir de novo" : "Pedir permissão de uso"}
                     </Button>
                   )}
                 </div>
