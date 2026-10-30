@@ -3811,10 +3811,15 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
   const [testingAi, setTestingAi] = useState(false);
   const [testResult, setTestResult] = useState<{ success: boolean; text: string } | null>(null);
+  // Falha ao ler a configuração atual: salvar fica bloqueado para não gravar os valores padrão por cima.
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+  const testRun = useRef(0);
 
   useEffect(() => {
     if (!isOpen || !selectedCompanyId) return;
     setLoading(true);
+    setLoadFailed(false);
     setStatus(null);
     setShowKey(false);
     api<AiConfig>("get_ai_config", { companyId: selectedCompanyId })
@@ -3828,7 +3833,7 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
         setSystemPrompt(cfg.systemPrompt || "");
         setTestResult(null);
       })
-      .catch(() => {})
+      .catch(() => setLoadFailed(true))
       .finally(() => setLoading(false));
 
     api<ProviderKeys>("get_ai_provider_keys", { companyId: selectedCompanyId })
@@ -3836,7 +3841,7 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
         if (keys) setSavedProviderKeys(keys);
       })
       .catch(() => {});
-  }, [isOpen, selectedCompanyId]);
+  }, [isOpen, selectedCompanyId, reloadKey]);
 
   const info = getAiProviderInfo(provider);
   const isLocal = provider === "ollama" || provider === "lmstudio";
@@ -3867,15 +3872,23 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
       setSavedProviderKeys((prev) => ({ ...prev, [provider]: { apiKey, endpoint, model } }));
       setStatus({ ok: true, text: "Configuração de IA salva." });
       setTimeout(() => onClose(), 1200);
-    } catch {
-      setStatus({ ok: false, text: "Não foi possível salvar a configuração de IA. Tente de novo." });
+    } catch (e) {
+      setStatus({ ok: false, text: `Não foi possível salvar a configuração de IA: ${String(e)}` });
     } finally {
       setSaving(false);
     }
   };
 
+  // "Parar" descarta a resposta atrasada (o pedido segue na IA até terminar).
+  const stopTest = () => {
+    testRun.current += 1;
+    setTestingAi(false);
+    setTestResult(null);
+  };
+
   const handleTest = async () => {
     if (!selectedCompanyId) return;
+    const run = ++testRun.current;
     setTestingAi(true);
     setTestResult(null);
     try {
@@ -3889,11 +3902,13 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
         apiKey,
         endpoint,
       });
+      if (run !== testRun.current) return;
       setTestResult({ success: true, text: rewritten });
     } catch (err) {
+      if (run !== testRun.current) return;
       setTestResult({ success: false, text: String(err) });
     } finally {
-      setTestingAi(false);
+      if (run === testRun.current) setTestingAi(false);
     }
   };
 
@@ -3909,7 +3924,7 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
           <Button variant="secondary" onClick={onClose}>
             Cancelar
           </Button>
-          <Button onClick={handleSave} loading={saving} disabled={loading}>
+          <Button onClick={handleSave} loading={saving} disabled={loading || loadFailed}>
             Salvar
           </Button>
         </>
@@ -3923,6 +3938,20 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
         </div>
       ) : (
         <div className="space-y-6">
+          {loadFailed && (
+            <InlineAlert
+              tone="danger"
+              icon={<AlertCircle size={15} />}
+              title="Não foi possível carregar a configuração atual"
+              action={
+                <Button size="sm" variant="secondary" icon={<RefreshCw size={13} />} onClick={() => setReloadKey((k) => k + 1)}>
+                  Tentar de novo
+                </Button>
+              }
+            >
+              Salvar fica bloqueado para não gravar os valores padrão por cima da configuração da empresa.
+            </InlineAlert>
+          )}
           {status && (
             <InlineAlert tone={status.ok ? "success" : "danger"} icon={status.ok ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />} title={status.text} />
           )}
@@ -3986,9 +4015,16 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
                   <p className="text-[0.8125rem] font-medium text-primary">Testar conexão</p>
                   <p className="text-[0.75rem] text-tertiary">Reescreve uma frase de exemplo com os dados acima, sem salvar.</p>
                 </div>
-                <Button size="sm" variant="secondary" icon={<PlugZap size={13} />} onClick={handleTest} loading={testingAi}>
-                  {testingAi ? "Testando…" : "Testar"}
-                </Button>
+                <div className="flex shrink-0 items-center gap-2">
+                  <Button size="sm" variant="secondary" icon={<PlugZap size={13} />} onClick={handleTest} loading={testingAi}>
+                    {testingAi ? "Testando…" : "Testar"}
+                  </Button>
+                  {testingAi && (
+                    <Button size="sm" variant="ghost" onClick={stopTest}>
+                      Parar
+                    </Button>
+                  )}
+                </div>
               </div>
               {testResult && (
                 <InlineAlert
