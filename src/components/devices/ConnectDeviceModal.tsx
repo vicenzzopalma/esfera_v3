@@ -140,7 +140,7 @@ export function ConnectDeviceModal({
   };
 
   const busy = linkingSerial !== null;
-  const isError = !!linkingStatus && linkingStatus.startsWith("Erro");
+  const isError = !!linkingStatus && (linkingStatus.startsWith("Erro") || linkingStatus.startsWith("Tempo esgotado"));
   const nameTrim = deviceNameInput.trim();
   const genericName = /^aparelho\s/i.test(nameTrim);
 

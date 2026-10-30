@@ -161,6 +161,16 @@ export function describeAgent(status?: AgentUpdateStatus): { text: string; tone:
       if (d.includes("não foi possível verificar") || d.includes("falha ao verificar")) {
         return { text: "Não foi possível verificar o agente agora: o aparelho não respondeu.", tone: "warning", technical: detail };
       }
+      if (d.includes("túnel")) {
+        return { text: "Atualização automática indisponível pelo túnel: conecte o aparelho por USB ou Wi-Fi para atualizar o agente.", tone: "warning", technical: detail };
+      }
+      if (d.includes("falha ao instalar") || d.includes("falha ao atualizar") || d.includes("versão instalada não corresponde")) {
+        return {
+          text: "A atualização do agente falhou. O Esfera tenta de novo sozinho; se continuar, use Reinstalar em Configurações > Sistema.",
+          tone: "danger",
+          technical: detail,
+        };
+      }
       return { text: `Agente: ${detail || "erro na última verificação"}`, tone: "danger", technical: detail };
     default:
       return { text: detail ? `Agente: ${detail}` : "Agente: sem informação", tone: "muted", technical: detail };
