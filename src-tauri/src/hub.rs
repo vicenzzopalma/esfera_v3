@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -147,14 +147,13 @@ async fn handle_connection(
 
     loop {
         line.clear();
-        let n = match timeout(READ_LINE_TIMEOUT, reader.read_line(&mut line)).await {
+        let n = match timeout(READ_LINE_TIMEOUT, (&mut reader).take((MAX_LINE + 2) as u64).read_line(&mut line)).await {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e.to_string()),
             Err(_) => return Err("Timeout de leitura no Hub".to_string()),
         };
-        if n == 0 {
-            break;
-        }
+        if n == 0 { break; }
+        if n > MAX_LINE || !line.ends_with('\n') { return Err("Mensagem do hub excede o limite.".to_string()); }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;

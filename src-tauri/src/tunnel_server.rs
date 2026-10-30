@@ -68,16 +68,20 @@ struct LineReader {
 
 impl LineReader {
     async fn next_line(&mut self, timeout: Option<Duration>) -> Option<String> {
+        const MAX_LINE: usize = 8192;
+        let deadline = tokio::time::Instant::now() + timeout.unwrap_or(Duration::from_secs(30));
         loop {
             if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                if pos > MAX_LINE { return None; }
                 let line = String::from_utf8_lossy(&self.buf[..pos]).to_string();
                 self.buf.drain(..=pos);
                 return Some(line);
             }
+            if self.buf.len() > MAX_LINE { return None; }
             let mut guard = self.stream.lock().await;
             let mut chunk = [0u8; 2048];
-            let read = tokio::time::timeout(
-                timeout.unwrap_or(Duration::from_secs(30)),
+            let read = tokio::time::timeout_at(
+                deadline,
                 guard.read(&mut chunk),
             );
             match read.await {
@@ -195,7 +199,7 @@ async fn handle_agent(stream: TcpStream, db: Arc<Database>, app_handle: Option<A
 
     // 4. Registra no mapa — substitui conexão antiga (socket obsoleto) do mesmo aparelho
     let (tx, mut rx) = mpsc::unbounded_channel::<ProxyRequest>();
-    REGISTRY.lock().unwrap().insert(uuid.clone(), tx);
+    REGISTRY.lock().unwrap().insert(uuid.clone(), tx.clone());
 
     // 5. Loop de heartbeat L7: responde ping com pong; derruba se silencioso por 45s.
     //    Pedido de proxy interrompe o loop e entrega o soquete cru ao relay.
@@ -204,7 +208,7 @@ async fn handle_agent(stream: TcpStream, db: Arc<Database>, app_handle: Option<A
     let mut last_line = Instant::now();
     loop {
         tokio::select! {
-            line = reader.next_line(None) => {
+            line = reader.next_line(Some(silent)) => {
                 let line = match line {
                     Some(l) => l,
                     None => break,
@@ -239,11 +243,12 @@ async fn handle_agent(stream: TcpStream, db: Arc<Database>, app_handle: Option<A
         run_proxy_relay(&mut reader, shared, req).await;
     }
 
-    REGISTRY.lock().unwrap().remove(&uuid);
-    crate::adb_tcp::unregister_tunnel_serial(&uuid);
-    crate::session_manager::update_adb_tunnel_status(&uuid, false);
-    if let Ok(mut m) = TUNNEL_IPS.lock() {
-        m.remove(&uuid);
+    let mut registry = REGISTRY.lock().unwrap();
+    if registry.get(&uuid).is_some_and(|current| current.same_channel(&tx)) {
+        registry.remove(&uuid);
+        crate::adb_tcp::unregister_tunnel_serial(&uuid);
+        crate::session_manager::update_adb_tunnel_status(&uuid, false);
+        if let Ok(mut m) = TUNNEL_IPS.lock() { m.remove(&uuid); }
     }
 }
 
@@ -306,7 +311,7 @@ async fn run_proxy_relay(
     let leftover = std::mem::take(&mut reader.buf);
     let mut guard = shared.lock().await;
     if !leftover.is_empty() {
-        let _ = guard.write_all(&leftover).await;
+        if local.write_all(&leftover).await.is_err() { return; }
     }
     let _ = tokio::io::copy_bidirectional(&mut *guard, &mut local).await;
 }
@@ -366,4 +371,42 @@ pub fn is_tunnel_active(uuid: &str) -> bool {
 /// Retorna None se não houver sessão ativa.
 pub fn tunnel_local_ip(uuid: &str) -> Option<String> {
     TUNNEL_IPS.lock().ok().and_then(|m| m.get(uuid).cloned())
+}
+
+#[cfg(test)]
+mod testes_tunel {
+    use super::*;
+
+    #[tokio::test]
+    async fn ack_e_payload_no_mesmo_pacote_chegam_ao_cliente() {
+        let agent_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut agent = TcpStream::connect(agent_listener.local_addr().unwrap()).await.unwrap();
+        let (socket, _) = agent_listener.accept().await.unwrap();
+        let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let shared = Arc::new(AsyncMutex::new(socket));
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let req = ProxyRequest { port: 5555, local_addr: local_listener.local_addr().unwrap(), ack: ack_tx };
+        let mut reader = LineReader { stream: shared.clone(), buf: Vec::new() };
+        let task = tokio::spawn(async move { run_proxy_relay(&mut reader, shared, req).await; });
+        let mut request = [0u8; 128];
+        let _ = agent.read(&mut request).await.unwrap();
+        agent.write_all(b"{\"type\":\"proxy-ack\"}\nPAYLOAD").await.unwrap();
+        let (mut local, _) = local_listener.accept().await.unwrap();
+        assert!(ack_rx.await.unwrap().is_ok());
+        let mut bytes = [0u8; 7];
+        tokio::time::timeout(Duration::from_secs(2), local.read_exact(&mut bytes)).await.unwrap().unwrap();
+        assert_eq!(&bytes, b"PAYLOAD");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn linha_grande_e_recusada() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut reader = LineReader { stream: Arc::new(AsyncMutex::new(socket)), buf: Vec::new() };
+        let writer = tokio::spawn(async move { let _ = client.write_all(&vec![b'x'; 9000]).await; });
+        assert!(reader.next_line(Some(Duration::from_secs(2))).await.is_none());
+        let _ = writer.await;
+    }
 }

@@ -6,6 +6,46 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use crate::db::Database;
 
+// Coalescencia por alvo e limite compartilhado entre check-in e presenca.
+static ADB_PENDENTES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static ADB_LIMITE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(3)));
+
+pub fn agendar_conexao_adb(alvo: String, desconectar: bool) {
+    let Ok(mut pendentes) = ADB_PENDENTES.lock() else { return; };
+    let agora = std::time::Instant::now();
+    if pendentes.contains_key(&alvo) { return; }
+    pendentes.insert(alvo.clone(), agora);
+    drop(pendentes);
+    tokio::spawn(async move {
+        let permissao = match tokio::time::timeout(std::time::Duration::from_secs(30), ADB_LIMITE.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            _ => { if let Ok(mut pending) = ADB_PENDENTES.lock() { pending.remove(&alvo); } return; }
+        };
+        tokio::task::spawn_blocking(move || {
+        let _permissao = permissao;
+        let executar = |acao: &str| {
+            let mut cmd = crate::adb_manager::create_cmd("adb");
+            cmd.arg(acao).arg(&alvo).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            if let Ok(mut child) = cmd.spawn() {
+                let limite = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) | Err(_) => break,
+                        Ok(None) if std::time::Instant::now() >= limite => { let _ = child.kill(); let _ = child.wait(); break; }
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                    }
+                }
+            }
+        };
+        if desconectar { executar("disconnect"); }
+        executar("connect");
+        if let Ok(mut pending) = ADB_PENDENTES.lock() { pending.remove(&alvo); }
+        });
+    });
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckInPayload {
@@ -74,26 +114,15 @@ pub fn start_udp_broadcast_listener(db: Arc<Database>, app_handle: Option<AppHan
 
                     println!("[UDP HANDSHAKE] Aparelho '{}' anunciado em {}:{}", payload.hardware_uuid, payload.ip, port);
 
-                    let updated = db.process_checkin(&payload.hardware_uuid, &target_addr, &payload.ip, port, &now, &payload.adb_serial);
-                    if let Ok(0) = updated {
-                        let _ = db.insert_unknown_device(&payload.hardware_uuid, &target_addr, &payload.ip, port, &now, &payload.adb_serial);
-                    }
+                    let db_copy = db.clone();
+                    let (uuid, address, ip, stamp, serial) = (payload.hardware_uuid.clone(), target_addr.clone(), payload.ip.clone(), now.clone(), payload.adb_serial.clone());
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(0) = db_copy.process_checkin(&uuid, &address, &ip, port, &stamp, &serial) {
+                            let _ = db_copy.insert_unknown_device(&uuid, &address, &ip, port, &stamp, &serial);
+                        }
+                    }).await;
 
-                    // Flush preventivo de socket zumbi antes de reconectar (evita "already connected")
-                    let flush_target = target_addr.clone();
-                    let _ = crate::adb_manager::create_cmd("adb")
-                        .arg("disconnect")
-                        .arg(&flush_target)
-                        .output();
-
-                    // Conecta via ADB sob demanda
-                    let conn_target = target_addr.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let _ = crate::adb_manager::create_cmd("adb")
-                            .arg("connect")
-                            .arg(&conn_target)
-                            .output();
-                    });
+                    agendar_conexao_adb(target_addr.clone(), true);
 
                     if let Some(ref app) = app_handle {
                         let _ = app.emit("device-updated", serde_json::json!({
@@ -121,33 +150,19 @@ async fn handle_checkin(
         None => (adb_address.clone(), 5555),
     };
 
-    let updated = db.process_checkin(&payload.esfera_device_id, adb_address, &ip, port, &now, &payload.adb_serial);
-
-    match updated {
-        Ok(0) => {
-            let _ = db.insert_unknown_device(&payload.esfera_device_id, adb_address, &ip, port, &now, &payload.adb_serial);
+    let db_copy = db.clone();
+    let (uuid, address, db_ip, stamp, serial) = (payload.esfera_device_id.clone(), adb_address.clone(), ip.clone(), now.clone(), payload.adb_serial.clone());
+    let updated = tokio::task::spawn_blocking(move || {
+        match db_copy.process_checkin(&uuid, &address, &db_ip, port, &stamp, &serial) {
+            Ok(0) => db_copy.insert_unknown_device(&uuid, &address, &db_ip, port, &stamp, &serial).map(|_| ()),
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
         }
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("Check-in DB error: {}", e);
-            return "erro";
-        }
-    }
+    }).await;
+    if !matches!(updated, Ok(Ok(()))) { return "erro"; }
 
-    // Event-Driven PUSH: Conecta instantaneamente via ADB ao endereço notificado pelo APK do aparelho
     let connect_target = format!("{}:{}", ip, port);
-    // Flush preventivo de socket zumbi antes de reconectar (evita "already connected")
-    let flush_target = connect_target.clone();
-    let _ = crate::adb_manager::create_cmd("adb")
-        .arg("disconnect")
-        .arg(&flush_target)
-        .output();
-    tokio::task::spawn_blocking(move || {
-        let _ = crate::adb_manager::create_cmd("adb")
-            .arg("connect")
-            .arg(&connect_target)
-            .output();
-    });
+    agendar_conexao_adb(connect_target, true);
 
     if let Some(app) = app_handle {
         let _ = app.emit("device-updated", serde_json::json!({

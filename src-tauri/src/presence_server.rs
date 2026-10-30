@@ -16,6 +16,11 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use tauri::{AppHandle, Emitter};
 
+static ATUALIZACOES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static LIMITE_DB: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(3)));
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HeartbeatPayload {
@@ -163,10 +168,6 @@ async fn handle_socket(socket: WebSocket, client_ip: String, app_handle: Option<
                                     hb.is_charging,
                                     hb.is_screen_on,
                                 );
-                                let serial_clone = hb.adb_serial.clone();
-                                std::thread::spawn(move || {
-                                    let _ = crate::adb_manager::AdbManager::connect_device(&serial_clone, 5555);
-                                });
                                 if let Some(ref app) = app_handle {
                                     if let Some(session) = crate::session_manager::get_session(&hb.adb_serial) {
                                         let _ = app.emit("presence-updated", &session);
@@ -179,14 +180,26 @@ async fn handle_socket(socket: WebSocket, client_ip: String, app_handle: Option<
                             let uuid_clone = hb.uuid.clone();
                             let ip_clone = phone_ip.clone();
                             let app_clone = app_handle.clone();
-                            std::thread::spawn(move || {
-                                let _ = crate::adb_manager::AdbManager::connect_device(&ip_clone, 5555);
-                                if let Some(ref app) = app_clone {
-                                    if let Some(state) = tauri::Manager::try_state::<crate::AppState>(app) {
-                                        let _ = state.db.update_device_network_by_id(&uuid_clone, &ip_clone, 5555);
-                                    }
-                                }
-                            });
+                            crate::checkin_server::agendar_conexao_adb(format!("{}:5555", ip_clone), false);
+                            let atualizar = if let Ok(mut lista) = ATUALIZACOES.lock() {
+                                let agora = std::time::Instant::now();
+                                lista.retain(|_, (_, instante)| agora.duration_since(*instante) < std::time::Duration::from_secs(60));
+                                let mudou = lista.get(&uuid_clone).map_or(true, |(ip, instante)| ip != &ip_clone || agora.duration_since(*instante) >= std::time::Duration::from_secs(15));
+                                if mudou { lista.insert(uuid_clone.clone(), (ip_clone.clone(), agora)); }
+                                mudou
+                            } else { false };
+                            if atualizar {
+                                if let Ok(permit) = LIMITE_DB.clone().try_acquire_owned() {
+                                    tokio::task::spawn_blocking(move || {
+                                        let _permit = permit;
+                                        if let Some(ref app) = app_clone {
+                                            if let Some(state) = tauri::Manager::try_state::<crate::AppState>(app) {
+                                                let _ = state.db.update_device_network_by_id(&uuid_clone, &ip_clone, 5555);
+                                            }
+                                        }
+                                    });
+                                } else if let Ok(mut lista) = ATUALIZACOES.lock() { lista.remove(&hb.uuid); }
+                            }
 
                             // Notifica o frontend via Tauri Event
                             if let Some(ref app) = app_handle {
