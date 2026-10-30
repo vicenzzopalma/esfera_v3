@@ -431,14 +431,20 @@ export default function SettingsTab() {
   const aiTemperatureValue = parseDecimal(aiTemperature);
   const aiTemperatureError =
     !Number.isFinite(aiTemperatureValue) || aiTemperatureValue < 0 || aiTemperatureValue > 1 ? "Use um número de 0 a 1 (ex.: 0,7)." : "";
-  const aiEndpointTrim = aiEndpoint.trim();
+  // IA própria como principal: endereço e modelo são sempre os do cartão IA própria (quando ele já
+  // carregou); assim não há dois lugares para editar o mesmo valor.
+  const vpsCard = aiProvider === "vps_ia" && vpsInfo?.configured ? vpsInfo : null;
+  const aiEndpointTrim = vpsCard ? vpsCard.endpoint : aiEndpoint.trim();
+  const aiModelTrim = vpsCard ? vpsCard.model : aiModel.trim();
   const aiEndpointError =
-    aiProvider === "custom" && !aiEndpointTrim
+    aiProvider === "vps_ia"
+      ? ""
+      : aiProvider === "custom" && !aiEndpointTrim
       ? "Informe o endereço da API."
       : aiEndpointTrim && !/^https?:\/\/\S+$/i.test(aiEndpointTrim)
       ? "O endereço deve começar com http:// ou https://."
       : "";
-  const aiModelError = !aiModel.trim() && !getAiProviderInfo(aiProvider)?.defaultModel ? "Informe o modelo." : "";
+  const aiModelError = !aiModelTrim && !getAiProviderInfo(aiProvider)?.defaultModel ? "Informe o modelo." : "";
 
   // Chave que vai para o backend: a digitada agora ou, em branco, a já salva (o backend novo
   // devolve vazio e preserva a salva; o antigo precisava receber a mesma chave de volta).
@@ -459,7 +465,7 @@ export default function SettingsTab() {
     }
     const info = getAiProviderInfo(aiProvider);
     const provider = aiProvider;
-    const model = aiModel.trim() || info?.defaultModel || "";
+    const model = aiModelTrim || info?.defaultModel || "";
     const endpoint = aiEndpointTrim || info?.defaultEndpoint || "";
     const typedKey = aiApiKey.trim();
     setSavingAi(true);
@@ -504,7 +510,7 @@ export default function SettingsTab() {
           contactName: AI_TEST_CONTACT,
           companyId: selectedCompanyId,
           provider: aiProvider,
-          model: aiModel.trim(),
+          model: aiModelTrim,
           prompt: aiSystemPrompt,
           apiKey: aiKeyToSend(),
           endpoint: aiEndpointTrim,
@@ -525,7 +531,7 @@ export default function SettingsTab() {
     aiSaved !== null &&
     (aiApiKey.trim() !== "" ||
       !sameSnapshot(
-        { provider: aiProvider, model: aiModel.trim(), temperature: aiTemperature.trim(), systemPrompt: aiSystemPrompt, endpoint: aiEndpointTrim },
+        { provider: aiProvider, model: aiModelTrim, temperature: aiTemperature.trim(), systemPrompt: aiSystemPrompt, endpoint: aiEndpointTrim },
         aiSaved,
       ));
 
@@ -767,46 +773,49 @@ export default function SettingsTab() {
                           </select>
                         </Field>
 
-                        <Field label="Modelo" htmlFor="set-ai-model" error={aiModelError || undefined}>
-                          <input
-                            id="set-ai-model"
-                            type="text"
-                            value={aiModel}
-                            onChange={(e) => setAiModel(e.target.value)}
-                            placeholder={providerInfo?.defaultModel || DEFAULT_AI_MODEL}
-                            spellCheck={false}
-                            className="font-mono"
-                          />
-                          {providerInfo && providerInfo.suggestedModels.length > 0 && (
-                            <div className="flex flex-wrap gap-1.5 pt-1">
-                              {providerInfo.suggestedModels.map((m) => (
-                                <button
-                                  key={m.id}
-                                  type="button"
-                                  onClick={() => setAiModel(m.id)}
-                                  aria-pressed={aiModel === m.id}
-                                  className={`rounded-md border px-2 py-1 text-xs transition-colors cursor-pointer ${
-                                    aiModel === m.id
-                                      ? "border-[var(--color-accent)] bg-[var(--color-accent-glow)] text-primary"
-                                      : "border-border text-secondary hover:border-border-strong hover:text-primary"
-                                  }`}
-                                >
-                                  {m.name} <span className="text-tertiary">({m.tag})</span>
-                                </button>
-                              ))}
-                            </div>
-                          )}
-                        </Field>
+                        {aiProvider !== "vps_ia" && (
+                          <Field label="Modelo" htmlFor="set-ai-model" error={aiModelError || undefined}>
+                            <input
+                              id="set-ai-model"
+                              type="text"
+                              value={aiModel}
+                              onChange={(e) => setAiModel(e.target.value)}
+                              placeholder={providerInfo?.defaultModel || DEFAULT_AI_MODEL}
+                              spellCheck={false}
+                              className="font-mono"
+                            />
+                            {providerInfo && providerInfo.suggestedModels.length > 0 && (
+                              <div className="flex flex-wrap gap-1.5 pt-1">
+                                {providerInfo.suggestedModels.map((m) => (
+                                  <button
+                                    key={m.id}
+                                    type="button"
+                                    onClick={() => setAiModel(m.id)}
+                                    aria-pressed={aiModel === m.id}
+                                    className={`rounded-md border px-2 py-1 text-xs transition-colors cursor-pointer ${
+                                      aiModel === m.id
+                                        ? "border-[var(--color-accent)] bg-[var(--color-accent-glow)] text-primary"
+                                        : "border-border text-secondary hover:border-border-strong hover:text-primary"
+                                    }`}
+                                  >
+                                    {m.name} <span className="text-tertiary">({m.tag})</span>
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </Field>
+                        )}
 
                         {aiProvider === "vps_ia" ? (
                           <div className="rounded-lg border border-border bg-secondary px-3 py-2.5 text-[0.8125rem] text-secondary">
-                            <p className="font-medium text-primary">Endereço e token vêm do cartão “IA própria (VPS)”, logo abaixo</p>
-                            <p className="mt-0.5 break-all font-mono text-xs">{aiEndpointTrim || "Ainda não configurado"}</p>
+                            <p className="font-medium text-primary">Endereço, modelo e token vêm do cartão “IA própria (VPS)”, logo abaixo</p>
+                            <p className="mt-0.5 break-all font-mono text-xs">{aiEndpointTrim || "Endereço ainda não configurado"}</p>
+                            <p className="break-all font-mono text-xs">{aiModelTrim || "Modelo ainda não configurado"}</p>
                             {vpsInfo && !vpsInfo.configured ? (
                               <p className="mt-1 text-xs text-[var(--color-warning)]">A IA própria ainda não está configurada: preencha o cartão abaixo antes de salvar.</p>
                             ) : (
                               aiSaved?.provider === "vps_ia" &&
-                              (aiSaved.endpoint !== aiEndpointTrim || aiSaved.model !== aiModel.trim()) && (
+                              (aiSaved.endpoint !== aiEndpointTrim || aiSaved.model !== aiModelTrim) && (
                                 <p className="mt-1 text-xs text-[var(--color-warning)]">
                                   A IA principal gravada usa outro endereço ou modelo. Clique em Salvar IA para usar os do cartão.
                                 </p>
