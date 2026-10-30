@@ -137,6 +137,8 @@ export default function DashboardTab() {
   const { canAccessDashboard } = usePermissions();
   const navigate = useNavigate();
   const now = useNow(30_000);
+  // Só o clique em Atualizar gira o botão; as leituras automáticas acontecem em silêncio.
+  const [manualRefresh, setManualRefresh] = useState(false);
 
   // Sem permissão, nenhuma consulta é feita.
   const cid = canAccessDashboard ? selectedCompanyId : null;
@@ -160,10 +162,16 @@ export default function DashboardTab() {
   }
 
   const queries = [kpisQ, devicesQ, campaignsQ, networkQ, optOutsQ];
-  const refreshing = queries.some((q) => q.isFetching);
   const hasError = kpisQ.isError || devicesQ.isError || campaignsQ.isError;
   const lastUpdate = Math.max(...queries.map((q) => q.dataUpdatedAt || 0));
-  const handleRefresh = () => queries.forEach((q) => q.refetch());
+  const handleRefresh = async () => {
+    setManualRefresh(true);
+    try {
+      await Promise.all(queries.map((q) => q.refetch()));
+    } finally {
+      setManualRefresh(false);
+    }
+  };
 
   // ── Aparelhos ──
   const devices = devicesQ.data ?? [];
@@ -217,7 +225,7 @@ export default function DashboardTab() {
         }
         icon={<BarChart3 size={16} />}
         actions={
-          <Button variant="secondary" size="sm" onClick={handleRefresh} loading={refreshing} icon={<RefreshCw size={13} />}>
+          <Button variant="secondary" size="sm" onClick={handleRefresh} loading={manualRefresh} icon={<RefreshCw size={13} />}>
             Atualizar
           </Button>
         }
