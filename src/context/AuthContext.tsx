@@ -5,6 +5,7 @@
 // ============================================================
 
 import { createContext, useContext, useState, useCallback, useEffect, useRef, type ReactNode } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import type { User, SessionState, Permission, SectorPermission } from "../types";
 import { api, setToken, getToken, connectHub, errorMessage, isTauri } from "../tauri";
 
@@ -124,6 +125,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [sectorPermissions, setSectorPermissions] = useState<SectorPermission[]>([]);
   const [hubConnected, setHubConnected] = useState<boolean>(false);
 
+  const queryClient = useQueryClient();
+
   // Muda a cada login/logout: respostas atrasadas de uma sessão antiga são ignoradas.
   const sessionSeq = useRef(0);
   const userRef = useRef<User | null>(null);
@@ -227,8 +230,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (token && notice === null) {
       api("logout", { token }).catch(() => {});
     }
+    userRef.current = null;
     setToken(null);
     setUser(null);
+    // Dados em cache (aparelhos, empresas, campanhas) não passam para o próximo usuário.
+    queryClient.clear();
     setSelectedCompanyId(null);
     setHubConnected(false);
     setError(null);
@@ -236,7 +242,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setPermissions([]);
     setSectorPermissions([]);
     saveToStorage(STORAGE_KEY_COMPANY, null);
-  }, []);
+  }, [queryClient]);
 
   const logout = useCallback(() => endSession(null), [endSession]);
 
