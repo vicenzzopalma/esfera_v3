@@ -3,46 +3,69 @@
 // Cartão central sóbrio, segue o tema claro/escuro
 // ============================================================
 
-import { useState, type FormEvent } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState, type FormEvent, type KeyboardEvent } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
 import Button from "../components/ui/Button";
 import Field from "../components/ui/Field";
-import { User, Lock, Eye, EyeOff, Sun, Moon, AlertCircle } from "lucide-react";
+import { User, Lock, Eye, EyeOff, Sun, Moon, AlertCircle, Info, ArrowBigUp } from "lucide-react";
+
+function readLastUsername(): string {
+  try {
+    return localStorage.getItem("esfera_v3_last_username") || "";
+  } catch {
+    return "";
+  }
+}
 
 export default function LoginPage() {
-  const { login, error } = useAuth();
+  const { login, error, sessionNotice } = useAuth();
   const { isDark, toggleTheme } = useTheme();
   const navigate = useNavigate();
+  const location = useLocation();
 
-  const [username, setUsername] = useState(() => localStorage.getItem("esfera_v3_last_username") || "");
+  const [username, setUsername] = useState(readLastUsername);
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [shake, setShake] = useState(false);
+  const [capsLock, setCapsLock] = useState(false);
+  // O erro some quando o usuário volta a digitar e reaparece no próximo envio.
+  const [showError, setShowError] = useState(true);
+
+  // Depois de uma sessão expirada, volta para a tela em que o usuário estava.
+  const from = (location.state as { from?: { pathname?: string; search?: string } } | null)?.from;
+  const target = from?.pathname && from.pathname !== "/login" ? `${from.pathname}${from.search ?? ""}` : "/";
 
   const fillCredentials = (u: string, p: string) => {
     setUsername(u);
     setPassword(p);
   };
 
+  const checkCapsLock = (e: KeyboardEvent<HTMLInputElement>) => {
+    setCapsLock(e.getModifierState?.("CapsLock") ?? false);
+  };
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    if (loading || !username.trim() || !password) return;
     setLoading(true);
     setShake(false);
+    setShowError(true);
 
     const success = await login(username, password);
 
     if (success) {
-      navigate("/");
-    } else {
-      setShake(true);
-      setTimeout(() => setShake(false), 600);
+      navigate(target, { replace: true });
+      return;
     }
-
+    setShake(true);
+    setTimeout(() => setShake(false), 600);
     setLoading(false);
   };
+
+  const visibleError = showError ? error : null;
 
   return (
     <div className="min-h-screen flex items-center justify-center relative bg-primary text-primary p-4 font-sans">
@@ -64,16 +87,24 @@ export default function LoginPage() {
             <p className="text-[0.8125rem] text-secondary mt-1">Use seu usuário e senha para continuar.</p>
           </div>
 
-          <form onSubmit={handleSubmit} className="space-y-4">
-            {error && (
+          <form onSubmit={handleSubmit} className="space-y-4" noValidate>
+            {visibleError ? (
               <div
                 role="alert"
                 className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-red-500/10 border border-red-500/25 text-red-600 dark:text-red-400 text-[0.8125rem] animate-fade-in"
               >
                 <AlertCircle size={15} className="mt-0.5 shrink-0" />
-                <span>{error}</span>
+                <span>{visibleError}</span>
               </div>
-            )}
+            ) : sessionNotice ? (
+              <div
+                role="status"
+                className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-sky-500/10 border border-sky-500/25 text-sky-700 dark:text-sky-300 text-[0.8125rem] animate-fade-in"
+              >
+                <Info size={15} className="mt-0.5 shrink-0" />
+                <span>{sessionNotice}</span>
+              </div>
+            ) : null}
 
             <Field label="Usuário" htmlFor="login-username">
               <div className="relative flex items-center">
@@ -83,8 +114,14 @@ export default function LoginPage() {
                   type="text"
                   autoComplete="username"
                   autoFocus={!username}
+                  spellCheck={false}
+                  autoCapitalize="none"
                   value={username}
-                  onChange={(e) => setUsername(e.target.value)}
+                  onChange={(e) => {
+                    setUsername(e.target.value);
+                    setShowError(false);
+                  }}
+                  onKeyDown={checkCapsLock}
                   placeholder="Seu usuário"
                   className="input-with-icon-left"
                 />
@@ -100,26 +137,40 @@ export default function LoginPage() {
                   autoComplete="current-password"
                   autoFocus={!!username}
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  onChange={(e) => {
+                    setPassword(e.target.value);
+                    setShowError(false);
+                  }}
+                  onKeyDown={checkCapsLock}
+                  onKeyUp={checkCapsLock}
+                  onBlur={() => setCapsLock(false)}
                   placeholder="Sua senha"
+                  aria-describedby={capsLock ? "login-capslock" : undefined}
                   className="input-with-icon-both"
                 />
                 <button
                   type="button"
                   onClick={() => setShowPassword(!showPassword)}
                   aria-label={showPassword ? "Ocultar senha" : "Mostrar senha"}
+                  title={showPassword ? "Ocultar senha" : "Mostrar senha"}
                   className="input-icon-right text-tertiary hover:text-primary transition-colors cursor-pointer"
                 >
                   {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
                 </button>
               </div>
+              {capsLock && (
+                <p id="login-capslock" className="flex items-center gap-1 text-[0.75rem] text-amber-700 dark:text-amber-400">
+                  <ArrowBigUp size={13} className="shrink-0" />
+                  Caps Lock está ativado.
+                </p>
+              )}
             </Field>
 
             <Button
               type="submit"
               size="lg"
               loading={loading}
-              disabled={!username || !password}
+              disabled={!username.trim() || !password}
               className="w-full"
             >
               {loading ? "Entrando..." : "Entrar"}
