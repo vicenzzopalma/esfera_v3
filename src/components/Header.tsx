@@ -105,10 +105,12 @@ export default function Header() {
   const selectedCompany = companies.find((c) => c.id === selectedCompanyId);
   const canSwitch = user.role === "master";
 
+  // Continua na mesma tela ao trocar de empresa (a página é recriada no Layout, sem dados da anterior).
+  const COMPANY_PAGES = ["/dashboard", "/devices", "/campaigns", "/automations", "/logs", "/settings"];
   const handleCompanySelect = (companyId: number) => {
     enterCompany(companyId);
     setCompanyDropdownOpen(false);
-    navigate("/devices");
+    if (!COMPANY_PAGES.includes(location.pathname)) navigate("/devices");
   };
 
   const handleLeaveCompany = () => {
