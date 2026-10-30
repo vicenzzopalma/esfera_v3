@@ -296,6 +296,8 @@ export default function SettingsTab() {
               </FormSection>
             )}
 
+            {activeSection === "geral" && <NetworkSettings canEdit={user?.role === "master" || user?.role === "gestor"} />}
+
             {activeSection === "notificacoes" && (
               <FormSection title="Notificações" description="Escolha quais avisos o sistema deve exibir.">
                 <div className="max-w-xl divide-y divide-border">
@@ -1088,4 +1090,41 @@ function IntegrationsSection({ companyId, isMaster, canManage }: { companyId: nu
       </div>
     </FormSection>
   );
+}
+
+
+type NetworkStatus = { hourly: number; daily: number; sentLastHour: number; sentToday: number; waitSeconds: number };
+function NetworkSettings({ canEdit }: { canEdit: boolean }) {
+  const [hourly, setHourly] = useState("40");
+  const [daily, setDaily] = useState("200");
+  const [status, setStatus] = useState<NetworkStatus | null>(null);
+  const [message, setMessage] = useState("");
+  useEffect(() => {
+    let active = true;
+    const refresh = () => api<NetworkStatus>("get_network_status").then(v => { if (active) setStatus(v); }).catch(e => { if (active) setMessage(`Erro ao consultar a rede: ${String(e)}`); });
+    api<{ hourly: number; daily: number }>("get_network_limits").then(v => { if (active) { setHourly(String(v.hourly)); setDaily(String(v.daily)); } }).catch(e => { if (active) setMessage(`Erro ao carregar limites: ${String(e)}`); });
+    refresh();
+    const timer = window.setInterval(refresh, 30000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
+  const save = async () => {
+    const h = Number(hourly), d = Number(daily);
+    if (!Number.isSafeInteger(h) || !Number.isSafeInteger(d) || h < 1 || d < h) { setMessage("Informe números inteiros positivos; o limite diário deve ser maior ou igual ao horário."); return; }
+    try {
+      await api("set_network_limits", { hourly: h, daily: d });
+      setStatus(await api<NetworkStatus>("get_network_status"));
+      setMessage("Limites da rede salvos.");
+    } catch (e) { setMessage(`Erro ao salvar limites: ${String(e)}`); }
+  };
+  return <div className="mt-6 border-t border-border pt-6"><FormSection title="Rede e ritmo" description="Limites compartilhados por todos os aparelhos desta instalação.">
+    <div className="space-y-4 max-w-xl">
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="Por hora" htmlFor="network-hour"><input id="network-hour" type="number" min={1} value={hourly} disabled={!canEdit} onChange={e => setHourly(e.target.value)} /></Field>
+        <Field label="Por dia" htmlFor="network-day"><input id="network-day" type="number" min={1} value={daily} disabled={!canEdit} onChange={e => setDaily(e.target.value)} /></Field>
+      </div>
+      <Button onClick={save} disabled={!canEdit}>Salvar limites</Button>
+      {message && <p role="status" className="text-sm text-secondary">{message}</p>}
+      {status && <p className="text-sm text-secondary">Última hora: {status.sentLastHour}/{status.hourly}. Hoje: {status.sentToday}/{status.daily}. {status.waitSeconds > 0 ? `Próxima janela em até ${Math.ceil(status.waitSeconds / 60)} min.` : "Rede disponível."}</p>}
+    </div>
+  </FormSection></div>;
 }
