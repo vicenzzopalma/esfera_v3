@@ -10,12 +10,15 @@ import { FormSection } from "../ui/Field";
 import type { Device } from "../../types";
 import { getConnectionOrigin } from "../../types";
 import { Smartphone, Copy, Check } from "lucide-react";
-import { StatusDot, BatteryMeter, ORIGIN_LABEL, sectorLabel } from "./deviceUi";
+import { StatusDot, BatteryMeter, ORIGIN_LABEL, sectorLabel, deviceDisplayName, parseDbDate, formatAgo, chipSummary, type DeviceChip } from "./deviceUi";
+import { describeAgent, type AgentUpdateStatus } from "./DeviceCard";
 
 interface DeviceIdentityModalProps {
   isOpen: boolean;
   onClose: () => void;
   device: Device | null;
+  chips?: DeviceChip[];
+  agentStatus?: AgentUpdateStatus;
 }
 
 function Row({ label, value, mono = false, copy = false }: { label: string; value: React.ReactNode; mono?: boolean; copy?: boolean }) {
@@ -55,11 +58,15 @@ function Row({ label, value, mono = false, copy = false }: { label: string; valu
   );
 }
 
-export function DeviceIdentityModal({ isOpen, onClose, device }: DeviceIdentityModalProps) {
+export function DeviceIdentityModal({ isOpen, onClose, device, chips, agentStatus }: DeviceIdentityModalProps) {
   if (!device) return null;
 
   const origin = getConnectionOrigin(device);
-  const displayName = device.name || device.model || device.serial;
+  const displayName = deviceDisplayName(device);
+  const rawSeen = device.lastSeenUtc || device.lastSeen || "";
+  const seen = parseDbDate(rawSeen);
+  const chip = chipSummary(chips);
+  const agent = describeAgent(agentStatus);
 
   return (
     <Modal
@@ -108,7 +115,22 @@ export function DeviceIdentityModal({ isOpen, onClose, device }: DeviceIdentityM
             />
             <Row label="Setor" value={sectorLabel(device.sector)} />
             <Row label="Número" value={`#${device.deviceNumber}`} mono />
-            <Row label="Último sinal (UTC)" value={device.lastSeenUtc || device.lastSeen || "Sem registro"} mono />
+            <Row
+              label="Último sinal"
+              value={seen ? `${formatAgo(seen)} · ${seen.toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}` : rawSeen || "Sem registro"}
+            />
+            {chip && (
+              <Row
+                label="Chip"
+                value={
+                  <span className="inline-flex items-center gap-2" title={chip.title}>
+                    {chip.phone && <span className="font-mono text-[0.75rem]">{chip.phone}</span>}
+                    <Badge variant={chip.tone}>{chip.label}</Badge>
+                  </span>
+                }
+              />
+            )}
+            <Row label="Agente" value={<span className="block whitespace-normal text-right" title={agent.technical || undefined}>{agent.text}</span>} />
           </div>
         </FormSection>
       </div>

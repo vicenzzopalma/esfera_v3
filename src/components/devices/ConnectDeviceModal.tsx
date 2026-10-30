@@ -1,9 +1,9 @@
 // ============================================================
-// Esfera v3 — Modal "Conectar celular"
+// Esfera v3 — Modal "Conectar aparelho"
 // Conexão por USB, IP e código de pareamento (Android 11+)
 // ============================================================
 
-import { useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import Modal from "../ui/Modal";
 import Button from "../ui/Button";
 import Badge from "../ui/Badge";
@@ -11,8 +11,8 @@ import Field, { FormSection } from "../ui/Field";
 import { Tabs } from "../ui/Tabs";
 import EmptyState from "../ui/EmptyState";
 import type { Device } from "../../types";
-import { RefreshCw, Smartphone, Usb, Globe, KeyRound, Loader2 } from "lucide-react";
-import { inputCls, SECTOR_OPTIONS } from "./deviceUi";
+import { RefreshCw, Smartphone, Usb, Globe, KeyRound, Loader2, Hand, Zap } from "lucide-react";
+import { inputCls, SECTOR_OPTIONS, deviceDisplayName } from "./deviceUi";
 
 interface ConnectDeviceModalProps {
   isOpen: boolean;
@@ -39,6 +39,42 @@ interface ConnectDeviceModalProps {
 
 type ConnectTab = "usb" | "manual" | "pair";
 
+type SetupData =
+  | { kind: "usb"; serial: string }
+  | { kind: "ip"; ip: string; port: number }
+  | { kind: "pair"; ip: string; pairPort: number; code: string; connectPort: number };
+
+// Estado do ADB em português, com o que o operador precisa fazer.
+function usbStateView(state: string): { label: string; tone: "success" | "warning" | "neutral"; help?: string; ready: boolean } {
+  switch (state) {
+    case "device":
+      return { label: "Pronto", tone: "success", ready: true };
+    case "unauthorized":
+      return {
+        label: "Aguardando permissão",
+        tone: "warning",
+        ready: false,
+        help: 'Desbloqueie o aparelho e toque em "Permitir" na janela "Permitir depuração USB?". Marque "Sempre permitir deste computador" e clique em Atualizar lista.',
+      };
+    case "offline":
+      return { label: "Sem resposta", tone: "warning", ready: false, help: "Desconecte e conecte o cabo de novo. Se continuar, reinicie o aparelho." };
+    case "authorizing":
+      return { label: "Autorizando", tone: "warning", ready: false, help: "Aguarde alguns segundos e clique em Atualizar lista." };
+    default:
+      return { label: state || "Desconhecido", tone: "neutral", ready: false };
+  }
+}
+
+function portValid(v: string) {
+  const n = Number(v);
+  return /^\d+$/.test(v.trim()) && n > 0 && n < 65536;
+}
+
+// Mensagens do backend vêm com emoji e tempo em ms: mostra só o que interessa.
+function prettyStatus(text: string) {
+  return text.replace(/^[^\p{L}\p{N}]+/u, "").replace(/\s+em\s+\d+\s*ms!?/i, ".").trim();
+}
+
 export function ConnectDeviceModal({
   isOpen,
   onClose,
@@ -61,79 +97,87 @@ export function ConnectDeviceModal({
   const [pairCode, setPairCode] = useState("");
   const [connectPortInput, setConnectPortInput] = useState("5555");
 
-  const [setupDeviceData, setSetupDeviceData] = useState<{ serial?: string; ip?: string; port?: number } | null>(null);
-  const [deviceNumberInput, setDeviceNumberInput] = useState(nextDeviceNumber.toString());
-  const [deviceNameInput, setDeviceNameInput] = useState(`Aparelho ${nextDeviceNumber}`);
+  const [setupData, setSetupData] = useState<SetupData | null>(null);
+  const [deviceNameInput, setDeviceNameInput] = useState("");
   const [sectorInput, setSectorInput] = useState("junior");
 
-  // Filtra dispositivos que já estão vinculados no sistema
-  const isDeviceAlreadyAdded = (devSerial: string) => {
-    const s = devSerial.trim().toLowerCase();
-    const ipOnly = s.includes(":") ? s.split(":")[0] : s;
-    return existingDevices.some((d) => {
+  // Cada abertura começa do zero: antes, o passo de identificação de uma conexão
+  // anterior reaparecia com o nome antigo.
+  useEffect(() => {
+    if (!isOpen) return;
+    setSetupData(null);
+    setPairCode("");
+  }, [isOpen]);
+
+  // Procura o cadastro deste aparelho com comparação exata (evita confundir aparelhos
+  // de serial parecido e herdar o nome de outro).
+  const findExisting = (adbSerial: string): Device | undefined => {
+    const s = adbSerial.trim().toLowerCase();
+    if (!s) return undefined;
+    const ip = s.includes(":") ? s.split(":")[0] : "";
+    return existingDevices.find((d) => {
       const ds = (d.serial || "").trim().toLowerCase();
       const da = (d.currentAdbAddress || "").trim().toLowerCase();
       const di = (d.ip || "").trim().toLowerCase();
       const de = (d.esferaDeviceId || "").trim().toLowerCase();
-      const rawDe = de.replace("esf-", "");
-
-      if (s && (ds === s || da === s || di === s)) return true;
-      if (ipOnly && (di === ipOnly || da.startsWith(ipOnly) || ds.startsWith(ipOnly))) return true;
-      if (rawDe && rawDe.length >= 4 && (s.includes(rawDe) || rawDe.includes(s))) return true;
-      if (de && (s === de || s.includes(de))) return true;
-      return false;
+      if (ds === s || da === s || de === s) return true;
+      if (ip && (di === ip || ds.split(":")[0] === ip || da.split(":")[0] === ip)) return true;
+      // ID antigo derivado do serial USB (ESF-<8 primeiros caracteres>).
+      const rawDe = de.replace(/^esf-/, "");
+      return rawDe.length >= 8 && !rawDe.includes("-") && s.startsWith(rawDe);
     });
   };
 
-  const handlePrepareSetup = (data: { serial?: string; ip?: string; port?: number }) => {
-    const matchedUsb = usbDevices.find((u) => u.serial === data.serial);
-    const suggestedName =
-      matchedUsb?.model && matchedUsb.model !== "Aparelho Android" ? matchedUsb.model : `Aparelho ${nextDeviceNumber}`;
-    setDeviceNumberInput(nextDeviceNumber.toString());
-    setDeviceNameInput(suggestedName);
-    setSetupDeviceData(data);
+  const openSetup = (data: SetupData) => {
+    setDeviceNameInput(`Celular ${nextDeviceNumber}`);
+    setSectorInput("junior");
+    setSetupData(data);
   };
 
   const handleClose = () => {
-    setSetupDeviceData(null);
+    setSetupData(null);
     onClose();
   };
 
   const busy = linkingSerial !== null;
   const isError = !!linkingStatus && linkingStatus.startsWith("Erro");
+  const nameTrim = deviceNameInput.trim();
+  const genericName = /^aparelho\s/i.test(nameTrim);
 
   const statusBox = linkingStatus && (
     <div
+      role={isError ? "alert" : "status"}
       className={`flex items-start gap-2 rounded-lg border p-3 text-[0.8125rem] animate-scale-in ${
-        isError
-          ? "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400"
-          : "border-border bg-secondary text-secondary"
+        isError ? "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400" : "border-border bg-secondary text-secondary"
       }`}
     >
       {busy && !isError && <Loader2 size={14} className="mt-0.5 shrink-0 animate-spin" />}
-      <p className="min-w-0 break-words">{linkingStatus}</p>
+      <p className="min-w-0 break-words">{prettyStatus(linkingStatus)}</p>
     </div>
   );
 
-  const footer = setupDeviceData ? (
+  const confirmSetup = () => {
+    if (!setupData || !nameTrim || busy) return;
+    if (setupData.kind === "usb") {
+      onForceWirelessAdb(setupData.serial, nextDeviceNumber, sectorInput, nameTrim);
+    } else if (setupData.kind === "ip") {
+      onConnectDevice(setupData.ip, setupData.port, nextDeviceNumber, sectorInput, nameTrim);
+    } else {
+      onPairAndConnectDevice(setupData.ip, setupData.pairPort, setupData.code, setupData.connectPort, nextDeviceNumber, sectorInput, nameTrim);
+    }
+  };
+
+  const ipValid = connectIp.trim().length > 0 && (connectPort.trim() === "" || portValid(connectPort));
+  const codeDigits = pairCode.replace(/\D/g, "");
+  const pairValid = pairIp.trim().length > 0 && portValid(pairPort) && codeDigits.length === 6 && (connectPortInput.trim() === "" || portValid(connectPortInput));
+
+  const footer = setupData ? (
     <>
-      <Button variant="secondary" size="sm" onClick={() => setSetupDeviceData(null)} disabled={busy}>
+      <Button variant="secondary" size="sm" onClick={() => setSetupData(null)} disabled={busy}>
         Voltar
       </Button>
-      <Button
-        variant="primary"
-        size="sm"
-        loading={busy}
-        onClick={() => {
-          const devNum = parseInt(deviceNumberInput, 10) || 1;
-          if (setupDeviceData.serial) {
-            onForceWirelessAdb(setupDeviceData.serial, devNum, sectorInput, deviceNameInput);
-          } else if (setupDeviceData.ip) {
-            onConnectDevice(setupDeviceData.ip, setupDeviceData.port || 5555, devNum, sectorInput, deviceNameInput);
-          }
-        }}
-      >
-        {busy ? "Conectando..." : "Conectar celular"}
+      <Button variant="primary" size="sm" loading={busy} disabled={!nameTrim} onClick={confirmSetup}>
+        {busy ? "Conectando..." : setupData.kind === "pair" ? "Parear e conectar" : "Conectar aparelho"}
       </Button>
     </>
   ) : (
@@ -150,10 +194,10 @@ export function ConnectDeviceModal({
         <Button
           variant="primary"
           size="sm"
-          disabled={!connectIp.trim()}
+          disabled={!ipValid}
           onClick={() => {
-            if (!connectIp) return;
-            handlePrepareSetup({ ip: connectIp, port: parseInt(connectPort, 10) || 5555 });
+            if (!ipValid) return;
+            openSetup({ kind: "ip", ip: connectIp.trim(), port: parseInt(connectPort, 10) || 5555 });
           }}
         >
           Avançar
@@ -163,39 +207,49 @@ export function ConnectDeviceModal({
         <Button
           variant="primary"
           size="sm"
-          loading={busy}
-          disabled={!pairIp || !pairPort || !pairCode}
+          disabled={!pairValid}
           onClick={() => {
-            if (!pairIp || !pairPort || !pairCode) return;
-            onPairAndConnectDevice(
-              pairIp.trim(),
-              parseInt(pairPort, 10) || 5555,
-              pairCode.trim(),
-              parseInt(connectPortInput, 10) || 5555,
-              nextDeviceNumber,
-              "junior",
-              `Aparelho ${nextDeviceNumber}`
-            );
+            if (!pairValid) return;
+            openSetup({
+              kind: "pair",
+              ip: pairIp.trim(),
+              pairPort: parseInt(pairPort, 10),
+              code: codeDigits,
+              connectPort: parseInt(connectPortInput, 10) || 5555,
+            });
           }}
         >
-          Parear e conectar
+          Avançar
         </Button>
       )}
     </>
   );
 
   return (
-    <Modal isOpen={isOpen} onClose={handleClose} title="Conectar celular" size="lg" footer={footer}>
-      {setupDeviceData ? (
+    <Modal isOpen={isOpen} onClose={handleClose} title="Conectar aparelho" size="lg" footer={footer} closeOnOverlayClick={!setupData && !busy}>
+      {setupData ? (
         <div className="space-y-5 animate-scale-in">
-          <FormSection title="Identificação do aparelho" description="Defina o nome e o setor em que este celular vai atuar.">
-            <Field label="Nome do aparelho" htmlFor="conn-name">
+          <FormSection title="Identificação do aparelho" description="Defina o nome e o setor em que este aparelho vai atuar. O nome só muda depois por edição manual nas configurações.">
+            <Field
+              label="Nome do aparelho"
+              htmlFor="conn-name"
+              required
+              error={!nameTrim ? "Dê um nome ao aparelho." : undefined}
+              hint={
+                genericName
+                  ? 'Nomes no formato "Aparelho N" são tratados como automáticos e trocados por "Celular" + código. Prefira outro nome.'
+                  : "Use um nome fácil de achar na lista, como o número do aparelho na bancada."
+              }
+            >
               <input
                 id="conn-name"
                 type="text"
                 value={deviceNameInput}
                 onChange={(e) => setDeviceNameInput(e.target.value)}
-                placeholder="Ex.: Aparelho 1"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") confirmSetup();
+                }}
+                placeholder="Ex.: Celular 4"
                 className={inputCls}
               />
             </Field>
@@ -228,13 +282,13 @@ export function ConnectDeviceModal({
               {loadingUsb ? (
                 <div className="flex flex-col items-center justify-center gap-2 py-10 text-[0.8125rem] text-secondary">
                   <RefreshCw size={18} className="animate-spin" />
-                  Buscando celulares conectados por USB...
+                  Buscando aparelhos conectados por USB...
                 </div>
               ) : usbDevices.length === 0 ? (
                 <EmptyState
                   icon={<Smartphone size={18} />}
-                  title="Nenhum celular detectado"
-                  description="Conecte o cabo USB e ative a depuração USB nas opções do desenvolvedor do Android."
+                  title="Nenhum aparelho detectado"
+                  description="Conecte o cabo USB (de dados, não só de carga) e ative a depuração USB nas opções do desenvolvedor do Android."
                   action={
                     <Button variant="secondary" size="sm" icon={<RefreshCw size={13} />} onClick={onFetchUsb}>
                       Buscar novamente
@@ -244,40 +298,71 @@ export function ConnectDeviceModal({
               ) : (
                 <>
                   <p className="text-[0.8125rem] text-secondary">
-                    {usbDevices.length} {usbDevices.length === 1 ? "celular detectado" : "celulares detectados"} neste computador
+                    {usbDevices.length} {usbDevices.length === 1 ? "aparelho detectado" : "aparelhos detectados"} neste computador
                   </p>
                   <div className="max-h-72 space-y-2 overflow-y-auto pr-1 custom-scrollbar">
                     {usbDevices.map((dev) => {
                       const safeSerial = String(dev.serial || "");
                       const safeModel = String(dev.model || "Aparelho Android");
-                      const safeState = String(dev.state || "");
-                      const isConnected = isDeviceAlreadyAdded(safeSerial);
+                      const view = usbStateView(String(dev.state || ""));
+                      const existing = findExisting(safeSerial);
                       const isIp = safeSerial.includes(":");
+                      const linkingThis = busy && linkingSerial === safeSerial;
 
-                      return (
-                        <div key={safeSerial} className="flex items-center justify-between gap-3 rounded-lg border border-border bg-card p-3">
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-2">
-                              <p className="truncate text-[0.8125rem] font-medium text-primary">{safeModel}</p>
-                              {isConnected && <Badge variant="success">Já conectado</Badge>}
-                            </div>
-                            <p className="truncate font-mono text-[0.75rem] text-tertiary">
-                              {safeSerial} · {safeState}
-                            </p>
-                          </div>
+                      let action: ReactNode = null;
+                      if (!view.ready) {
+                        action = null;
+                      } else if (existing) {
+                        // Já cadastrado: religa sem formulário, mantendo nome, número e setor.
+                        action = isIp ? (
+                          <span className="text-[0.75rem] text-tertiary">Conectado por Wi-Fi</span>
+                        ) : (
                           <Button
                             size="sm"
-                            variant={isConnected ? "secondary" : "primary"}
-                            onClick={() => {
-                              if (isIp) {
-                                handlePrepareSetup({ ip: safeSerial.split(":")[0], port: 5555 });
-                              } else {
-                                handlePrepareSetup({ serial: safeSerial });
-                              }
-                            }}
+                            variant="secondary"
+                            loading={linkingThis}
+                            disabled={busy && !linkingThis}
+                            icon={<Zap size={13} />}
+                            title="Liga o controle por Wi-Fi para usar o aparelho sem o cabo"
+                            onClick={() => onForceWirelessAdb(safeSerial, existing.deviceNumber || 0, existing.sector || "junior", existing.name || "")}
                           >
-                            {isConnected ? "Sincronizar" : isIp ? "Conectar por IP" : "Vincular por Wi-Fi"}
+                            Ativar Wi-Fi
                           </Button>
+                        );
+                      } else {
+                        action = (
+                          <Button
+                            size="sm"
+                            variant="primary"
+                            disabled={busy}
+                            onClick={() => (isIp ? openSetup({ kind: "ip", ip: safeSerial.split(":")[0], port: parseInt(safeSerial.split(":")[1], 10) || 5555 }) : openSetup({ kind: "usb", serial: safeSerial }))}
+                          >
+                            Cadastrar
+                          </Button>
+                        );
+                      }
+
+                      return (
+                        <div key={safeSerial} className="space-y-2 rounded-lg border border-border bg-card p-3">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="flex min-w-0 items-center gap-2">
+                                <p className="truncate text-[0.8125rem] font-medium text-primary">{existing ? deviceDisplayName(existing) : safeModel}</p>
+                                {existing ? <Badge variant="success">Já cadastrado</Badge> : <Badge variant={view.tone}>{view.label}</Badge>}
+                              </div>
+                              <p className="truncate font-mono text-[0.75rem] text-tertiary">
+                                {existing ? `${safeModel} · ` : ""}
+                                {safeSerial}
+                              </p>
+                            </div>
+                            <div className="shrink-0">{action}</div>
+                          </div>
+                          {view.help && (
+                            <p className="flex items-start gap-1.5 rounded-md bg-amber-500/10 px-2.5 py-1.5 text-[0.75rem] text-amber-700 dark:text-amber-400">
+                              <Hand size={12} className="mt-0.5 shrink-0" />
+                              <span>{view.help}</span>
+                            </p>
+                          )}
                         </div>
                       );
                     })}
@@ -286,9 +371,9 @@ export function ConnectDeviceModal({
               )}
             </div>
           ) : connectTab === "manual" ? (
-            <FormSection title="Conectar por IP" description="O celular e este computador precisam estar na mesma rede.">
+            <FormSection title="Conectar por IP" description="O aparelho e este computador precisam estar na mesma rede, com a depuração por Wi-Fi ativa no aparelho.">
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-[1fr_8rem]">
-                <Field label="Endereço IP do celular" htmlFor="conn-ip">
+                <Field label="Endereço IP do aparelho" htmlFor="conn-ip">
                   <input
                     id="conn-ip"
                     type="text"
@@ -298,10 +383,11 @@ export function ConnectDeviceModal({
                     className={`${inputCls} font-mono`}
                   />
                 </Field>
-                <Field label="Porta" htmlFor="conn-port" hint="Padrão 5555">
+                <Field label="Porta" htmlFor="conn-port" hint="Padrão 5555" error={connectPort.trim() && !portValid(connectPort) ? "Porta inválida." : undefined}>
                   <input
                     id="conn-port"
                     type="text"
+                    inputMode="numeric"
                     value={connectPort}
                     onChange={(e) => setConnectPort(e.target.value)}
                     placeholder="5555"
@@ -314,27 +400,48 @@ export function ConnectDeviceModal({
             <div className="space-y-4">
               <FormSection
                 title="Parear com código"
-                description='No Android, abra "Depuração sem fio" e toque em "Parear dispositivo com código". Informe os dados exibidos.'
+                description='No Android 11 ou mais novo, abra "Depuração por Wi-Fi" e toque em "Parear dispositivo com código de pareamento". Informe os dados exibidos.'
               >
                 <div className="grid grid-cols-2 gap-4">
-                  <Field label="IP do celular" htmlFor="pair-ip">
+                  <Field label="IP do aparelho" htmlFor="pair-ip">
                     <input id="pair-ip" type="text" value={pairIp} onChange={(e) => setPairIp(e.target.value)} placeholder="192.168.1.82" className={`${inputCls} font-mono`} />
                   </Field>
-                  <Field label="Porta de pareamento" htmlFor="pair-port">
-                    <input id="pair-port" type="text" value={pairPort} onChange={(e) => setPairPort(e.target.value)} placeholder="37123" className={`${inputCls} font-mono`} />
+                  <Field label="Porta de pareamento" htmlFor="pair-port" error={pairPort.trim() && !portValid(pairPort) ? "Porta inválida." : undefined}>
+                    <input id="pair-port" type="text" inputMode="numeric" value={pairPort} onChange={(e) => setPairPort(e.target.value)} placeholder="37123" className={`${inputCls} font-mono`} />
                   </Field>
-                  <Field label="Código de 6 dígitos" htmlFor="pair-code">
-                    <input id="pair-code" type="text" value={pairCode} onChange={(e) => setPairCode(e.target.value)} placeholder="849201" className={`${inputCls} font-mono text-center`} />
+                  <Field label="Código de 6 dígitos" htmlFor="pair-code" error={pairCode.trim() && codeDigits.length !== 6 ? "O código tem 6 dígitos." : undefined}>
+                    <input
+                      id="pair-code"
+                      type="text"
+                      inputMode="numeric"
+                      autoComplete="off"
+                      value={pairCode}
+                      onChange={(e) => setPairCode(e.target.value)}
+                      placeholder="849201"
+                      className={`${inputCls} font-mono text-center`}
+                    />
                   </Field>
-                  <Field label="Porta de conexão" htmlFor="pair-cport" hint="Padrão 5555">
-                    <input id="pair-cport" type="text" value={connectPortInput} onChange={(e) => setConnectPortInput(e.target.value)} placeholder="5555" className={`${inputCls} font-mono`} />
+                  <Field
+                    label="Porta de conexão"
+                    htmlFor="pair-cport"
+                    hint="A que aparece em Depuração por Wi-Fi (padrão 5555)"
+                    error={connectPortInput.trim() && !portValid(connectPortInput) ? "Porta inválida." : undefined}
+                  >
+                    <input
+                      id="pair-cport"
+                      type="text"
+                      inputMode="numeric"
+                      value={connectPortInput}
+                      onChange={(e) => setConnectPortInput(e.target.value)}
+                      placeholder="5555"
+                      className={`${inputCls} font-mono`}
+                    />
                   </Field>
                 </div>
               </FormSection>
-              {statusBox}
             </div>
           )}
-          {connectTab !== "pair" && statusBox}
+          {statusBox}
         </div>
       )}
     </Modal>
