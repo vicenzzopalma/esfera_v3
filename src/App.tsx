@@ -5,7 +5,7 @@
 
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { useAuth } from "./context/AuthContext";
-import Layout from "./components/Layout";
+import Layout, { ErrorBoundary } from "./components/Layout";
 import LoginPage from "./pages/LoginPage";
 import CompaniesTab from "./pages/CompaniesTab";
 import PermissionsTab from "./pages/PermissionsTab";
@@ -197,7 +197,10 @@ function AppRoutes() {
 export default function App() {
   return (
     <BrowserRouter>
-      <AppRoutes />
+      {/* Último recurso: erro fora das telas (ex.: no cabeçalho) não deixa a janela em branco */}
+      <ErrorBoundary fullPage>
+        <AppRoutes />
+      </ErrorBoundary>
       {/* Notificações (toast.*) e confirmações (confirmDialog) disponíveis em todas as telas */}
       <ToastContainer />
       <ConfirmHost />
