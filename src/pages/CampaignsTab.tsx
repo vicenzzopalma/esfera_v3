@@ -2700,6 +2700,10 @@ export function ensureProgressListener() {
   }
 }
 
+// Liga já ao carregar o app (o App importa esta tela direto): campanhas retomadas sozinhas na abertura
+// também avisam pausa e conclusão, mesmo antes de alguém abrir a tela de Campanhas.
+if (typeof window !== "undefined") ensureProgressListener();
+
 function subscribeActivity(cb: () => void) {
   activitySubs.add(cb);
   return () => {
@@ -5487,7 +5491,7 @@ function StickyBar({ children }: { children: ReactNode }) {
 
 // Lista densa de campanhas (linhas clicáveis com progresso, estado ao vivo e ações).
 
-const GRID = "lg:grid lg:grid-cols-[minmax(0,2.3fr)_10rem_minmax(0,1.6fr)_5.5rem_7rem_6.5rem] lg:items-center lg:gap-4";
+const GRID = "lg:grid lg:grid-cols-[minmax(0,2.3fr)_10rem_minmax(0,1.6fr)_5rem_6.5rem_8.5rem] lg:items-center lg:gap-4";
 
 export function CampaignListSkeleton() {
   return (
