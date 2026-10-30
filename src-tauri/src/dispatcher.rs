@@ -562,6 +562,16 @@ fn base_with_name_placeholder(campaign: &crate::db::Campaign) -> String {
 }
 
 /// Guarda a versão nova (se veio) e escolhe uma combinação ainda não usada nesta campanha.
+fn pool_store(pool: &mut VariantPool, parts: Vec<String>) {
+    if pool.parts.is_empty() { pool.parts = vec![Vec::new(); parts.len()]; }
+    if pool.parts.len() == parts.len() {
+        for (versions, text) in pool.parts.iter_mut().zip(parts) {
+            if versions.len() < AI_VARIANTS_PER_PART && !versions.contains(&text) { versions.push(text); }
+        }
+    }
+}
+
+/// Escolhe uma combinacao ainda nao usada nesta campanha.
 fn pool_take(pool: &mut VariantPool, fresh: Option<Vec<String>>) -> Option<Vec<String>> {
     if let Some(parts) = fresh {
         if pool.parts.is_empty() {
@@ -622,37 +632,121 @@ fn pool_take(pool: &mut VariantPool, fresh: Option<Vec<String>>) -> Option<Vec<S
     None
 }
 
-async fn pooled_ai_message(campaign: &crate::db::Campaign, chain: &[crate::db::AiConfig], contact_name: &str) -> Result<String, String> {
-    let key = (campaign.id, campaign_fingerprint(campaign));
-    let need_more = AI_VARIANT_POOLS
-        .lock()
-        .map(|pools| {
-            pools
-                .get(&key)
-                .map_or(true, |p| p.parts.is_empty() || p.parts.iter().any(|v| v.len() < AI_VARIANTS_PER_PART))
-        })
-        .unwrap_or(true);
-    let mut fresh = None;
-    let mut error = None;
-    if need_more {
-        let base = base_with_name_placeholder(campaign);
-        let has_gemini_web = chain.iter().any(|c| c.provider.eq_ignore_ascii_case("gemini_web"));
-        let has_vps_ia = chain.iter().any(|c| c.provider.eq_ignore_ascii_case("vps_ia"));
-        let total_timeout_secs = if has_gemini_web || has_vps_ia { 180 } else { 45 };
-        match timeout(Duration::from_secs(total_timeout_secs), AiEngine::rewrite_parts(chain, &base)).await {
-            Ok(Ok(parts)) => fresh = Some(parts),
-            Ok(Err(e)) => error = Some(e),
-            Err(_) => error = Some(format!("Tempo limite total de {}s na geração de IA", total_timeout_secs)),
+// Uma tarefa por versao de campanha. O intervalo impede novas tentativas em rajada
+// quando os provedores falham ou retornam sempre a mesma resposta.
+#[derive(Default)]
+struct PoolWorkers {
+    entries: HashMap<(i32, u64), (bool, std::time::Instant)>,
+    current: HashMap<i32, u64>,
+}
+
+impl PoolWorkers {
+    fn start(&mut self, key: (i32, u64)) -> bool {
+        self.current.insert(key.0, key.1);
+        self.entries.retain(|&(id, fingerprint), (running, _)|
+            id != key.0 || fingerprint == key.1 || *running);
+        if let Some((running, last)) = self.entries.get(&key) {
+            if *running || last.elapsed() < Duration::from_secs(30) { return false; }
+        }
+        self.entries.insert(key, (true, std::time::Instant::now()));
+        true
+    }
+
+    fn is_current(&self, key: (i32, u64)) -> bool {
+        self.current.get(&key.0) == Some(&key.1)
+    }
+
+    fn finish(&mut self, key: (i32, u64)) {
+        if self.is_current(key) {
+            if let Some(state) = self.entries.get_mut(&key) {
+                *state = (false, std::time::Instant::now());
+            }
+        } else {
+            self.entries.remove(&key);
         }
     }
-    let chosen = {
-        let mut pools = AI_VARIANT_POOLS.lock().map_err(|_| "banco de variações indisponível".to_string())?;
-        pool_take(pools.entry(key).or_default(), fresh)
-    };
-    match chosen {
-        Some(parts) => Ok(AiEngine::replace_contact_name(&parts.join("\n\n"), contact_name)),
-        None => Err(error.unwrap_or_else(|| "sem variações de IA disponíveis".to_string())),
+}
+
+static AI_POOL_WORKERS: std::sync::LazyLock<Mutex<PoolWorkers>> =
+    std::sync::LazyLock::new(|| Mutex::new(PoolWorkers::default()));
+
+struct PoolWorkerGuard((i32, u64));
+impl Drop for PoolWorkerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut workers) = AI_POOL_WORKERS.lock() { workers.finish(self.0); }
     }
+}
+
+fn schedule_ai_pool(db: Arc<Database>, campaign: crate::db::Campaign) {
+    let key = (campaign.id, campaign_fingerprint(&campaign));
+    let needs_more = AI_VARIANT_POOLS.lock().map(|pools| pools.get(&key).map_or(true, |p|
+        p.parts.is_empty() || p.parts.iter().any(|v| v.len() < AI_VARIANTS_PER_PART)
+    )).unwrap_or(false);
+    if !needs_more { return; }
+    let Ok(mut workers) = AI_POOL_WORKERS.lock() else { return; };
+    if !workers.start(key) { return; }
+    // Sob a mesma trava, invalida gravacoes de trabalhadores de versoes antigas.
+    if let Ok(mut pools) = AI_VARIANT_POOLS.lock() {
+        pools.retain(|&(id, fingerprint), _| id != key.0 || fingerprint == key.1);
+    }
+    drop(workers);
+    tauri::async_runtime::spawn(async move {
+        let _guard = PoolWorkerGuard(key);
+        let db2 = db.clone();
+        let campaign2 = campaign.clone();
+        let chain = match spawn_blocking(move || {
+            let mut config = db2.get_ai_config(campaign2.company_id).unwrap_or_else(|| crate::db::AiConfig {
+                company_id: campaign2.company_id,
+                provider: if campaign2.ai_provider.is_empty() { "groq".to_string() } else { campaign2.ai_provider.clone() },
+                model: if campaign2.ai_model.is_empty() { "openai/gpt-oss-120b".to_string() } else { campaign2.ai_model.clone() },
+                temperature: 0.7, system_prompt: String::new(), api_key: String::new(), endpoint: String::new(),
+            });
+            if !campaign2.ai_provider.is_empty() && campaign2.ai_provider != config.provider {
+                config.provider = campaign2.ai_provider.clone();
+                config.endpoint = String::new();
+                if let Some((saved_key, saved_ep, saved_model)) = db2.get_ai_provider_key(campaign2.company_id, &campaign2.ai_provider) {
+                    config.api_key = saved_key;
+                    if !saved_ep.is_empty() { config.endpoint = saved_ep; }
+                    if !saved_model.is_empty() && campaign2.ai_model.trim().is_empty() { config.model = saved_model; }
+                } else { config.api_key = String::new(); }
+            }
+            if !campaign2.ai_model.trim().is_empty() { config.model = campaign2.ai_model.clone(); }
+            if !campaign2.ai_prompt.trim().is_empty() { config.system_prompt = campaign2.ai_prompt.clone(); }
+            build_ai_fallback_chain(&db2, campaign2.company_id, &config)
+        }).await {
+            Ok(chain) => chain,
+            Err(_) => return,
+        };
+        let total_timeout_secs = if chain.iter().any(|c| c.provider.eq_ignore_ascii_case("gemini_web") || c.provider.eq_ignore_ascii_case("vps_ia")) { 180 } else { 45 };
+        // Numero finito de tentativas mesmo se a IA sempre devolver texto repetido.
+        for _ in 0..AI_VARIANTS_PER_PART {
+            let needs_more = AI_POOL_WORKERS.lock().map(|workers| {
+                workers.is_current(key) && AI_VARIANT_POOLS.lock().map(|pools| pools.get(&key).map_or(true, |p|
+                    p.parts.is_empty() || p.parts.iter().any(|v| v.len() < AI_VARIANTS_PER_PART)
+                )).unwrap_or(false)
+            }).unwrap_or(false);
+            if !needs_more { break; }
+            let base = base_with_name_placeholder(&campaign);
+            match timeout(Duration::from_secs(total_timeout_secs), AiEngine::rewrite_parts(&chain, &base)).await {
+                Ok(Ok(parts)) => {
+                    let Ok(workers) = AI_POOL_WORKERS.lock() else { break; };
+                    if !workers.is_current(key) { break; }
+                    if let Ok(mut pools) = AI_VARIANT_POOLS.lock() {
+                        pool_store(pools.entry(key).or_default(), parts);
+                    } else { break; }
+                }
+                Ok(Err(error)) => { eprintln!("[DISPATCHER IA] Falha ao preencher banco: {}", error); break; }
+                Err(_) => { eprintln!("[DISPATCHER IA] Tempo limite ao preencher banco"); break; }
+            }
+        }
+    });
+}
+
+fn pooled_ai_message(campaign: &crate::db::Campaign, contact_name: &str) -> Option<String> {
+    let key = (campaign.id, campaign_fingerprint(campaign));
+    let mut pools = AI_VARIANT_POOLS.lock().ok()?;
+    let parts = pool_take(pools.get_mut(&key)?, None)?;
+    Some(AiEngine::replace_contact_name(&parts.join("\n\n"), contact_name))
 }
 
 /// Monta a cadeia de reserva de IA:
@@ -755,7 +849,7 @@ async fn build_message(
     db_arc: Arc<Database>,
     campaign: crate::db::Campaign,
     next_contact: crate::db::Contact,
-    app_handle: Option<AppHandle>,
+    _app_handle: Option<AppHandle>,
 ) -> String {
     // Monta o texto base: saudação + corpo + despedida, com Spintax resolvido
     let campaign_text = {
@@ -782,71 +876,9 @@ async fn build_message(
     };
 
     if campaign.use_ai {
-        let db2 = db_arc.clone();
-        match spawn_blocking(move || db2.get_ai_config(campaign.company_id)).await {
-            Ok(global_config) => {
-                let mut config = if let Some(config) = global_config {
-                    config
-                } else {
-                    crate::db::AiConfig {
-                        company_id: campaign.company_id,
-                        provider: if !campaign.ai_provider.is_empty() { campaign.ai_provider.clone() } else { "groq".to_string() },
-                        model: if !campaign.ai_model.is_empty() { campaign.ai_model.clone() } else { "openai/gpt-oss-120b".to_string() },
-                        temperature: 0.7,
-                        system_prompt: String::new(),
-                        api_key: String::new(),
-                        endpoint: String::new(),
-                    }
-                };
-
-                // Se a campanha tiver provedor específico, prioriza o da campanha
-                if !campaign.ai_provider.is_empty() {
-                    if campaign.ai_provider != config.provider {
-                        config.provider = campaign.ai_provider.clone();
-                        config.endpoint = String::new();
-                        if let Some((saved_key, saved_ep, saved_model)) = db_arc.get_ai_provider_key(campaign.company_id, &campaign.ai_provider) {
-                            config.api_key = saved_key;
-                            if !saved_ep.is_empty() { config.endpoint = saved_ep; }
-                            if !saved_model.is_empty() && campaign.ai_model.trim().is_empty() { config.model = saved_model; }
-                        } else {
-                            config.api_key = String::new();
-                        }
-                    }
-                }
-                if !campaign.ai_model.trim().is_empty() {
-                    config.model = campaign.ai_model.clone();
-                }
-                if !campaign.ai_prompt.trim().is_empty() {
-                    config.system_prompt = campaign.ai_prompt.clone();
-                }
-
-                // Cadeia: provedor da campanha/global primeiro, depois os outros com chave salva
-                // (Groq 120b -> Groq 20b -> gemini_web -> Cerebras -> OpenRouter).
-                let chain = build_ai_fallback_chain(&db_arc, campaign.company_id, &config);
-                // Variações da IA reaproveitadas na campanha (poucas chamadas; nome não vai para a IA).
-                let ai_result = pooled_ai_message(&campaign, &chain, &next_contact.contact_name).await;
-                match ai_result {
-                    Ok(custom_msg) => custom_msg,
-                    Err(error) => {
-                        // Fallback resiliente: não quebra a campanha de 100 celulares. Usa a mensagem base com substituição de nome.
-                        eprintln!("[DISPATCHER IA] Falha na IA: {}. Aplicando fallback de mensagem original.", error);
-                        if let Some(ref handle) = app_handle {
-                            let _ = handle.emit("campaign-progress", CampaignProgressEvent {
-                                campaign_id: campaign.id,
-                                campaign_name: campaign.name.clone(),
-                                sent_count: campaign.sent_count,
-                                total_contacts: campaign.contacts_count,
-                                last_contact_phone: next_contact.phone.clone(),
-                                delay_used_ms: 0,
-                                status: format!("IA aviso (fallback ativo): {}", error),
-                            });
-                        }
-                        AiEngine::replace_contact_name(&campaign_text, &next_contact.contact_name)
-                    }
-                }
-            }
-            _ => AiEngine::replace_contact_name(&campaign_text, &next_contact.contact_name),
-        }
+        schedule_ai_pool(db_arc, campaign.clone());
+        pooled_ai_message(&campaign, &next_contact.contact_name)
+            .unwrap_or_else(|| AiEngine::replace_contact_name(&campaign_text, &next_contact.contact_name))
     } else {
         AiEngine::replace_contact_name(&campaign_text, &next_contact.contact_name)
     }
@@ -1056,7 +1088,7 @@ impl Dispatcher {
                     let prefetched = PREFETCHED_MESSAGES.lock().ok().and_then(|mut m| m.remove(&(campaign.id, next_contact.id)));
                     let message_to_send = match prefetched {
                         // Só vale se a campanha não mudou desde a pré-carga (texto, spintax, IA).
-                        Some((fingerprint, handle)) if fingerprint == campaign_fingerprint(&campaign) => match handle.await {
+                        Some((fingerprint, handle)) if fingerprint == campaign_fingerprint(&campaign) && handle.is_finished() => match handle.await {
                             Ok(m) => {
                                 println!("[DISPATCHER] Mensagem de {} já estava pronta (pré-carregada).", next_contact.phone);
                                 m
@@ -1690,6 +1722,38 @@ mod variant_pool_tests {
         assert_eq!(seen.len(), 4);
         // Banco esgotado: recomeça em vez de travar a campanha.
         assert!(pool_take(&mut pool, None).is_some());
+    }
+
+    #[test]
+    fn worker_e_unico_por_campanha_e_versao() {
+        let mut workers = super::PoolWorkers::default();
+        let a = (91, 1);
+        assert!(workers.start(a));
+        assert!(!workers.start(a));
+        assert!(workers.start((92, 1)));
+        assert!(workers.start((91, 2)));
+        assert!(!workers.is_current(a));
+        workers.finish(a);
+        assert!(!workers.entries.contains_key(&a));
+        workers.finish((91, 2));
+        assert!(!workers.start((91, 2)), "cooldown evita rajadas");
+    }
+
+    #[test]
+    fn banco_vazio_retorna_imediatamente_mesmo_com_worker_ativo() {
+        let mut pool = VariantPool::default();
+        let mut workers = super::PoolWorkers::default();
+        assert!(workers.start((93, 1)));
+        assert!(pool_take(&mut pool, None).is_none());
+        assert!(!workers.start((93, 1)));
+    }
+
+    #[test]
+    fn preenchimento_nao_marca_combinacao_como_usada() {
+        let mut pool = VariantPool::default();
+        super::pool_store(&mut pool, vec!["Oi {nome}".into(), "Corpo".into()]);
+        assert!(pool.used.is_empty());
+        assert_eq!(pool_take(&mut pool, None).unwrap(), vec!["Oi {nome}", "Corpo"]);
     }
 
     #[test]
