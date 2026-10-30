@@ -54,15 +54,23 @@ impl AiEngine {
             11. Escreva sempre para o próprio titular. Nunca peça para repassar a mensagem a terceiros nem fale da dívida como se fosse para outra pessoa.\n\
             12. Se o texto original oferecer um canal para negociar, contestar ou parar de receber mensagens, mantenha esse canal.";
 
-        let prompt = if !config.system_prompt.is_empty() {
+        // Prefixo fixo facilita o cache do Ollama para todas as partes.
+        let vps_system = "Reescreva em português brasileiro uma única mensagem de WhatsApp, apenas o texto final em um parágrafo. Preserve sentido, variáveis presentes exatamente como estão, credor, contatos, links, datas, prazos e SAIR. Não invente dados, acordos, condições, urgência ou consequências; consequências existentes devem manter as mesmas palavras sem agravar. Não use valores, parcelas, juros, multas ou descontos. Se houver valores, retire-os e indique o canal de negociação. Seja educado, sem ameaça, coação, exposição a terceiros ou exploração de vulneráveis; escreva ao titular. Mantenha canais de negociação, contestação e descadastro. Não acrescente saudação ou despedida; varie a redação, no máximo um emoji.";
+        let system = if config.provider.eq_ignore_ascii_case("vps_ia") { vps_system } else { default_system };
+        let prompt = if config.provider.eq_ignore_ascii_case("vps_ia") {
+            let variable_rule = if Self::normalize_name_variables(base_message).contains("{nome}") {
+                "Copie obrigatoriamente a variável {nome} exatamente no texto final.\n"
+            } else { "Não acrescente variáveis.\n" };
+            format!("{}\n\nInstruções adicionais da empresa (subordinadas às regras): {}\n\n{}Reescreva somente este trecho:\n{}", system, config.system_prompt, variable_rule, base_message)
+        } else if !config.system_prompt.is_empty() {
             format!(
                 "{}\n\nInstruções adicionais da empresa (as regras legais acima sempre prevalecem):\n{}\n\nReescreva a mensagem para o contato '{}':\n{}",
-                default_system, config.system_prompt, contact_name, base_message
+                system, config.system_prompt, contact_name, base_message
             )
         } else {
             format!(
                 "{}\n\nReescreva a mensagem para o contato '{}':\n{}",
-                default_system, contact_name, base_message
+                system, contact_name, base_message
             )
         };
 
@@ -92,9 +100,18 @@ impl AiEngine {
             }
         };
 
-        let sanitized = Self::sanitize_ai_response(&raw_response, contact_name);
-        Self::validate_rewrite(base_message, &sanitized)?;
-        Ok(sanitized)
+        // Valide os marcadores antes de substituir pelo nome real do contato.
+        let with_marker = Self::sanitize_ai_response(&raw_response, "{nome}");
+        let expected_marker = Self::normalize_name_variables(base_message).contains("{nome}");
+        let with_marker = if expected_marker && !contact_name.is_empty() && contact_name != "{nome}" {
+            with_marker.replace(contact_name, "{nome}")
+        } else { with_marker };
+        if !expected_marker && !contact_name.is_empty() && contact_name != "{nome}"
+            && !base_message.contains(contact_name) && with_marker.contains(contact_name) {
+            return Err("IA acrescentou o nome do contato".to_string());
+        }
+        Self::validate_rewrite(base_message, &with_marker)?;
+        Ok(Self::replace_contact_name(&with_marker, contact_name))
     }
 
     /// Reescreve cada parte (blocos separados por linha em branco) e devolve as partes reescritas.
@@ -139,12 +156,12 @@ impl AiEngine {
             } else {
                 20
             };
-            let attempt = tokio::time::timeout(
-                Duration::from_secs(max_secs),
-                Self::generate_message(cfg, base_message, contact_name),
-            )
-            .await
-            .unwrap_or_else(|_| Err(format!("tempo limite de {}s", max_secs)));
+            let attempt = if cfg.provider.eq_ignore_ascii_case("vps_ia") {
+                Self::generate_message(cfg, base_message, contact_name).await
+            } else {
+                tokio::time::timeout(Duration::from_secs(max_secs), Self::generate_message(cfg, base_message, contact_name))
+                    .await.unwrap_or_else(|_| Err(format!("tempo limite de {}s", max_secs)))
+            };
             match attempt {
                 Ok(text) => return Ok(text),
                 Err(e) => {
@@ -170,6 +187,54 @@ impl AiEngine {
             "conforme solicitado", "versão reescrita", "aqui está", "segue a mensagem", "reescrevi",
         ];
         let orig_lower = original.to_lowercase();
+        let orig_normalizado = Self::normalize_name_variables(original).to_lowercase();
+        let out_normalizado = Self::normalize_name_variables(out).to_lowercase();
+        if orig_normalizado.contains("{nome}") != out_normalizado.contains("{nome}") {
+            return Err("IA acrescentou ou removeu o nome do contato".to_string());
+        }
+        // Recusa classes sensíveis novas; respostas rejeitadas tentam o próximo provedor.
+        let groups: &[&[&str]] = &[
+            &["combinamos", "combinado", "acordamos", "acordado", "prometemos", "prometido"],
+            &["amanhã", "amanha"], &["hoje"], &["ontem"], &["segunda-feira"], &["terça-feira"],
+            &["quarta-feira"], &["quinta-feira"], &["sexta-feira"], &["sábado"], &["domingo"],
+            &["se pagar", "se fizer", "desde que", "somente se", "apenas se", "caso pague"],
+            &["desconto", "abatimento"],
+            &["quitada", "quitado", "quitamos", "liquidada", "liquidado", "paga", "pago", "pagamento confirmado"],
+            &["urgente", "última chance", "ultima chance", "só hoje", "somente hoje"],
+            &["negativação", "negativacao", "negativado", "protesto", "processo judicial", "corte", "visita", "perda de bens"],
+        ];
+        let has_term = |text: &str, term: &str| {
+            text.match_indices(term).any(|(i, _)| {
+                let before = text[..i].chars().next_back();
+                let after = text[i + term.len()..].chars().next();
+                !before.map_or(false, char::is_alphanumeric) && !after.map_or(false, char::is_alphanumeric)
+            })
+        };
+        for group in groups {
+            if group.iter().any(|term| has_term(&lower, term)) && !group.iter().any(|term| has_term(&orig_lower, term)) {
+                return Err("IA acrescentou compromisso, condição, prazo ou consequência".to_string());
+            }
+        }
+        let words = |s: &str| -> Vec<String> {
+            s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect()
+        };
+        let negation_original = if original.contains("SAIR") {
+            orig_lower.replace("não receber mais", "descadastrar").replace("não receber mensagens", "descadastrar")
+        } else { orig_lower.clone() };
+        let orig_words = words(&negation_original);
+        let negation_output = if original.contains("SAIR") {
+            lower.replace("não receber mais", "descadastrar").replace("não receber mensagens", "descadastrar")
+        } else { lower.clone() };
+        let out_words = words(&negation_output);
+        for neg in ["não", "nao", "nunca", "jamais"] {
+            if orig_words.iter().any(|w| w == neg) != out_words.iter().any(|w| w == neg) {
+                return Err("IA alterou uma negação".to_string());
+            }
+        }
+        let english = ["the", "you", "your", "please", "hello", "we", "can", "today", "thank", "with", "bonjour", "mon", "ami", "vous", "hola", "usted", "gracias"];
+        if out_words.iter().filter(|w| english.contains(&w.as_str()) && !orig_words.contains(w)).count() >= 2 {
+            return Err("IA respondeu fora do português".to_string());
+        }
         if let Some(m) = META.iter().find(|m| lower.contains(*m) && !orig_lower.contains(*m)) {
             return Err(format!("IA respondeu com recusa/explicação ('{}')", m));
         }
@@ -197,6 +262,12 @@ impl AiEngine {
 
             if is_protected && !Self::contains_exact_token(out, &out_tokens, w) {
                 return Err(format!("IA alterou ou removeu '{}'", w));
+            }
+        }
+        let orig_tokens: Vec<String> = raw_orig.iter().map(|w| Self::trim_token_punct(w).to_string()).collect();
+        for token in &out_tokens {
+            if (Self::is_date_token(token) || Self::is_number_token(token)) && !Self::contains_exact_token(original, &orig_tokens, token) {
+                return Err(format!("IA acrescentou dado numérico '{}'", token));
             }
         }
         if original.contains("SAIR") && !out.contains("SAIR") {
@@ -690,6 +761,26 @@ impl AiEngine {
 
     /// Requisição para OpenAI API (/v1/chat/completions) ou endpoints compatíveis
     async fn call_openai(client: &Client, config: &AiConfig, prompt: &str) -> Result<String, String> {
+        if !config.provider.eq_ignore_ascii_case("vps_ia") {
+            return Self::call_openai_raw(client, config, prompt).await;
+        }
+        // A tarefa mantém a fila mesmo se seu consumidor for cancelado.
+        static FILA: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>> = std::sync::OnceLock::new();
+        // A espera pode ser cancelada sem deixar uma requisição obsoleta na fila.
+        let mut ultimo = FILA.get_or_init(|| std::sync::Arc::new(tokio::sync::Mutex::new(None))).clone().lock_owned().await;
+        let client = client.clone();
+        let config = config.clone();
+        let prompt = prompt.to_string();
+        tokio::spawn(async move {
+            if let Some(last) = *ultimo {
+                tokio::time::sleep_until(last + Duration::from_millis(2100)).await;
+            }
+            *ultimo = Some(tokio::time::Instant::now());
+            Self::call_openai_raw(&client, &config, &prompt).await
+        }).await.map_err(|e| format!("Falha na fila da VPS: {}", e))?
+    }
+
+    async fn call_openai_raw(client: &Client, config: &AiConfig, prompt: &str) -> Result<String, String> {
         let endpoint = if config.endpoint.is_empty() {
             "https://api.openai.com/v1/chat/completions".to_string()
         } else if !config.endpoint.contains("/chat/completions") && !config.endpoint.contains("/v1") {
@@ -702,7 +793,7 @@ impl AiEngine {
 
         let model = if config.model.is_empty() { "gpt-4o-mini".to_string() } else { config.model.clone() };
 
-        let payload = json!({
+        let mut payload = json!({
             "model": model,
             "temperature": config.temperature,
             "messages": [
@@ -714,6 +805,9 @@ impl AiEngine {
             ]
         });
 
+        if config.provider.eq_ignore_ascii_case("vps_ia") {
+            payload["max_tokens"] = json!(512);
+        }
         let mut req = client.post(&endpoint).json(&payload);
 
         // Headers recomendados para OpenRouter (evita rate limits e prioriza free models)
@@ -2443,5 +2537,42 @@ mod has_money_tests {
         let t0 = std::time::Instant::now();
         AiEngine::enforce_gemini_web_rate_limit(&mut last, min_wait).await;
         assert!(t0.elapsed() >= std::time::Duration::from_millis(70));
+    }
+}
+
+#[cfg(test)]
+mod seguranca_reescrita_tests {
+    use super::AiEngine;
+
+    #[test]
+    fn recusa_nome_inventado_ou_removido() {
+        assert!(AiEngine::validate_rewrite("Olá, tudo bem?", "Oi {nome}, tudo bem?").is_err());
+        assert!(AiEngine::validate_rewrite("Olá {nome}, tudo bem?", "Oi, tudo bem?").is_err());
+        assert!(AiEngine::validate_rewrite("Olá {nome}, tudo bem?", "Oi {nome}, tudo certo?").is_ok());
+    }
+
+    #[test]
+    fn recusa_compromisso_condicao_prazo_e_dados_inventados() {
+        let original = "Temos uma condição especial para regularizar sua pendência.";
+        for output in [
+            "Conforme combinamos, temos uma opção diferenciada para regularizar sua pendência.",
+            "Temos uma condição especial para regularizar sua pendência até amanhã.",
+            "Temos uma condição especial se pagar hoje.",
+            "Temos uma condição especial com desconto para sua pendência.",
+            "Temos uma condição especial para regularizar sua pendência em 20/10/2026.",
+        ] {
+            assert!(AiEngine::validate_rewrite(original, output).is_err(), "aceitou: {}", output);
+        }
+        assert!(AiEngine::validate_rewrite("Conforme combinamos, fale conosco hoje.", "Como combinamos, entre em contato hoje.").is_ok());
+    }
+
+    #[test]
+    fn recusa_inversao_e_texto_estrangeiro() {
+        assert!(AiEngine::validate_rewrite("Não podemos negociar agora.", "Podemos negociar agora.").is_err());
+        assert!(AiEngine::validate_rewrite("Podemos conversar?", "We can talk to you today.").is_err());
+        assert!(AiEngine::validate_rewrite("Temos uma condição especial para regularizar sua pendência.", "Sua dívida foi quitada.").is_err());
+        assert!(AiEngine::validate_rewrite("Podemos conversar?", "Bonjour mon ami.").is_err());
+        assert!(AiEngine::validate_rewrite("Podemos conversar hoje?", "Você pode falar conosco hoje?").is_ok());
+        assert!(AiEngine::validate_rewrite("Para não receber mais mensagens, envie SAIR.", "Para não receber mais mensagens, envie SAIR.").is_ok());
     }
 }
