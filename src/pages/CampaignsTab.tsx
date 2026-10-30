@@ -1625,13 +1625,13 @@ function AiFields({
     <div className="space-y-4">
       <div className="flex items-start justify-between gap-4 rounded-lg border border-border px-3.5 py-3">
         <div className="min-w-0">
-          <p className="text-[0.8125rem] font-medium text-primary">Reescrever mensagens com IA</p>
+          <p id={`${uid}-ai-title`} className="text-[0.8125rem] font-medium text-primary">Reescrever mensagens com IA</p>
           <p className="text-[0.75rem] text-tertiary">
             A IA reescreve cada parte da mensagem com outras palavras para cada contato, o que reduz o risco de bloqueio por spam. As versões ficam
             prontas aos poucos; até lá, ou se a IA falhar, sai o texto com as variações.
           </p>
         </div>
-        <Toggle checked={value.useAI} onChange={(v) => onChange({ useAI: v })} />
+        <Toggle checked={value.useAI} onChange={(v) => onChange({ useAI: v })} ariaLabelledby={`${uid}-ai-title`} />
       </div>
 
       {value.useAI && (
@@ -1904,10 +1904,10 @@ function MessageFields({
       <div className="rounded-lg border border-border">
         <div className="flex items-center justify-between gap-3 px-3.5 py-3">
           <div className="min-w-0">
-            <p className="text-[0.8125rem] font-medium text-primary">Variações automáticas (spintax)</p>
+            <p id={`${uid}-spin-title`} className="text-[0.8125rem] font-medium text-primary">Variações automáticas (spintax)</p>
             <p className="text-[0.75rem] text-tertiary">Cada contato recebe uma combinação diferente do texto. Desligadas, as chaves sairiam no texto.</p>
           </div>
-          <Toggle size="sm" checked={value.useSpintax} onChange={(v) => onChange({ useSpintax: v })} />
+          <Toggle size="sm" checked={value.useSpintax} onChange={(v) => onChange({ useSpintax: v })} ariaLabelledby={`${uid}-spin-title`} />
         </div>
         <button
           type="button"
@@ -4084,6 +4084,31 @@ function initialForm(c: Campaign | null): FormState {
   };
 }
 
+// Modelos prontos dentro das regras: sem valores, sem links, com o nome e a opção de descadastro.
+export const MESSAGE_TEMPLATES: { id: string; label: string; greeting: string; body: string; closing: string }[] = [
+  {
+    id: "condicao",
+    label: "Condição especial",
+    greeting: "{Olá|Oi|Bom dia} {nome}, tudo bem?",
+    body: "Identificamos uma pendência no seu cadastro e temos uma condição especial para regularizar. {Podemos conversar por aqui|Posso te explicar por aqui}?",
+    closing: `Atenciosamente, {Equipe REALESS|Setor Financeiro}. ${OPT_OUT_TEXT}`,
+  },
+  {
+    id: "cadastro",
+    label: "Atualização de cadastro",
+    greeting: "{Olá|Oi} {nome}, tudo bem?",
+    body: "Estamos atualizando os contatos dos nossos clientes. {Este número ainda é seu|Você ainda usa este número}? Se puder, responda esta mensagem.",
+    closing: `Obrigado, {Equipe REALESS|Setor Financeiro}. ${OPT_OUT_TEXT}`,
+  },
+  {
+    id: "retorno",
+    label: "Retorno de contato",
+    greeting: "{Olá|Oi|Bom dia} {nome}!",
+    body: "Tentamos falar com você sobre o seu cadastro conosco. {Qual o melhor horário|Quando fica melhor} para conversarmos?",
+    closing: `Atenciosamente, {Equipe REALESS|Setor Financeiro}. ${OPT_OUT_TEXT}`,
+  },
+];
+
 const autoName = () =>
   `Campanha ${new Date().toLocaleDateString("pt-BR")} ${new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}`;
 
@@ -4115,6 +4140,7 @@ function CampaignWizard({
   const [devicesLoading, setDevicesLoading] = useState(false);
   const [devicesError, setDevicesError] = useState("");
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [templateAsk, setTemplateAsk] = useState<(typeof MESSAGE_TEMPLATES)[number] | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -4124,6 +4150,7 @@ function CampaignWizard({
     setShowErrors({});
     setSaveError("");
     setConfirmDiscard(false);
+    setTemplateAsk(null);
     // Reinicia só ao abrir ou trocar de campanha (a lista atualiza ao vivo durante o disparo).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, campaign?.id]);
@@ -4230,6 +4257,17 @@ function CampaignWizard({
 
   const fullMessage = joinMessage(form.greeting, form.body, form.closing);
   const partCount = messagePartCount(form);
+  // Modelo: aplica direto se o texto ainda é o padrão; senão confirma antes de trocar.
+  const applyTemplate = (t: (typeof MESSAGE_TEMPLATES)[number]) => patch({ greeting: t.greeting, body: t.body, closing: t.closing });
+  const pickTemplate = (t: (typeof MESSAGE_TEMPLATES)[number]) => {
+    const blank = initialForm(null);
+    const untouched =
+      (!form.greeting.trim() && !form.body.trim() && !form.closing.trim()) ||
+      (form.greeting === blank.greeting && form.body === blank.body && form.closing === blank.closing) ||
+      MESSAGE_TEMPLATES.some((x) => x.greeting === form.greeting && x.body === form.body && x.closing === form.closing);
+    if (untouched) applyTemplate(t);
+    else setTemplateAsk(t);
+  };
   const invalidSteps = (Object.keys(showErrors) as StepId[]).filter((id) => showErrors[id] && errors[id]);
   const devStats = deviceSelectionStats(devices, form.deviceIds);
   const providerName = form.aiProvider ? getAiProviderInfo(form.aiProvider)?.name || form.aiProvider : "Padrão da empresa";
@@ -4315,6 +4353,19 @@ function CampaignWizard({
         {step === "message" && (
           <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,22rem)]">
             <FormSection title="Mensagem" description="Saudação, corpo e encerramento saem como mensagens seguidas, nesta ordem.">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="mr-1 text-[0.75rem] text-secondary">Começar de um modelo:</span>
+                {MESSAGE_TEMPLATES.map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    onClick={() => pickTemplate(t)}
+                    className="rounded-md border border-border px-2 py-1 text-[0.75rem] text-secondary transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text-primary)] cursor-pointer"
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
               <MessageFields
                 value={form}
                 onChange={(p) => patch(p)}
@@ -4419,6 +4470,19 @@ function CampaignWizard({
         )}
       </div>
     </Modal>
+    <ConfirmDialog
+      isOpen={templateAsk !== null}
+      title="Trocar o texto pelo modelo?"
+      confirmLabel="Usar o modelo"
+      danger={false}
+      onConfirm={() => {
+        if (templateAsk) applyTemplate(templateAsk);
+        setTemplateAsk(null);
+      }}
+      onClose={() => setTemplateAsk(null)}
+    >
+      A saudação, a mensagem e o encerramento que você escreveu serão substituídos pelo modelo “{templateAsk?.label}”.
+    </ConfirmDialog>
     <ConfirmDialog
       isOpen={confirmDiscard}
       title="Descartar alterações?"
