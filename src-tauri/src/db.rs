@@ -3250,7 +3250,10 @@ impl Database {
             "SELECT ApiKey, Endpoint, Model FROM ESF_AiProviderKey WHERE CompanyId = ?1 AND Provider = ?2;",
             params![company_id, provider.to_lowercase()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).ok()
+        ).ok().map(|(key, endpoint, model): (String, String, String)| {
+            let endpoint = if provider.eq_ignore_ascii_case("vps_ia") { crate::hub_client::endpoint_vps_https(&endpoint) } else { endpoint };
+            (key, endpoint, model)
+        })
     }
 
     pub fn save_ai_provider_key(&self, company_id: i32, provider: &str, api_key: &str, endpoint: &str, model: &str) -> Result<(), String> {
@@ -4152,6 +4155,19 @@ mod agent_restore_tests {
 #[cfg(test)]
 mod vps_ia_sync_tests {
     use super::Database;
+    #[test]
+    fn leitura_migra_http_sem_impedir_sincronizacao() {
+        let path = std::env::temp_dir().join(format!("esfera_vps_https_{}.db", uuid::Uuid::new_v4()));
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let antiga = ("token", "http://187.77.243.224:11435/v1/chat/completions", "model");
+        assert!(db.sync_vps_ia_from_hub(1, Some(antiga)).unwrap());
+        assert_eq!(db.get_ai_provider_key(1, "vps_ia").unwrap().1, "https://187.77.243.224:11435/v1/chat/completions");
+        assert!(db.sync_vps_ia_from_hub(1, Some(("novo", antiga.1, "model"))).unwrap());
+        assert_eq!(db.get_ai_provider_key(1, "vps_ia").unwrap().0, "novo");
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn sincroniza_rotacao_e_remocao_preservando_edicao_local() {
         let path = std::env::temp_dir().join(format!("esfera_vps_sync_{}.db", uuid::Uuid::new_v4()));

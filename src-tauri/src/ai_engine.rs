@@ -768,8 +768,13 @@ impl AiEngine {
         static FILA: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>> = std::sync::OnceLock::new();
         // A espera pode ser cancelada sem deixar uma requisição obsoleta na fila.
         let mut ultimo = FILA.get_or_init(|| std::sync::Arc::new(tokio::sync::Mutex::new(None))).clone().lock_owned().await;
-        let client = client.clone();
-        let config = config.clone();
+        let mut config = config.clone();
+        config.endpoint = crate::hub_client::endpoint_vps_https(&config.endpoint);
+        let client = if crate::hub_client::usa_certificado_vps(&config.endpoint) {
+            crate::hub_client::client_vps(Duration::from_secs(90))?
+        } else {
+            client.clone()
+        };
         let prompt = prompt.to_string();
         tokio::spawn(async move {
             if let Some(last) = *ultimo {
@@ -2324,7 +2329,7 @@ mod gemini_web_live_tests {
             model: "qwen3:4b-instruct".to_string(),
             temperature: 0.8,
             api_key: token,
-            endpoint: "http://187.77.243.224:11435/v1/chat/completions".to_string(),
+            endpoint: "https://187.77.243.224:11435/v1/chat/completions".to_string(),
             system_prompt: String::new(),
         };
         let base = "Olá {nome}, tudo bem? Aqui é da Realess.\n\nTemos uma condição especial para regularizar sua pendência.\n\nPodemos conversar hoje?";
