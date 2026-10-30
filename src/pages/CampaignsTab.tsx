@@ -21,6 +21,7 @@ import { useAuth } from "../context/AuthContext";
 import { listen } from "@tauri-apps/api/event";
 import StatCard from "../components/ui/StatCard";
 import PageHeader from "../components/ui/PageHeader";
+import { toast } from "../components/ui/ToastContainer";
 
 // ============================================================
 // shared
@@ -2679,6 +2680,11 @@ function handleProgress(p: ProgressPayload) {
   const withDelay = p.status === "running" || p.status === "send_error";
   appendCampaignLog(p.campaign_id, d.level, d.text, withDelay ? p.delay_used_ms || undefined : undefined);
   if (d.live) setLiveState(p.campaign_id, { ...d.live, at: Date.now() });
+  // Aviso no app inteiro: o operador pode estar em outra tela quando a campanha para.
+  const who = p.campaign_name ? `${p.campaign_name}: ` : "";
+  if (d.live?.kind === "auto_paused") toast.error("Campanha pausada pelo sistema", { description: `${who}${d.live.text}`, duration: 0 });
+  else if (d.live?.kind === "parts_over") toast.error("Mensagem maior que o teto da rede", { description: `${who}${d.live.text}`, duration: 0 });
+  else if (d.live?.kind === "completed") toast.success("Campanha concluída", p.campaign_name || undefined);
 }
 
 // Um ouvinte só, para o app inteiro: a atividade continua chegando com a tela de Campanhas fechada.
@@ -2862,6 +2868,7 @@ function contactBucket(status: string): Exclude<ContactFilter, "all"> {
 export function exportCampaignContacts(campaign: Campaign, contacts: Contact[]) {
   const stamp = new Date().toISOString().slice(0, 10);
   const safe = campaign.name.replace(/[\\/:*?"<>|]+/g, " ").trim() || `campanha-${campaign.id}`;
+  toast.success("Relatório exportado", `${safe} - ${stamp}.csv, na pasta de downloads.`);
   downloadCsv(
     `${safe} - ${stamp}.csv`,
     ["Nome", "Telefone", "Situação", "Enviado em"],
@@ -3864,7 +3871,7 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
     setTestResult(null);
     try {
       const rewritten = await api<string>("rewrite_message_ai", {
-        message: "Olá {nome}! Seu boleto vence hoje. Pague via PIX financeiro@empresa.com ou no link https://empresa.com/fatura",
+        message: "Olá {nome}, tudo bem? Temos uma condição especial para regularizar o seu cadastro. Podemos conversar?",
         contactName: "Mariana",
         companyId: selectedCompanyId,
         provider,
@@ -3948,7 +3955,7 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
                     type={showKey ? "text" : "password"}
                     value={apiKey}
                     onChange={(e) => setApiKey(e.target.value)}
-                    placeholder={info?.keyPlaceholder || "sk-..."}
+                    placeholder={savedProviderKeys[provider] ? "Chave salva (não é exibida). Deixe em branco para manter." : info?.keyPlaceholder || "sk-..."}
                     autoComplete="off"
                     spellCheck={false}
                     className="input-with-icon-right font-mono"
@@ -3968,7 +3975,7 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <p className="text-[0.8125rem] font-medium text-primary">Testar conexão</p>
-                  <p className="text-[0.75rem] text-tertiary">Envia uma mensagem de exemplo com os dados acima, sem salvar.</p>
+                  <p className="text-[0.75rem] text-tertiary">Reescreve uma frase de exemplo com os dados acima, sem salvar.</p>
                 </div>
                 <Button size="sm" variant="secondary" icon={<PlugZap size={13} />} onClick={handleTest} loading={testingAi}>
                   {testingAi ? "Testando…" : "Testar"}
@@ -3991,7 +3998,7 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
               label="Temperatura"
               htmlFor="ai-temp"
               aside={<span className="tabular-nums text-primary">{temperature.toFixed(2)}</span>}
-              hint="Valores entre 0,3 e 0,7 mantêm links e números intactos. Valores altos deixam o texto mais criativo."
+              hint="Entre 0,3 e 0,7 a IA mantém números, datas e o SAIR como estão. Valores altos deixam o texto mais criativo (e mais arriscado)."
             >
               <input id="ai-temp" type="range" min="0" max="1" step="0.05" value={temperature} onChange={(e) => setTemperature(Number(e.target.value))} className="w-full" />
             </Field>
@@ -4569,6 +4576,7 @@ function CampaignDetail({
   const [network, setNetwork] = useState<NetworkStatusInfo | null>(null);
   const [devices, setDevices] = useState<Device[]>([]);
   const [devicesLoading, setDevicesLoading] = useState(true);
+  const [devicesError, setDevicesError] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<"" | "start" | "pause" | "stop" | "retry" | "reset" | "save" | "saveDevices">("");
   const [savedFlash, setSavedFlash] = useState<"" | "settings" | "devices">("");
@@ -4644,8 +4652,9 @@ function CampaignDetail({
     try {
       const data = await api<Device[]>("get_devices", { companyId: campaign.companyId });
       setDevices(data || []);
-    } catch {
-      /* mantém lista */
+      setDevicesError("");
+    } catch (e) {
+      setDevicesError(String(e));
     } finally {
       setDevicesLoading(false);
     }
@@ -4875,6 +4884,7 @@ function CampaignDetail({
       onUpdateCampaign(buildUpdated({ status: "running" }));
       onLog("info", resumed ? "Disparo retomado." : "Campanha iniciada no motor de disparo.");
       if (!withinSendWindow()) onLog("warning", `Fora do horário de envio: o primeiro envio sai ${formatWhen(nextWindowOpen())}.`);
+      toast.success(resumed ? "Disparo retomado" : "Disparo iniciado", withinSendWindow() ? undefined : `Fora do horário: o primeiro envio sai ${formatWhen(nextWindowOpen())}.`);
     } catch (e) {
       setError(String(e));
       onRefresh();
@@ -5289,15 +5299,30 @@ function CampaignDetail({
               {chipProblems.join(" · ")}. Cadastre exatamente um chip em cada aparelho (Dispositivos); senão a campanha pausa quando chegar a vez dele.
             </InlineAlert>
           )}
-          <DevicePicker
-            devices={devices}
-            loading={devicesLoading && devices.length === 0}
-            selected={draft.deviceIds}
-            onChange={(ids) => patch({ deviceIds: ids })}
-            onRefresh={loadDevices}
-            refreshing={devicesLoading}
-            listClassName="max-h-[min(520px,55vh)]"
-          />
+          {devicesError && devices.length === 0 ? (
+            <InlineAlert
+              tone="danger"
+              icon={<AlertCircle size={15} />}
+              title="Não foi possível carregar os aparelhos"
+              action={
+                <Button size="sm" variant="secondary" icon={<RefreshCw size={13} />} onClick={loadDevices} loading={devicesLoading}>
+                  Tentar de novo
+                </Button>
+              }
+            >
+              {devicesError}
+            </InlineAlert>
+          ) : (
+            <DevicePicker
+              devices={devices}
+              loading={devicesLoading && devices.length === 0}
+              selected={draft.deviceIds}
+              onChange={(ids) => patch({ deviceIds: ids })}
+              onRefresh={loadDevices}
+              refreshing={devicesLoading}
+              listClassName="max-h-[min(520px,55vh)]"
+            />
+          )}
           <StickyBar>
             <p className="text-[0.8125rem] text-secondary">
               <strong className="text-primary tabular-nums">{devStats.selectedCount}</strong> selecionados ·{" "}
@@ -5829,11 +5854,13 @@ export default function CampaignsTab() {
         await api("pause_campaign", { campaignId: c.id });
         upsertCampaign({ ...c, status: "paused" });
         appendLog(c.id, "info", "Campanha pausada pelo operador.");
+        toast.info("Campanha pausada", c.name);
       } else {
         await api("start_campaign", { campaignId: c.id });
         clearLiveState(c.id);
         upsertCampaign({ ...c, status: "running" });
         appendLog(c.id, "info", "Disparo retomado.");
+        toast.success("Disparo retomado", withinSendWindow() ? c.name : `${c.name}: fora do horário, o primeiro envio sai ${formatWhen(nextWindowOpen())}.`);
       }
     } catch (e) {
       setListError(`${c.name}: ${String(e)}`);
@@ -5915,6 +5942,8 @@ export default function CampaignsTab() {
               setImportForId(saved.id);
             }
             appendLog(saved.id, "info", meta.created ? "Campanha criada." : "Alterações da campanha salvas.");
+            if (meta.openAfter) toast.success("Campanha criada", "Agora importe a lista de contatos.");
+            else toast.success(meta.created ? "Rascunho salvo" : "Alterações salvas", saved.name);
             refreshCampaigns();
           }}
         />
@@ -5936,6 +5965,7 @@ export default function CampaignsTab() {
           if (s.optedOut) parts.push(`${formatNumber(s.optedOut)} descadastrados não recebem`);
           if (s.alreadyInCampaign) parts.push(`${formatNumber(s.alreadyInCampaign)} já estavam na campanha`);
           appendLog(importCampaign.id, "info", `Lista importada: ${parts.join(" · ")}.`);
+          toast.success("Lista importada", parts.join(" · "));
         }}
       />
 
@@ -6216,6 +6246,9 @@ function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () =>
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [search, setSearch] = useState("");
+  const [removeTarget, setRemoveTarget] = useState<string | null>(null);
+  const [removing, setRemoving] = useState(false);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -6251,15 +6284,25 @@ function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () =>
     }
   };
 
+  // Remover devolve o número a todas as campanhas: só com confirmação.
   const remove = async (phone: string) => {
+    setRemoving(true);
     try {
       await api("remove_opt_out", { companyId, phone });
       setMsg({ ok: true, text: `Número ${formatOptOutPhone(phone)} removido do descadastro.` });
       load();
     } catch (e) {
       setMsg({ ok: false, text: String(e) });
+    } finally {
+      setRemoving(false);
+      setRemoveTarget(null);
     }
   };
+
+  const searchKey = search.replace(/\D/g, "") ? optOutKey(search) : "";
+  const visibleItems = search.trim()
+    ? items.filter((it) => (searchKey && it.phone.includes(searchKey)) || (it.reason || "").toLowerCase().includes(search.trim().toLowerCase()))
+    : items;
 
   const resolveReview = async (reviewId: number) => {
     const phone = (reviewPhones[reviewId] || "").trim();
@@ -6351,7 +6394,8 @@ function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () =>
                       value={reviewPhones[rev.id] || ""}
                       onChange={(e) => setReviewPhones((prev) => ({ ...prev, [rev.id]: e.target.value }))}
                       placeholder="DDD + número (ex.: 75 98805-2539)"
-                      className="h-8 flex-1 rounded-md border border-border bg-primary px-2.5 font-mono text-[0.75rem] text-primary"
+                      aria-label={`Número de quem pediu SAIR (${rev.title || "remetente sem número"})`}
+                      className="!h-8 !w-auto min-w-[12rem] flex-1 font-mono !text-[0.75rem]"
                     />
                     <Button
                       size="sm"
@@ -6378,9 +6422,11 @@ function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () =>
         </div>
 
         <div className="rounded-lg border border-border">
-          <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-            <span className="text-[0.8125rem] font-medium text-primary">Lista</span>
-            <span className="text-[0.75rem] tabular-nums text-tertiary">{items.length}</span>
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2.5">
+            <span className="text-[0.8125rem] font-medium text-primary">
+              Lista <span className="ml-1 text-[0.75rem] font-normal tabular-nums text-tertiary">{items.length}</span>
+            </span>
+            {items.length > 5 && <SearchInput value={search} onChange={setSearch} placeholder="Buscar número" className="w-48" />}
           </div>
           {loading ? (
             <div className="space-y-2 p-4">
@@ -6389,9 +6435,11 @@ function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () =>
             </div>
           ) : items.length === 0 ? (
             <p className="px-4 py-6 text-center text-[0.8125rem] text-tertiary">Ninguém descadastrado ainda.</p>
+          ) : visibleItems.length === 0 ? (
+            <p className="px-4 py-6 text-center text-[0.8125rem] text-tertiary">Nenhum número corresponde à busca.</p>
           ) : (
             <ul className="max-h-72 divide-y divide-[var(--color-border)] overflow-y-auto custom-scrollbar">
-              {items.map((it) => (
+              {visibleItems.map((it) => (
                 <li key={it.phone} className="flex items-center justify-between gap-3 px-4 py-2">
                   <div className="min-w-0">
                     <p className="font-mono text-[0.8125rem] text-primary">{formatOptOutPhone(it.phone)}</p>
@@ -6402,7 +6450,7 @@ function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () =>
                     </p>
                   </div>
                   {canRemove && (
-                    <Button variant="ghost" size="sm" icon={<Trash2 size={13} />} onClick={() => remove(it.phone)} aria-label={`Remover ${it.phone}`}>
+                    <Button variant="ghost" size="sm" icon={<Trash2 size={13} />} onClick={() => setRemoveTarget(it.phone)} aria-label={`Remover ${formatOptOutPhone(it.phone)} do descadastro`}>
                       Remover
                     </Button>
                   )}
@@ -6411,6 +6459,18 @@ function OptOutModal({ companyId, onClose }: { companyId: number; onClose: () =>
             </ul>
           )}
         </div>
+
+        <ConfirmDialog
+          isOpen={removeTarget !== null}
+          title="Remover do descadastro?"
+          confirmLabel="Remover"
+          loading={removing}
+          onConfirm={() => removeTarget && remove(removeTarget)}
+          onClose={() => setRemoveTarget(null)}
+        >
+          O número <strong className="font-mono text-primary">{removeTarget ? formatOptOutPhone(removeTarget) : ""}</strong> volta a poder receber mensagens de
+          todas as campanhas. Faça isso só se a própria pessoa pediu para voltar a receber. A remoção fica registrada no histórico.
+        </ConfirmDialog>
 
         {removedAudits.length > 0 && (
           <div className="rounded-lg border border-border px-4 py-2.5">
