@@ -204,14 +204,17 @@ export function useNetworkStatus(enabled = true) {
   });
 }
 
-/** Lista completa de descadastros da empresa. Pode ser grande: atualiza a cada 2 minutos. */
+/**
+ * Lista completa de descadastros da empresa. Pode ter milhares de números, então só é relida
+ * a cada 5 minutos (ou no botão Atualizar). O ideal é um comando de contagem leve (hoje/total).
+ */
 export function useOptOuts(companyId: number | null) {
   return useQuery({
     queryKey: keys.optOuts(companyId ?? 0),
     queryFn: () => api<OptOutEntry[]>("list_opt_outs", { companyId: companyId ?? 0 }),
     enabled: companyId != null,
-    staleTime: 60_000,
-    refetchInterval: 120_000,
+    staleTime: 120_000,
+    refetchInterval: 300_000,
   });
 }
 
