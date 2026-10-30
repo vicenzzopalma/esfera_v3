@@ -6,6 +6,7 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { Outlet, useLocation } from "react-router-dom";
 import { AlertTriangle, RotateCcw } from "lucide-react";
+import { useAuth } from "../context/AuthContext";
 import Sidebar from "./Sidebar";
 import Header from "./Header";
 import StatusBar from "./StatusBar";
@@ -80,6 +81,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, { error: Error 
 
 export default function Layout() {
   const location = useLocation();
+  const { selectedCompanyId } = useAuth();
   return (
     <div className="min-h-screen bg-primary text-primary relative font-sans overflow-x-hidden">
       <Sidebar />
@@ -90,7 +92,8 @@ export default function Layout() {
 
         <main className="flex-1 px-6 py-6 pb-14 overflow-x-hidden min-w-0">
           <div className="max-w-[1440px] mx-auto w-full space-y-6 min-w-0">
-            <ErrorBoundary resetKey={location.pathname}>
+            {/* key: ao trocar de empresa a página é recriada — nada da empresa anterior fica na tela */}
+            <ErrorBoundary key={selectedCompanyId ?? "sem-empresa"} resetKey={location.pathname}>
               <Outlet />
             </ErrorBoundary>
           </div>
