@@ -1,18 +1,19 @@
 import React, { useState, useEffect } from "react";
 import { User, DeviceWithActiveUser } from "../types";
 import { UserCheck, UserX, ShieldAlert, Smartphone, CheckCircle, Clock } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from "../tauri";
 import Modal from "./ui/Modal";
 import Button from "./ui/Button";
 import Field, { FormSection } from "./ui/Field";
-import { inputCls } from "./devices/deviceUi";
+import { inputCls, errorText } from "./devices/deviceUi";
 
 interface DeviceAssignmentModalProps {
   isOpen: boolean;
   onClose: () => void;
   device: DeviceWithActiveUser | null;
   users: User[];
-  token: string;
+  // Mantido por compatibilidade: as chamadas usam a sessão atual do app (api).
+  token?: string;
   onRefresh: () => void;
 }
 
@@ -21,7 +22,6 @@ export const DeviceAssignmentModal: React.FC<DeviceAssignmentModalProps> = ({
   onClose,
   device,
   users,
-  token,
   onRefresh,
 }) => {
   const [selectedUserId, setSelectedUserId] = useState<number | "">("");
@@ -29,15 +29,17 @@ export const DeviceAssignmentModal: React.FC<DeviceAssignmentModalProps> = ({
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
 
+  // Só zera o formulário ao abrir ou trocar de aparelho: a atualização periódica da lista
+  // cria um objeto novo e antes apagava a escolha e a mensagem de sucesso.
+  const deviceSerial = device?.serial;
+  const assignedUserId = device?.assignedUserId;
   useEffect(() => {
-    if (device?.assignedUserId) {
-      setSelectedUserId(device.assignedUserId);
-    } else {
-      setSelectedUserId("");
-    }
     setMessage(null);
     setReason("");
-  }, [device]);
+  }, [deviceSerial, isOpen]);
+  useEffect(() => {
+    setSelectedUserId(assignedUserId || "");
+  }, [deviceSerial, assignedUserId, isOpen]);
 
   if (!isOpen || !device) return null;
 
@@ -49,15 +51,14 @@ export const DeviceAssignmentModal: React.FC<DeviceAssignmentModalProps> = ({
     setLoading(true);
     setMessage(null);
     try {
-      await invoke("set_device_responsible_collaborator", {
-        token,
+      await api("set_device_responsible_collaborator", {
         deviceSerial: device.serial,
         userId: Number(selectedUserId),
       });
-      setMessage({ text: "Colaborador atribuído como responsável com sucesso!", type: "success" });
+      setMessage({ text: "Responsável salvo.", type: "success" });
       onRefresh();
     } catch (err: any) {
-      setMessage({ text: String(err), type: "error" });
+      setMessage({ text: errorText(err, "Não foi possível salvar o responsável."), type: "error" });
     } finally {
       setLoading(false);
     }
@@ -69,16 +70,15 @@ export const DeviceAssignmentModal: React.FC<DeviceAssignmentModalProps> = ({
     setMessage(null);
     try {
       const userIdToRemove = device.assignedUserId || Number(selectedUserId);
-      await invoke("remove_device_responsible_collaborator", {
-        token,
+      await api("remove_device_responsible_collaborator", {
         deviceSerial: device.serial,
         userId: userIdToRemove,
       });
-      setMessage({ text: "Vínculo de responsabilidade removido.", type: "success" });
+      setMessage({ text: "Responsável desvinculado.", type: "success" });
       setSelectedUserId("");
       onRefresh();
     } catch (err: any) {
-      setMessage({ text: String(err), type: "error" });
+      setMessage({ text: errorText(err, "Não foi possível desvincular o responsável."), type: "error" });
     } finally {
       setLoading(false);
     }
@@ -88,15 +88,14 @@ export const DeviceAssignmentModal: React.FC<DeviceAssignmentModalProps> = ({
     setLoading(true);
     setMessage(null);
     try {
-      await invoke("request_device_access", {
-        token,
+      await api("request_device_access", {
         deviceSerial: device.serial,
-        reason: reason || "Solicitação de acesso direto pelo painel de dispositivos",
+        reason: reason || "Pedido de acesso feito na tela de aparelhos",
       });
-      setMessage({ text: "Solicitação enviada ao Gestor com sucesso!", type: "success" });
+      setMessage({ text: "Pedido enviado ao gestor.", type: "success" });
       onRefresh();
     } catch (err: any) {
-      setMessage({ text: String(err), type: "error" });
+      setMessage({ text: errorText(err, "Não foi possível enviar o pedido."), type: "error" });
     } finally {
       setLoading(false);
     }
@@ -120,7 +119,7 @@ export const DeviceAssignmentModal: React.FC<DeviceAssignmentModalProps> = ({
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      title="Responsável pelo celular"
+      title="Responsável pelo aparelho"
       size="md"
       footer={
         <Button variant="secondary" size="sm" onClick={onClose}>
@@ -134,7 +133,7 @@ export const DeviceAssignmentModal: React.FC<DeviceAssignmentModalProps> = ({
             <Smartphone size={18} />
           </div>
           <div className="min-w-0">
-            <h3 className="truncate text-sm font-semibold text-primary">{device.name || `Celular #${device.deviceNumber}`}</h3>
+            <h3 className="truncate text-sm font-semibold text-primary">{device.name || `Aparelho #${device.deviceNumber}`}</h3>
             <p className="truncate font-mono text-[0.75rem] text-tertiary">{device.serial}</p>
           </div>
         </div>
@@ -156,7 +155,7 @@ export const DeviceAssignmentModal: React.FC<DeviceAssignmentModalProps> = ({
           </div>
         </div>
 
-        <FormSection title="Atribuir responsável" description="O colaborador escolhido passa a responder por este celular.">
+        <FormSection title="Atribuir responsável" description="O colaborador escolhido passa a responder por este aparelho.">
           <Field label="Colaborador" htmlFor="assign-user">
             <select
               id="assign-user"
@@ -173,7 +172,7 @@ export const DeviceAssignmentModal: React.FC<DeviceAssignmentModalProps> = ({
             </select>
           </Field>
           <div className="flex gap-2">
-            <Button variant="primary" size="sm" onClick={handleAssignResponsible} disabled={!selectedUserId} loading={loading} icon={<UserCheck className="h-4 w-4" />}>
+            <Button variant="primary" size="sm" onClick={handleAssignResponsible} disabled={!selectedUserId || selectedUserId === device.assignedUserId} loading={loading} icon={<UserCheck className="h-4 w-4" />}>
               Salvar responsável
             </Button>
             {device.assignedUserId && (
@@ -184,7 +183,7 @@ export const DeviceAssignmentModal: React.FC<DeviceAssignmentModalProps> = ({
           </div>
         </FormSection>
 
-        <FormSection title="Pedir uso ao gestor" description="Envie uma solicitação de acesso a este celular.">
+        <FormSection title="Pedir uso ao gestor" description="Envie uma solicitação de acesso a este aparelho.">
           <Field label="Motivo" htmlFor="assign-reason">
             <input
               id="assign-reason"
