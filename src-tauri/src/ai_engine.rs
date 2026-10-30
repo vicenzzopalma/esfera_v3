@@ -25,6 +25,10 @@ impl AiEngine {
         contact_name: &str,
     ) -> Result<String, String> {
         // IA própria na VPS (CPU, um pedido por vez): partes da mensagem esperam na fila.
+        // O nome fica no aparelho e so e restaurado apos validar a resposta.
+        let base_anonima = Self::ocultar_nome(base_message, contact_name);
+        let prompt_anonimo = Self::ocultar_nome(&config.system_prompt, contact_name);
+        let base_message = base_anonima.as_str();
         let http_secs = if config.provider.eq_ignore_ascii_case("vps_ia") { 90 } else { 25 };
         let client = Client::builder()
             .timeout(Duration::from_secs(http_secs))
@@ -61,16 +65,16 @@ impl AiEngine {
             let variable_rule = if Self::normalize_name_variables(base_message).contains("{nome}") {
                 "Copie obrigatoriamente a variável {nome} exatamente no texto final.\n"
             } else { "Não acrescente variáveis.\n" };
-            format!("{}\n\nInstruções adicionais da empresa (subordinadas às regras): {}\n\n{}Reescreva somente este trecho:\n{}", system, config.system_prompt, variable_rule, base_message)
+            format!("{}\n\nInstruções adicionais da empresa (subordinadas às regras): {}\n\n{}Reescreva somente este trecho:\n{}", system, prompt_anonimo, variable_rule, base_message)
         } else if !config.system_prompt.is_empty() {
             format!(
                 "{}\n\nInstruções adicionais da empresa (as regras legais acima sempre prevalecem):\n{}\n\nReescreva a mensagem para o contato '{}':\n{}",
-                system, config.system_prompt, contact_name, base_message
+                system, prompt_anonimo, if Self::normalize_name_variables(base_message).contains("{nome}") { "{nome}" } else { "" }, base_message
             )
         } else {
             format!(
                 "{}\n\nReescreva a mensagem para o contato '{}':\n{}",
-                system, contact_name, base_message
+                system, if Self::normalize_name_variables(base_message).contains("{nome}") { "{nome}" } else { "" }, base_message
             )
         };
 
@@ -117,6 +121,30 @@ impl AiEngine {
     /// Reescreve cada parte (blocos separados por linha em branco) e devolve as partes reescritas.
     /// Usa o marcador {nome} no lugar do nome: a IA não recebe o nome do devedor e a mesma versão
     /// serve para qualquer contato (o nome entra só na hora do envio).
+    fn ocultar_nome(texto: &str, nome: &str) -> String {
+        let nome = nome.trim();
+        if nome.is_empty() || nome == "{nome}" { return texto.to_string(); }
+        let alvo = nome.to_lowercase();
+        let mut saida = String::with_capacity(texto.len());
+        let mut inicio = 0;
+        while inicio < texto.len() {
+            let resto = &texto[inicio..];
+            let fronteira_inicial = inicio == 0 || !texto[..inicio].chars().next_back().map_or(false, char::is_alphanumeric);
+            let fim = resto.char_indices().map(|(i, c)| i + c.len_utf8())
+                .find(|&i| fronteira_inicial && resto[..i].to_lowercase() == alvo
+                    && !resto[i..].chars().next().map_or(false, char::is_alphanumeric));
+            if let Some(fim) = fim {
+                saida.push_str("{nome}");
+                inicio += fim;
+            } else {
+                let c = resto.chars().next().unwrap();
+                saida.push(c);
+                inicio += c.len_utf8();
+            }
+        }
+        saida
+    }
+
     pub async fn rewrite_parts(chain: &[AiConfig], base_message: &str) -> Result<Vec<String>, String> {
         let parts: Vec<&str> = base_message
             .split("\n\n")
@@ -266,6 +294,9 @@ impl AiEngine {
         }
         let orig_tokens: Vec<String> = raw_orig.iter().map(|w| Self::trim_token_punct(w).to_string()).collect();
         for token in &out_tokens {
+            if Self::is_url_token(token) && !Self::contains_exact_token(original, &orig_tokens, token) {
+                return Err("IA acrescentou um link nao presente na mensagem".to_string());
+            }
             if (Self::is_date_token(token) || Self::is_number_token(token)) && !Self::contains_exact_token(original, &orig_tokens, token) {
                 return Err(format!("IA acrescentou dado numérico '{}'", token));
             }
@@ -378,6 +409,13 @@ impl AiEngine {
                 && host.chars().any(|c| c.is_ascii_alphabetic())
                 && host.split('.').all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
             {
+                return true;
+            }
+        }
+        let host = lower.split(['/', '?', '#']).next().unwrap_or("");
+        if let Some((_, tld)) = host.rsplit_once('.') {
+            if (2..=63).contains(&tld.len()) && tld.chars().all(|c| c.is_ascii_alphabetic())
+                && host.split('.').all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')) {
                 return true;
             }
         }
@@ -829,13 +867,12 @@ impl AiEngine {
         let res = req.send().await.map_err(|e| format!("Falha de conexão com IA ({endpoint}): {e}"))?;
         if !res.status().is_success() {
             let status_code = res.status();
-            let err_body = res.text().await.unwrap_or_default();
-            return Err(format!("Provedor IA retornou erro HTTP {status_code}: {err_body}"));
+            return Err(format!("Provedor de IA retornou erro HTTP {status_code}."));
         }
 
         let body: serde_json::Value = res.json().await.map_err(|e| format!("Resposta de IA inválida: {e}"))?;
-        if let Some(err_msg) = body.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
-            return Err(format!("Erro da API de IA: {err_msg}"));
+        if body.get("error").is_some() {
+            return Err("Provedor de IA informou um erro.".to_string());
         }
         body["choices"][0]["message"]["content"]
             .as_str()
@@ -875,8 +912,7 @@ impl AiEngine {
 
         if !res.status().is_success() {
             let status_code = res.status();
-            let err_body = res.text().await.unwrap_or_default();
-            return Err(format!("Anthropic retornou erro HTTP {status_code}: {err_body}"));
+            return Err(format!("Anthropic retornou erro HTTP {status_code}."));
         }
 
         let body: serde_json::Value = res.json().await.map_err(|e| format!("Resposta Anthropic inválida: {e}"))?;
@@ -2579,5 +2615,47 @@ mod seguranca_reescrita_tests {
         assert!(AiEngine::validate_rewrite("Podemos conversar?", "Bonjour mon ami.").is_err());
         assert!(AiEngine::validate_rewrite("Podemos conversar hoje?", "Você pode falar conosco hoje?").is_ok());
         assert!(AiEngine::validate_rewrite("Para não receber mais mensagens, envie SAIR.", "Para não receber mais mensagens, envie SAIR.").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod privacidade_ia_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn rejeita_url_inventada() {
+        assert!(AiEngine::validate_rewrite("Entre em contato.", "Entre em contato em exemplo.com.").is_err());
+        assert!(AiEngine::validate_rewrite("Entre em contato.", "Entre em contato em exemplo.site.").is_err());
+        assert!(AiEngine::validate_rewrite("Visite exemplo.com", "Acesse exemplo.com").is_ok());
+    }
+
+    #[tokio::test]
+    async fn chamada_local_nao_envia_nome() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut data = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 { break; }
+                data.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..pos]).to_lowercase();
+                    let len: usize = headers.lines().find_map(|l| l.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+                    if data.len() >= pos + 4 + len { break; }
+                }
+            }
+            let body = r#"{"choices":[{"message":{"content":"Ola {nome}, como vai?"}}]}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            String::from_utf8(data).unwrap()
+        });
+        let cfg = AiConfig { company_id: 1, provider: "openai".into(), model: "teste".into(), temperature: 0.7, system_prompt: "Nome Ana Exemplo".into(), api_key: String::new(), endpoint: format!("http://{}/v1/chat/completions", addr) };
+        let result = AiEngine::generate_message(&cfg, "Oi Ana Exemplo, tudo bem?", "Ana Exemplo").await.unwrap();
+        let request = server.await.unwrap();
+        assert!(!request.to_lowercase().contains("ana exemplo"));
+        assert!(result.contains("Ana Exemplo"));
     }
 }
