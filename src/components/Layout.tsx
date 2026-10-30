@@ -1,6 +1,6 @@
 // ============================================================
 // Esfera v3 — Layout Principal
-// Sidebar fixa (240px) + Header + conteúdo + StatusBar
+// Sidebar fixa (240px, ou 64px recolhida) + Header + conteúdo + StatusBar
 // ============================================================
 
 import { Outlet } from "react-router-dom";
@@ -13,8 +13,8 @@ export default function Layout() {
     <div className="min-h-screen bg-primary text-primary relative font-sans overflow-x-hidden">
       <Sidebar />
 
-      {/* Offset de 240px definido também em .layout-main-wrapper (index.css) */}
-      <div style={{ paddingLeft: "240px" }} className="layout-main-wrapper min-h-screen flex flex-col min-w-0">
+      {/* Recuo da sidebar: .layout-main-wrapper usa var(--sidebar-w) (index.css) */}
+      <div className="layout-main-wrapper min-h-screen flex flex-col min-w-0">
         <Header />
 
         <main className="flex-1 px-6 py-6 pb-14 overflow-x-hidden min-w-0">

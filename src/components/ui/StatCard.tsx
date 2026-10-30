@@ -20,19 +20,45 @@ interface StatCardProps {
   tone?: Tone;
   className?: string;
   onClick?: () => void;
+  /** Mostra um esqueleto no lugar do valor enquanto carrega. */
+  loading?: boolean;
+  title?: string;
 }
 
-export default function StatCard({ label, value, icon, hint, tone = "neutral", className = "", onClick }: StatCardProps) {
+export default function StatCard({ label, value, icon, hint, tone = "neutral", className = "", onClick, loading = false, title }: StatCardProps) {
+  const clickable = Boolean(onClick);
   return (
     <div
       onClick={onClick}
-      className={`rounded-xl border border-border bg-card p-4 transition-colors ${onClick ? "cursor-pointer hover:border-border-strong" : ""} ${className}`}
+      // Clicável também pelo teclado (Tab + Enter/Espaço).
+      role={clickable ? "button" : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      onKeyDown={
+        clickable
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onClick?.();
+              }
+            }
+          : undefined
+      }
+      title={title}
+      className={`rounded-xl border border-border bg-card p-4 transition-colors ${
+        clickable
+          ? "cursor-pointer hover:border-border-strong focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-accent)]"
+          : ""
+      } ${className}`}
     >
       <div className="flex items-center justify-between gap-3">
         <span className="text-[0.75rem] font-medium text-secondary">{label}</span>
         {icon && <span className={`flex h-7 w-7 items-center justify-center rounded-md ${toneIcon[tone]}`}>{icon}</span>}
       </div>
-      <div className="mt-2 text-[1.5rem] font-semibold leading-none tracking-tight text-primary tabular-nums">{value}</div>
+      {loading ? (
+        <div className="skeleton mt-2 h-6 w-16" aria-label="Carregando" />
+      ) : (
+        <div className="mt-2 text-[1.5rem] font-semibold leading-none tracking-tight text-primary tabular-nums">{value}</div>
+      )}
       {hint && <div className="mt-1.5 text-[0.75rem] text-tertiary">{hint}</div>}
     </div>
   );

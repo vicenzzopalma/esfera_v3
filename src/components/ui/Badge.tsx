@@ -13,6 +13,8 @@ interface BadgeProps {
   dot?: boolean;
   pulse?: boolean;
   className?: string;
+  /** Explicação ao passar o mouse (ex.: o motivo de "Sem conexão"). */
+  title?: string;
 }
 
 const variantClasses: Record<BadgeVariant, string> = {
@@ -39,9 +41,11 @@ export default function Badge({
   dot = false,
   pulse = false,
   className = "",
+  title,
 }: BadgeProps) {
   return (
     <span
+      title={title}
       className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] leading-4
         font-medium border whitespace-nowrap shrink-0 ${variantClasses[variant]} ${className}`}
     >
