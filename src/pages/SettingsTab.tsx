@@ -1093,16 +1093,34 @@ function IntegrationsSection({ companyId, isMaster, canManage }: { companyId: nu
 }
 
 
-type NetworkStatus = { hourly: number; daily: number; sentLastHour: number; sentToday: number; waitSeconds: number };
+type NetworkChipState = "normal" | "reduzido" | "pausado" | "indisponivel";
+type NetworkChip = { chipId: number; deviceId: number; deviceName: string; replyRate: number | null; sample: number; state: NetworkChipState; reason: string };
+// attempts* = o que o teto conta (tentativas, inclusive falhas; cada parte extra soma uma); sent* = só enviadas.
+type NetworkStatus = { hourly: number; daily: number; sentLastHour: number; sentToday: number; attemptsLastHour: number; attemptsToday: number; waitSeconds: number; chips: NetworkChip[] };
+const CHIP_STATE_LABEL: Record<NetworkChipState, string> = { normal: "Normal", reduzido: "Reduzido", pausado: "Pausado", indisponivel: "Indisponível" };
+
+// Linha curta do freio por resposta: estado, taxa com a amostra e motivo.
+function chipBrakeText(c: NetworkChip): string {
+  const rate = c.replyRate === null ? "" : `${c.replyRate.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% de resposta em ${c.sample} envios`;
+  return [CHIP_STATE_LABEL[c.state] ?? c.state, rate, c.reason].filter(Boolean).join(" · ");
+}
+
 function NetworkSettings({ canEdit }: { canEdit: boolean }) {
   const [hourly, setHourly] = useState("40");
   const [daily, setDaily] = useState("200");
   const [status, setStatus] = useState<NetworkStatus | null>(null);
+  // Retorno do Salvar e erro da consulta ficam separados: o erro some na próxima consulta que der certo.
   const [message, setMessage] = useState("");
+  const [loadError, setLoadError] = useState("");
+  const [saving, setSaving] = useState(false);
   useEffect(() => {
     let active = true;
-    const refresh = () => api<NetworkStatus>("get_network_status").then(v => { if (active) setStatus(v); }).catch(e => { if (active) setMessage(`Erro ao consultar a rede: ${String(e)}`); });
-    api<{ hourly: number; daily: number }>("get_network_limits").then(v => { if (active) { setHourly(String(v.hourly)); setDaily(String(v.daily)); } }).catch(e => { if (active) setMessage(`Erro ao carregar limites: ${String(e)}`); });
+    const refresh = () => api<NetworkStatus>("get_network_status")
+      .then(v => { if (active) { setStatus(v); setLoadError(""); } })
+      .catch(e => { if (active) setLoadError(`Erro ao consultar a rede: ${String(e)}`); });
+    api<{ hourly: number; daily: number }>("get_network_limits")
+      .then(v => { if (active) { setHourly(String(v.hourly)); setDaily(String(v.daily)); } })
+      .catch(e => { if (active) setMessage(`Erro ao carregar limites: ${String(e)}`); });
     refresh();
     const timer = window.setInterval(refresh, 30000);
     return () => { active = false; window.clearInterval(timer); };
@@ -1110,21 +1128,41 @@ function NetworkSettings({ canEdit }: { canEdit: boolean }) {
   const save = async () => {
     const h = Number(hourly), d = Number(daily);
     if (!Number.isSafeInteger(h) || !Number.isSafeInteger(d) || h < 1 || d < h) { setMessage("Informe números inteiros positivos; o limite diário deve ser maior ou igual ao horário."); return; }
+    setSaving(true);
     try {
       await api("set_network_limits", { hourly: h, daily: d });
-      setStatus(await api<NetworkStatus>("get_network_status"));
       setMessage("Limites da rede salvos.");
-    } catch (e) { setMessage(`Erro ao salvar limites: ${String(e)}`); }
+    } catch (e) {
+      setMessage(`Erro ao salvar limites: ${String(e)}`);
+    } finally {
+      setSaving(false);
+    }
+    try { setStatus(await api<NetworkStatus>("get_network_status")); setLoadError(""); }
+    catch (e) { setLoadError(`Erro ao consultar a rede: ${String(e)}`); }
   };
-  return <div className="mt-6 border-t border-border pt-6"><FormSection title="Rede e ritmo" description="Limites compartilhados por todos os aparelhos desta instalação.">
+  return <div className="mt-6 border-t border-border pt-6"><FormSection title="Rede e ritmo" description="Teto de tentativas compartilhado por todos os aparelhos desta instalação. Cada parte da mensagem conta como uma tentativa, mesmo quando o envio falha.">
     <div className="space-y-4 max-w-xl">
       <div className="grid grid-cols-2 gap-4">
-        <Field label="Por hora" htmlFor="network-hour"><input id="network-hour" type="number" min={1} value={hourly} disabled={!canEdit} onChange={e => setHourly(e.target.value)} /></Field>
-        <Field label="Por dia" htmlFor="network-day"><input id="network-day" type="number" min={1} value={daily} disabled={!canEdit} onChange={e => setDaily(e.target.value)} /></Field>
+        <Field label="Tentativas por hora" hint="Padrão: 40." htmlFor="network-hour">
+          <input id="network-hour" type="number" min={1} value={hourly} disabled={!canEdit} onChange={e => setHourly(e.target.value)} className="font-mono" />
+        </Field>
+        <Field label="Tentativas por dia" hint="Padrão: 200. Igual ou maior que por hora." htmlFor="network-day">
+          <input id="network-day" type="number" min={1} value={daily} disabled={!canEdit} onChange={e => setDaily(e.target.value)} className="font-mono" />
+        </Field>
       </div>
-      <Button onClick={save} disabled={!canEdit}>Salvar limites</Button>
+      <Button onClick={save} loading={saving} disabled={!canEdit}>Salvar limites</Button>
       {message && <p role="status" className="text-sm text-secondary">{message}</p>}
-      {status && <p className="text-sm text-secondary">Última hora: {status.sentLastHour}/{status.hourly}. Hoje: {status.sentToday}/{status.daily}. {status.waitSeconds > 0 ? `Próxima janela em até ${Math.ceil(status.waitSeconds / 60)} min.` : "Rede disponível."}</p>}
+      {loadError && <p role="alert" className="text-sm text-red-500">{loadError}</p>}
+      {status && <div className="space-y-1 text-sm text-secondary">
+        <p>Tentativas na última hora: <span className="font-mono text-primary">{status.attemptsLastHour}</span> de {status.hourly}. Tentativas hoje: <span className="font-mono text-primary">{status.attemptsToday}</span> de {status.daily}.</p>
+        <p>{status.waitSeconds > 0 ? `Teto atingido: a rede volta a enviar em até ${Math.ceil(status.waitSeconds / 60)} min.` : "Rede disponível para enviar."}</p>
+      </div>}
+      {status && status.chips.length > 0 && <div className="space-y-1">
+        <p className="text-[0.8125rem] font-medium text-primary">Freio por resposta</p>
+        <ul className="space-y-1 text-sm text-secondary">
+          {status.chips.map(c => <li key={c.chipId}><span className="font-medium text-primary">{c.deviceName || `Aparelho ${c.deviceId}`}</span>: {chipBrakeText(c)}</li>)}
+        </ul>
+      </div>}
     </div>
   </FormSection></div>;
 }
