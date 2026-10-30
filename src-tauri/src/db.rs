@@ -2315,11 +2315,49 @@ impl Database {
     }
 
     pub fn add_chip(&self, device_id: i32, phone: &str, name: &str) -> Result<i32, String> {
-        self.conn().execute(
+        let conn = self.conn();
+        conn.execute(
             "INSERT INTO ESF_Chip (DeviceId, PhoneNumber, ChipName, Status) VALUES (?1, ?2, ?3, 'livre');",
             params![device_id, phone, name],
         ).map_err(|e| e.to_string())?;
-        Ok(self.conn().last_insert_rowid() as i32)
+        Ok(conn.last_insert_rowid() as i32)
+    }
+
+    pub fn chip_owner(&self, chip_id: i32) -> Result<(i32, i32, String, Option<String>), String> {
+        self.conn().query_row("SELECT d.rowid,d.CompanyId,d.AdbDeviceId,d.EsferaDeviceId FROM ESF_Chip c JOIN ESF_Device d ON d.rowid=c.DeviceId WHERE c.ChipId=?1 AND c.ExcluidoEm IS NULL", params![chip_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
+            .map_err(|e| if matches!(e, rusqlite::Error::QueryReturnedNoRows) { "Chip não encontrado.".to_string() } else { e.to_string() })
+    }
+
+    pub fn remove_device_chip(&self, chip_id: i32, device_id: i32) -> Result<(), String> {
+        let n = self.conn().execute("UPDATE ESF_Chip SET ExcluidoEm=datetime('now') WHERE ChipId=?1 AND DeviceId=?2 AND ExcluidoEm IS NULL", params![chip_id,device_id]).map_err(|e|e.to_string())?;
+        if n == 0 { return Err("Chip não encontrado ou mudou de aparelho.".into()); }
+        Ok(())
+    }
+
+    pub fn update_device_chip(&self, chip_id: i32, device_id: i32, phone: &str, name: &str) -> Result<(), String> {
+        let n = self.conn().execute("UPDATE ESF_Chip SET PhoneNumber=?1,ChipName=?2 WHERE ChipId=?3 AND DeviceId=?4 AND ExcluidoEm IS NULL", params![phone,name,chip_id,device_id]).map_err(|e|e.to_string())?;
+        if n == 0 { return Err("Chip não encontrado ou mudou de aparelho.".into()); }
+        Ok(())
+    }
+
+    pub fn get_company_chips(&self, company_id: i32) -> Result<Vec<Chip>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT c.ChipId,c.DeviceId,c.PhoneNumber,c.ChipName,c.Status,c.RestrictedUntil,c.CreatedAt FROM ESF_Chip c JOIN ESF_Device d ON d.rowid=c.DeviceId WHERE d.CompanyId=?1 AND c.ExcluidoEm IS NULL ORDER BY c.ChipId DESC").map_err(|e|e.to_string())?;
+        let rows = stmt.query_map(params![company_id], |r| Ok(Chip { id:r.get(0)?,device_id:r.get(1)?,phone_number:r.get(2)?,chip_name:r.get(3)?,status:r.get(4)?,restricted_until:r.get(5)?,created_at:r.get(6)? })).map_err(|e|e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())
+    }
+
+    pub fn chip_device_has_running_campaign(&self, company_id: i32, serial: &str, esfera_id: Option<&str>) -> Result<bool, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT SelectedDevices FROM ESF_Campaign WHERE CompanyId=?1 AND Status='running' AND ExcluidoEm IS NULL").map_err(|e|e.to_string())?;
+        let rows = stmt.query_map(params![company_id], |r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
+        for row in rows {
+            let text = row.map_err(|e|e.to_string())?;
+            if text.trim().is_empty() { continue; }
+            let ids: Vec<String> = serde_json::from_str(&text).map_err(|_| "Não foi possível verificar os aparelhos da campanha ativa.".to_string())?;
+            if ids.iter().any(|id| id == serial || esfera_id == Some(id.as_str())) { return Ok(true); }
+        }
+        Ok(false)
     }
 
     /// A rede é conservadoramente compartilhada por todos os aparelhos desta instalação.
@@ -4591,5 +4629,56 @@ mod dashboard_network_regression_tests {
         assert!(state.chips.iter().any(|c|c.chip_id==chip && c.cooldown_seconds>0));
         let sent: i32=db.conn().query_row("SELECT SentContacts FROM ESF_Campaign WHERE CampaignId=?1",params![campaign],|r|r.get(0)).unwrap();
         assert_eq!(sent,1);
+    }
+}
+
+#[cfg(test)]
+mod gerenciamento_de_chips_tests {
+    use super::*;
+    #[test]
+    fn gerenciamento_de_chips_respeita_empresa_e_exclusao_logica() {
+        let path=std::env::temp_dir().join(format!("esfera_chips_{}.db",std::process::id()));
+        let _=std::fs::remove_file(&path);
+        let db=Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let other=db.create_company("Outra",5).unwrap();
+        db.conn().execute("INSERT INTO ESF_Device(AdbDeviceId,DeviceName,CompanyId) VALUES('chip-usb-a','A',1)",[]).unwrap();
+        db.conn().execute("INSERT INTO ESF_Device(AdbDeviceId,DeviceName,CompanyId) VALUES('chip-usb-b','B',?1)",params![other.id]).unwrap();
+        let a=db.get_devices(1).into_iter().find(|d|d.serial=="chip-usb-a").unwrap();
+        let b=db.get_devices(other.id).into_iter().find(|d|d.serial=="chip-usb-b").unwrap();
+        let id=db.add_chip(a.id,"11999990001","Antigo").unwrap();
+        let other_id=db.add_chip(b.id,"11999990002","Outro").unwrap();
+        assert_ne!(id,other_id);
+        db.set_chip_restriction(id,"banido","9999-12-31 23:59:59").unwrap();
+        assert!(db.update_device_chip(id,b.id,"erro","Erro").is_err());
+        db.update_device_chip(id,a.id,"11999990003","Corrigido").unwrap();
+        let list=db.get_company_chips(1).unwrap();
+        let c=list.iter().find(|c|c.id==id).unwrap();
+        assert_eq!(c.phone_number,"11999990003"); assert_eq!(c.chip_name,"Corrigido"); assert_eq!(c.status,"banido");
+        assert!(!list.iter().any(|c|c.id==other_id));
+        assert!(db.remove_device_chip(id,b.id).is_err());
+        db.remove_device_chip(id,a.id).unwrap();
+        assert!(db.chip_owner(id).is_err());
+        assert!(db.update_device_chip(id,a.id,"novo","Novo").is_err());
+        assert!(!db.get_company_chips(1).unwrap().iter().any(|c|c.id==id));
+        assert_eq!(db.get_company_chips(other.id).unwrap()[0].id,other_id);
+        let archived: i32=db.conn().query_row("SELECT count(*) FROM ESF_Chip WHERE ChipId=?1 AND ExcluidoEm IS NOT NULL",params![id],|r|r.get(0)).unwrap();
+        assert_eq!(archived,1);
+    }
+
+    #[test]
+    fn gerenciamento_de_chips_detecta_campanha_ativa_e_trava_de_envio() {
+        let path=std::env::temp_dir().join(format!("esfera_chips_trava_{}.db",std::process::id()));
+        let _=std::fs::remove_file(&path);
+        let db=Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId,Status,SelectedDevices) VALUES('C','Oi',1,'running',?1)",params![serde_json::json!(["usb-teste"]).to_string()]).unwrap();
+        assert!(db.chip_device_has_running_campaign(1,"usb-teste",None).unwrap());
+        assert!(!db.chip_device_has_running_campaign(1,"outro",None).unwrap());
+        db.conn().execute("UPDATE ESF_Campaign SET Status='paused'",[]).unwrap();
+        assert!(!db.chip_device_has_running_campaign(1,"usb-teste",None).unwrap());
+        let lock=crate::dispatcher::device_operation_lock_for_id(987654);
+        let guard=lock.try_lock().unwrap();
+        assert!(crate::dispatcher::device_operation_lock_for_id(987654).try_lock().is_err());
+        drop(guard);
+        assert!(crate::dispatcher::device_operation_lock_for_id(987654).try_lock().is_ok());
     }
 }

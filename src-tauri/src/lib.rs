@@ -201,6 +201,9 @@ pub fn run() {
             get_hpc_capabilities,
             // Chips
             get_device_chips,
+            remove_device_chip,
+            update_device_chip,
+            get_company_chips,
             add_device_chip,
             update_chip_status,
             set_chip_restriction,
