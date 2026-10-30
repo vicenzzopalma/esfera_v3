@@ -40,7 +40,9 @@ export function isErrorMsg(text: string) {
 }
 
 // Mensagem de resultado/andamento de uma ação.
-export function StatusNote({ text, busy = false }: { text: string | null; busy?: boolean }) {
+export function StatusNote({ text: raw, busy = false }: { text: string | null; busy?: boolean }) {
+  // Mensagens do backend às vezes começam com emoji: mostra só o texto.
+  const text = raw ? raw.replace(/^[^\p{L}\p{N}]+/u, "") : raw;
   if (!text) return null;
   const err = isErrorMsg(text);
   return (
