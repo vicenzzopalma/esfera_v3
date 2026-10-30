@@ -1,5 +1,5 @@
 use crate::protocol::*;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -50,6 +50,7 @@ pub struct HubClient {
     writer: Mutex<tokio::io::BufWriter<OwnedWriteHalf>>,
     reader: Mutex<BufReader<OwnedReadHalf>>,
     session_id: Option<String>,
+    command_lock: Mutex<()>,
 }
 
 impl HubClient {
@@ -72,6 +73,7 @@ impl HubClient {
             writer: Mutex::new(writer),
             reader: Mutex::new(reader),
             session_id: None,
+            command_lock: Mutex::new(()),
         };
 
         client.authenticate(token, role).await?;
@@ -133,11 +135,13 @@ impl HubClient {
     pub async fn read_one(&self) -> Result<HubMessage, String> {
         let mut reader = self.reader.lock().await;
         let mut line = String::new();
-        match timeout(Duration::from_secs(300), reader.read_line(&mut line)).await {
+        match timeout(Duration::from_secs(300), (&mut *reader).take(16777217).read_line(&mut line)).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e.to_string()),
             Err(_) => return Err("Timeout de leitura no HubClient".to_string()),
         }
+        if line.is_empty() { return Err("Conexao fechada.".into()); }
+        if line.len() > 16777216 || !line.ends_with('\n') { return Err("Resposta do hub invalida ou muito grande.".into()); }
         if line.trim().is_empty() {
             return Err("Conexão fechada.".to_string());
         }
@@ -150,23 +154,23 @@ impl HubClient {
         cmd: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let msg = HubMessage::Command {
-            from: "empresa".to_string(),
-            to_company: Some(to_company),
-            cmd: cmd.to_string(),
-            args,
-            id: format!("cmd_{}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()),
+        let operation = async {
+            let _guard = self.command_lock.lock().await;
+            let id = uuid::Uuid::new_v4().to_string();
+            let msg = HubMessage::Command { from: "empresa".to_string(), to_company: Some(to_company), cmd: cmd.to_string(), args, id: id.clone() };
+            self.send(&msg).await?;
+            loop {
+                match self.read_one().await? {
+                    HubMessage::CommandResponse { id: response_id, result, error } if response_id == id => {
+                        return match (result, error) { (Some(value), _) => Ok(value), (_, Some(e)) => Err(e), _ => Err("Resposta vazia do hub.".into()) };
+                    }
+                    HubMessage::Ping => { self.send(&HubMessage::Pong).await?; }
+                    HubMessage::CommandResponse { .. } | HubMessage::Pong => continue,
+                    _ => return Err("Resposta inesperada do hub.".into()),
+                }
+            }
         };
-        self.send(&msg).await?;
-        let response = self.read_one().await?;
-        match response {
-            HubMessage::CommandResponse { result: Some(val), .. } => Ok(val),
-            HubMessage::CommandResponse { error: Some(e), .. } => Err(e),
-            _ => Err("Resposta de comando inválida.".to_string()),
-        }
+        timeout(Duration::from_secs(8), operation).await.map_err(|_| "O hub demorou para responder.".to_string())?
     }
 
     pub async fn listen<F>(&self, on_command: F) -> Result<(), String>
