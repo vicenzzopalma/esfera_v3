@@ -19,7 +19,6 @@ import {
   Zap,
   Power,
   RefreshCw,
-  CheckCircle2,
   AlertCircle,
   Eye,
   ShieldCheck,
@@ -39,6 +38,7 @@ import StatCard from "../components/ui/StatCard";
 import EmptyState from "../components/ui/EmptyState";
 import Field, { FormSection } from "../components/ui/Field";
 import { Tabs, SegmentedControl } from "../components/ui/Tabs";
+import { toast } from "../components/ui/ToastContainer";
 
 type RequestFilter = "pending" | "approved" | "history";
 
@@ -115,7 +115,6 @@ export default function PermissionsTab() {
   const [userSearch, setUserSearch] = useState("");
   const [confirmAction, setConfirmAction] = useState<{ title: string; message: string; confirmLabel: string; danger?: boolean; run: () => void | Promise<void> } | null>(null);
 
-  const [feedbackMsg, setFeedbackMsg] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   // Respostas atrasadas (de outra empresa ou de leitura antiga) são descartadas.
   const seqRef = useRef(0);
@@ -224,7 +223,7 @@ export default function PermissionsTab() {
         role: newRole,
         companyId,
       });
-      setFeedbackMsg({ type: "success", text: `Usuário ${newDisplayName.trim()} criado.` });
+      toast.success(`Usuário ${newDisplayName.trim()} criado.`);
       setShowCreateModal(false);
       resetCreateForm();
       await loadData(false);
@@ -237,13 +236,12 @@ export default function PermissionsTab() {
 
   const runRequestAction = async (requestId: number, action: () => Promise<unknown>, success: string, failure: string) => {
     setBusyRequest(requestId);
-    setFeedbackMsg(null);
     try {
       await action();
-      setFeedbackMsg({ type: "success", text: success });
+      toast.success(success);
       await loadData(false);
     } catch (err) {
-      setFeedbackMsg({ type: "error", text: friendlyError(err, failure) });
+      toast.error(friendlyError(err, failure));
     } finally {
       setBusyRequest(null);
     }
@@ -260,17 +258,16 @@ export default function PermissionsTab() {
     e.preventDefault();
     if (!selectedUserForAssign || !selectedDeviceForAssign) return;
     setAssigning(true);
-    setFeedbackMsg(null);
     try {
       await api("assign_device_to_user", {
         deviceSerial: selectedDeviceForAssign,
         userId: Number(selectedUserForAssign),
       });
-      setFeedbackMsg({ type: "success", text: "Aparelho vinculado ao usuário." });
+      toast.success("Aparelho vinculado ao usuário.");
       setSelectedDeviceForAssign("");
       await loadData(false);
     } catch (err) {
-      setFeedbackMsg({ type: "error", text: friendlyError(err, "Não foi possível vincular o aparelho.") });
+      toast.error(friendlyError(err, "Não foi possível vincular o aparelho."));
     } finally {
       setAssigning(false);
     }
@@ -278,16 +275,15 @@ export default function PermissionsTab() {
 
   const handleUnassignDevice = async (assignment: DeviceAssignmentInfo) => {
     setUnassigning(assignment.assignmentId);
-    setFeedbackMsg(null);
     try {
       await api("unassign_device_from_user", {
         deviceSerial: assignment.adbDeviceId,
         userId: assignment.userId,
       });
-      setFeedbackMsg({ type: "success", text: "Vínculo removido." });
+      toast.success("Vínculo removido.");
       await loadData(false);
     } catch (err) {
-      setFeedbackMsg({ type: "error", text: friendlyError(err, "Não foi possível desvincular o aparelho.") });
+      toast.error(friendlyError(err, "Não foi possível desvincular o aparelho."));
     } finally {
       setUnassigning(null);
     }
@@ -380,25 +376,6 @@ export default function PermissionsTab() {
           <Button variant="secondary" size="sm" icon={<RefreshCw size={13} />} onClick={() => loadData(true)}>
             Tentar de novo
           </Button>
-        </div>
-      )}
-
-      {feedbackMsg && (
-        <div
-          role={feedbackMsg.type === "error" ? "alert" : "status"}
-          className={`flex items-center justify-between gap-3 rounded-lg border px-4 py-2.5 text-[0.8125rem] ${
-            feedbackMsg.type === "success"
-              ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-              : "border-red-500/25 bg-red-500/10 text-red-600 dark:text-red-400"
-          }`}
-        >
-          <span className="flex items-center gap-2 min-w-0">
-            {feedbackMsg.type === "success" ? <CheckCircle2 size={15} className="shrink-0" /> : <AlertCircle size={15} className="shrink-0" />}
-            <span className="break-words">{feedbackMsg.text}</span>
-          </span>
-          <button onClick={() => setFeedbackMsg(null)} aria-label="Fechar aviso" className="shrink-0 cursor-pointer">
-            <X size={15} />
-          </button>
         </div>
       )}
 

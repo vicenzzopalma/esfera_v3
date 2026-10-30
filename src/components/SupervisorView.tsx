@@ -24,7 +24,6 @@ import {
   Search,
   Bell,
   AlertCircle,
-  X,
 } from "lucide-react";
 import Button from "./ui/Button";
 import Card from "./ui/Card";
@@ -35,6 +34,7 @@ import PageHeader from "./ui/PageHeader";
 import StatCard from "./ui/StatCard";
 import EmptyState from "./ui/EmptyState";
 import { SegmentedControl } from "./ui/Tabs";
+import { toast } from "./ui/ToastContainer";
 import { SECTOR_OPTIONS, normSector, sectorLabel, StatusDot, BatteryMeter } from "./devices/deviceUi";
 
 /** Intervalo entre uma captura e a próxima. As telas são capturadas UMA de cada vez, em rodízio. */
@@ -78,7 +78,6 @@ export default function SupervisorView() {
   const [livePreview, setLivePreview] = useState(true);
   const [busyRequest, setBusyRequest] = useState<number | null>(null);
   const [rejectTarget, setRejectTarget] = useState<DevicePermissionRequest | null>(null);
-  const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const inFlightRef = useRef(new Set<string>());
   const seqRef = useRef(0);
   const now = useNow(5000);
@@ -122,13 +121,12 @@ export default function SupervisorView() {
 
   const runRequestAction = async (req: DevicePermissionRequest, approve: boolean) => {
     setBusyRequest(req.requestId);
-    setMessage(null);
     try {
       await api(approve ? "approve_device_access" : "reject_device_access", { requestId: req.requestId });
-      setMessage({ type: "success", text: approve ? "Uso do aparelho liberado." : "Pedido recusado." });
+      toast.success(approve ? "Uso do aparelho liberado." : "Pedido recusado.");
       await loadData(false);
     } catch (err) {
-      setMessage({ type: "error", text: apiErrorText(err, approve ? "Não foi possível aprovar o pedido." : "Não foi possível recusar o pedido.") });
+      toast.error(apiErrorText(err, approve ? "Não foi possível aprovar o pedido." : "Não foi possível recusar o pedido."));
     } finally {
       setBusyRequest(null);
     }
@@ -166,7 +164,7 @@ export default function SupervisorView() {
       // Mostra o efeito do toque logo em seguida.
       setTimeout(() => captureScreen(dev), 700);
     } catch (err) {
-      setMessage({ type: "error", text: apiErrorText(err, "Não foi possível enviar o toque ao aparelho.") });
+      toast.error(apiErrorText(err, "Não foi possível enviar o toque ao aparelho."));
     }
   };
 
@@ -175,7 +173,7 @@ export default function SupervisorView() {
       await api("send_adb_keyevent", { serial: targetOf(dev), keycode });
       setTimeout(() => captureScreen(dev), 700);
     } catch (err) {
-      setMessage({ type: "error", text: apiErrorText(err, "Não foi possível enviar o comando ao aparelho.") });
+      toast.error(apiErrorText(err, "Não foi possível enviar o comando ao aparelho."));
     }
   };
 
@@ -197,14 +195,12 @@ export default function SupervisorView() {
 
   const handleLaunchScrcpy = async (dev: DeviceWithActiveUser) => {
     setLaunchingScrcpy((prev) => ({ ...prev, [dev.serial]: true }));
-    setMessage(null);
     try {
       await api<string>("launch_scrcpy_stream", { serial: targetOf(dev), turnScreenOff: false });
     } catch (err) {
       console.error("Erro ao abrir o controle total:", err);
-      setMessage({
-        type: "error",
-        text: `Não foi possível abrir o controle de ${dev.name || dev.model || "aparelho"}. Confira se ele está desbloqueado e conectado. (${apiErrorText(err, "erro desconhecido")})`,
+      toast.error(`Não foi possível abrir o controle de ${dev.name || dev.model || "aparelho"}.`, {
+        description: `Confira se ele está desbloqueado e conectado. (${apiErrorText(err, "erro desconhecido")})`,
       });
     } finally {
       setTimeout(() => setLaunchingScrcpy((prev) => ({ ...prev, [dev.serial]: false })), 1500);
@@ -328,28 +324,21 @@ export default function SupervisorView() {
         <StatCard label="Em uso" value={inUseCount} icon={<UserCheck size={14} />} tone="accent" />
       </div>
 
-      {(message || loadError) && (
+      {loadError && (
         <div
-          role={message?.type === "success" ? "status" : "alert"}
-          className={`flex items-center justify-between gap-3 rounded-lg border px-4 py-2.5 text-[0.8125rem] ${
-            message?.type === "success"
-              ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-              : "border-red-500/25 bg-red-500/10 text-red-600 dark:text-red-400"
-          }`}
+          role="alert"
+          className="flex items-center justify-between gap-3 rounded-lg border border-red-500/25 bg-red-500/10 px-4 py-2.5 text-[0.8125rem] text-red-600 dark:text-red-400"
         >
           <span className="flex min-w-0 items-center gap-2">
             <AlertCircle size={15} className="shrink-0" />
-            <span className="break-words">{message?.text || loadError}</span>
+            <span className="break-words">
+              {devicesWithUsers.length > 0 ? "A última atualização falhou; os dados podem estar desatualizados. " : ""}
+              {loadError}
+            </span>
           </span>
-          {message ? (
-            <button onClick={() => setMessage(null)} aria-label="Fechar aviso" className="shrink-0 cursor-pointer">
-              <X size={15} />
-            </button>
-          ) : (
-            <Button variant="secondary" size="sm" icon={<RefreshCw size={13} />} onClick={() => loadData(true)}>
-              Tentar de novo
-            </Button>
-          )}
+          <Button variant="secondary" size="sm" icon={<RefreshCw size={13} />} onClick={() => loadData(true)}>
+            Tentar de novo
+          </Button>
         </div>
       )}
 
