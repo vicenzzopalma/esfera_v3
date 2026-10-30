@@ -4626,7 +4626,7 @@ function CampaignDetail({
   const [contactsLoading, setContactsLoading] = useState(true);
   const [contactsFilter, setContactsFilter] = useState<ContactFilter>("all");
   const [confirmations, setConfirmations] = useState<{ pending: number; sent: number; uncertain: number } | null>(null);
-  const [network, setNetwork] = useState<NetworkStatusInfo | null>(null);
+  const [network, setNetwork] = useState<(NetworkStatusInfo & { fetchedAt: number }) | null>(null);
   const [devices, setDevices] = useState<Device[]>([]);
   const [devicesLoading, setDevicesLoading] = useState(true);
   const [devicesError, setDevicesError] = useState("");
@@ -4669,7 +4669,7 @@ function CampaignDetail({
     const refresh = () =>
       api<NetworkStatusInfo>("get_network_status")
         .then((v) => {
-          if (alive) setNetwork(v);
+          if (alive) setNetwork(v ? { ...v, fetchedAt: Date.now() } : null);
         })
         .catch(() => {
           if (alive) setNetwork(null);
@@ -4835,7 +4835,9 @@ function CampaignDetail({
         .filter((c) => c.state !== "normal" && selectedDevices.some((d) => d.id === c.deviceId))
         .map((c) => {
           const d = selectedDevices.find((x) => x.id === c.deviceId);
-          return `${d ? deviceLabel(d) : c.deviceName}: ${c.reason || c.state}${c.replyRate !== null ? ` (respostas: ${c.replyRate.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%)` : ""}`;
+          const rate = c.replyRate !== null ? ` (respostas: ${c.replyRate.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%)` : "";
+          // "Indisponível" é permanente em aparelho sem leitura de notificações: informa sem alarmar.
+          return { text: `${d ? deviceLabel(d) : c.deviceName}: ${c.reason || c.state}${rate}`, warn: c.state !== "indisponivel" };
         })
     : [];
   const windowOpen = withinSendWindow(new Date(now));
@@ -5275,8 +5277,8 @@ function CampaignDetail({
               {(live.notes.length > 0 || chipNotes.length > 0) && (
                 <ul className="mt-3 space-y-1.5">
                   {chipNotes.map((n) => (
-                    <li key={n} className="flex items-start gap-2 text-[0.75rem] text-amber-700 dark:text-amber-300">
-                      <AlertTriangle size={13} className="mt-0.5 shrink-0" /> {n}
+                    <li key={n.text} className={`flex items-start gap-2 text-[0.75rem] ${n.warn ? "text-amber-700 dark:text-amber-300" : "text-tertiary"}`}>
+                      {n.warn ? <AlertTriangle size={13} className="mt-0.5 shrink-0" /> : <Info size={13} className="mt-0.5 shrink-0" />} {n.text}
                     </li>
                   ))}
                   {live.notes
@@ -5314,7 +5316,7 @@ function CampaignDetail({
                   </p>
                   {network.waitSeconds > 0 && (
                     <p className="text-amber-700 dark:text-amber-300">
-                      Teto atingido: libera por volta de {formatWhen(new Date(now + network.waitSeconds * 1000), new Date(now))}.
+                      Teto atingido: libera por volta de {formatWhen(new Date(network.fetchedAt + network.waitSeconds * 1000), new Date(now))}.
                     </p>
                   )}
                   <p className="text-tertiary">Cada parte da mensagem conta uma vez ({parts} por contato).</p>
