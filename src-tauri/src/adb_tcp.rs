@@ -8,11 +8,9 @@
 // Seriais de túnel inverso roteiam por ponte local do tunnel_server.
 // ============================================================
 
-use base64::Engine;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
-use rsa::traits::PublicKeyParts;
-use rsa::{BigUint, Pkcs1v15Sign, RsaPrivateKey};
+use rsa::{Pkcs1v15Sign, RsaPrivateKey};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -34,7 +32,7 @@ const A_AUTH_RSAPUBLICKEY: u32 = 3;
 
 const MAX_PAYLOAD: usize = 256 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
-const ID_STDIN: u8 = 0;
+const ID_CLOSE_STDIN: u8 = 4;
 const ID_STDOUT: u8 = 1;
 const ID_STDERR: u8 = 2;
 const ID_EXIT: u8 = 3;
@@ -49,28 +47,8 @@ struct AdbMessage {
 
 // ------------------------- CRC32 (tabela, ADB ignora mas mantém integridade) -------------------------
 
-static CRC_TABLE: LazyLock<[u32; 256]> = LazyLock::new(|| {
-    let mut table = [0u32; 256];
-    let mut i = 0u32;
-    while i < 256 {
-        let mut c = i;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
-            k += 1;
-        }
-        table[i as usize] = c;
-        i += 1;
-    }
-    table
-});
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc = CRC_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    crc ^ 0xFFFF_FFFF
+fn adb_checksum(data: &[u8]) -> u32 {
+    data.iter().fold(0u32, |sum, byte| sum.wrapping_add(*byte as u32))
 }
 
 // ------------------------- Mensagens -------------------------
@@ -81,7 +59,7 @@ fn write_msg(stream: &mut TcpStream, cmd: u32, arg0: u32, arg1: u32, payload: &[
     hdr[4..8].copy_from_slice(&arg0.to_le_bytes());
     hdr[8..12].copy_from_slice(&arg1.to_le_bytes());
     hdr[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    hdr[16..20].copy_from_slice(&crc32(payload).to_le_bytes());
+    hdr[16..20].copy_from_slice(&adb_checksum(payload).to_le_bytes());
     hdr[20..24].copy_from_slice(&(cmd ^ 0xFFFF_FFFF).to_le_bytes());
     stream.write_all(&hdr)?;
     if !payload.is_empty() {
@@ -90,22 +68,39 @@ fn write_msg(stream: &mut TcpStream, cmd: u32, arg0: u32, arg1: u32, payload: &[
     Ok(())
 }
 
-fn read_msg(stream: &mut TcpStream) -> io::Result<AdbMessage> {
+fn read_exact_until(stream: &mut TcpStream, mut buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
+    while !buffer.is_empty() {
+        apply_deadline(stream, deadline)?;
+        match stream.read(buffer) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "A conexão com o aparelho foi encerrada")),
+            Ok(n) => buffer = &mut buffer[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn read_msg_until(stream: &mut TcpStream, deadline: Instant) -> io::Result<AdbMessage> {
     let mut hdr = [0u8; 24];
-    stream.read_exact(&mut hdr)?;
-    let cmd = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
-    let arg0 = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-    let arg1 = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
-    let len = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
-    if len > MAX_PAYLOAD {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("payload ADB gigante: {}", len),
-        ));
+    read_exact_until(stream, &mut hdr, deadline)?;
+    let field = |at| u32::from_le_bytes(hdr[at..at+4].try_into().unwrap());
+    let cmd = field(0);
+    let len = field(12) as usize;
+    if field(20) != cmd ^ u32::MAX || len > MAX_PAYLOAD {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Resposta inválida do aparelho"));
     }
     let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-    Ok(AdbMessage { cmd, arg0, arg1, payload })
+    read_exact_until(stream, &mut payload, deadline)?;
+    if field(16) != 0 && adb_checksum(&payload) != field(16) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Resposta incompleta do aparelho"));
+    }
+    Ok(AdbMessage { cmd, arg0: field(4), arg1: field(8), payload })
+}
+
+#[cfg(test)]
+fn read_msg(stream: &mut TcpStream) -> io::Result<AdbMessage> {
+    read_msg_until(stream, Instant::now() + Duration::from_secs(2))
 }
 
 // ------------------------- Chave RSA -------------------------
@@ -127,45 +122,21 @@ fn load_adb_key() -> Option<RsaPrivateKey> {
         .ok()
 }
 
-fn mpint(v: &BigUint) -> Vec<u8> {
-    let mut bytes = v.to_bytes_be();
-    if bytes.first() == Some(&0) {
-        bytes.remove(0);
-    }
-    let mut out = Vec::new();
-    let mut prefix = Vec::new();
-    if bytes.first().map(|b| b & 0x80 != 0).unwrap_or(false) {
-        prefix.push(0u8);
-    }
-    let len = (prefix.len() + bytes.len()) as u32;
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(&prefix);
-    out.extend_from_slice(&bytes);
-    out
-}
-
-/// Chave pública no formato ssh-rsa (usada no AUTH RSAPUBLICKEY).
-fn ssh_rsa_pubkey(key: &RsaPrivateKey) -> String {
-    let mut blob = Vec::new();
-    blob.extend_from_slice(b"ssh-rsa\0");
-    blob.extend_from_slice(&mpint(key.e()));
-    blob.extend_from_slice(&mpint(key.n()));
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
-    format!("ssh-rsa {} esfera_v3", b64)
-}
-
 // ------------------------- Handshake -------------------------
 
 fn handshake(stream: &mut TcpStream, key: Option<&RsaPrivateKey>, deadline: Instant) -> io::Result<()> {
-    let ident = b"device::esfera_v3\0";
+    let ident = b"host::features=shell_v2\0";
     write_msg(stream, A_CNXN, A_VERSION, MAX_PAYLOAD as u32, ident)?;
 
+    let mut signed = false;
     loop {
         apply_deadline(stream, deadline)?;
-        let msg = read_msg(stream)?;
+        let msg = read_msg_until(stream, deadline)?;
         match msg.cmd {
             A_CNXN => return Ok(()),
             A_AUTH if msg.arg0 == A_AUTH_TOKEN => {
+                if signed { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Autorize este computador pela conexão USB antes de usar Wi-Fi")); }
+                signed = true;
                 let Some(k) = key else {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -179,15 +150,7 @@ fn handshake(stream: &mut TcpStream, key: Option<&RsaPrivateKey>, deadline: Inst
                 write_msg(stream, A_AUTH, A_AUTH_SIGNATURE, 0, &sig)?;
             }
             A_AUTH if msg.arg0 == A_AUTH_RSAPUBLICKEY => {
-                if let Some(k) = key {
-                    let pubkey = ssh_rsa_pubkey(k);
-                    write_msg(stream, A_AUTH, A_AUTH_RSAPUBLICKEY, 0, pubkey.as_bytes())?;
-                } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "aparelho pediu registro de chave pública sem chave local",
-                    ));
-                }
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Autorize este computador pela conexão USB antes de usar Wi-Fi"));
             }
             other => {
                 return Err(io::Error::new(
@@ -214,29 +177,20 @@ fn apply_deadline(stream: &TcpStream, deadline: Instant) -> io::Result<()> {
     stream.set_write_timeout(Some(remaining))
 }
 
-fn open_shell(mut stream: TcpStream, deadline: Instant) -> io::Result<AdbConn> {
+fn open_shell(mut stream: TcpStream, command: &str, deadline: Instant) -> io::Result<AdbConn> {
     let local_id = rand::random::<u32>().max(1);
-    write_msg(&mut stream, A_OPEN, local_id, 0, b"shell,v2\0")?;
-    let remote_id = loop {
-        apply_deadline(&stream, deadline)?;
-        let msg = read_msg(&mut stream)?;
-        match msg.cmd {
-            A_OKAY => {
-                break msg.arg1;
-            }
-            A_CLSE => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "shell,v2 recusado pelo aparelho",
-                ));
-            }
-            _ => {}
-        }
-    };
-    Ok(AdbConn { stream, local_id, remote_id })
+    if command.as_bytes().contains(&0) { return Err(io::Error::new(io::ErrorKind::InvalidInput, "Comando inválido")); }
+    apply_deadline(&stream, deadline)?;
+    let service = format!("shell,v2,raw:{}\0", command);
+    write_msg(&mut stream, A_OPEN, local_id, 0, service.as_bytes())?;
+    let msg = read_msg_until(&mut stream, deadline)?;
+    if msg.cmd != A_OKAY || msg.arg1 != local_id || msg.arg0 == 0 {
+        return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "O aparelho não aceitou a operação"));
+    }
+    Ok(AdbConn { stream, local_id, remote_id: msg.arg0 })
 }
 
-/// Frame binário do shell v2: [id:1][len:4 LE][dados]
+/// Frame binário do shell v2: [id:1][len:4 LE][dados].
 fn frame(id: u8, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + data.len());
     out.push(id);
@@ -246,60 +200,55 @@ fn frame(id: u8, data: &[u8]) -> Vec<u8> {
 }
 
 impl AdbConn {
-    fn write_frame(&mut self, id: u8, data: &[u8]) -> io::Result<()> {
-        write_msg(&mut self.stream, A_WRTE, self.local_id, self.remote_id, &frame(id, data))
-    }
-
-    fn exec(&mut self, cmd: &str, deadline: Instant) -> io::Result<(Vec<u8>, Vec<u8>, bool)> {
-        self.write_frame(ID_STDIN, format!("{}\n", cmd).as_bytes())?;
-        // Fecha o stdin para sinalizar fim do comando
-        self.write_frame(ID_STDIN, &[])?;
-
+    // Operações pontuais: comandos que precisam receber stdin não são suportados.
+    fn exec(&mut self, deadline: Instant) -> io::Result<(Vec<u8>, Vec<u8>, bool)> {
+        apply_deadline(&self.stream, deadline)?;
+        // Um único WRTE pendente: nenhuma nova escrita de dados antes do ACK.
+        write_msg(&mut self.stream, A_WRTE, self.local_id, self.remote_id, &frame(ID_CLOSE_STDIN, &[]))?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let mut exited = false;
-
+        let mut pending = Vec::new();
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() { return Err(io::Error::new(io::ErrorKind::TimedOut, "tempo esgotado no ADB")); }
-            self.stream.set_read_timeout(Some(remaining))?;
-            self.stream.set_write_timeout(Some(remaining))?;
-            let msg = read_msg(&mut self.stream)?;
+            let msg = read_msg_until(&mut self.stream, deadline)?;
+            if msg.arg1 != self.local_id || msg.arg0 != self.remote_id {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "A resposta veio de outra conexão do aparelho"));
+            }
             match msg.cmd {
+                A_OKAY => {},
+                A_CLSE => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "O aparelho encerrou a operação sem confirmar o resultado")),
                 A_WRTE => {
-                    let _ = write_msg(&mut self.stream, A_OKAY, self.local_id, self.remote_id, &[]);
-                    if msg.payload.is_empty() {
-                        continue;
-                    }
-                    let id = msg.payload[0];
-                    let len = if msg.payload.len() >= 5 {
-                        u32::from_le_bytes(msg.payload[1..5].try_into().unwrap()) as usize
-                    } else {
-                        0
-                    };
-                    let data = if msg.payload.len() >= 5 + len {
-                        &msg.payload[5..5 + len]
-                    } else {
-                        &msg.payload[1..]
-                    };
-                    match id {
-                        ID_STDOUT => stdout.extend_from_slice(data),
-                        ID_STDERR => stderr.extend_from_slice(data),
-                        ID_EXIT => {
-                            exited = true;
-                            break;
+                    apply_deadline(&self.stream, deadline)?;
+                    write_msg(&mut self.stream, A_OKAY, self.local_id, self.remote_id, &[])?;
+                    pending.extend(msg.payload);
+                    while pending.len() >= 5 {
+                        let id = pending[0];
+                        let len = u32::from_le_bytes(pending[1..5].try_into().unwrap()) as usize;
+                        if len > 32 * 1024 * 1024 || stdout.len() + stderr.len() + pending.len() > 32 * 1024 * 1024 {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, "A resposta do aparelho excedeu o limite de leitura"));
                         }
-                        _ => {}
+                        if pending.len() < 5 + len { break; }
+                        let data = &pending[5..5+len];
+                        match id {
+                            ID_STDOUT => stdout.extend_from_slice(data),
+                            ID_STDERR => stderr.extend_from_slice(data),
+                            ID_EXIT => {
+                                if data.len() != 1 { return Err(io::Error::new(io::ErrorKind::InvalidData, "Resultado inválido do aparelho")); }
+                                let code = data[0];
+                                apply_deadline(&self.stream, deadline)?;
+                                let _ = write_msg(&mut self.stream, A_CLSE, self.local_id, self.remote_id, &[]);
+                                if code != 0 {
+                                    return Err(io::Error::other(format!("O aparelho não concluiu a operação (código {})", code)));
+                                }
+                                return Ok((stdout, stderr, true));
+                            },
+                            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Resposta desconhecida do aparelho")),
+                        }
+                        pending.drain(..5+len);
                     }
-                }
-                A_OKAY => {}
-                A_CLSE => break,
-                A_CNXN => {}
-                _ => break,
+                },
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Resposta inesperada do aparelho")),
             }
         }
-
-        Ok((stdout, stderr, exited))
     }
 }
 
@@ -367,11 +316,11 @@ fn connect_transport(serial: &str, budget: Duration) -> Result<TcpStream, String
     if is_tunnel_serial(serial) {
         let handle = RUNTIME_HANDLE
             .lock()
-            .unwrap()
+            .map_err(|_| "Não foi possível abrir a conexão com o aparelho".to_string())?
             .clone()
             .ok_or_else(|| "runtime tokio não inicializado (adb_tcp::init)".to_string())?;
         return handle
-            .block_on(tokio::time::timeout(budget, crate::tunnel_server::open_proxy(serial, 5555)))
+            .block_on(async { tokio::time::timeout(budget, crate::tunnel_server::open_proxy(serial, 5555)).await })
             .map_err(|_| format!("Tempo esgotado ao abrir túnel para {}", serial))?
             .map_err(|e| format!("falha ao abrir proxy de túnel para {}: {}", serial, e));
     }
@@ -416,14 +365,14 @@ fn exec_shell_bytes_with_timeout(serial: &str, cmd: &str, timeout: Duration) -> 
     handshake(&mut handshake_stream, key.as_ref(), deadline)
         .map_err(|e| format!("handshake ADB falhou: {}", e))?;
     apply_deadline(&stream, deadline).map_err(|e| e.to_string())?;
-    let mut conn = open_shell(stream, deadline).map_err(|e| format!("open shell falhou: {}", e))?;
+    let mut conn = open_shell(stream, cmd, deadline).map_err(|e| format!("open shell falhou: {}", e))?;
 
-    let result = run_with_conn(&mut conn, cmd, deadline);
+    let result = run_with_conn(&mut conn, deadline);
     result
 }
 
-fn run_with_conn(conn: &mut AdbConn, cmd: &str, deadline: Instant) -> Result<(Vec<u8>, Vec<u8>, bool), String> {
-    conn.exec(cmd, deadline)
+fn run_with_conn(conn: &mut AdbConn, deadline: Instant) -> Result<(Vec<u8>, Vec<u8>, bool), String> {
+    conn.exec(deadline)
         .map_err(|e| format!("exec nativo falhou: {}", e))
 }
 
@@ -440,5 +389,76 @@ mod wifi_timeout_tests {
         assert!(result.is_err());
         assert!(start.elapsed() < Duration::from_secs(2));
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod native_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn aceita_data_check_zero_do_daemon_moderno() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            // Cabeçalho independente do escritor sob teste: CNXN, payload abc, checksum zero.
+            let mut bytes = Vec::new();
+            for field in [0x4e584e43u32, 0x01000001, 4096, 3, 0, 0xb1a7b1bc] { bytes.extend(field.to_le_bytes()); }
+            bytes.extend(b"abc");
+            socket.write_all(&bytes).unwrap();
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        let reply = read_msg_until(&mut stream, Instant::now() + Duration::from_secs(1)).unwrap();
+        assert_eq!(reply.payload, b"abc");
+        server.join().unwrap();
+        assert_eq!(adb_checksum(b"abc"), 294);
+    }
+
+    fn simulated_command(exit: u8) -> Result<String, String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            let hello = read_msg(&mut socket).unwrap();
+            assert_eq!(hello.cmd, A_CNXN);
+            write_msg(&mut socket, A_CNXN, A_VERSION, 4096, b"device::features=shell_v2\0").unwrap();
+            let open = read_msg(&mut socket).unwrap();
+            if open.payload != b"shell,v2,raw:printf teste\0" {
+                let _ = write_msg(&mut socket, A_CLSE, 0, open.arg0, &[]);
+                return;
+            }
+            let remote = if open.arg0 == 7 { 8 } else { 7 };
+            write_msg(&mut socket, A_OKAY, remote, open.arg0, &[]).unwrap();
+            let close_stdin = read_msg(&mut socket).unwrap();
+            assert_eq!((close_stdin.arg0, close_stdin.arg1), (open.arg0, remote));
+            assert_eq!(close_stdin.payload, frame(4, &[]));
+            write_msg(&mut socket, A_OKAY, remote, open.arg0, &[]).unwrap();
+            let mut output = frame(ID_STDOUT, b"teste");
+            output.extend(frame(ID_STDERR, b"aviso"));
+            output.extend(frame(ID_EXIT, &[exit]));
+            // Um cabeçalho dividido entre WRTE; o último WRTE contém vários frames.
+            for data in [&output[..2], &output[2..7], &output[7..]] {
+                write_msg(&mut socket, A_WRTE, remote, open.arg0, data).unwrap();
+                let ack = read_msg(&mut socket).unwrap();
+                assert_eq!((ack.cmd, ack.arg0, ack.arg1), (A_OKAY, open.arg0, remote));
+            }
+            let _ = read_msg(&mut socket);
+        });
+        let result = exec_shell_with_timeout(&address.to_string(), "printf teste", Duration::from_secs(3));
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn ids_distintos_e_frames_fragmentados_e_agrupados() {
+        assert_eq!(simulated_command(0).unwrap(), "teste");
+    }
+
+    #[test]
+    fn codigo_de_saida_nao_zero_e_falha() {
+        assert!(simulated_command(7).unwrap_err().contains('7'));
     }
 }
