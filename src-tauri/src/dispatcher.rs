@@ -168,6 +168,8 @@ pub fn import_opt_out_requests(db: &Database) {
         let serial = dev.current_adb_address.clone().filter(|a| !a.trim().is_empty()).unwrap_or(dev.serial.clone());
         sync_opt_out_from_device(db, &serial, dev.company_id);
     }
+    let token = crate::config::vexor_token();
+    if !token.trim().is_empty() { let _ = flush_device_outbox_at(db, token.trim(), "http://127.0.0.1:4000/esfera/device-messages"); }
 }
 
 /// Importa os "SAIR" de um aparelho. O arquivo é movido para `.reading` antes de ler (linhas novas
@@ -182,17 +184,29 @@ pub fn import_opt_out_from_device(db: &Database, serial: &str, company_id: i32) 
 /// A sincronização HTTP ocorre fora do bloqueio usado pela verificação anterior a cada envio.
 fn sync_opt_out_from_device(db: &Database, serial: &str, company_id: i32) {
     let lock = opt_out_device_lock(serial);
-    let batch = {
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        match read_device_opt_out(db, serial, company_id) { Ok(batch) => batch, Err(_) => return }
-    };
-    if batch.trim().is_empty() || !forward_device_messages(db, serial, company_id, &batch) { return; }
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    // O arquivo só é removido se ainda for o mesmo lote que recebeu ACK do VEXOR.
-    let current = AdbManager::execute_shell(serial, "if [ -f /sdcard/esfera_optout.reading ]; then cat /sdcard/esfera_optout.reading; fi", 6);
-    if current.as_deref() == Ok(batch.as_str()) {
-        let _ = AdbManager::execute_shell(serial, "rm -f /sdcard/esfera_optout.reading", 4);
+    let _ = read_device_opt_out(db, serial, company_id);
+}
+
+fn stable_device_serial(db: &Database, serial: &str, company: i32) -> String {
+    db.get_all_devices().into_iter().find(|d| d.company_id == company && (d.serial == serial || d.current_adb_address.as_deref() == Some(serial) || d.esfera_device_id.as_deref() == Some(serial)))
+        .map(|d| d.esfera_device_id.filter(|s| !s.trim().is_empty()).unwrap_or(d.serial)).unwrap_or_else(|| serial.to_string())
+}
+
+fn persist_device_batch(db: &Database, serial: &str, company: i32, lines: &str) -> Result<(), String> {
+    if !process_opt_out_jsonl(db, serial, company, lines, None) { return Err("Não foi possível registrar as respostas".into()); }
+    db.enqueue_device_batch(company, &stable_device_serial(db, serial, company), lines)
+}
+
+fn flush_device_outbox_at(db: &Database, token: &str, endpoint: &str) -> bool {
+    if token.trim().is_empty() { return false; }
+    let pending = match db.pending_device_messages() { Ok(v) => v, Err(_) => return false };
+    let mut all_sent = true;
+    for (id, company, serial, line) in pending {
+        if !forward_device_messages_at(db, &serial, company, &line, token, endpoint) { let _ = db.defer_device_message(&id); all_sent = false; continue; }
+        if db.acknowledge_device_message(&id).is_err() { all_sent = false; }
     }
+    all_sent
 }
 
 fn read_device_opt_out(db: &Database, serial: &str, company_id: i32) -> Result<String, String> {
@@ -203,8 +217,12 @@ fn read_device_opt_out(db: &Database, serial: &str, company_id: i32) -> Result<S
     let out = AdbManager::execute_shell(serial,
         "if [ ! -s /sdcard/esfera_optout.reading ] && [ -s /sdcard/esfera_optout.jsonl ]; then mv /sdcard/esfera_optout.jsonl /sdcard/esfera_optout.reading; fi; if [ -f /sdcard/esfera_optout.reading ]; then cat /sdcard/esfera_optout.reading; fi", 6)?;
     let newer = AdbManager::execute_shell(serial, "if [ -f /sdcard/esfera_optout.jsonl ]; then cat /sdcard/esfera_optout.jsonl; fi", 6)?;
-    if !process_opt_out_jsonl(db, serial, company_id, &out, None) || !process_opt_out_jsonl(db, serial, company_id, &newer, None) {
-        return Err("Não foi possível registrar os pedidos de descadastro".into());
+    // O arquivo novo pode estar sendo escrito: ele ainda não é removido nem enfileirado.
+    if !process_opt_out_jsonl(db, serial, company_id, &newer, None) { return Err("Não foi possível registrar os pedidos de descadastro".into()); }
+    persist_device_batch(db, serial, company_id, &out)?;
+    if !out.trim().is_empty() {
+        let current = AdbManager::execute_shell(serial, "if [ -f /sdcard/esfera_optout.reading ]; then cat /sdcard/esfera_optout.reading; fi", 6)?;
+        if current == out { AdbManager::execute_shell(serial, "rm -f /sdcard/esfera_optout.reading", 4)?; }
     }
     Ok(out)
 }
@@ -212,16 +230,10 @@ fn read_device_opt_out(db: &Database, serial: &str, company_id: i32) -> Result<S
 /// Texto aprovado, mantido íntegro para revisões que chegam depois pelo endpoint do Esfera.
 pub const OPT_OUT_CONFIRMATION_TEXT: &str = "Pronto, seu número foi retirado das nossas mensagens automáticas. Você não receberá mais avisos por este canal, conforme o seu direito de oposição previsto na LGPD (Lei 13.709/2018, art. 18) e as regras de cobrança do Código de Defesa do Consumidor.\nEste pedido não altera e não reconhece nenhum débito.";
 
-fn forward_device_messages(db: &Database, serial: &str, company: i32, lines: &str) -> bool {
-    let token = crate::config::vexor_token();
-    if token.trim().is_empty() { eprintln!("[SAIR] Token da integração não configurado; mensagens mantidas no aparelho."); return false; }
-    forward_device_messages_at(db, serial, company, lines, token.trim(), "http://127.0.0.1:4000/esfera/device-messages")
-}
-
 fn forward_device_messages_at(db: &Database, serial: &str, company: i32, lines: &str, token: &str, endpoint: &str) -> bool {
     use sha2::{Digest, Sha256};
     let client = match reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(10)).build() { Ok(c) => c, Err(_) => return false };
-    let stable_serial = db.get_all_devices().into_iter().find(|d| d.company_id == company && (d.serial == serial || d.current_adb_address.as_deref() == Some(serial))).map(|d| d.esfera_device_id.filter(|s| !s.trim().is_empty()).unwrap_or(d.serial)).unwrap_or_else(|| serial.to_string());
+    let stable_serial = db.get_all_devices().into_iter().find(|d| d.company_id == company && (d.serial == serial || d.current_adb_address.as_deref() == Some(serial) || d.esfera_device_id.as_deref() == Some(serial))).map(|d| d.esfera_device_id.filter(|s| !s.trim().is_empty()).unwrap_or(d.serial)).unwrap_or_else(|| serial.to_string());
     let device: String = stable_serial.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-')).take(64).collect();
     let device = if device.is_empty() { "celular" } else { &device };
     for line in lines.lines().filter(|l| l.trim().starts_with('{')) {
@@ -231,11 +243,13 @@ fn forward_device_messages_at(db: &Database, serial: &str, company: i32, lines: 
         let phone = AdbManager::extract_phone_digits(title);
         if phone.len() < 10 {
             if local_opt_out(text) && db.add_opt_out_review(company,title,text,serial).is_err() { return false; }
-            continue;
+            // Sem remetente identificável não existe ACK remoto: conserva a linha na fila.
+            return false;
         }
         let id = hex::encode(Sha256::digest(format!("{}|{}",device,line).as_bytes()));
         let event = format!("device:{}:{}",device,id);
-        if db.remember_device_inbound(&event,company,&phone,&stable_serial,OPT_OUT_CONFIRMATION_TEXT).is_err() { return false; }
+        let valid_phone = Database::validate_opt_out_phone(&phone).is_ok();
+        if valid_phone && db.remember_device_inbound(&event,company,&phone,&stable_serial,OPT_OUT_CONFIRMATION_TEXT).is_err() { return false; }
         use chrono::TimeZone;
         let received_at = v.get("ts").and_then(|x| x.as_i64()).and_then(|ms| chrono::Utc.timestamp_millis_opt(ms).single()).map(|t| t.to_rfc3339());
         let mut message = serde_json::json!({"id":id,"from":phone,"text":text,"device":device});
@@ -250,10 +264,12 @@ fn forward_device_messages_at(db: &Database, serial: &str, company: i32, lines: 
         match item.get("decision").and_then(|v| v.as_str()) {
             Some("OPT_OUT") => {
                 if item.get("confirmationText").and_then(|v|v.as_str()) != Some(OPT_OUT_CONFIRMATION_TEXT) { return false; }
-                match db.record_opt_out_event(&event,company,&phone,"celular","Pedido pelo WhatsApp","") {
-                    Ok(outcome) if outcome.same_company && outcome.phone_key == Database::opt_out_key(&phone) => (),
-                    _ => return false,
-                }
+                if valid_phone {
+                    match db.record_opt_out_event(&event,company,&phone,"celular","Pedido pelo WhatsApp","") {
+                        Ok(outcome) if outcome.same_company && outcome.phone_key == Database::opt_out_key(&phone) => (),
+                        _ => return false,
+                    }
+                } else if db.add_opt_out_review(company,title,text,&stable_serial).is_err() { return false; }
             }
             Some("REVIEW") | Some("NONE") => (),
             _ => return false,
@@ -275,8 +291,10 @@ fn local_opt_out(text: &str) -> bool {
     }
     let words: Vec<&str> = normalized.split_whitespace().collect();
     if words.is_empty() { return false; }
-    // Um pedido explícito de SAIR permanece válido mesmo em mensagem mais longa.
+    // Reconhece pedidos claros mesmo em frases longas, sem tratar perguntas comuns como SAIR.
     if words.contains(&"sair") { return true; }
+    let joined = words.join(" ");
+    if ["retirem meu numero", "retirem meu contato", "retire meu numero", "retire meu contato", "parem de mandar mensagem", "parem de enviar mensagem", "nao quero mais receber"].iter().any(|p| joined.contains(p)) { return true; }
     if words.len() > 8 { return false; }
     let phrase = words.join(" ");
     let phrases = ["sair", "parar", "pare", "stop", "cancelar", "descadastrar", "nao quero mais receber", "remover meu numero",
@@ -318,10 +336,11 @@ pub fn process_opt_out_jsonl(
     fallback_file: Option<&std::path::Path>,
 ) -> bool {
     let mut all_saved = true;
-    for line in out.lines().filter(|l| l.trim().starts_with('{')) {
-        let v: serde_json::Value = match serde_json::from_str(line.trim()) {
-            Ok(v) => v,
-            Err(_) => { all_saved = false; continue; },
+    let stable = stable_device_serial(db, serial, company_id);
+    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let v: serde_json::Value = match serde_json::from_str::<serde_json::Value>(line.trim()) {
+            Ok(v) if v.is_object() => v,
+            _ => { all_saved = false; continue; },
         };
         let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("");
         let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
@@ -331,7 +350,6 @@ pub fn process_opt_out_jsonl(
             use sha2::{Digest, Sha256};
             use chrono::TimeZone;
             if let Some(when) = v.get("ts").and_then(|t| t.as_i64()).and_then(|ms| chrono::Utc.timestamp_millis_opt(ms).single()) {
-                let stable = db.get_all_devices().into_iter().find(|d| d.company_id == company_id && (d.serial == serial || d.current_adb_address.as_deref() == Some(serial) || d.esfera_device_id.as_deref() == Some(serial))).map(|d| d.esfera_device_id.filter(|s| !s.is_empty()).unwrap_or(d.serial)).unwrap_or_else(|| serial.to_string());
                 let id = hex::encode(Sha256::digest(format!("{}|{}|{}", company_id, stable, line.trim()).as_bytes()));
                 if db.remember_reply(&id, company_id, serial, &phone, &when.format("%Y-%m-%d %H:%M:%S").to_string()).is_err() { all_saved = false; }
             }
@@ -351,6 +369,7 @@ pub fn process_opt_out_jsonl(
                     );
                 }
                 Err(e) => {
+                    all_saved = false;
                     let target_path = match fallback_file {
                         Some(p) => p.to_path_buf(),
                         None => {
@@ -481,6 +500,11 @@ pub fn ensure_temp_contact(serial: &str, phone: &str) -> bool {
     )
 }
 
+struct TempContactInflightGuard(String);
+impl Drop for TempContactInflightGuard {
+    fn drop(&mut self) { if let Ok(mut pending) = TEMP_CONTACTS_INFLIGHT.lock() { pending.remove(&self.0); } }
+}
+
 pub fn ensure_temp_contact_with<L, I>(serial: &str, phone: &str, loader: L, inserter: I) -> bool
 where
     L: FnOnce(&str) -> Result<Vec<String>, String>,
@@ -502,6 +526,7 @@ where
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    let _inflight_guard = TempContactInflightGuard(key.clone());
     let created = match inserter(serial, &temp_contact_name(phone), phone) {
         Ok(Some(_)) => {
             if let Ok(mut s) = TEMP_CONTACTS.lock() {
@@ -521,9 +546,6 @@ where
             false
         }
     };
-    if let Ok(mut s) = TEMP_CONTACTS_INFLIGHT.lock() {
-        s.remove(&key);
-    }
     created
 }
 
@@ -554,27 +576,21 @@ fn campaign_device_serials(db: &Database, company_id: i32, device_ids: &[String]
         .collect()
 }
 
-/// Ao iniciar: salva em segundo plano todos os contatos pendentes nos aparelhos da campanha.
-pub fn seed_campaign_contacts(db: Arc<Database>, campaign_id: i32, company_id: i32, device_ids: Vec<String>) {
-    std::thread::spawn(move || {
-        let serials = campaign_device_serials(&db, company_id, &device_ids);
-        let contacts = db.get_pending_contacts(campaign_id, 100_000);
-        let mut created = 0;
-        for serial in &serials {
-            for c in &contacts {
-                if ensure_temp_contact(serial, &c.phone) {
-                    created += 1;
-                }
-            }
-        }
-        println!("[CONTATOS TEMP] Campanha {}: {} contatos salvos em {} aparelho(s).", campaign_id, created, serials.len());
-    });
+/// Mantém a API de início; contatos são preparados apenas quando necessários.
+pub fn seed_campaign_contacts(_db: Arc<Database>, _campaign_id: i32, _company_id: i32, _device_ids: Vec<String>) {
+    // Os contatos são salvos sob demanda no envio; evita sobrecarregar o provedor Android.
 }
 
 /// Ao concluir/parar: apaga todos os contatos temporários dos aparelhos da campanha.
 pub fn cleanup_campaign_contacts(db: Arc<Database>, company_id: i32, device_ids: Vec<String>) {
     std::thread::spawn(move || {
         for serial in campaign_device_serials(&db, company_id, &device_ids) {
+            let devices = db.get_devices(company_id);
+            let device = devices.iter().find(|d| d.serial == serial || d.current_adb_address.as_deref() == Some(serial.as_str()));
+            let Some(device) = device else { continue; };
+            let device_lock = device_operation_lock_for_id(device.id);
+            let Ok(_guard) = device_lock.try_lock() else { continue; };
+            if db.device_has_open_campaign(company_id, &device.serial, device.esfera_device_id.as_deref()).unwrap_or(true) { continue; }
             let _ = AdbManager::cleanup_all_temporary_contacts(&serial);
             if let Ok(mut s) = TEMP_CONTACTS.lock() {
                 s.retain(|k| !k.starts_with(&format!("{}|", serial)));
@@ -588,6 +604,9 @@ pub fn cleanup_campaign_contacts(db: Arc<Database>, company_id: i32, device_ids:
 }
 
 /// Mensagens geradas antecipadamente (campanha, contato) enquanto o disparo anterior pausa.
+static RETRY_MESSAGES: std::sync::LazyLock<Mutex<HashMap<(i32,i32), (u64,String,String)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 static PREFETCHED_MESSAGES: std::sync::LazyLock<Mutex<HashMap<(i32, i32), (u64, tokio::task::JoinHandle<String>)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -972,17 +991,18 @@ async fn build_message(
     }
 }
 
-/// Inicia em segundo plano a mensagem do próximo contato pendente depois de `after_id`.
-fn prefetch_next_message(db_arc: Arc<Database>, campaign: crate::db::Campaign, after_id: i32, app_handle: Option<AppHandle>) {
+/// Pré-carrega o mesmo contato que o laço de envio selecionará.
+fn prefetch_next_message(db_arc: Arc<Database>, campaign: crate::db::Campaign, _after_id: i32, app_handle: Option<AppHandle>) {
     tauri::async_runtime::spawn(async move {
         let db = db_arc.clone();
         let cid = campaign.id;
-        let next = match spawn_blocking(move || db.try_get_pending_contact_after(cid, after_id)).await {
+        let next = match spawn_blocking(move || db.try_get_next_pending_contact(cid)).await {
             Ok(Ok(Some(c))) => c,
             _ => return,
         };
         let key = (campaign.id, next.id);
         let fingerprint = campaign_fingerprint(&campaign);
+        if RETRY_MESSAGES.lock().map(|m| m.get(&key).map_or(false, |(fp,name,_)| *fp == fingerprint && *name == next.contact_name)).unwrap_or(false) { return; }
         let handle = tokio::spawn(build_message(db_arc, campaign, next, app_handle));
         if let Ok(mut m) = PREFETCHED_MESSAGES.lock() {
             // Uma pré-carga por campanha: descarta as antigas (contato já tratado ou pulado).
@@ -1006,6 +1026,7 @@ fn contains_link(message: &str) -> bool {
     }
     lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
         .any(|word| {
+            if word.trim_matches('.').parse::<std::net::Ipv4Addr>().is_ok() { return true; }
             let mut pieces = word.trim_matches('.').rsplit('.');
             match (pieces.next(), pieces.next()) {
                 (Some(tld), Some(host)) => tld.len() >= 2 && tld.len() <= 24
@@ -1038,8 +1059,22 @@ pub enum SendOutcome {
 }
 
 /// Pausa a campanha e mostra o motivo no log da tela.
+static LAST_NETWORK_WARNING: std::sync::LazyLock<Mutex<HashMap<i32, String>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn emit_network_warning(campaign: &crate::db::Campaign, app_handle: &Option<AppHandle>, reason: &str) {
+    let changed = LAST_NETWORK_WARNING.lock().map(|mut m| {
+        if m.get(&campaign.id).map(String::as_str) == Some(reason) { false } else { m.insert(campaign.id, reason.to_string()); true }
+    }).unwrap_or(false);
+    if changed {
+        if let Some(handle) = app_handle {
+            let _ = handle.emit("campaign-progress", CampaignProgressEvent { campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count, total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0, status: reason.into() });
+        }
+    }
+}
+
 fn pause_campaign_with_reason(db: &Database, campaign: &crate::db::Campaign, app_handle: &Option<AppHandle>, reason: &str) {
     let _ = db.set_campaign_status(campaign.id, "paused");
+    db.queue_add_log(campaign.company_id, "warning", "Disparador", reason);
     if let Some(handle) = app_handle {
         let _ = handle.emit("campaign-progress", CampaignProgressEvent {
             campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
@@ -1080,7 +1115,7 @@ impl Dispatcher {
                     poll_delay = Duration::from_secs(2);
                     continue;
                 }
-                poll_delay = Duration::from_millis(250);
+                poll_delay = Duration::from_secs(2);
 
                 // Cada campanha mantém sua própria cadência. Campanhas diferentes
                 // podem avançar juntas sem somar os intervalos HCP umas às outras.
@@ -1184,9 +1219,15 @@ impl Dispatcher {
                     let lookup_ms = lookup_started.elapsed().as_millis();
                     let preparation_started = Instant::now();
 
+                    // Mantém a mesma variação quando a tentativa volta sem enviar.
+                    let fingerprint = campaign_fingerprint(&campaign);
+                    let cached = RETRY_MESSAGES.lock().ok().and_then(|mut m| {
+                        m.retain(|(campaign_id, contact_id), _| *campaign_id != campaign.id || *contact_id == next_contact.id);
+                        m.get(&(campaign.id, next_contact.id)).filter(|(fp,name,_)| *fp == fingerprint && *name == next_contact.contact_name).map(|(_,_,text)| text.clone())
+                    });
                     // Mensagem: usa a pré-carregada durante a pausa do contato anterior, se houver.
-                    let prefetched = PREFETCHED_MESSAGES.lock().ok().and_then(|mut m| m.remove(&(campaign.id, next_contact.id)));
-                    let message_to_send = match prefetched {
+                    let prefetched = if cached.is_none() { PREFETCHED_MESSAGES.lock().ok().and_then(|mut m| m.remove(&(campaign.id, next_contact.id))) } else { None };
+                    let message_to_send = if let Some(text) = cached { text } else { match prefetched {
                         // Só vale se a campanha não mudou desde a pré-carga (texto, spintax, IA).
                         Some((fingerprint, handle)) if fingerprint == campaign_fingerprint(&campaign) && handle.is_finished() => match handle.await {
                             Ok(m) => {
@@ -1201,19 +1242,14 @@ impl Dispatcher {
                             build_message(db_arc.clone(), campaign.clone(), next_contact.clone(), app_handle.clone()).await
                         }
                         None => build_message(db_arc.clone(), campaign.clone(), next_contact.clone(), app_handle.clone()).await,
-                    };
+                    }};
+                    if let Ok(mut m) = RETRY_MESSAGES.lock() {
+                        m.insert((campaign.id,next_contact.id),(fingerprint,next_contact.contact_name.clone(),message_to_send.clone()));
+                    }
 
                     // Sem prova confiável de conversa anterior, tratar o contato como novo.
                     if contains_link(&message_to_send) {
-                        let _ = db_arc.set_campaign_status(campaign.id, "paused");
-                        if let Some(ref handle) = app_handle {
-                            let _ = handle.emit("campaign-progress", CampaignProgressEvent {
-                                campaign_id: campaign.id, campaign_name: campaign.name.clone(),
-                                sent_count: campaign.sent_count, total_contacts: campaign.contacts_count,
-                                last_contact_phone: String::new(), delay_used_ms: 0,
-                                status: "Campanha pausada: remova links da primeira mensagem para contatos novos.".to_string(),
-                            });
-                        }
+                        pause_campaign_with_reason(&db_arc, &campaign, &app_handle, "Remova links da primeira mensagem para contatos novos.");
                         return;
                     }
 
@@ -1279,13 +1315,8 @@ impl Dispatcher {
                                     ritmo_reduzido = status.state == "reduzido";
                                     if status.state != "normal" {
                                         reply_warning = true;
-                                        if let Some(ref handle) = app_handle {
-                                            let _ = handle.emit("campaign-progress", CampaignProgressEvent {
-                                                campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
-                                                total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
-                                                status: status.reason.clone(),
-                                            });
-                                        }
+                                        let limited = NETWORK_LIMITED_CAMPAIGNS.lock().map(|s| s.contains(&campaign.id)).unwrap_or(true);
+                                        if !limited { emit_network_warning(&campaign, &app_handle, &status.reason); }
                                     }
                                     if status.state == "pausado" {
                                         if let Ok(mut unavailable) = DEVICE_UNAVAILABLE_UNTIL.lock() { unavailable.insert(serial.clone(), Instant::now() + std::time::Duration::from_secs(30)); }
@@ -1302,13 +1333,7 @@ impl Dispatcher {
                             Err(_) => {
                         let was_limited = NETWORK_LIMITED_CAMPAIGNS.lock().map(|s| s.contains(&campaign.id)).unwrap_or(true);
                         if !reply_warning && !was_limited {
-                            if let Some(ref handle) = app_handle {
-                                let _ = handle.emit("campaign-progress", CampaignProgressEvent {
-                                    campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
-                                    total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
-                                    status: "Aguardando vez na rede".into(),
-                                });
-                            }
+                            emit_network_warning(&campaign, &app_handle, "Aguardando vez na rede");
                         }
                         NETWORK_SEND_GATE.lock().await
                             }
@@ -1318,13 +1343,7 @@ impl Dispatcher {
                         if wait > 0 {
                             if let Ok(mut limited) = NETWORK_LIMITED_CAMPAIGNS.lock() { limited.insert(campaign.id); }
                             drop(network_guard);
-                            if let Some(ref handle) = app_handle {
-                                let _ = handle.emit("campaign-progress", CampaignProgressEvent {
-                                    campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
-                                    total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
-                                    status: if limit_result.is_ok() { "Teto da rede atingido; aguardando a próxima janela." } else { "Não foi possível verificar o teto da rede; tentando novamente." }.into(),
-                                });
-                            }
+                            emit_network_warning(&campaign, &app_handle, if limit_result.is_ok() { "Teto da rede atingido; aguardando a próxima janela." } else { "Não foi possível verificar o teto da rede; tentando novamente." });
                             sleep(Duration::from_secs(wait.min(30))).await;
                             return;
                         }
@@ -1448,6 +1467,7 @@ impl Dispatcher {
                     if let SendOutcome::SendFailed(ref error) = outcome {
                         // Chip em descanso: o contato volta para a fila, sem contar falha.
                         if error.starts_with("RITMO:") {
+                            emit_network_warning(&campaign, &app_handle, "Chip em descanso; aguardando disponibilidade.");
                             sleep(Duration::from_secs(1)).await;
                             return;
                         }
@@ -1458,13 +1478,8 @@ impl Dispatcher {
                         }
                         if error.starts_with("REDE:") {
                             if let Ok(mut limited) = NETWORK_LIMITED_CAMPAIGNS.lock() { limited.insert(campaign.id); }
-                            if let Some(ref handle) = app_handle {
-                                let _ = handle.emit("campaign-progress", CampaignProgressEvent {
-                                    campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
-                                    total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
-                                    status: error.trim_start_matches("REDE: ").to_string(),
-                                });
-                            }
+                            let reason = error.trim_start_matches("REDE: ");
+                            emit_network_warning(&campaign, &app_handle, if reason.starts_with("teto da rede atingido") { "Teto da rede atingido; aguardando a próxima janela." } else { reason });
                             sleep(Duration::from_secs(30)).await;
                             return;
                         }
@@ -1507,21 +1522,34 @@ impl Dispatcher {
                     }
 
                     let gaussian_delay_ms = if ritmo_reduzido { base_delay_ms.saturating_mul(2) } else { base_delay_ms };
+                    if matches!(outcome, SendOutcome::Sent) {
+                        let db3 = db_arc.clone();
+                        let phone3 = phone.clone();
+                        let cid = campaign.id;
+                        let contact_id = next_contact.id;
+                        let persisted = spawn_blocking(move || db3.complete_send_now(&phone3, cid, contact_id)).await;
+                        if !matches!(persisted, Ok(Ok(()))) {
+                            let _ = db_arc.update_contact_status(contact_id, "partial");
+                            pause_campaign_with_reason(&db_arc, &campaign, &app_handle, "Falha ao registrar envio; contato requer revisão.");
+                            return;
+                        }
+                        if let Ok(mut m) = RETRY_MESSAGES.lock() { m.remove(&(campaign.id,next_contact.id)); }
+                        if let Ok(mut m) = LAST_NETWORK_WARNING.lock() { m.remove(&campaign.id); }
+                        if let Some(ref handle) = app_handle {
+                            let _ = handle.emit("campaign-progress", CampaignProgressEvent {
+                                campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count + 1,
+                                total_contacts: campaign.contacts_count, last_contact_phone: phone.clone(), delay_used_ms: gaussian_delay_ms,
+                                status: "running".into(),
+                            });
+                        }
+                    }
 
                     // A IA do próximo contato trabalha durante a pausa, não depois dela.
                     prefetch_next_message(db_arc.clone(), campaign.clone(), next_contact.id, app_handle.clone());
                     sleep(Duration::from_millis(gaussian_delay_ms as u64)).await;
 
                     match outcome {
-                        SendOutcome::Sent => {
-                            let db3 = db_arc.clone();
-                            let phone3 = phone.clone();
-                            let contact_id = next_contact.id;
-                            // Escrita atômica na Fila Única (MPSC): SentHistory + contato + contador
-                            spawn_blocking(move || db3.queue_send_completed(&phone3, campaign.id, contact_id))
-                                .await
-                                .unwrap_or_default();
-                        }
+                        SendOutcome::Sent => {}
                         SendOutcome::SendFailed(ref e) if e.starts_with("PARCIAL:") || e.starts_with("INCERTO:") => {
                             // Parte já pode ter chegado: NÃO reenviar (duplicaria). Fica para revisão do operador.
                             let db_partial = db_arc.clone();
@@ -1566,7 +1594,7 @@ impl Dispatcher {
                             last_contact_phone: next_contact.phone.clone(),
                             delay_used_ms: gaussian_delay_ms,
                             status: if matches!(outcome, SendOutcome::NoOnlineDevice) {
-                                "waiting_device".to_string()
+                                LAST_NETWORK_WARNING.lock().ok().and_then(|m| m.get(&campaign.id).cloned()).unwrap_or_else(|| "waiting_device".to_string())
                             } else if matches!(outcome, SendOutcome::SendFailed(_)) {
                                 "send_error".to_string()
                             } else {
@@ -1593,6 +1621,8 @@ impl Dispatcher {
             let chips = db.get_chips(device.id);
             if chips.len() != 1 || chips[0].status != "livre" || chips[0].restricted_until.is_some() { continue; }
             let serial = device.current_adb_address.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| device.serial.clone());
+            let busy_before = db.get_running_campaigns().map(|cs| cs.iter().any(|c| c.company_id == company && c.device_ids.iter().any(|id| id == &device.serial || device.esfera_device_id.as_deref() == Some(id.as_str())))).unwrap_or(true);
+            if !confirmation_allowed(within_send_window(), busy_before) || db.chip_cooldown_seconds(chips[0].id).unwrap_or(u64::MAX) > 0 { continue; }
             let network_guard = NETWORK_SEND_GATE.lock().await;
             if db.network_limit_wait().unwrap_or(30) > 0 { continue; }
             // Portão da rede → aparelho; aparelho ocupado solta o portão e a confirmação fica para a próxima rodada.
@@ -1909,13 +1939,31 @@ mod dispatcher_tests {
         db.pooled_conn().unwrap().execute("DROP TABLE ESF_OptOutReview;", []).unwrap();
         let line_sem_num = "{\"title\":\"Contato Oculto\",\"text\":\"pare de mandar\"}\n";
         let ok_fallback = process_opt_out_jsonl(&db, "192.168.1.90:5555", 1, line_sem_num, Some(&fallback_path));
-        assert!(ok_fallback);
+        assert!(!ok_fallback, "não apaga o lote sem registrar a revisão no banco");
         assert!(fallback_path.exists(), "arquivo de reserva deve ser criado quando o banco falha");
         let saved_jsonl = std::fs::read_to_string(&fallback_path).unwrap();
         assert!(saved_jsonl.contains("Contato Oculto"));
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&fallback_path);
+    }
+
+    #[test]
+    fn contatos_concorrentes_nao_duplicam_e_panico_libera_a_trava() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..2).map(|_| {
+            let barrier=barrier.clone(); let calls=calls.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                ensure_temp_contact_with("test-concurrent", "11999990001", |_| Ok(vec![]), |_,_,_| { calls.fetch_add(1, Ordering::SeqCst); std::thread::sleep(std::time::Duration::from_millis(50)); Ok(Some(1)) })
+            })
+        }).collect();
+        for handle in handles { let _ = handle.join().unwrap(); }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let failed=std::panic::catch_unwind(|| ensure_temp_contact_with("test-panic", "11999990002", |_| Ok(vec![]), |_,_,_| -> Result<Option<i64>,String> { panic!("teste") }));
+        assert!(failed.is_err());
+        assert!(ensure_temp_contact_with("test-panic", "11999990002", |_| Ok(vec![]), |_,_,_| Ok(Some(2))));
     }
 
     #[test]
@@ -2093,6 +2141,11 @@ mod variant_pool_tests {
             ]
         );
 
+        db.save_ai_provider_key(1, "vps_ia", "teste", "https://localhost/v1/chat/completions", "qwen3:4b-instruct").unwrap();
+        let with_vps = super::build_ai_fallback_chain(&db, 1, &primary);
+        let providers: Vec<&str> = with_vps.iter().map(|c| c.provider.as_str()).collect();
+        assert_eq!(&providers[..4], &["groq", "groq", "vps_ia", "gemini_web"]);
+
         // Se desconectar o gemini_web (chave vazia), ele sai da cadeia:
         db.save_ai_provider_key(1, "gemini_web", "", "", "").unwrap();
         let chain_disconnected = super::build_ai_fallback_chain(&db, 1, &primary);
@@ -2104,6 +2157,10 @@ mod variant_pool_tests {
 
 #[cfg(test)]
 mod antiban_link_tests {
+    #[test]
+    fn bloqueia_ips_e_dominios_sem_protocolo() {
+        for url in ["187.77.243.224:8080", "portal: realess.com.br, confira", "bit.ly/acordo", "wa.me/5575988052539"] { assert!(super::contains_link(url), "{}", url); }
+    }
     #[test]
     fn bloqueia_links_no_texto_final() {
         assert!(super::contains_link("acesse https://exemplo.com"));
@@ -2117,6 +2174,56 @@ mod antiban_link_tests {
 mod vexor_device_bridge_tests {
     use super::*;
     use std::io::{Read, Write};
+    #[test]
+    fn fila_local_reimporta_e_guarda_ate_ack_mesmo_se_falhar_no_meio() {
+        let path = std::env::temp_dir().join(format!("esfera_outbox_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let first = r#"{"title":"Esfera 5575988052539","text":"SAIR","ts":1793180000000}"#;
+        let second = r#"{"title":"Esfera 5575911112222","text":"Oi","ts":1793180000001}"#;
+        let batch = format!("{}\n{}\n", first,second);
+        assert!(persist_device_batch(&db,"device1",1,&batch).is_ok());
+        assert!(persist_device_batch(&db,"device1",1,&batch).is_ok());
+        assert!(db.is_opted_out(1,"75988052539"));
+        assert_eq!(db.pending_device_messages().unwrap().len(),2);
+        assert!(!flush_device_outbox_at(&db,"","http://127.0.0.1:0"));
+        assert!(persist_device_batch(&db,"device1",1,&format!("{}\ninvalid",first)).is_err());
+        assert_eq!(db.pending_device_messages().unwrap().len(),2);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr=listener.local_addr().unwrap();
+        let server=std::thread::spawn(move || {
+            for n in 0..3 {
+                let (mut stream,_) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request=Vec::new(); let mut buf=[0u8;4096];
+                let (start,len)=loop {
+                    let size=stream.read(&mut buf).unwrap(); assert!(size>0); request.extend_from_slice(&buf[..size]);
+                    if let Some(i)=request.windows(4).position(|w|w==b"\r\n\r\n") {
+                        let headers=String::from_utf8_lossy(&request[..i]).to_lowercase();
+                        let len=headers.lines().find_map(|l|l.strip_prefix("content-length:").and_then(|v|v.trim().parse::<usize>().ok())).unwrap();
+                        break (i+4,len);
+                    }
+                };
+                while request.len()<start+len { let size=stream.read(&mut buf).unwrap(); assert!(size>0); request.extend_from_slice(&buf[..size]); }
+                let payload: serde_json::Value=serde_json::from_slice(&request[start..start+len]).unwrap();
+                let id=payload["messages"][0]["id"].as_str().unwrap();
+                let body=serde_json::json!({"results":[{"id":id,"decision":"NONE"}]}).to_string();
+                let code=if n==1 {"500 Internal Server Error"} else {"200 OK"};
+                write!(stream,"HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",code,body.len(),body).unwrap();
+            }
+        });
+        let endpoint=format!("http://{}/esfera/device-messages",addr);
+        assert!(!flush_device_outbox_at(&db,"teste",&endpoint));
+        let remaining: i64 = db.pooled_conn().unwrap().query_row("SELECT count(*) FROM ESF_DeviceOutbox WHERE Delivered=0", [], |r|r.get(0)).unwrap();
+        assert_eq!(remaining,1);
+        db.pooled_conn().unwrap().execute("UPDATE ESF_DeviceOutbox SET NextAt='1970-01-01'", []).unwrap();
+        assert!(flush_device_outbox_at(&db,"teste",&endpoint));
+        server.join().unwrap();
+        assert!(db.pending_device_messages().unwrap().is_empty());
+        assert!(persist_device_batch(&db,"device1",1,&batch).is_ok());
+        assert!(db.pending_device_messages().unwrap().is_empty());
+    }
+
     #[test]
     fn optout_do_vexor_grava_e_enfileira_sem_duplicar() {
         let path = std::env::temp_dir().join(format!("esfera_vexor_bridge_{}.db", std::process::id()));
@@ -2162,6 +2269,13 @@ mod local_fallback_tests {
     use crate::db::Campaign;
     use chrono::Weekday;
 
+    #[test]
+    fn frases_longas_de_descadastro_e_janela_completa() {
+        assert!(local_opt_out("por favor retirem meu contato da lista"));
+        assert!(local_opt_out("parem de mandar mensagem por favor"));
+        assert!(!local_opt_out("bom dia gostaria de saber mais detalhes sobre a proposta enviada"));
+        for h in 0..24 { assert!(!send_window_at(Weekday::Sun,h)); assert_eq!(send_window_at(Weekday::Sat,h),(8..14).contains(&h)); assert_eq!(send_window_at(Weekday::Mon,h),(8..20).contains(&h)); }
+    }
     #[test]
     fn janela_de_confirmacao_exige_horario_e_aparelho_livre() {
         assert!(send_window_at(Weekday::Mon,8));
