@@ -672,6 +672,7 @@ export function PerformanceTab({ serial }: { serial: string }) {
   const [debloating, setDebloating] = useState<string | null>(null);
   const [confirmProfile, setConfirmProfile] = useState<string | null>(null);
   const [hardwareBusy, setHardwareBusy] = useState<string | null>(null);
+  const [confirmHardware, setConfirmHardware] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const busy = optimizing || !!debloating || !!hardwareBusy;
 
@@ -705,6 +706,7 @@ export function PerformanceTab({ serial }: { serial: string }) {
 
   const hardware = async (profile: string) => {
     const title = HARDWARE_PROFILES.find((p) => p.id === profile)?.title || profile;
+    setConfirmHardware(null);
     setHardwareBusy(profile);
     setStatus(`Aplicando o perfil "${title}"...`);
     try {
@@ -769,9 +771,20 @@ export function PerformanceTab({ serial }: { serial: string }) {
                 <p className="text-[0.8125rem] font-medium text-primary">{p.title}</p>
                 <p className="mt-0.5 text-[0.75rem] text-secondary">{p.desc}</p>
               </div>
-              <Button variant="secondary" size="sm" onClick={() => hardware(p.id)} disabled={busy && hardwareBusy !== p.id} loading={hardwareBusy === p.id}>
-                Ativar
-              </Button>
+              {confirmHardware === p.id ? (
+                <InlineConfirm
+                  question={`Ativar o perfil "${p.title}"?`}
+                  detail="Muda energia e limites de processos do aparelho."
+                  confirmLabel="Sim, ativar"
+                  danger={false}
+                  onConfirm={() => hardware(p.id)}
+                  onCancel={() => setConfirmHardware(null)}
+                />
+              ) : (
+                <Button variant="secondary" size="sm" onClick={() => setConfirmHardware(p.id)} disabled={busy && hardwareBusy !== p.id} loading={hardwareBusy === p.id}>
+                  Ativar
+                </Button>
+              )}
             </div>
           ))}
         </div>
@@ -801,6 +814,7 @@ export function SystemTab({ device, serial, displayName, agentStatus, onRemove, 
   const [installingApk, setInstallingApk] = useState(false);
   const [rebooting, setRebooting] = useState(false);
   const [confirmReboot, setConfirmReboot] = useState(false);
+  const [confirmProvision, setConfirmProvision] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [removing, setRemoving] = useState(false);
   const agent = describeAgent(agentStatus);
@@ -808,6 +822,7 @@ export function SystemTab({ device, serial, displayName, agentStatus, onRemove, 
 
   // Sem server_url: o backend escolhe o endereço certo (conexão reversa com este computador).
   const reprovision = async () => {
+    setConfirmProvision(false);
     setProvisioning(true);
     setMsg("Gravando a identidade e configurando o Agente Esfera...");
     try {
@@ -881,7 +896,14 @@ export function SystemTab({ device, serial, displayName, agentStatus, onRemove, 
             title="Provisionar agente"
             description={`Grava a identidade ${device.esferaDeviceId || device.serial}, instala ou atualiza o Agente e liga acessibilidade e leitura de notificações (quando o Android permite).`}
           >
-            <Button variant="primary" size="sm" onClick={reprovision} loading={provisioning} disabled={busy && !provisioning} icon={<RefreshCw size={13} />}>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => setConfirmProvision(true)}
+              loading={provisioning}
+              disabled={(busy && !provisioning) || confirmProvision}
+              icon={<RefreshCw size={13} />}
+            >
               Provisionar
             </Button>
           </SettingRow>
@@ -896,6 +918,16 @@ export function SystemTab({ device, serial, displayName, agentStatus, onRemove, 
             </Button>
           </SettingRow>
         </div>
+        {confirmProvision && (
+          <InlineConfirm
+            question={`Provisionar ${displayName} agora?`}
+            detail="Instala ou atualiza o Agente e reaplica a configuração. Se a instalação falhar com o aparelho no cabo, a conexão ADB de todos os aparelhos é reiniciada: prefira fazer isso fora do horário de disparo."
+            confirmLabel="Sim, provisionar"
+            danger={false}
+            onConfirm={reprovision}
+            onCancel={() => setConfirmProvision(false)}
+          />
+        )}
         {confirmReboot && (
           <InlineConfirm
             question={`Reiniciar ${displayName} agora?`}

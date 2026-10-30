@@ -195,6 +195,7 @@ export function DeviceHeaderActions({
             Provisionar {targets.length} {targets.length === 1 ? "aparelho" : "aparelhos"} online sem ID do Esfera? O agente é instalado ou atualizado em cada um.
           </p>
           {skipped > 0 && <p>{skipped} offline ficam de fora.</p>}
+          <p>Se a instalação falhar em um aparelho no cabo, a conexão ADB de todos é reiniciada: prefira fazer isso fora do horário de disparo.</p>
         </>
       ),
       confirmLabel: "Provisionar",
@@ -241,7 +242,20 @@ export function DeviceHeaderActions({
     }
   };
 
+  // kill-server: derruba a conexão ADB de todos os aparelhos antes de religar.
   const reconnectAll = async () => {
+    const ok = await confirmAction({
+      title: "Reconectar todos os aparelhos",
+      message: (
+        <>
+          <p>Reinicia a conexão ADB deste computador e religa os aparelhos por Wi-Fi.</p>
+          <p>Todos ficam alguns segundos sem conexão: um envio em andamento pode falhar. Prefira usar fora do horário de disparo.</p>
+        </>
+      ),
+      confirmLabel: "Reconectar todos",
+      danger: true,
+    });
+    if (!ok) return;
     setBusy("reconnect");
     try {
       const msg = await api<string>("force_reconnect_all_adb", {});
