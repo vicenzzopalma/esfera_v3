@@ -218,20 +218,32 @@
 }
 
 /* ============================================================
-   SIDEBAR & LAYOUT OFFSETS (240px)
+   SIDEBAR & LAYOUT OFFSETS — 240px, ou 64px com o menu recolhido
+   (Sidebar grava data-sidebar no <html>; Layout e StatusBar seguem a variável)
    ============================================================ */
+:root {
+  --sidebar-w: 240px;
+}
+
+html[data-sidebar="collapsed"] {
+  --sidebar-w: 64px;
+}
+
 .sidebar-panel {
-  width: 240px !important;
-  min-width: 240px !important;
-  max-width: 240px !important;
+  width: var(--sidebar-w) !important;
+  min-width: var(--sidebar-w) !important;
+  max-width: var(--sidebar-w) !important;
+  transition: width 0.16s ease, min-width 0.16s ease, max-width 0.16s ease;
 }
 
 .layout-main-wrapper {
-  padding-left: 240px !important;
+  padding-left: var(--sidebar-w) !important;
+  transition: padding-left 0.16s ease;
 }
 
 .statusbar-panel {
-  left: 240px !important;
+  left: var(--sidebar-w) !important;
+  transition: left 0.16s ease;
 }
 
 /* ============================================================

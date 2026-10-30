@@ -52,6 +52,7 @@ export default function Button({
         disabled:opacity-50 disabled:cursor-not-allowed
         ${variantClasses[variant]} ${sizeClasses[size]} ${className}`}
       disabled={disabled || loading}
+      aria-busy={loading || undefined}
       {...props}
     >
       {loading ? <Loader2 size={size === "sm" ? 13 : 14} className="animate-spin" /> : icon}
