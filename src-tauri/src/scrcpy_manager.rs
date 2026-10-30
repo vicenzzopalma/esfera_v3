@@ -5,10 +5,11 @@
 // ============================================================
 
 use std::process::{Child, Command};
+use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 
-use crate::adb_manager::{bundled_tools_dir, create_cmd};
+use crate::adb_manager::{bundled_tools_dir, create_cmd, CommandDeadline};
 
 pub struct ScrcpySession {
     pub serial: String,
@@ -57,7 +58,7 @@ impl ScrcpyManager {
             .arg(serial)
             .arg("shell")
             .arg("ls /data/local/tmp/scrcpy-server.jar")
-            .output();
+            .output_timeout(Duration::from_secs(8));
 
         let exists = match check_cmd {
             Ok(out) => String::from_utf8_lossy(&out.stdout).contains("scrcpy-server.jar"),
@@ -72,7 +73,7 @@ impl ScrcpyManager {
                     .arg("push")
                     .arg(&local)
                     .arg("/data/local/tmp/scrcpy-server.jar")
-                    .output();
+                    .output_timeout(Duration::from_secs(8));
 
                 match push_cmd {
                     Ok(out) if out.status.success() => return Ok(()),
@@ -103,7 +104,7 @@ impl ScrcpyManager {
                 .arg("forward")
                 .arg(format!("tcp:{port}"))
                 .arg("localabstract:scrcpy")
-                .output();
+                .output_timeout(Duration::from_secs(8));
 
             if let Err(e) = forward_cmd {
                 return Err(format!("Falha ao redirecionar porta ADB {}: {}", port, e));
@@ -138,7 +139,7 @@ impl ScrcpyManager {
                 .spawn();
 
             match child {
-                Ok(_) => Ok(()),
+                Ok(child) => GLOBAL_SCRCPY_MANAGER.register_process(serial, port, mode, child),
                 Err(e) => Err(format!("Erro ao iniciar processo scrcpy-server no aparelho: {}", e)),
             }
         } else {
@@ -153,7 +154,7 @@ impl ScrcpyManager {
             }
 
             match cmd.spawn() {
-                Ok(_) => Ok(()),
+                Ok(child) => GLOBAL_SCRCPY_MANAGER.register_process(serial, port, mode, child),
                 Err(e) => Err(format!("Erro ao iniciar scrcpy nativo: {}. Verifique se o scrcpy.exe está no PATH.", e)),
             }
         }
@@ -161,6 +162,11 @@ impl ScrcpyManager {
 
     /// Encerra o scrcpy-server e remove o redirecionamento de porta ADB quando aplicável.
     pub fn stop_server(serial: &str, port: u16) -> Result<(), String> {
+        if let Ok(mut sessions) = GLOBAL_SCRCPY_MANAGER.sessions.lock() {
+            if let Some(mut session) = sessions.remove(serial) {
+                if let Some(mut child) = session.process.take() { let _ = child.kill(); let _ = child.wait(); }
+            }
+        }
         if local_jar_path().is_some() {
             let _ = create_cmd("adb")
                 .arg("-s")
@@ -168,7 +174,7 @@ impl ScrcpyManager {
                 .arg("forward")
                 .arg("--remove")
                 .arg(format!("tcp:{port}"))
-                .output();
+                .output_timeout(Duration::from_secs(8));
         }
 
         let _ = create_cmd("adb")
@@ -176,18 +182,27 @@ impl ScrcpyManager {
             .arg(serial)
             .arg("shell")
             .arg("pkill -f scrcpy")
-            .output();
+            .output_timeout(Duration::from_secs(8));
 
+        Ok(())
+    }
+
+    pub fn register_process(&self, serial: &str, port: u16, mode: &str, process: Child) -> Result<(), String> {
+        let mut sessions = self.sessions.lock().map_err(|_| "Não foi possível registrar o espelhamento")?;
+        if let Some(mut old) = sessions.remove(serial) {
+            if let Some(mut child) = old.process.take() { let _ = child.kill(); let _ = child.wait(); }
+        }
+        sessions.insert(serial.into(), ScrcpySession { serial: serial.into(), port, mode: mode.into(), process: Some(process) });
         Ok(())
     }
 
     /// Retorna os PIDs de todos os processos Scrcpy ativamente gerenciados
     pub fn get_active_pids(&self) -> Vec<u32> {
         let mut pids = Vec::new();
-        if let Ok(sessions) = self.sessions.lock() {
-            for sess in sessions.values() {
-                if let Some(ref child) = sess.process {
-                    pids.push(child.id());
+        if let Ok(mut sessions) = self.sessions.lock() {
+            for sess in sessions.values_mut() {
+                if let Some(ref mut child) = sess.process {
+                    if matches!(child.try_wait(), Ok(None)) { pids.push(child.id()); }
                 }
             }
         }
@@ -226,7 +241,7 @@ impl OrphanOtto {
                     Command::new("tasklist")
                         .args(["/FO", "CSV", "/NH", "/FI", &format!("IMAGENAME eq {target}")])
                         .creation_flags(0x08000000)
-                        .output()
+                        .output_timeout(Duration::from_secs(8))
                 };
 
                 if let Ok(out) = output {
