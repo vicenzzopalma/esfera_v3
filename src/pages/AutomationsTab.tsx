@@ -15,6 +15,7 @@ import StatCard from "../components/ui/StatCard";
 import EmptyState from "../components/ui/EmptyState";
 import Field, { FormSection } from "../components/ui/Field";
 import type { Automation, AutomationTriggerType, AutomationActionType } from "../types";
+import { TRIGGER_LABELS, ACTION_LABELS } from "../types";
 import { api } from "../tauri";
 import { apiErrorText, useCampaigns } from "../hooks/useQueries";
 import { SECTOR_OPTIONS, sectorLabel } from "../components/devices/deviceUi";
@@ -56,22 +57,7 @@ const ACTION_ICONS: Record<AutomationActionType, React.ReactNode> = {
   send_to_sector: <Users size={16} />,
 };
 
-// Rótulos desta tela (frases curtas em português, no lugar dos rótulos em Title Case de types.ts).
-const TRIGGER_TEXT: Record<AutomationTriggerType, string> = {
-  keyword: "Palavra-chave",
-  message_received: "Mensagem recebida",
-  ban_detected: "Chip bloqueado",
-  device_offline: "Aparelho offline",
-  schedule: "Agendamento",
-};
-const ACTION_TEXT: Record<AutomationActionType, string> = {
-  send_response: "Responder",
-  notify: "Avisar o gestor",
-  send_to_sector: "Encaminhar ao setor",
-  move_chip: "Mover chip",
-  set_chip_status: "Mudar status do chip",
-  toggle_campaign: "Pausar ou retomar campanha",
-};
+// Rótulos vêm de types.ts (TRIGGER_LABELS / ACTION_LABELS); aqui só a ordem dos botões.
 const TRIGGER_ORDER: AutomationTriggerType[] = ["keyword", "message_received", "ban_detected", "device_offline", "schedule"];
 const ACTION_ORDER: AutomationActionType[] = ["send_response", "notify", "send_to_sector", "move_chip", "set_chip_status", "toggle_campaign"];
 
@@ -367,7 +353,7 @@ export default function AutomationsTab() {
       const days = parseDays(String(tc.days ?? "")).map((d) => DAY_CHIPS.find((c) => c.n === d)?.label).filter(Boolean).join(", ");
       return `Agendamento${tc.time ? ` às ${tc.time}` : ""}${days ? ` (${days})` : ""}`;
     }
-    return TRIGGER_TEXT[a.triggerType || "keyword"] ?? a.triggerType;
+    return TRIGGER_LABELS[a.triggerType || "keyword"] ?? a.triggerType;
   };
 
   // Setor salvo por versões antigas (ex.: pa_fixa_1) continua aparecendo no seletor.
@@ -497,7 +483,7 @@ export default function AutomationsTab() {
                         <span className="font-mono rounded bg-secondary px-1.5 py-0.5 text-primary">"{automation.keyword}"</span>
                       )}
                       <ArrowRight size={12} className="text-tertiary" />
-                      <span>{ACTION_TEXT[automation.actionType || "send_response"] ?? automation.actionType}</span>
+                      <span>{ACTION_LABELS[automation.actionType || "send_response"] ?? automation.actionType}</span>
                     </p>
 
                     <p className="mt-1 text-xs text-tertiary line-clamp-1">{actionSummary(automation)}</p>
@@ -511,6 +497,8 @@ export default function AutomationsTab() {
                     onChange={() => toggleActive(automation)}
                     disabled={togglingId === automation.id}
                     size="sm"
+                    ariaLabel={`${automation.active ? "Desativar" : "Ativar"} ${automation.name}`}
+                    title={automation.active ? "Ativa: clique para desativar" : "Inativa: clique para ativar"}
                   />
                   <Button variant="secondary" size="sm" icon={<Pencil size={13} />} onClick={() => openEditModal(automation)}>
                     Editar
@@ -570,7 +558,7 @@ export default function AutomationsTab() {
               {TRIGGER_ORDER.map((t) => (
                 <button key={t} type="button" onClick={() => setTriggerType(t)} aria-pressed={triggerType === t} className={optionButton(triggerType === t)}>
                   {TRIGGER_ICONS[t]}
-                  {TRIGGER_TEXT[t]}
+                  {TRIGGER_LABELS[t]}
                 </button>
               ))}
             </div>
@@ -639,7 +627,7 @@ export default function AutomationsTab() {
               {ACTION_ORDER.map((a) => (
                 <button key={a} type="button" onClick={() => setActionType(a)} aria-pressed={actionType === a} className={optionButton(actionType === a)}>
                   {ACTION_ICONS[a]}
-                  {ACTION_TEXT[a]}
+                  {ACTION_LABELS[a]}
                 </button>
               ))}
             </div>
