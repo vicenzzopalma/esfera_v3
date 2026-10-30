@@ -33,7 +33,7 @@ function sendWindowState(now: Date): { open: boolean; label: string } {
   const hour = now.getHours();
   const today = windowHours(day);
   if (today && hour >= today[0] && hour < today[1]) {
-    return { open: true, label: `Envios liberados até ${today[1]}h` };
+    return { open: true, label: `Janela de envio aberta até ${today[1]}h` };
   }
   for (let i = 0; i < 8; i++) {
     const d = (day + i) % 7;
@@ -41,9 +41,9 @@ function sendWindowState(now: Date): { open: boolean; label: string } {
     if (!hours) continue;
     if (i === 0 && hour >= hours[0]) continue; // a janela de hoje já fechou
     const when = i === 0 ? "hoje" : i === 1 ? "amanhã" : DAY_NAMES[d];
-    return { open: false, label: `Fora do horário de envio · volta ${when} às ${hours[0]}h` };
+    return { open: false, label: `Janela de envio fechada · abre ${when} às ${hours[0]}h` };
   }
-  return { open: false, label: "Fora do horário de envio" };
+  return { open: false, label: "Janela de envio fechada" };
 }
 
 function useNow(intervalMs: number) {
