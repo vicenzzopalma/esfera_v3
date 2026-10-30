@@ -125,6 +125,24 @@ pub fn login(
         .ok_or_else(|| "Usuário ou senha incorretos.".to_string())?;
     let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
     let token = sessions.create_session(user.id, &user.username, &user.role, user.company_id);
+    drop(sessions);
+    // Sincronizacao HTTPS em segundo plano; o login nao depende da VPS.
+    let company_id = user.company_id.filter(|id| *id > 0).unwrap_or(1);
+    if let Ok(creds) = get_hub_credentials(state.clone(), token.clone()) {
+        let db = state.db.clone();
+        let sessions = state.sessions.clone();
+        let session_token = token.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Ok(remote) = crate::hub_client::fetch_vps_ia(&creds.hub_address, &creds.hub_token, company_id).await {
+                if let Ok(session) = validate_session(&sessions, &session_token) {
+                    if check_company_access(&session, company_id).is_ok() {
+                        let borrowed = remote.as_ref().map(|(k, e, m)| (k.as_str(), e.as_str(), m.as_str()));
+                        let _ = db.sync_vps_ia_from_hub(company_id, borrowed);
+                    }
+                }
+            }
+        });
+    }
     Ok(LoginResponse { token, user })
 }
 
@@ -2648,14 +2666,21 @@ pub fn get_ai_config(
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
     let db = &state.db;
-    Ok(db.get_ai_config(company_id))
+    let mut config = db.get_ai_config(company_id);
+    if let Some(ref mut config) = config {
+        if config.provider.eq_ignore_ascii_case("vps_ia") { config.api_key.clear(); }
+    }
+    Ok(config)
 }
 
 #[tauri::command]
-pub fn save_ai_config(state: State<'_, AppState>, token: String, config: AiConfig) -> Result<(), String> {
+pub fn save_ai_config(state: State<'_, AppState>, token: String, mut config: AiConfig) -> Result<(), String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, config.company_id)?;
     let db = &state.db;
+    if config.provider.eq_ignore_ascii_case("vps_ia") && config.api_key.trim().is_empty() {
+        config.api_key = db.get_ai_provider_key(config.company_id, "vps_ia").map(|v| v.0).unwrap_or_default();
+    }
     db.save_ai_config(&config)
 }
 
@@ -3169,6 +3194,77 @@ pub fn start_campaign(state: State<'_, AppState>, token: String, campaign_id: i3
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VpsIaStatus {
+    configured: bool,
+    endpoint: String,
+    model: String,
+}
+
+fn vps_ia_status_data(db: &Database, company_id: i32) -> VpsIaStatus {
+    match db.get_ai_provider_key(company_id, "vps_ia") {
+        Some((key, endpoint, model)) => VpsIaStatus { configured: !key.trim().is_empty() && !endpoint.trim().is_empty(), endpoint, model },
+        None => VpsIaStatus { configured: false, endpoint: String::new(), model: String::new() },
+    }
+}
+
+fn save_vps_ia(db: &Database, company_id: i32, endpoint: &str, model: &str, api_token: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    let url = reqwest::Url::parse(endpoint).map_err(|_| "Endereço da IA inválido.".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+        return Err("Endereço da IA inválido.".into());
+    }
+    let model = model.trim();
+    if model.is_empty() { return Err("Informe o modelo da IA.".into()); }
+    let key = if api_token.trim().is_empty() {
+        db.get_ai_provider_key(company_id, "vps_ia").map(|v| v.0).unwrap_or_default()
+    } else { api_token.trim().to_string() };
+    if key.is_empty() { return Err("Informe o token da IA.".into()); }
+    db.save_ai_provider_key(company_id, "vps_ia", &key, endpoint, model)
+}
+
+fn remove_vps_ia(db: &Database, company_id: i32) -> Result<(), String> {
+    db.delete_ai_provider_key(company_id, "vps_ia")
+}
+
+#[tauri::command]
+pub fn vps_ia_status(state: State<'_, AppState>, token: String, company_id: i32) -> Result<VpsIaStatus, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    Ok(vps_ia_status_data(&state.db, company_id))
+}
+
+#[tauri::command]
+pub fn vps_ia_save(state: State<'_, AppState>, token: String, company_id: i32, endpoint: String, model: String, api_token: String) -> Result<VpsIaStatus, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    save_vps_ia(&state.db, company_id, &endpoint, &model, &api_token)?;
+    Ok(vps_ia_status_data(&state.db, company_id))
+}
+
+#[tauri::command]
+pub fn vps_ia_remove(state: State<'_, AppState>, token: String, company_id: i32) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    remove_vps_ia(&state.db, company_id)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VpsIaTestResult { text: String, elapsed_ms: u128 }
+
+#[tauri::command]
+pub async fn vps_ia_test(state: State<'_, AppState>, token: String, company_id: i32) -> Result<VpsIaTestResult, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    let (key, endpoint, model) = state.db.get_ai_provider_key(company_id, "vps_ia").ok_or("IA própria não configurada.")?;
+    let config = AiConfig { company_id, provider: "vps_ia".into(), model, temperature: 0.7, system_prompt: String::new(), api_key: key, endpoint };
+    let start = std::time::Instant::now();
+    let text = crate::ai_engine::AiEngine::generate_message(&config, "Olá, entre em contato conosco quando puder.", "").await.map_err(|_| "Não foi possível testar a IA própria. Verifique o endereço, modelo e token.".to_string())?;
+    Ok(VpsIaTestResult { text, elapsed_ms: start.elapsed().as_millis() })
+}
+
 #[tauri::command]
 pub fn get_ai_provider_keys(
     state: State<'_, AppState>,
@@ -3177,7 +3273,9 @@ pub fn get_ai_provider_keys(
 ) -> Result<std::collections::HashMap<String, serde_json::Value>, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
-    Ok(state.db.get_all_ai_provider_keys(company_id))
+    let mut keys = state.db.get_all_ai_provider_keys(company_id);
+    if let Some(value) = keys.get_mut("vps_ia") { value["apiKey"] = serde_json::Value::String(String::new()); }
+    Ok(keys)
 }
 
 #[tauri::command]
@@ -4089,6 +4187,36 @@ pub fn rotate_master_token(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn vps_ia_salvar_ler_mascarar_e_remover() {
+        let path = std::env::temp_dir().join(format!("esfera_vps_test_{}.db", uuid::Uuid::new_v4()));
+        let db = Database::init(path.to_str().unwrap()).unwrap();
+        save_vps_ia(&db, 1, "http://localhost:11435", "modelo", "segredo").unwrap();
+        save_vps_ia(&db, 1, "http://localhost:11435", "novo", "").unwrap();
+        let status = vps_ia_status_data(&db, 1);
+        assert!(status.configured);
+        assert_eq!(status.model, "novo");
+        assert!(!serde_json::to_string(&status).unwrap().contains("segredo"));
+        assert_eq!(db.get_ai_provider_key(1, "vps_ia").unwrap().0, "segredo");
+        remove_vps_ia(&db, 1).unwrap();
+        assert!(!vps_ia_status_data(&db, 1).configured);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn vps_ia_cadeia_apos_groq_antes_gemini() {
+        let path = std::env::temp_dir().join(format!("esfera_vps_chain_{}.db", uuid::Uuid::new_v4()));
+        let db = Database::init(path.to_str().unwrap()).unwrap();
+        save_vps_ia(&db, 1, "http://localhost:11435", "modelo", "segredo").unwrap();
+        db.save_ai_provider_key(1, "gemini_web", "connected", "", "").unwrap();
+        let cfg = AiConfig { company_id: 1, provider: "groq".into(), model: "large".into(), temperature: 0.7, system_prompt: String::new(), api_key: "groq".into(), endpoint: String::new() };
+        let chain = crate::dispatcher::build_ai_fallback_chain(&db, 1, &cfg);
+        assert_eq!(chain.iter().map(|c| c.provider.as_str()).collect::<Vec<_>>(), vec!["groq", "groq", "vps_ia", "gemini_web"]);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
 
     fn dev_with(serial: &str, esfera_id: Option<&str>, ip: &str, addr: Option<&str>) -> Device {
         Device {
