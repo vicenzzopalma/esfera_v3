@@ -3,7 +3,7 @@
 // Persiste preferência no localStorage
 // ============================================================
 
-import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from "react";
+import { createContext, useContext, useState, useLayoutEffect, useCallback, type ReactNode } from "react";
 
 type Theme = "dark" | "light";
 
@@ -15,22 +15,34 @@ interface ThemeContextType {
 
 const ThemeContext = createContext<ThemeContextType | null>(null);
 
+const STORAGE_KEY = "esfera-theme";
+
 function getInitialTheme(): Theme {
-  if (typeof window !== "undefined") {
-    const stored = localStorage.getItem("esfera-theme");
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
     if (stored === "dark" || stored === "light") return stored;
-  }
+  } catch { /* localStorage indisponível */ }
   return "dark"; // default
 }
+
+function applyTheme(theme: Theme) {
+  const root = document.documentElement;
+  root.classList.remove("dark", "light");
+  root.classList.add(theme);
+}
+
+// Aplica o tema salvo assim que o módulo carrega, antes do primeiro render:
+// quem usa o tema claro não vê a tela piscar no escuro ao abrir o app.
+if (typeof document !== "undefined") applyTheme(getInitialTheme());
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
 
-  useEffect(() => {
-    const root = document.documentElement;
-    root.classList.remove("dark", "light");
-    root.classList.add(theme);
-    localStorage.setItem("esfera-theme", theme);
+  useLayoutEffect(() => {
+    applyTheme(theme);
+    try {
+      localStorage.setItem(STORAGE_KEY, theme);
+    } catch { /* localStorage indisponível */ }
   }, [theme]);
 
   const toggleTheme = useCallback(() => {

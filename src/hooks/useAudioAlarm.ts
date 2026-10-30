@@ -5,13 +5,23 @@
 
 import { useCallback } from "react";
 
+// Um único AudioContext para o app inteiro: criar um por som esgota o limite do navegador
+// depois de alguns avisos e o som para de tocar.
+let sharedContext: AudioContext | null = null;
+
+function getAudioContext(): AudioContext | null {
+  const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioCtx) return null;
+  if (!sharedContext || sharedContext.state === "closed") sharedContext = new AudioCtx();
+  if (sharedContext.state === "suspended") sharedContext.resume().catch(() => {});
+  return sharedContext;
+}
+
 export function useAudioAlarm() {
   const playChipLiberatedSound = useCallback(() => {
     try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return;
-
-      const ctx = new AudioCtx();
+      const ctx = getAudioContext();
+      if (!ctx) return;
       const now = ctx.currentTime;
 
       // Sequência de notas harmoniosas de vitória (C5 -> E5 -> G5 -> C6)
@@ -40,10 +50,8 @@ export function useAudioAlarm() {
 
   const playWarningAlarmSound = useCallback(() => {
     try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return;
-
-      const ctx = new AudioCtx();
+      const ctx = getAudioContext();
+      if (!ctx) return;
       const now = ctx.currentTime;
 
       const osc = ctx.createOscillator();
