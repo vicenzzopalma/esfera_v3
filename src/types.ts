@@ -158,19 +158,19 @@ export type AutomationActionType =
 
 export const TRIGGER_LABELS: Record<AutomationTriggerType, string> = {
   keyword: "Palavra-chave",
-  ban_detected: "Ban Detectado",
-  device_offline: "Dispositivo Offline",
+  ban_detected: "Banimento detectado",
+  device_offline: "Aparelho offline",
   schedule: "Agendamento",
-  message_received: "Mensagem Recebida",
+  message_received: "Mensagem recebida",
 };
 
 export const ACTION_LABELS: Record<AutomationActionType, string> = {
-  send_response: "Enviar Resposta",
-  move_chip: "Mover Chip",
-  notify: "Notificar Gestor",
-  toggle_campaign: "Pausar/Iniciar Campanha",
-  set_chip_status: "Alterar Status do Chip",
-  send_to_sector: "Encaminhar para Setor",
+  send_response: "Enviar resposta",
+  move_chip: "Mover chip",
+  notify: "Notificar gestor",
+  toggle_campaign: "Pausar ou iniciar campanha",
+  set_chip_status: "Alterar status do chip",
+  send_to_sector: "Encaminhar para setor",
 };
 
 // --- Novos tipos Fase 1 ---
@@ -196,7 +196,20 @@ export interface Chip {
   createdAt: string;
 }
 
-export type ContactStatus = "pending" | "sent" | "failed" | "replied" | "processing";
+// Estados gravados pelo disparo (dispatcher.rs/db.rs): além de pendente/enviado/falhou,
+// opt_out (descadastrado), partial (envio parcial), no_whatsapp (número sem WhatsApp),
+// already_sent (já recebeu antes) e sending (em envio).
+export type ContactStatus =
+  | "pending"
+  | "sent"
+  | "failed"
+  | "replied"
+  | "processing"
+  | "sending"
+  | "partial"
+  | "opt_out"
+  | "no_whatsapp"
+  | "already_sent";
 
 export interface Contact {
   id: number;
@@ -331,9 +344,9 @@ export const CONNECTION_BADGE_CONFIG: Record<
   ConnectionOrigin,
   { label: string; icon: string; badgeVariant: "purple" | "info" | "success" }
 > = {
-  vps: { label: "VPS Núvem", icon: "☁️", badgeVariant: "purple" },
-  usb: { label: "ADB USB", icon: "🔌", badgeVariant: "info" },
-  wifi: { label: "Wi-Fi Direct", icon: "📡", badgeVariant: "success" },
+  vps: { label: "Nuvem (VPS)", icon: "☁️", badgeVariant: "purple" },
+  usb: { label: "Cabo USB", icon: "🔌", badgeVariant: "info" },
+  wifi: { label: "Wi-Fi", icon: "📡", badgeVariant: "success" },
 };
 
 export function getConnectionOrigin(device: Device): ConnectionOrigin {

@@ -81,10 +81,15 @@
   --color-bg-hover: rgba(255, 255, 255, 0.05);
   --color-bg-input: rgba(255, 255, 255, 0.035);
   --color-bg-overlay: rgba(0, 0, 0, 0.6);
+  /* Botão secundário: um pouco mais claro que qualquer superfície (cartão, modal, página) */
+  --color-bg-button: rgba(255, 255, 255, 0.045);
+  --color-bg-button-hover: rgba(255, 255, 255, 0.085);
+  --color-border-button: rgba(255, 255, 255, 0.12);
 
   --color-text-primary: #ededf0;
   --color-text-secondary: #a1a1ab;
-  --color-text-tertiary: #71717c;
+  /* #80808b: ~4,8:1 sobre o cartão (o anterior, #71717c, ficava em 3,9:1 — abaixo do mínimo de leitura) */
+  --color-text-tertiary: #80808b;
 
   --color-accent: #5e6ad2;
   --color-accent-hover: #6b77de;
@@ -122,6 +127,9 @@
   --color-bg-hover: rgba(0, 0, 0, 0.045);
   --color-bg-input: #ffffff;
   --color-bg-overlay: rgba(15, 15, 20, 0.45);
+  --color-bg-button: #ffffff;
+  --color-bg-button-hover: #f3f3f6;
+  --color-border-button: rgba(0, 0, 0, 0.14);
 
   --color-text-primary: #111114;
   --color-text-secondary: #494953;
@@ -213,8 +221,12 @@
   to { background-position: -200% 0; }
 }
 
+/* Windows com "Mostrar animações" desligado: sem entradas animadas nem transições de layout */
 @media (prefers-reduced-motion: reduce) {
   .skeleton { animation: none; }
+  .animate-fade-in, .animate-scale-in, .animate-slide-down, .animate-shake { animation: none !important; }
+  .sidebar-panel, .layout-main-wrapper, .statusbar-panel { transition: none !important; }
+  .custom-scrollbar { scroll-behavior: auto; }
 }
 
 /* ============================================================
