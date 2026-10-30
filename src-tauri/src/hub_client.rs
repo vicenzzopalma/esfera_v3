@@ -5,6 +5,47 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
+// Certificado publico da VPS; a chave privada permanece no servidor.
+const CERTIFICADO_VPS: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBojCCAUigAwIBAgIUESUE4dHvfL20FxhPctEIuk6qqsAwCgYIKoZIzj0EAwIw
+FTETMBEGA1UEAwwKZXNmZXJhLXZwczAeFw0yNjEwMzAxMjAwNDlaFw0zNjEwMjcx
+MjAwNDlaMBUxEzARBgNVBAMMCmVzZmVyYS12cHMwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAAQcd4U+CopieYApwbqOUdk/izE7xucs9RM8TR1SCMd4LM540le/dQ4Z
+MMpGlMfVA75mXxoxm7UT22ImpsgGe/1ko3YwdDAdBgNVHQ4EFgQU54tg8DntyeT3
+FbqykR9K7JOcXuMwHwYDVR0jBBgwFoAU54tg8DntyeT3FbqykR9K7JOcXuMwDwYD
+VR0RBAgwBocEu03z4DAMBgNVHRMBAf8EAjAAMBMGA1UdJQQMMAoGCCsGAQUFBwMB
+MAoGCCqGSM49BAMCA0gAMEUCIQCWoC5aj5t0H5f1sJe0Htj9Nv9MnKOKer3Pi9Ym
+d2VUZwIgb6JLH+79cKQZICyXB6iHDHRdQz7d9rQ2krCUIZE29eE=
+-----END CERTIFICATE-----"#;
+
+fn client_vps_com_pem(pem: &[u8], timeout: Duration) -> Result<reqwest::Client, String> {
+    let cert = reqwest::Certificate::from_pem(pem).map_err(|_| "Certificado da VPS invalido".to_string())?;
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(cert)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build().map_err(|_| "Falha ao preparar HTTPS da VPS".to_string())
+}
+
+pub fn client_vps(timeout: Duration) -> Result<reqwest::Client, String> {
+    client_vps_com_pem(CERTIFICADO_VPS.as_bytes(), timeout)
+}
+
+pub fn usa_certificado_vps(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint).map(|u| u.scheme() == "https" && u.host_str() == Some("187.77.243.224")).unwrap_or(false)
+}
+
+pub fn endpoint_vps_https(endpoint: &str) -> String {
+    if let Ok(mut url) = reqwest::Url::parse(endpoint) {
+        if url.scheme() == "http" && url.host_str() == Some("187.77.243.224") && url.port() == Some(11435) {
+            if url.set_scheme("https").is_ok() { return url.to_string(); }
+        }
+    }
+    endpoint.to_string()
+}
+
 pub struct HubClient {
     writer: Mutex<tokio::io::BufWriter<OwnedWriteHalf>>,
     reader: Mutex<BufReader<OwnedReadHalf>>,
@@ -174,10 +215,14 @@ pub async fn fetch_vps_ia(hub_address: &str, hub_token: &str, company_id: i32) -
         std::net::IpAddr::V6(ip) => format!("[{}]", ip),
     };
     let url = format!("https://{}:8443/api/desktop/vps-ia?companyId={}", host, company_id);
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build().map_err(|_| "Falha ao preparar conexao HTTPS com o Hub.".to_string())?;
+    let client = if usa_certificado_vps(&url) {
+        client_vps(Duration::from_secs(5))?
+    } else {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build().map_err(|_| "Falha ao preparar conexao HTTPS com o Hub.".to_string())?
+    };
     let response = client.get(url).bearer_auth(hub_token).send().await
         .map_err(|_| "Falha na conexao HTTPS com o Hub de IA.".to_string())?;
     if !response.status().is_success() { return Err(format!("Hub de IA retornou HTTP {}.", response.status())); }
@@ -193,4 +238,24 @@ pub async fn fetch_vps_ia(hub_address: &str, hub_token: &str, company_id: i32) -
         return Err("Configuracao de IA incompleta no Hub.".into());
     }
     Ok(Some((token, endpoint, model)))
+}
+
+#[cfg(test)]
+mod vps_tls_tests {
+    use super::*;
+
+    #[test]
+    fn certificado_vps_valido_e_invalido() {
+        assert!(client_vps_com_pem(CERTIFICADO_VPS.as_bytes(), Duration::from_secs(5)).is_ok());
+        assert!(client_vps_com_pem(b"pem invalido", Duration::from_secs(5)).is_err());
+    }
+
+    #[test]
+    fn identifica_e_migra_somente_o_endereco_correto() {
+        assert_eq!(endpoint_vps_https("http://187.77.243.224:11435/v1/chat/completions"), "https://187.77.243.224:11435/v1/chat/completions");
+        assert_eq!(endpoint_vps_https("http://187.77.243.224:11436/v1"), "http://187.77.243.224:11436/v1");
+        assert!(usa_certificado_vps("https://187.77.243.224:8443/teste"));
+        assert!(!usa_certificado_vps("https://187.77.243.224.outro.example:8443/teste"));
+        assert!(!usa_certificado_vps("http://187.77.243.224:11435"));
+    }
 }

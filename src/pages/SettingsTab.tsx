@@ -913,7 +913,7 @@ function IntegrationsSection({ companyId, isMaster, canManage }: { companyId: nu
               </span>
             </div>
             <Field label="Endere&#231;o" htmlFor="int-vps-endpoint">
-              <input id="int-vps-endpoint" type="url" value={vpsEndpoint} onChange={(e) => setVpsEndpoint(e.target.value)} placeholder="https://servidor/v1/chat/completions" />
+              <input id="int-vps-endpoint" type="url" value={vpsEndpoint} onChange={(e) => setVpsEndpoint(e.target.value)} placeholder="https://187.77.243.224:11435/v1/chat/completions" />
             </Field>
             <Field label="Modelo" htmlFor="int-vps-model">
               <input id="int-vps-model" type="text" value={vpsModel} onChange={(e) => setVpsModel(e.target.value)} placeholder="Nome do modelo" />
