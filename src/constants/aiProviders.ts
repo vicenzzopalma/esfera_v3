@@ -162,14 +162,15 @@ export const DEFAULT_AI_MODEL = "openai/gpt-oss-120b";
 /**
  * Reservas automáticas, na ordem em que o disparo tenta (dispatcher.rs, build_ai_fallback_chain).
  * A IA principal vem sempre antes; cada reserva só entra se tiver chave ou estiver conectada.
+ * `alsoWhenPrimary`: continua como reserva mesmo quando o provedor é o principal (Groq 20B).
  */
-export const AI_RESERVE_CHAIN: { provider: string; label: string; detail: string }[] = [
-  { provider: "groq", label: "Groq", detail: "modelo salvo (recomendado: GPT-OSS 120B)" },
-  { provider: "groq", label: "Groq · GPT-OSS 20B", detail: "mesma chave, outro limite diário" },
-  { provider: "vps_ia", label: "IA própria (VPS)", detail: "quando configurada" },
-  { provider: "gemini_web", label: "Gemini Web", detail: "só se a conta Google estiver conectada" },
-  { provider: "cerebras", label: "Cerebras", detail: "com a chave da Cerebras" },
-  { provider: "openrouter", label: "OpenRouter", detail: "com a chave; depois o roteador grátis" },
+export const AI_RESERVE_CHAIN: { id: string; provider: string; label: string; detail: string; alsoWhenPrimary?: boolean }[] = [
+  { id: "groq", provider: "groq", label: "Groq", detail: "modelo salvo (recomendado: GPT-OSS 120B)" },
+  { id: "groq-20b", provider: "groq", label: "Groq · GPT-OSS 20B", detail: "mesma chave, outro limite diário", alsoWhenPrimary: true },
+  { id: "vps_ia", provider: "vps_ia", label: "IA própria (VPS)", detail: "quando configurada" },
+  { id: "gemini_web", provider: "gemini_web", label: "Gemini Web", detail: "só se a conta Google estiver conectada" },
+  { id: "cerebras", provider: "cerebras", label: "Cerebras", detail: "com a chave da Cerebras" },
+  { id: "openrouter", provider: "openrouter", label: "OpenRouter", detail: "com a chave; depois o roteador grátis" },
 ];
 
 // Persona padrão da empresa. As regras legais (CDC/LGPD) ficam fixas no backend (ai_engine.rs).
