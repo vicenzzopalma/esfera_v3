@@ -39,6 +39,8 @@ import { SECTOR_OPTIONS, normSector, sectorLabel, StatusDot, BatteryMeter } from
 
 /** Intervalo entre uma captura e a próxima. As telas são capturadas UMA de cada vez, em rodízio. */
 const PREVIEW_GAP_MS = 1500;
+/** Aparelho lento não trava o rodízio: depois disso a fila segue (a captura dele termina em segundo plano). */
+const CAPTURE_WAIT_MAX_MS = 8000;
 const DATA_REFRESH_MS = 8000;
 
 const isOnline = (status: string) => status === "online" || status === "online_agent";
@@ -267,7 +269,7 @@ export default function SupervisorView() {
       if (!document.hidden && list.length > 0) {
         const dev = list[cursor % list.length];
         cursor = (cursor + 1) % list.length;
-        await captureScreen(dev);
+        await Promise.race([captureScreen(dev), new Promise((resolve) => setTimeout(resolve, CAPTURE_WAIT_MAX_MS))]);
       }
       if (!stopped) timer = setTimeout(tick, PREVIEW_GAP_MS);
     };
