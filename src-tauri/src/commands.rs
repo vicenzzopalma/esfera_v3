@@ -4371,3 +4371,30 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
     }
 }
+
+#[derive(serde::Serialize)]
+pub struct NetworkLimitsResponse { pub hourly: i64, pub daily: i64 }
+
+#[tauri::command]
+pub fn get_network_limits(state: State<'_, AppState>, token: String) -> Result<NetworkLimitsResponse, String> {
+    validate_session(&state.sessions, &token)?;
+    let (hourly, daily) = state.db.network_limits()?;
+    Ok(NetworkLimitsResponse { hourly, daily })
+}
+
+#[tauri::command]
+pub fn set_network_limits(state: State<'_, AppState>, token: String, hourly: i64, daily: i64) -> Result<(), String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Apenas master ou gestor pode alterar os limites da rede.".into());
+    }
+    state.db.set_network_limits(hourly, daily)
+}
+
+#[tauri::command]
+pub fn get_network_status(state: State<'_, AppState>, token: String) -> Result<crate::db::NetworkStatus, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    let company = if session.role == "master" { None } else { session.company_id };
+    if session.role != "master" && company.is_none() { return Err("Usuário sem empresa vinculada.".into()); }
+    state.db.network_status(company)
+}

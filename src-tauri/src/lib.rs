@@ -154,6 +154,9 @@ pub fn run() {
         })
         .manage(AppState { db: db_arc, sessions, hub_client })
         .invoke_handler(tauri::generate_handler![
+            get_network_limits,
+            set_network_limits,
+            get_network_status,
             // Auth
             login,
             logout,
