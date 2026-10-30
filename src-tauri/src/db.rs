@@ -52,16 +52,54 @@ const REPLY_PAUSE_HOURS: i64 = 24;
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkChipStatus { pub chip_id: i32, pub device_id: i32, pub device_name: String, pub reply_rate: Option<f64>, pub sample: usize, pub state: String, pub reason: String }
+/// `attempts_*` são as tentativas que o teto conta (cada parte extra soma uma); `sent_*`, só as enviadas.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NetworkStatus { pub hourly: i64, pub daily: i64, pub sent_last_hour: i64, pub sent_today: i64, pub wait_seconds: u64, pub chips: Vec<NetworkChipStatus> }
+pub struct NetworkStatus { pub hourly: i64, pub daily: i64, pub sent_last_hour: i64, pub sent_today: i64, pub attempts_last_hour: i64, pub attempts_today: i64, pub wait_seconds: u64, pub chips: Vec<NetworkChipStatus> }
 
-fn reply_state(available: bool, sample: usize, replies: usize) -> &'static str {
-    if !available { "indisponivel" }
-    else if sample < REPLY_SAMPLE { "normal" }
-    else if (replies as i64) * 100 < (sample as i64) * REPLY_PAUSE_PERCENT { "pausado" }
-    else if (replies as i64) * 100 < (sample as i64) * REPLY_SLOW_PERCENT { "reduzido" }
-    else { "normal" }
+const REPLY_REASON_PAUSED: &str = "Poucas respostas: chip pausado por 24 h para proteger o número";
+const REPLY_REASON_SLOW: &str = "Ritmo reduzido por poucas respostas";
+const REPLY_REASON_NONE_YET: &str = "Nenhuma resposta captada ainda neste aparelho; confira se as notificações do WhatsApp chegam ao celular";
+const REPLY_REASON_UNAVAILABLE: &str = "Taxa de resposta indisponível neste aparelho";
+
+/// Freio por resposta: (estado, motivo). Disponível = leitura de notificações ativa no aparelho.
+/// Aparelho que nunca captou resposta, com a amostra cheia, só reduz o ritmo (sem pausa): pode ser
+/// notificação que não chega ao celular. Com respostas já captadas valem os limiares normais.
+fn reply_state(available: bool, ever_replied: bool, sample: usize, replies: usize) -> (&'static str, &'static str) {
+    if !available { ("indisponivel", REPLY_REASON_UNAVAILABLE) }
+    else if sample < REPLY_SAMPLE { ("normal", "") }
+    else if !ever_replied { ("reduzido", REPLY_REASON_NONE_YET) }
+    else if (replies as i64) * 100 < (sample as i64) * REPLY_PAUSE_PERCENT { ("pausado", REPLY_REASON_PAUSED) }
+    else if (replies as i64) * 100 < (sample as i64) * REPLY_SLOW_PERCENT { ("reduzido", REPLY_REASON_SLOW) }
+    else { ("normal", "") }
+}
+
+/// Data/hora UTC no formato de `datetime('now')`, usado em CreatedAt.
+fn sql_utc(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Início do dia local e do dia seguinte (relógio do Windows, Brasília), em UTC. O teto da rede e o
+/// limite diário do chip contam o dia pelo mesmo critério da janela de envio (`chrono::Local`).
+fn local_day_bounds(now: chrono::DateTime<chrono::Utc>) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+    use chrono::{Local, Offset, TimeZone};
+    let local = now.with_timezone(&Local);
+    let offset = chrono::TimeDelta::try_seconds(local.offset().fix().local_minus_utc() as i64).unwrap_or_default();
+    let start = |date: chrono::NaiveDate| {
+        // Meia-noite inexistente (horário de verão) cai no primeiro horário válido do dia.
+        (0..3).find_map(|h| Local.from_local_datetime(&date.and_hms_opt(h, 0, 0)?).earliest())
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|| (date.and_time(chrono::NaiveTime::MIN) - offset).and_utc())
+    };
+    let today = local.date_naive();
+    (start(today), start(today.succ_opt().unwrap_or(today)))
+}
+
+/// Espera até caber `required` tentativas: (tentativas na hora, no dia, espera da hora, espera do dia).
+fn network_wait(hourly: i64, daily: i64, usage: (i64, i64, i64, i64), required: i64) -> u64 {
+    let (hour_count, day_count, hour_wait, day_wait) = usage;
+    (if hour_count.saturating_add(required) > hourly { hour_wait } else { 0 })
+        .max(if day_count.saturating_add(required) > daily { day_wait } else { 0 }) as u64
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2267,15 +2305,25 @@ impl Database {
     pub fn network_limit_wait(&self) -> Result<u64, String> { self.network_limit_wait_for(1) }
 
     pub fn network_limit_wait_for(&self, required: i64) -> Result<u64, String> {
+        self.network_limit_wait_at(required, chrono::Utc::now())
+    }
+
+    fn network_limit_wait_at(&self, required: i64, now: chrono::DateTime<chrono::Utc>) -> Result<u64, String> {
         let (hourly, daily) = self.network_limits()?;
-        let conn = self.conn();
-        let (hour_count, day_count, hour_wait, day_wait): (i64,i64,i64,i64) = conn.query_row(
-            "SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE CreatedAt >= datetime('now','-1 hour')) + (SELECT coalesce(sum(Extra),0) FROM ESF_NetworkExtra WHERE CreatedAt >= datetime('now','-1 hour')),
-                    (SELECT count(*) FROM ESF_ChipAttempt WHERE date(CreatedAt,'-3 hours')=date('now','-3 hours')) + (SELECT coalesce(sum(Extra),0) FROM ESF_NetworkExtra WHERE date(CreatedAt,'-3 hours')=date('now','-3 hours')),
-                    coalesce((SELECT max(1, CAST(strftime('%s',min(CreatedAt)) AS INTEGER)+3601-CAST(strftime('%s','now') AS INTEGER)) FROM (SELECT CreatedAt FROM ESF_ChipAttempt WHERE CreatedAt >= datetime('now','-1 hour') UNION ALL SELECT CreatedAt FROM ESF_NetworkExtra WHERE CreatedAt >= datetime('now','-1 hour'))),3600),
-                    max(1, CAST(strftime('%s',datetime('now','-3 hours','start of day','+1 day','+3 hours')) AS INTEGER)-CAST(strftime('%s','now') AS INTEGER))", [],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|e| e.to_string())?;
-        Ok((if hour_count.saturating_add(required) > hourly { hour_wait } else { 0 }).max(if day_count.saturating_add(required) > daily { day_wait } else { 0 }) as u64)
+        Ok(network_wait(hourly, daily, self.network_usage_at(now)?, required))
+    }
+
+    /// Uso da rede em `now`: tentativas (com as partes extras) na última hora e no dia local, e a
+    /// espera até cada janela reabrir.
+    fn network_usage_at(&self, now: chrono::DateTime<chrono::Utc>) -> Result<(i64, i64, i64, i64), String> {
+        let (day_start, next_day) = local_day_bounds(now);
+        let (hour_count, day_count, hour_wait): (i64, i64, i64) = self.conn().query_row(
+            "SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE CreatedAt >= ?1) + (SELECT coalesce(sum(Extra),0) FROM ESF_NetworkExtra WHERE CreatedAt >= ?1),
+                    (SELECT count(*) FROM ESF_ChipAttempt WHERE CreatedAt >= ?2) + (SELECT coalesce(sum(Extra),0) FROM ESF_NetworkExtra WHERE CreatedAt >= ?2),
+                    coalesce((SELECT max(1, CAST(strftime('%s',min(CreatedAt)) AS INTEGER)+3601-CAST(strftime('%s',?3) AS INTEGER)) FROM (SELECT CreatedAt FROM ESF_ChipAttempt WHERE CreatedAt >= ?1 UNION ALL SELECT CreatedAt FROM ESF_NetworkExtra WHERE CreatedAt >= ?1)),3600)",
+            params![sql_utc(now - chrono::TimeDelta::hours(1)), sql_utc(day_start), sql_utc(now)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|e| e.to_string())?;
+        Ok((hour_count, day_count, hour_wait, (next_day - now).num_seconds().max(1)))
     }
 
     pub fn reserve_network_extra(&self, attempt_id: i64, parts: usize) -> Result<(), String> {
@@ -2287,18 +2335,28 @@ impl Database {
         self.conn().execute("INSERT INTO ESF_ReplyCapture(DeviceId,Available) SELECT rowid,?1 FROM ESF_Device WHERE CompanyId=?2 AND (AdbDeviceId=?3 OR EsferaDeviceId=?3 OR CurrentAdbAddress=?3) ON CONFLICT(DeviceId) DO UPDATE SET Available=excluded.Available", params![available,company,serial]).map(|_| ()).map_err(|e|e.to_string())
     }
 
+    /// Chave de resposta só para número brasileiro normalizável (DDD + número, 10 dígitos na chave).
+    /// Estrangeiro, título de grupo ou dígitos demais devolvem None.
+    fn reply_phone_key(phone: &str) -> Option<String> {
+        let key = Self::validate_opt_out_phone(phone).ok()?;
+        let b = key.as_bytes();
+        (key.len() == 10 && b[0] != b'0' && b[1] != b'0').then_some(key)
+    }
+
+    /// Número fora do padrão brasileiro é ignorado com Ok: uma linha ruim nunca trava a importação
+    /// (e com ela o envio do aparelho); só erro real do banco falha.
     pub fn remember_reply(&self, event_id: &str, company: i32, serial: &str, phone: &str, received_at: &str) -> Result<(), String> {
-        let key = Self::validate_opt_out_phone(phone)?;
+        let Some(key) = Self::reply_phone_key(phone) else { return Ok(()); };
         self.conn().execute("INSERT OR IGNORE INTO ESF_ReplyInbound(EventId,DeviceId,PhoneDigits,ReceivedAt) SELECT ?1,rowid,?2,?3 FROM ESF_Device WHERE CompanyId=?5 AND (AdbDeviceId=?4 OR EsferaDeviceId=?4 OR CurrentAdbAddress=?4) LIMIT 1", params![event_id,key,received_at,serial,company]).map(|_| ()).map_err(|e| e.to_string())
     }
 
     pub fn reply_status(&self, chip: &Chip, device: &Device) -> Result<NetworkChipStatus, String> {
         let conn = self.conn();
-        let available: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM ESF_ReplyInbound WHERE DeviceId=?1) AND EXISTS(SELECT 1 FROM ESF_ReplyCapture WHERE DeviceId=?1 AND Available=1)", params![device.id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        // Disponível = leitura de notificações ativa; "já respondeu" separa chip novo de chip ignorado.
+        let (available, ever_replied): (bool, bool) = conn.query_row("SELECT EXISTS(SELECT 1 FROM ESF_ReplyCapture WHERE DeviceId=?1 AND Available=1), EXISTS(SELECT 1 FROM ESF_ReplyInbound WHERE DeviceId=?1)", params![device.id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
         let (sample,replies): (i64,i64) = conn.query_row("SELECT count(*),coalesce(sum(CASE WHEN EXISTS(SELECT 1 FROM ESF_ReplyInbound r WHERE r.DeviceId=?2 AND r.PhoneDigits=a.PhoneDigits AND r.ReceivedAt>=a.CreatedAt) THEN 1 ELSE 0 END),0) FROM (SELECT PhoneDigits,CreatedAt FROM ESF_ChipAttempt WHERE ChipId=?1 AND Purpose='campaign' AND Outcome='enviado' AND CreatedAt<=datetime('now',?3) AND CreatedAt>coalesce((SELECT UntilAt FROM ESF_ReplyBrake WHERE ChipId=?1),'0000-01-01') ORDER BY AttemptId DESC LIMIT ?4) a", params![chip.id, device.id, format!("-{} hours", REPLY_WAIT_HOURS), REPLY_SAMPLE as i64], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
         let paused: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM ESF_ReplyBrake WHERE ChipId=?1 AND UntilAt>datetime('now'))", params![chip.id], |r| r.get(0)).map_err(|e| e.to_string())?;
-        let state = if paused { "pausado" } else { reply_state(available, sample as usize, replies as usize) };
-        let reason = match state { "pausado" => "Poucas respostas: chip pausado por 24 h para proteger o número", "reduzido" => "Ritmo reduzido por poucas respostas", "indisponivel" => "Taxa de resposta indisponível neste aparelho", _ => "" };
+        let (state, reason) = if paused { ("pausado", REPLY_REASON_PAUSED) } else { reply_state(available, ever_replied, sample as usize, replies as usize) };
         Ok(NetworkChipStatus { chip_id: chip.id, device_id: device.id, device_name: device.name.clone(), reply_rate: if available && sample > 0 { Some(replies as f64 * 100.0 / sample as f64) } else { None }, sample: sample as usize, state: state.into(), reason: reason.into() })
     }
 
@@ -2317,17 +2375,29 @@ impl Database {
     }
 
     pub fn network_status(&self, company: Option<i32>) -> Result<NetworkStatus, String> {
+        let now = chrono::Utc::now();
         let (hourly,daily) = self.network_limits()?;
-        let (sent_last_hour,sent_today): (i64,i64) = self.conn().query_row("SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE Outcome='enviado' AND CreatedAt>=datetime('now','-1 hour')) + (SELECT coalesce(sum(e.Extra),0) FROM ESF_NetworkExtra e JOIN ESF_ChipAttempt a ON a.AttemptId=e.AttemptId WHERE a.Outcome='enviado' AND e.CreatedAt>=datetime('now','-1 hour')), (SELECT count(*) FROM ESF_ChipAttempt WHERE Outcome='enviado' AND date(CreatedAt,'-3 hours')=date('now','-3 hours')) + (SELECT coalesce(sum(e.Extra),0) FROM ESF_NetworkExtra e JOIN ESF_ChipAttempt a ON a.AttemptId=e.AttemptId WHERE a.Outcome='enviado' AND date(e.CreatedAt,'-3 hours')=date('now','-3 hours'))", [], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
+        let usage = self.network_usage_at(now)?;
+        let (sent_last_hour,sent_today): (i64,i64) = self.conn().query_row("SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE Outcome='enviado' AND CreatedAt>=?1) + (SELECT coalesce(sum(e.Extra),0) FROM ESF_NetworkExtra e JOIN ESF_ChipAttempt a ON a.AttemptId=e.AttemptId WHERE a.Outcome='enviado' AND e.CreatedAt>=?1), (SELECT count(*) FROM ESF_ChipAttempt WHERE Outcome='enviado' AND CreatedAt>=?2) + (SELECT coalesce(sum(e.Extra),0) FROM ESF_NetworkExtra e JOIN ESF_ChipAttempt a ON a.AttemptId=e.AttemptId WHERE a.Outcome='enviado' AND e.CreatedAt>=?2)", params![sql_utc(now - chrono::TimeDelta::hours(1)), sql_utc(local_day_bounds(now).0)], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
         let mut chips = Vec::new();
         for d in self.get_all_devices().into_iter().filter(|d| company.map_or(true, |id| d.company_id == id)) {
             for chip in self.get_chips(d.id) { chips.push(self.reply_status(&chip,&d)?); }
         }
-        Ok(NetworkStatus { hourly,daily,sent_last_hour,sent_today,wait_seconds:self.network_limit_wait()?,chips })
+        Ok(NetworkStatus { hourly,daily,sent_last_hour,sent_today,attempts_last_hour:usage.0,attempts_today:usage.1,wait_seconds:network_wait(hourly,daily,usage,1),chips })
     }
 
     /// Reserva uma tentativa antes de tocar no WhatsApp. Tentativas interrompidas contam como falha.
     pub fn reserve_chip_attempt(&self, chip: &Chip, company_id: i32, campaign_id: i32, phone: &str, confirmation: bool) -> Result<i64, String> {
+        self.reserve_attempt(chip, company_id, campaign_id, phone, if confirmation { "confirmation" } else { "campaign" }, chrono::Utc::now())
+    }
+
+    /// Envio manual: conta nos limites do chip e no teto da rede, fora da amostra de respostas da campanha.
+    pub fn reserve_manual_attempt(&self, chip: &Chip, company_id: i32, phone: &str) -> Result<i64, String> {
+        self.reserve_attempt(chip, company_id, 0, phone, "manual", chrono::Utc::now())
+    }
+
+    fn reserve_attempt(&self, chip: &Chip, company_id: i32, campaign_id: i32, phone: &str, purpose: &str, now: chrono::DateTime<chrono::Utc>) -> Result<i64, String> {
+        let confirmation = purpose == "confirmation";
         if chip.status != "livre" || chip.restricted_until.is_some() {
             return Err("Chip restrito ou indisponível. Verifique o aparelho antes de retomar.".into());
         }
@@ -2339,11 +2409,13 @@ impl Database {
         let hour_limit = config("HOURLY_LIMIT", 10);
         let day_limit = config("DAILY_LIMIT", 60);
         let conn = self.conn();
+        // O dia do chip começa na meia-noite local, pelo mesmo critério do teto da rede.
         let (hour, day, age): (i64, i64, i64) = conn.query_row(
-            "SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= datetime('now','-1 hour')),
-                    (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND date(CreatedAt,'localtime')=date('now','localtime')),
-                    max(0, CAST(julianday('now') - julianday(?2) AS INTEGER))",
-            params![chip.id, chip.created_at], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e| e.to_string())?;
+            "SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?3),
+                    (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?4),
+                    max(0, CAST(julianday(?5) - julianday(?2) AS INTEGER))",
+            params![chip.id, chip.created_at, sql_utc(now - chrono::TimeDelta::hours(1)), sql_utc(local_day_bounds(now).0), sql_utc(now)],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e| e.to_string())?;
         // O dia de cadastro começa com 15 tentativas; o teto cresce cinco por dia.
         let warm_limit = (15 + age * 5).min(day_limit);
         if hour >= hour_limit || day >= warm_limit {
@@ -2357,7 +2429,7 @@ impl Database {
         if !confirmation && count >= 20 && (failed * 100 > count * 15 || optouts * 100 > count * 10) {
             return Err(format!("Freio automático: nas últimas {} tentativas, {} falhas e {} pedidos de SAIR.", count, failed, optouts));
         }
-        conn.execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Purpose) VALUES (?1,?2,?3,?4,?5)", params![chip.id,company_id,campaign_id,Self::opt_out_key(phone),if confirmation {"confirmation"} else {"campaign"}]).map_err(|e| e.to_string())?;
+        conn.execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Purpose) VALUES (?1,?2,?3,?4,?5)", params![chip.id,company_id,campaign_id,Self::opt_out_key(phone),purpose]).map_err(|e| e.to_string())?;
         let id = conn.last_insert_rowid();
         let n = config("BREAK_EVERY", 10);
         let total: i64 = conn.query_row("SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1", params![chip.id], |r| r.get(0)).map_err(|e| e.to_string())?;
@@ -4190,14 +4262,25 @@ mod opt_out_key_tests {
 mod antiban_tests {
     use super::{Chip, Database};
     use rusqlite::params;
+    /// Horário local (relógio do Windows) convertido para UTC.
+    fn local_utc(text: &str) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        let naive = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").unwrap();
+        chrono::Local.from_local_datetime(&naive).earliest().unwrap().with_timezone(&chrono::Utc)
+    }
     #[test]
     fn limites_de_resposta_e_dados_indisponiveis() {
-        assert_eq!(super::reply_state(false,30,0), "indisponivel");
-        assert_eq!(super::reply_state(true,29,0), "normal");
-        assert_eq!(super::reply_state(true,30,0), "pausado");
-        assert_eq!(super::reply_state(true,30,1), "reduzido");
-        assert_eq!(super::reply_state(true,100,2), "reduzido");
-        assert_eq!(super::reply_state(true,100,5), "normal");
+        use super::reply_state;
+        assert_eq!(reply_state(false,true,30,0).0, "indisponivel");
+        assert_eq!(reply_state(false,false,30,0).0, "indisponivel");
+        assert_eq!(reply_state(true,true,29,0).0, "normal");
+        assert_eq!(reply_state(true,true,30,0).0, "pausado");
+        assert_eq!(reply_state(true,true,30,1).0, "reduzido");
+        assert_eq!(reply_state(true,true,100,2).0, "reduzido");
+        assert_eq!(reply_state(true,true,100,5).0, "normal");
+        // Listener ativo e nenhuma resposta captada desde sempre: reduz com a amostra cheia, sem pausar.
+        assert_eq!(reply_state(true,false,29,0).0, "normal");
+        assert_eq!(reply_state(true,false,30,0), ("reduzido", super::REPLY_REASON_NONE_YET));
     }
     #[test]
     fn resposta_idempotente_e_amostra_recomeca_apos_pausa() {
@@ -4213,6 +4296,16 @@ mod antiban_tests {
         }
         assert_eq!(db.reply_status(&chip,&device).unwrap().state,"indisponivel");
         db.set_reply_capture(1,"usb1",true).unwrap();
+        // Chip novo: 30 envios sem nenhuma resposta captada reduz o ritmo, sem pausar o chip.
+        let fresh = db.apply_reply_brake(&chip,&device).unwrap();
+        assert_eq!((fresh.state.as_str(), fresh.reason.as_str(), fresh.reply_rate), ("reduzido", super::REPLY_REASON_NONE_YET, Some(0.0)));
+        assert_eq!(db.get_chips(device.id)[0].status, "livre");
+        // Número estrangeiro ou título com dígitos demais é ignorado sem erro (não trava a importação).
+        for (id, title) in [("ext1", "+1 415 555 1234"), ("ext2", "+44 7911 123456"), ("grupo", "Grupo 2024 11 98888-7777 bloco 12")] {
+            db.remember_reply(id,1,"usb1",title,"2020-01-01 00:00:00").unwrap();
+        }
+        let n: i64 = db.conn().query_row("SELECT count(*) FROM ESF_ReplyInbound", [], |r|r.get(0)).unwrap();
+        assert_eq!(n,0);
         db.remember_reply("evento",1,"usb1","11988888888","2020-01-01 00:00:00").unwrap();
         db.remember_reply("evento",1,"usb1","11988888888","2020-01-01 00:00:00").unwrap();
         let n: i64 = db.conn().query_row("SELECT count(*) FROM ESF_ReplyInbound", [], |r|r.get(0)).unwrap();
@@ -4251,6 +4344,42 @@ mod antiban_tests {
         db.conn().execute("UPDATE ESF_ChipAttempt SET CreatedAt=datetime('now')", []).unwrap();
         db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,CreatedAt) VALUES(3,1,1,'11999999999',datetime('now'))", []).unwrap();
         assert!(db.network_limit_wait().unwrap() > 0);
+    }
+    #[test]
+    fn dia_local_comeca_na_meia_noite() {
+        let (start, end) = super::local_day_bounds(local_utc("2026-06-15 23:59:59"));
+        assert_eq!((start, end), (local_utc("2026-06-15 00:00:00"), local_utc("2026-06-16 00:00:00")));
+        assert_eq!(super::local_day_bounds(local_utc("2026-06-16 00:00:01")).0, local_utc("2026-06-16 00:00:00"));
+    }
+    #[test]
+    fn teto_diario_da_rede_vira_na_meia_noite_local() {
+        let path = std::env::temp_dir().join(format!("esfera_rede_meia_noite_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.set_network_limits(2, 2).unwrap();
+        for at in ["2026-06-14 23:30:00", "2026-06-15 00:01:00", "2026-06-15 23:30:00"] {
+            db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Outcome,CreatedAt) VALUES(1,1,1,'1199999999','enviado',?1)", params![super::sql_utc(local_utc(at))]).unwrap();
+        }
+        // 23:59:30: duas tentativas hoje (a de ontem não conta); a próxima só cabe na meia-noite local.
+        assert_eq!(db.network_limit_wait_at(1, local_utc("2026-06-15 23:59:30")).unwrap(), 30);
+        // 00:00:30: dia novo; a das 23:30 ainda ocupa a última hora (1 de 2), então cabe só mais uma.
+        assert_eq!(db.network_limit_wait_at(1, local_utc("2026-06-16 00:00:30")).unwrap(), 0);
+        assert!(db.network_limit_wait_at(2, local_utc("2026-06-16 00:00:30")).unwrap() > 0);
+    }
+    #[test]
+    fn limite_diario_do_chip_vira_na_meia_noite_local() {
+        let path = std::env::temp_dir().join(format!("esfera_chip_meia_noite_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let chip = Chip { id: 7, device_id: 1, phone_number: "".into(), chip_name: "".into(), status: "livre".into(), restricted_until: None, created_at: "2020-01-01 00:00:00".into() };
+        let noon = super::sql_utc(local_utc("2026-06-15 12:00:00"));
+        for i in 0..60 {
+            db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Outcome,CreatedAt) VALUES(7,1,1,?1,'enviado',?2)", params![format!("1199{:06}", i), noon]).unwrap();
+        }
+        // Mesmo critério do teto da rede: 60 tentativas no dia local esgotam o chip até a meia-noite.
+        let error = db.reserve_attempt(&chip, 1, 1, "11999990000", "campaign", local_utc("2026-06-15 23:59:30")).unwrap_err();
+        assert!(error.contains("Limite do chip"));
+        assert!(db.reserve_attempt(&chip, 1, 1, "11999990000", "campaign", local_utc("2026-06-16 00:00:30")).is_ok());
     }
     #[test]
     fn freio_janela_e_limites_persistentes() {
