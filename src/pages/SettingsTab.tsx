@@ -502,6 +502,11 @@ export default function SettingsTab() {
 
   const handleTestAi = async () => {
     if (!selectedCompanyId) return;
+    const formProblem = aiEndpointError || aiModelError;
+    if (formProblem) {
+      setAiTestResult({ tone: "error", title: "Corrija antes de testar", text: formProblem });
+      return;
+    }
     setAiTestResult(null);
     const outcome = await aiRun.run(
       () =>
