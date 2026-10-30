@@ -383,6 +383,13 @@ select option {
   background-color: var(--color-bg-card);
   color: var(--color-text-primary);
 }
+/* Títulos dos grupos da lista: sem isso o Windows pinta fundo branco com texto claro (ilegível). */
+select optgroup {
+  background-color: var(--color-bg-secondary);
+  color: var(--color-text-tertiary);
+  font-style: normal;
+  font-weight: 600;
+}
 
 /* ============================================================
    SCROLLBAR
