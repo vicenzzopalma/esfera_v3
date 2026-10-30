@@ -3,13 +3,14 @@
 // Configurações: empresa, notificações, ADB, conexão, IA e segurança
 // ============================================================
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
 import Card from "../components/ui/Card";
 import Button from "../components/ui/Button";
 import Toggle from "../components/ui/Toggle";
 import PageHeader from "../components/ui/PageHeader";
 import Field, { FormSection } from "../components/ui/Field";
+import Badge from "../components/ui/Badge";
 import { confirmDialog } from "../components/ui/Modal";
 import { toast } from "../components/ui/ToastContainer";
 import { api, setAppMode as setTauriAppMode, reloadConfig } from "../tauri";
@@ -43,10 +44,26 @@ import {
   Copy,
   KeyRound,
   Loader2,
+  Info,
 } from "lucide-react";
 
 type SettingsSection = "geral" | "notificacoes" | "adb" | "hub" | "ia" | "integracoes" | "seguranca";
 type LoadState = "loading" | "ready" | "error";
+type HubSnapshot = {
+  hubEnabled: boolean;
+  hubAddress: string;
+  empresaServerEnabled: boolean;
+  empresaServerPort: string;
+  tunnelServerEnabled: boolean;
+  tunnelServerPort: string;
+  appMode: string;
+};
+type AiSnapshot = { provider: string; model: string; temperature: string; systemPrompt: string; endpoint: string };
+
+/** Compara dois retratos do formulário campo a campo. */
+function sameSnapshot<T extends Record<string, unknown>>(a: T, b: T): boolean {
+  return (Object.keys(a) as (keyof T)[]).every((k) => a[k] === b[k]);
+}
 // O que get_ai_provider_keys devolve por provedor. A chave vem vazia (mascarada) no backend novo;
 // hasApiKey é o indicador pedido ao backend (pedidos-L-SET.md) e é usado quando existir.
 type ProviderKeyInfo = { apiKey?: string; endpoint?: string; model?: string; hasApiKey?: boolean };
@@ -76,6 +93,83 @@ function errText(e: unknown): string {
 function parsePort(value: string): number | null {
   const n = Number(value.trim());
   return Number.isInteger(n) && n >= 1024 && n <= 65535 ? n : null;
+}
+
+/** Segundos com uma casa, no formato brasileiro (ex.: "2,4"). */
+function formatSeconds(ms: number): string {
+  return (ms / 1000).toLocaleString("pt-BR", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+}
+
+// ---- Testes que a tela pode abandonar ----
+// "Parar" ou o tempo limite liberam a tela na hora. O backend não é cancelado: a resposta
+// que chegar depois é descartada. Ao sair da tela, a espera termina como parada.
+type RunOutcome<T> =
+  | { kind: "ok"; value: T; ms: number }
+  | { kind: "error"; message: string }
+  | { kind: "timeout"; seconds: number }
+  | { kind: "stopped" };
+
+function useTimedRun() {
+  const [running, setRunning] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const current = useRef<{ id: number; stop: () => void } | null>(null);
+  const seq = useRef(0);
+
+  useEffect(() => {
+    if (!running) return;
+    const started = Date.now();
+    setElapsed(0);
+    const timer = window.setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => window.clearInterval(timer);
+  }, [running]);
+
+  useEffect(() => () => current.current?.stop(), []);
+
+  const run = useCallback(<T,>(task: () => Promise<T>, limitSeconds: number): Promise<RunOutcome<T>> => {
+    current.current?.stop();
+    const id = ++seq.current;
+    setRunning(true);
+    const started = performance.now();
+    return new Promise<RunOutcome<T>>((resolve) => {
+      let timer = 0;
+      let settled = false;
+      const finish = (outcome: RunOutcome<T>) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        if (current.current?.id === id) {
+          current.current = null;
+          setRunning(false);
+        }
+        resolve(outcome);
+      };
+      current.current = { id, stop: () => finish({ kind: "stopped" }) };
+      timer = window.setTimeout(() => finish({ kind: "timeout", seconds: limitSeconds }), limitSeconds * 1000);
+      task().then(
+        (value) => finish({ kind: "ok", value, ms: performance.now() - started }),
+        (e) => finish({ kind: "error", message: errText(e) }),
+      );
+    });
+  }, []);
+
+  const stop = useCallback(() => current.current?.stop(), []);
+  return { running, elapsed, run, stop };
+}
+
+type TestResultData = { tone: "success" | "error" | "neutral"; title: string; text: string };
+
+/** Resultado de um teste a partir do desfecho; `ok` monta o texto de sucesso. */
+function outcomeToResult<T>(outcome: RunOutcome<T>, ok: (value: T, ms: number) => TestResultData, timeoutHint: string): TestResultData {
+  switch (outcome.kind) {
+    case "ok":
+      return ok(outcome.value, outcome.ms);
+    case "error":
+      return { tone: "error", title: "Falha no teste", text: outcome.message };
+    case "timeout":
+      return { tone: "error", title: "Tempo esgotado", text: `Sem resposta em ${outcome.seconds} s. ${timeoutHint}` };
+    case "stopped":
+      return { tone: "neutral", title: "Teste interrompido", text: "Se a resposta chegar depois, ela é descartada." };
+  }
 }
 
 /** Lê o arquivo como base64 sem estourar a pilha (o spread em String.fromCharCode quebra em arquivos grandes). */
@@ -160,8 +254,35 @@ export default function SettingsTab() {
   const [aiReload, setAiReload] = useState(0);
   const [savingAi, setSavingAi] = useState(false);
   const [aiStatus, setAiStatus] = useState("");
-  const [testingAi, setTestingAi] = useState(false);
-  const [aiTestResult, setAiTestResult] = useState<{ success: boolean; text: string } | null>(null);
+  const aiRun = useTimedRun();
+  const [aiTestResult, setAiTestResult] = useState<TestResultData | null>(null);
+
+  // Último estado salvo (ou carregado): base de "Alterações não salvas" e do Desfazer.
+  const [hubSaved, setHubSaved] = useState<HubSnapshot | null>(null);
+  const [aiSaved, setAiSaved] = useState<AiSnapshot | null>(null);
+
+  // Põe um retrato no formulário e o guarda como "salvo" (carregar, salvar e Desfazer usam).
+  const applyHubSnapshot = (s: HubSnapshot) => {
+    setHubEnabled(s.hubEnabled);
+    setHubAddress(s.hubAddress);
+    setEmpresaServerEnabled(s.empresaServerEnabled);
+    setEmpresaServerPort(s.empresaServerPort);
+    setTunnelServerEnabled(s.tunnelServerEnabled);
+    setTunnelServerPort(s.tunnelServerPort);
+    setAppMode(s.appMode);
+    setHubToken("");
+    setCustomIpOverride(false);
+    setHubSaved(s);
+  };
+  const applyAiSnapshot = (s: AiSnapshot) => {
+    setAiProvider(s.provider);
+    setAiModel(s.model);
+    setAiTemperature(s.temperature);
+    setAiSystemPrompt(s.systemPrompt);
+    setAiEndpoint(s.endpoint);
+    setAiApiKey("");
+    setAiSaved(s);
+  };
 
   // Configuração da instalação (hub, servidores, modo). Sem ela carregada, Salvar fica bloqueado:
   // salvar os valores de exemplo por cima da configuração real desligaria o hub ou os servidores.
@@ -173,15 +294,16 @@ export default function SettingsTab() {
       .then((cfg) => {
         if (!mounted) return;
         if (!cfg) throw new Error("A configuração veio vazia.");
-        setHubEnabled(Boolean(cfg.hub_enabled));
-        setHubAddress(cfg.hub_address || DEFAULT_HUB_ADDRESS);
         loadedHubToken.current = cfg.hub_token || "";
-        setHubToken("");
-        setEmpresaServerEnabled(Boolean(cfg.empresa_server_enabled));
-        setEmpresaServerPort(String(cfg.empresa_server_port || 7777));
-        setTunnelServerEnabled(cfg.tunnel_server_enabled ?? false);
-        setTunnelServerPort(String(cfg.tunnel_server_port || 8888));
-        setAppMode(cfg.mode || "empresa");
+        applyHubSnapshot({
+          hubEnabled: Boolean(cfg.hub_enabled),
+          hubAddress: cfg.hub_address || DEFAULT_HUB_ADDRESS,
+          empresaServerEnabled: Boolean(cfg.empresa_server_enabled),
+          empresaServerPort: String(cfg.empresa_server_port || 7777),
+          tunnelServerEnabled: cfg.tunnel_server_enabled ?? false,
+          tunnelServerPort: String(cfg.tunnel_server_port || 8888),
+          appMode: cfg.mode || "empresa",
+        });
         setAppConfigLoad("ready");
       })
       .catch((err) => {
@@ -230,11 +352,13 @@ export default function SettingsTab() {
         const info = getAiProviderInfo(provider);
         // IA própria: endereço e modelo valem os do cartão IA própria (atualizados também pelo hub).
         const vps = provider === "vps_ia" ? visible.vps_ia : undefined;
-        setAiProvider(provider);
-        setAiModel(vps?.model || cfg?.model || info?.defaultModel || DEFAULT_AI_MODEL);
-        setAiTemperature(String(cfg?.temperature ?? 0.7));
-        setAiSystemPrompt(cfg?.systemPrompt || "");
-        setAiEndpoint(vps?.endpoint || cfg?.endpoint || info?.defaultEndpoint || "");
+        applyAiSnapshot({
+          provider,
+          model: vps?.model || cfg?.model || info?.defaultModel || DEFAULT_AI_MODEL,
+          temperature: String(cfg?.temperature ?? 0.7),
+          systemPrompt: cfg?.systemPrompt || "",
+          endpoint: vps?.endpoint || cfg?.endpoint || info?.defaultEndpoint || "",
+        });
         setAiLoad("ready");
       })
       .catch((e) => {
@@ -305,9 +429,7 @@ export default function SettingsTab() {
         ...prev,
         [provider]: { endpoint, model, hasApiKey: typedKey ? true : prev[provider]?.hasApiKey },
       }));
-      setAiApiKey("");
-      setAiModel(model);
-      setAiEndpoint(endpoint);
+      applyAiSnapshot({ provider, model, temperature: aiTemperature.trim(), systemPrompt: aiSystemPrompt, endpoint });
       setAiStatus("Configuração de IA salva.");
       toast.success("Configuração de IA salva");
     } catch (e) {
@@ -317,28 +439,43 @@ export default function SettingsTab() {
     }
   };
 
+  // Tempo limite do teste: a IA própria tem fila e 90 s de HTTP; local pode estar carregando o modelo.
+  const aiTestLimit = aiProvider === "vps_ia" ? 150 : aiProvider === "ollama" || aiProvider === "lmstudio" ? 120 : 45;
+
   const handleTestAi = async () => {
     if (!selectedCompanyId) return;
-    setTestingAi(true);
     setAiTestResult(null);
-    try {
-      const rewritten = await api<string>("rewrite_message_ai", {
-        message: AI_TEST_MESSAGE,
-        contactName: AI_TEST_CONTACT,
-        companyId: selectedCompanyId,
-        provider: aiProvider,
-        model: aiModel.trim(),
-        prompt: aiSystemPrompt,
-        apiKey: aiKeyToSend(),
-        endpoint: aiEndpointTrim,
-      });
-      setAiTestResult({ success: true, text: rewritten });
-    } catch (err) {
-      setAiTestResult({ success: false, text: errText(err) });
-    } finally {
-      setTestingAi(false);
-    }
+    const outcome = await aiRun.run(
+      () =>
+        api<string>("rewrite_message_ai", {
+          message: AI_TEST_MESSAGE,
+          contactName: AI_TEST_CONTACT,
+          companyId: selectedCompanyId,
+          provider: aiProvider,
+          model: aiModel.trim(),
+          prompt: aiSystemPrompt,
+          apiKey: aiKeyToSend(),
+          endpoint: aiEndpointTrim,
+        }),
+      aiTestLimit,
+    );
+    setAiTestResult(
+      outcomeToResult(
+        outcome,
+        (text, ms) => ({ tone: "success", title: `Resposta em ${formatSeconds(ms)} s`, text }),
+        "Confira o endereço, a chave e a internet e tente de novo.",
+      ),
+    );
   };
+
+  const aiDirty =
+    aiLoad === "ready" &&
+    aiSaved !== null &&
+    (aiApiKey.trim() !== "" ||
+      !sameSnapshot(
+        { provider: aiProvider, model: aiModel.trim(), temperature: aiTemperature.trim(), systemPrompt: aiSystemPrompt, endpoint: aiEndpointTrim },
+        aiSaved,
+      ));
 
   // Validação da conexão: endereço host:porta e portas dos servidores ligados.
   const hubAddressTrim = hubAddress.trim();
@@ -374,8 +511,15 @@ export default function SettingsTab() {
       };
       await api("save_app_config", { config: payload });
       if (typedToken) loadedHubToken.current = typedToken;
-      setHubToken("");
-      setHubAddress(address);
+      applyHubSnapshot({
+        hubEnabled,
+        hubAddress: address,
+        empresaServerEnabled,
+        empresaServerPort: String(payload.empresa_server_port),
+        tunnelServerEnabled,
+        tunnelServerPort: String(payload.tunnel_server_port),
+        appMode,
+      });
       setTauriAppMode(isKnownMode(appMode) ? appMode : "local");
       reloadConfig();
       setHubStatus("Conexão salva. Hub e servidores locais passam a usar a configuração nova quando o Esfera for reaberto.");
@@ -386,6 +530,23 @@ export default function SettingsTab() {
       setSavingHub(false);
     }
   };
+
+  const hubDirty =
+    appConfigLoad === "ready" &&
+    hubSaved !== null &&
+    (hubToken.trim() !== "" ||
+      !sameSnapshot(
+        {
+          hubEnabled,
+          hubAddress: hubAddressTrim || DEFAULT_HUB_ADDRESS,
+          empresaServerEnabled,
+          empresaServerPort: empresaServerPort.trim(),
+          tunnelServerEnabled,
+          tunnelServerPort: tunnelServerPort.trim(),
+          appMode,
+        },
+        hubSaved,
+      ));
 
   // Atualizar VPS (self-update remoto do hub-standalone) — master only
   const handleUpdateVpsClick = () => {
@@ -704,12 +865,15 @@ export default function SettingsTab() {
                     </FormSection>
 
                     <div className="space-y-3 border-t border-border pt-5">
-                      <div className="flex flex-wrap items-center gap-3">
+                      <div className="flex flex-wrap items-center gap-2">
                         <Button icon={<Save size={15} />} onClick={handleSaveAll} loading={savingHub}>
                           Salvar conexão
                         </Button>
-                        <p className="text-xs text-tertiary">Vale para este computador. Hub e servidores locais usam a configuração nova quando o Esfera for reaberto.</p>
+                        {hubDirty && !savingHub && <UnsavedNote onUndo={() => hubSaved && applyHubSnapshot(hubSaved)} />}
                       </div>
+                      <p className="text-xs text-tertiary">
+                        Vale para este computador. Hub e servidores locais usam a configuração nova quando o Esfera for reaberto.
+                      </p>
                       {hubStatus && <StatusBanner error={hubStatusIsError} message={hubStatus} onClose={() => setHubStatus("")} />}
                     </div>
                   </>
@@ -880,35 +1044,29 @@ export default function SettingsTab() {
                       </Field>
 
                       <div className="flex flex-wrap items-center gap-2 pt-1">
-                        <Button icon={<Save size={15} />} onClick={handleSaveAi} loading={savingAi}>
+                        <Button icon={<Save size={15} />} onClick={handleSaveAi} loading={savingAi} disabled={aiRun.running}>
                           Salvar IA
                         </Button>
-                        <Button variant="secondary" icon={<Play size={14} />} loading={testingAi} onClick={handleTestAi}>
-                          {testingAi ? "Testando…" : "Testar"}
+                        <Button variant="secondary" icon={<Play size={14} />} loading={aiRun.running} onClick={handleTestAi}>
+                          {aiRun.running ? `Testando… ${aiRun.elapsed} s` : "Testar"}
                         </Button>
+                        {aiRun.running && (
+                          <Button variant="ghost" onClick={aiRun.stop}>
+                            Parar
+                          </Button>
+                        )}
+                        {aiDirty && !savingAi && (
+                          <UnsavedNote onUndo={() => aiSaved && applyAiSnapshot(aiSaved)} />
+                        )}
                       </div>
 
-                      {aiTestResult && (
-                        <div
-                          role={aiTestResult.success ? "status" : "alert"}
-                          className={`rounded-lg border p-3 text-[0.8125rem] space-y-1 ${
-                            aiTestResult.success
-                              ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
-                              : "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
-                          }`}
-                        >
-                          <div className="flex items-center gap-2 font-medium">
-                            {aiTestResult.success ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
-                            {aiTestResult.success ? "Teste concluído" : "Falha no teste"}
-                          </div>
-                          <p className="whitespace-pre-wrap text-xs text-secondary">{aiTestResult.text}</p>
-                        </div>
-                      )}
+                      {aiTestResult && <TestResult result={aiTestResult} />}
 
                       {aiStatus && <StatusBanner error={aiStatusIsError} message={aiStatus} onClose={() => setAiStatus("")} />}
 
                       <p className="text-xs text-tertiary">
-                        O teste usa os dados da tela (mesmo sem salvar) e um texto de exemplo para “{AI_TEST_CONTACT}”, sem valores e sem link.
+                        O teste usa os dados da tela, mesmo sem salvar, e um texto de exemplo para “{AI_TEST_CONTACT}”, sem valores e sem link.
+                        Desiste sozinho depois de {aiTestLimit} s.
                       </p>
                     </>
                   )}
@@ -981,6 +1139,42 @@ function LoadGate({ state, error, what, onRetry }: { state: LoadState; error: st
         Tentar de novo
       </Button>
     </div>
+  );
+}
+
+// Resultado de teste (IA principal, IA própria, Gemini): sucesso, falha ou interrompido.
+function TestResult({ result }: { result: TestResultData }) {
+  const tone =
+    result.tone === "success"
+      ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+      : result.tone === "error"
+      ? "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
+      : "border-border bg-secondary text-secondary";
+  const Icon = result.tone === "success" ? CheckCircle2 : result.tone === "error" ? AlertCircle : Info;
+  return (
+    <div role={result.tone === "error" ? "alert" : "status"} className={`space-y-1 rounded-lg border p-3 text-[0.8125rem] ${tone}`}>
+      <div className="flex items-center gap-2 font-medium">
+        <Icon size={15} className="shrink-0" />
+        {result.title}
+      </div>
+      {result.text && (
+        <p className={`whitespace-pre-wrap break-words text-xs ${result.tone === "success" ? "text-primary" : "text-secondary"}`}>{result.text}</p>
+      )}
+    </div>
+  );
+}
+
+// Aviso ao lado do Salvar quando o formulário difere do que está gravado.
+function UnsavedNote({ onUndo }: { onUndo: () => void }) {
+  return (
+    <span className="inline-flex items-center gap-2">
+      <Badge variant="warning" dot>
+        Alterações não salvas
+      </Badge>
+      <button type="button" onClick={onUndo} className="cursor-pointer text-xs text-secondary underline hover:text-primary">
+        Desfazer
+      </button>
+    </span>
   );
 }
 
