@@ -72,6 +72,10 @@ function useNow(intervalMs: number) {
   return now;
 }
 
+function plural(n: number, one: string, many: string) {
+  return `${n.toLocaleString("pt-BR")} ${n === 1 ? one : many}`;
+}
+
 function formatWait(seconds: number) {
   if (seconds < 90) return `${Math.max(1, Math.round(seconds))} s`;
   const min = Math.round(seconds / 60);
@@ -244,7 +248,13 @@ export default function DashboardTab() {
           icon={<XCircle size={14} />}
           tone={activeFailures > 0 ? "danger" : "neutral"}
           value={kpiValue(campaignsQ.isLoading, activeFailures)}
-          hint={activeCampaigns.length > 0 ? `nas ${activeCampaigns.length} campanhas ativas` : "nenhuma campanha ativa"}
+          hint={
+            activeCampaigns.length === 0
+              ? "nenhuma campanha ativa"
+              : activeCampaigns.length === 1
+              ? "na campanha ativa"
+              : `nas ${activeCampaigns.length} campanhas ativas`
+          }
         />
         <StatCard
           label="Na fila de envio"
@@ -308,16 +318,24 @@ export default function DashboardTab() {
                     <span className="text-tertiary">em {replySample.toLocaleString("pt-BR")} envios avaliados</span>
                   </p>
                 )}
-                <div className="mb-2 flex flex-wrap items-center gap-1.5 text-[0.75rem]">
-                  <span className="mr-1 text-secondary">Chips:</span>
-                  <Badge variant="success">{chipsByState("normal").length} normais</Badge>
-                  {chipsByState("reduzido").length > 0 && <Badge variant="warning">{chipsByState("reduzido").length} com ritmo reduzido</Badge>}
-                  {chipsByState("pausado").length > 0 && <Badge variant="danger">{chipsByState("pausado").length} em freio</Badge>}
-                  {(kpis?.blockedChips ?? 0) > 0 && <Badge variant="danger">{kpis?.blockedChips} bloqueados ou restritos</Badge>}
-                  {chipsByState("indisponivel").length > 0 && (
-                    <Badge variant="neutral">{chipsByState("indisponivel").length} sem leitura de respostas</Badge>
-                  )}
-                </div>
+                {chips.length === 0 ? (
+                  <p className="mb-2 text-[0.75rem] text-tertiary">Nenhum chip cadastrado nos aparelhos desta empresa.</p>
+                ) : (
+                  <div className="mb-2 flex flex-wrap items-center gap-1.5 text-[0.75rem]">
+                    <span className="mr-1 text-secondary">Chips:</span>
+                    <Badge variant="success">{plural(chipsByState("normal").length, "normal", "normais")}</Badge>
+                    {chipsByState("reduzido").length > 0 && (
+                      <Badge variant="warning">{chipsByState("reduzido").length} com ritmo reduzido</Badge>
+                    )}
+                    {chipsByState("pausado").length > 0 && <Badge variant="danger">{chipsByState("pausado").length} em freio</Badge>}
+                    {(kpis?.blockedChips ?? 0) > 0 && (
+                      <Badge variant="danger">{plural(kpis?.blockedChips ?? 0, "bloqueado ou restrito", "bloqueados ou restritos")}</Badge>
+                    )}
+                    {chipsByState("indisponivel").length > 0 && (
+                      <Badge variant="neutral">{chipsByState("indisponivel").length} sem leitura de respostas</Badge>
+                    )}
+                  </div>
+                )}
                 {brakedChips.length > 0 ? (
                   <ul className="space-y-1.5">
                     {brakedChips.slice(0, 5).map((c) => {
@@ -442,7 +460,8 @@ export default function DashboardTab() {
           Campanhas ativas
           {!campaignsQ.isLoading && activeCampaigns.length > 0 && (
             <span className="text-xs font-normal text-tertiary">
-              {runningCount} em andamento · {activeCampaigns.length - runningCount} pausadas
+              {runningCount} em andamento · {activeCampaigns.length - runningCount}{" "}
+              {activeCampaigns.length - runningCount === 1 ? "pausada" : "pausadas"}
             </span>
           )}
         </SectionTitle>
