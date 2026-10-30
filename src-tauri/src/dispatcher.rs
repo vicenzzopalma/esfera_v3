@@ -15,6 +15,25 @@ use tokio::task::spawn_blocking;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, timeout, Duration};
 
+// Sem identificação confiável da sub-rede, todos os aparelhos desta instalação
+// (USB e Wi-Fi) compartilham a mesma fila conservadora.
+static NETWORK_SEND_GATE: std::sync::LazyLock<AsyncMutex<Option<(i32, Instant)>>> =
+    std::sync::LazyLock::new(|| AsyncMutex::new(None));
+static NETWORK_LIMITED_CAMPAIGNS: std::sync::LazyLock<Mutex<std::collections::HashSet<i32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+struct NetworkSendGuard(tokio::sync::MutexGuard<'static, Option<(i32, Instant)>>, i32);
+impl Drop for NetworkSendGuard {
+    fn drop(&mut self) { *self.0 = Some((self.1, Instant::now())); }
+}
+
+fn network_gap(last: Option<(i32, u64)>, device_id: i32, interval: u64) -> u64 {
+    match last {
+        Some((previous, elapsed)) if previous != device_id => interval.saturating_sub(elapsed),
+        _ => 0,
+    }
+}
+
 static CAMPAIGN_DEVICE_INDEX: std::sync::LazyLock<Mutex<HashMap<i32, usize>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static KEEPALIVE_LAST_ATTEMPT: std::sync::LazyLock<Mutex<HashMap<String, (i64, bool)>>> =
@@ -139,6 +158,10 @@ fn sync_opt_out_from_device(db: &Database, serial: &str, company_id: i32) {
 }
 
 fn read_device_opt_out(db: &Database, serial: &str, company_id: i32) -> Result<String, String> {
+    let listener = AdbManager::execute_shell(serial, "settings get secure enabled_notification_listeners", 6)
+        .map(|s| s.contains("com.esfera.agent/com.esfera.agent.EsferaOptOutNotificationListener"))
+        .unwrap_or(false);
+    db.set_reply_capture(company_id, serial, listener)?;
     let out = AdbManager::execute_shell(serial,
         "if [ ! -s /sdcard/esfera_optout.reading ] && [ -s /sdcard/esfera_optout.jsonl ]; then mv /sdcard/esfera_optout.jsonl /sdcard/esfera_optout.reading; fi; if [ -f /sdcard/esfera_optout.reading ]; then cat /sdcard/esfera_optout.reading; fi", 6)?;
     let newer = AdbManager::execute_shell(serial, "if [ -f /sdcard/esfera_optout.jsonl ]; then cat /sdcard/esfera_optout.jsonl; fi", 6)?;
@@ -264,6 +287,17 @@ pub fn process_opt_out_jsonl(
         };
         let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("");
         let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        // Guarda localmente cada resposta identificável, independente do VEXOR.
+        let phone = AdbManager::extract_phone_digits(title);
+        if phone.len() >= 10 {
+            use sha2::{Digest, Sha256};
+            use chrono::TimeZone;
+            if let Some(when) = v.get("ts").and_then(|t| t.as_i64()).and_then(|ms| chrono::Utc.timestamp_millis_opt(ms).single()) {
+                let stable = db.get_all_devices().into_iter().find(|d| d.company_id == company_id && (d.serial == serial || d.current_adb_address.as_deref() == Some(serial) || d.esfera_device_id.as_deref() == Some(serial))).map(|d| d.esfera_device_id.filter(|s| !s.is_empty()).unwrap_or(d.serial)).unwrap_or_else(|| serial.to_string());
+                let id = hex::encode(Sha256::digest(format!("{}|{}|{}", company_id, stable, line.trim()).as_bytes()));
+                if db.remember_reply(&id, company_id, serial, &phone, &when.format("%Y-%m-%d %H:%M:%S").to_string()).is_err() { all_saved = false; }
+            }
+        }
         if !local_opt_out(text) { continue; }
         // O remetente vem no título: número sem contato salvo ou o contato temporário "Esfera <número>".
         let digits = AdbManager::extract_phone_digits(title);
@@ -1147,13 +1181,19 @@ impl Dispatcher {
                     let preparation_ms = preparation_started.elapsed().as_millis();
                     let send_started = Instant::now();
                     // Regra da empresa: nenhuma mensagem pode citar valores (nem quando a IA falha e volta o original).
+                    use rand::Rng;
+                    let low = (campaign.delay_min * 1000).max(1000);
+                    let high = (campaign.delay_max * 1000).max(low.saturating_mul(2));
+                    let base_delay_ms = rand::thread_rng().gen_range(low..=high);
+                    let mut ritmo_reduzido = false;
+                    let mut reply_warning = false;
                     let outcome = if AiEngine::has_money(&message_to_send) {
                         eprintln!("[DISPATCHER] Envio bloqueado para {}: a mensagem cita valores.", phone);
                         SendOutcome::SendFailed("Mensagem cita valores (proibido)".to_string())
                     } else if online_devices.is_empty() {
                         SendOutcome::NoOnlineDevice
                     } else {
-                        let (serial, device_id) = {
+                        let (serial, device_id, target_device) = {
                             let mut idx_map = CAMPAIGN_DEVICE_INDEX.lock().unwrap();
                             let idx = idx_map.entry(campaign.id).or_insert(0);
                             let target_dev = &online_devices[*idx % online_devices.len()];
@@ -1161,9 +1201,87 @@ impl Dispatcher {
                             (target_dev.current_adb_address.as_ref()
                                 .filter(|a| !a.trim().is_empty())
                                 .cloned()
-                                .unwrap_or_else(|| target_dev.serial.clone()), target_dev.id)
+                                .unwrap_or_else(|| target_dev.serial.clone()), target_dev.id, target_dev.clone())
                         };
+                        // Atualiza a capacidade de captura antes de avaliar uma amostra antiga.
+                        let db_capture = db_arc.clone();
+                        let serial_capture = serial.clone();
+                        let company_capture = campaign.company_id;
+                        if !spawn_blocking(move || import_opt_out_from_device(&db_capture, &serial_capture, company_capture)).await.unwrap_or(false) {
+                            eprintln!("[DISPATCHER REDE] Falha ao verificar respostas do aparelho.");
+                            sleep(Duration::from_secs(10)).await;
+                            return;
+                        }
+                        let chips = db_arc.get_chips(device_id);
+                        if chips.len() == 1 {
+                            match db_arc.apply_reply_brake(&chips[0], &target_device) {
+                                Ok(status) => {
+                                    ritmo_reduzido = status.state == "reduzido";
+                                    if status.state != "normal" {
+                                        reply_warning = true;
+                                        if let Some(ref handle) = app_handle {
+                                            let _ = handle.emit("campaign-progress", CampaignProgressEvent {
+                                                campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
+                                                total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
+                                                status: status.reason.clone(),
+                                            });
+                                        }
+                                    }
+                                    if status.state == "pausado" {
+                                        if let Ok(mut unavailable) = DEVICE_UNAVAILABLE_UNTIL.lock() { unavailable.insert(serial.clone(), Instant::now() + std::time::Duration::from_secs(30)); }
+                                        sleep(Duration::from_secs(2)).await;
+                                        return;
+                                    }
+                                }
+                                Err(e) => { eprintln!("[DISPATCHER REDE] {}", e); sleep(Duration::from_secs(10)).await; return; }
+                            }
+                        }
 
+                        let network_guard = match NETWORK_SEND_GATE.try_lock() {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                        let was_limited = NETWORK_LIMITED_CAMPAIGNS.lock().map(|s| s.contains(&campaign.id)).unwrap_or(true);
+                        if !reply_warning && !was_limited {
+                            if let Some(ref handle) = app_handle {
+                                let _ = handle.emit("campaign-progress", CampaignProgressEvent {
+                                    campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
+                                    total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
+                                    status: "Aguardando vez na rede".into(),
+                                });
+                            }
+                        }
+                        NETWORK_SEND_GATE.lock().await
+                            }
+                        };
+                        let limit_result = db_arc.network_limit_wait();
+                        let wait = limit_result.as_ref().copied().unwrap_or(30);
+                        if wait > 0 {
+                            if let Ok(mut limited) = NETWORK_LIMITED_CAMPAIGNS.lock() { limited.insert(campaign.id); }
+                            drop(network_guard);
+                            if let Some(ref handle) = app_handle {
+                                let _ = handle.emit("campaign-progress", CampaignProgressEvent {
+                                    campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
+                                    total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
+                                    status: if limit_result.is_ok() { "Teto da rede atingido; aguardando a próxima janela." } else { "Não foi possível verificar o teto da rede; tentando novamente." }.into(),
+                                });
+                            }
+                            sleep(Duration::from_secs(wait.min(30))).await;
+                            return;
+                        }
+                        if let Ok(mut limited) = NETWORK_LIMITED_CAMPAIGNS.lock() { limited.remove(&campaign.id); }
+                        if let Some(chip) = db_arc.get_chips(device_id).first() {
+                            let cooldown = db_arc.chip_cooldown_seconds(chip.id).unwrap_or(30);
+                            if cooldown > 0 {
+                                drop(network_guard);
+                                if let Ok(mut unavailable) = DEVICE_UNAVAILABLE_UNTIL.lock() { unavailable.insert(serial.clone(), Instant::now() + std::time::Duration::from_secs(cooldown.min(30))); }
+                                sleep(Duration::from_secs(1)).await;
+                                return;
+                            }
+                        }
+                        let interval = rand::thread_rng().gen_range(30..=90);
+                        let elapsed = network_guard.as_ref().map(|(id,t)| (*id, t.elapsed().as_secs()));
+                        let gap = network_gap(elapsed, device_id, interval);
+                        if gap > 0 { sleep(Duration::from_secs(gap)).await; }
                         let failed_serial = serial.clone();
                         let msg = message_to_send.clone();
                         let phone2 = phone.clone();
@@ -1174,7 +1292,9 @@ impl Dispatcher {
                         let company_last = campaign.company_id;
                         let campaign_last = campaign.id;
                         let contact_id_for_safety = next_contact.id;
+                        let network_guard = NetworkSendGuard(network_guard, device_id);
                         let send_res = spawn_blocking(move || {
+                            let _network_guard = network_guard;
                             AdbManager::ensure_dispatch_target(&serial).map_err(|e| format!("APARELHO: {}", e))?;
                             // Traz os "SAIR" capturados pelo agente agora, e revalida o descadastro no último instante.
                             if !import_opt_out_from_device(&db_last, &serial, company_last) {
@@ -1200,14 +1320,22 @@ impl Dispatcher {
                                 return Err("TRAVA: O chip do aparelho mudou durante a pausa.".into());
                             }
                             let chip = &fresh[0];
+                            let parts = AdbManager::split_human_parts(&msg);
+                            let (hourly, daily) = db_last.network_limits().map_err(|e| format!("REDE: falha ao verificar limites: {}", e))?;
+                            if parts.len() as i64 > hourly.min(daily) { return Err("REDE: a mensagem tem mais partes que o teto configurado; aumente o limite ou reduza o texto".into()); }
+                            let wait = db_last.network_limit_wait_for(parts.len().max(1) as i64).map_err(|e| format!("REDE: falha ao verificar teto: {}", e))?;
+                            if wait > 0 { return Err(format!("REDE: teto da rede atingido para {} partes; aguardando a próxima janela", parts.len())); }
                             let attempt = db_last.reserve_chip_attempt(chip, company_last, campaign_last, &phone2, false)
                                 .map_err(|e| format!("TRAVA: {}", e))?;
+                            if let Err(e) = db_last.reserve_network_extra(attempt, parts.len()) {
+                                let _ = db_last.finish_chip_attempt(attempt, false);
+                                return Err(format!("REDE: falha ao registrar reserva: {}",e));
+                            }
                             let name_ref = if contact_name.trim().is_empty() { None } else { Some(contact_name.as_str()) };
                             println!("[DISPATCHER] Disparando contato '{}' ({}) via navegacao nativa WhatsApp no aparelho {}", contact_name, phone2, serial);
                             // Garante o contato na agenda; espera só o que falta para o WhatsApp indexar.
                             prepare_temp_contact_for_send(&serial, &phone2);
                             let _ = name_ref;
-                            let parts = AdbManager::split_human_parts(&msg);
                             // Antes de cada parte: dentro do horário, ainda não descadastrado e campanha ainda rodando.
                             let check = || {
                                 import_opt_out_from_device(&db_last, &serial, company_last)
@@ -1222,6 +1350,13 @@ impl Dispatcher {
                             if let Err(ref e) = result {
                                 if e.starts_with("CONTA_RESTRITA:") {
                                     let _ = db_last.set_chip_restriction(chip.id, "banido", "9999-12-31 23:59:59");
+                                }
+                            }
+                            if ritmo_reduzido {
+                                let seconds = (base_delay_ms as u64 * 2 + 999) / 1000;
+                                if let Err(e) = db_last.extend_chip_cooldown(chip.id, seconds) {
+                                    let _ = db_last.update_contact_status(contact_id_for_safety, "partial");
+                                    return Err(format!("TRAVA: Falha ao registrar ritmo reduzido: {}", e));
                                 }
                             }
                             if let Err(e) = db_last.finish_chip_attempt(attempt, result.is_ok()) {
@@ -1251,6 +1386,18 @@ impl Dispatcher {
                         }
                     };
                     if let SendOutcome::SendFailed(ref error) = outcome {
+                        if error.starts_with("REDE:") {
+                            if let Ok(mut limited) = NETWORK_LIMITED_CAMPAIGNS.lock() { limited.insert(campaign.id); }
+                            if let Some(ref handle) = app_handle {
+                                let _ = handle.emit("campaign-progress", CampaignProgressEvent {
+                                    campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
+                                    total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
+                                    status: error.trim_start_matches("REDE: ").to_string(),
+                                });
+                            }
+                            sleep(Duration::from_secs(30)).await;
+                            return;
+                        }
                         if error.starts_with("APARELHO:") {
                             if let Some(ref handle) = app_handle {
                                 let _ = handle.emit("campaign-progress", CampaignProgressEvent {
@@ -1289,13 +1436,7 @@ impl Dispatcher {
                         );
                     }
 
-                    let delay_min_ms = campaign.delay_min * 1000;
-                    let delay_max_ms = campaign.delay_max * 1000;
-                    // Distribuição uniforme ampla, inclusive quando mínimo e máximo foram iguais.
-                    use rand::Rng;
-                    let low = delay_min_ms.max(1000);
-                    let high = delay_max_ms.max(low.saturating_mul(2));
-                    let gaussian_delay_ms = rand::thread_rng().gen_range(low..=high);
+                    let gaussian_delay_ms = if ritmo_reduzido { base_delay_ms.saturating_mul(2) } else { base_delay_ms };
 
                     // A IA do próximo contato trabalha durante a pausa, não depois dela.
                     prefetch_next_message(db_arc.clone(), campaign.clone(), next_contact.id, app_handle.clone());
@@ -1382,6 +1523,13 @@ impl Dispatcher {
             let chips = db.get_chips(device.id);
             if chips.len() != 1 || chips[0].status != "livre" || chips[0].restricted_until.is_some() { continue; }
             let serial = device.current_adb_address.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| device.serial.clone());
+            let network_guard = NETWORK_SEND_GATE.lock().await;
+            if db.network_limit_wait().unwrap_or(30) > 0 { continue; }
+            use rand::Rng;
+            let interval = rand::thread_rng().gen_range(30..=90);
+            let elapsed = network_guard.as_ref().map(|(id,t)| (*id, t.elapsed().as_secs()));
+            let gap = network_gap(elapsed, device.id, interval);
+            if gap > 0 { sleep(Duration::from_secs(gap)).await; }
             let lock = device_operation_lock_for_id(device.id);
             let _guard = lock.lock().await;
             let current_chips = db.get_chips(device.id);
@@ -1396,7 +1544,9 @@ impl Dispatcher {
             };
             let db2 = db.clone();
             let device2 = device.clone();
+            let network_guard = NetworkSendGuard(network_guard, device.id);
             let result = spawn_blocking(move || {
+                let _network_guard = network_guard;
                 prepare_temp_contact_for_send(&serial, &phone);
                 let check = || confirmation_allowed(within_send_window(), db2.get_running_campaigns().map(|cs| cs.iter().any(|c| c.company_id == company && c.device_ids.iter().any(|id| id == &device2.serial || device2.esfera_device_id.as_deref() == Some(id.as_str())))).unwrap_or(true));
                 AdbManager::send_whatsapp_parts(&serial, &phone, &[text], Some("com.whatsapp"), &check)
@@ -1409,7 +1559,6 @@ impl Dispatcher {
             let _ = db.finish_confirmation(company,&key,sent,&error);
             drop(_guard);
             // Intervalo humano entre confirmações, sem bloquear outras campanhas.
-            use rand::Rng;
             let pause = rand::thread_rng().gen_range(30..=90);
             sleep(Duration::from_secs(pause)).await;
         }
@@ -1933,5 +2082,44 @@ mod agent_install_lock_tests {
         let _guard=sending.lock().await;
         assert!(device_operation_lock_for_id(999999).try_lock().is_err());
         assert!(device_operation_lock_for_id(999998).try_lock().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod rede_tests {
+    use super::*;
+    #[tokio::test]
+    async fn trava_de_rede_sobrevive_ao_cancelamento_do_chamador() {
+        let guard = NetworkSendGuard(NETWORK_SEND_GATE.lock().await, 7);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || { let _guard = guard; started_tx.send(()).unwrap(); release_rx.recv().unwrap(); }).await;
+        });
+        tokio::task::yield_now().await;
+        started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        task.abort();
+        assert!(NETWORK_SEND_GATE.try_lock().is_err());
+        release_tx.send(()).unwrap();
+        let _guard = tokio::time::timeout(Duration::from_secs(2), NETWORK_SEND_GATE.lock()).await.unwrap();
+    }
+    #[test]
+    fn importa_resposta_local_sem_token_e_sem_duplicar() {
+        let path = std::env::temp_dir().join(format!("esfera_resposta_local_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.pooled_conn().unwrap().execute("INSERT INTO ESF_Device(AdbDeviceId,DeviceName,CompanyId) VALUES('usb-local','Teste',1)", []).unwrap();
+        let line = r#"{"title":"Esfera 11999999999","text":"Tudo bem","ts":1700000000000}"#;
+        assert!(process_opt_out_jsonl(&db,"usb-local",1,line,None));
+        assert!(process_opt_out_jsonl(&db,"usb-local",1,line,None));
+        let count: i64 = db.pooled_conn().unwrap().query_row("SELECT count(*) FROM ESF_ReplyInbound", [], |r|r.get(0)).unwrap();
+        assert_eq!(count,1);
+    }
+    #[test]
+    fn intervalo_se_aplica_na_troca_de_aparelho() {
+        assert_eq!(network_gap(Some((1, 8)), 2, 30), 22);
+        assert_eq!(network_gap(Some((1, 31)), 2, 30), 0);
+        assert_eq!(network_gap(Some((1, 8)), 1, 30), 0);
+        assert_eq!(network_gap(None, 1, 30), 0);
     }
 }
