@@ -43,6 +43,27 @@ pub struct User {
     pub is_active: bool,
 }
 
+const REPLY_SAMPLE: usize = 30;
+const REPLY_WAIT_HOURS: i64 = 2;
+const REPLY_SLOW_PERCENT: i64 = 5;
+const REPLY_PAUSE_PERCENT: i64 = 2;
+const REPLY_PAUSE_HOURS: i64 = 24;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkChipStatus { pub chip_id: i32, pub device_id: i32, pub device_name: String, pub reply_rate: Option<f64>, pub sample: usize, pub state: String, pub reason: String }
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkStatus { pub hourly: i64, pub daily: i64, pub sent_last_hour: i64, pub sent_today: i64, pub wait_seconds: u64, pub chips: Vec<NetworkChipStatus> }
+
+fn reply_state(available: bool, sample: usize, replies: usize) -> &'static str {
+    if !available { "indisponivel" }
+    else if sample < REPLY_SAMPLE { "normal" }
+    else if (replies as i64) * 100 < (sample as i64) * REPLY_PAUSE_PERCENT { "pausado" }
+    else if (replies as i64) * 100 < (sample as i64) * REPLY_SLOW_PERCENT { "reduzido" }
+    else { "normal" }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Device {
@@ -785,6 +806,15 @@ impl Database {
         CREATE TABLE IF NOT EXISTS ESF_ChipCooldown (ChipId INTEGER PRIMARY KEY, NextAt TEXT NOT NULL);")?;
 
         let _ = self.conn().execute("ALTER TABLE ESF_ChipAttempt ADD COLUMN Purpose TEXT NOT NULL DEFAULT 'campaign'", []);
+        self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_NetworkLimits (
+            Id INTEGER PRIMARY KEY CHECK(Id=1), Hourly INTEGER NOT NULL, Daily INTEGER NOT NULL
+        ); INSERT OR IGNORE INTO ESF_NetworkLimits(Id,Hourly,Daily) VALUES(1,40,200);")?;
+        self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_ReplyInbound (
+            EventId TEXT PRIMARY KEY, DeviceId INTEGER NOT NULL, PhoneDigits TEXT NOT NULL, ReceivedAt TEXT NOT NULL
+        ); CREATE INDEX IF NOT EXISTS idx_reply_device_phone ON ESF_ReplyInbound(DeviceId,PhoneDigits,ReceivedAt);
+        CREATE TABLE IF NOT EXISTS ESF_ReplyBrake (ChipId INTEGER PRIMARY KEY, UntilAt TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS ESF_ReplyCapture (DeviceId INTEGER PRIMARY KEY, Available INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS ESF_NetworkExtra (AttemptId INTEGER PRIMARY KEY, Extra INTEGER NOT NULL, CreatedAt TEXT NOT NULL DEFAULT (datetime('now')));")?;
 
         // 8. ESF_Contact (com custom_message, device_id, retry_count, excluido_em)
         self.conn().execute(
@@ -2223,6 +2253,79 @@ impl Database {
         Ok(self.conn().last_insert_rowid() as i32)
     }
 
+    /// A rede é conservadoramente compartilhada por todos os aparelhos desta instalação.
+    pub fn network_limits(&self) -> Result<(i64, i64), String> {
+        self.conn().query_row("SELECT Hourly, Daily FROM ESF_NetworkLimits WHERE Id=1", [], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())
+    }
+
+    pub fn set_network_limits(&self, hourly: i64, daily: i64) -> Result<(), String> {
+        if hourly <= 0 || daily <= 0 || hourly > daily { return Err("Informe limites positivos e hora menor ou igual ao dia.".into()); }
+        self.conn().execute("UPDATE ESF_NetworkLimits SET Hourly=?1, Daily=?2 WHERE Id=1", params![hourly, daily]).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Tentativas iniciadas, inclusive incertas, são contadas para não exceder o teto.
+    pub fn network_limit_wait(&self) -> Result<u64, String> { self.network_limit_wait_for(1) }
+
+    pub fn network_limit_wait_for(&self, required: i64) -> Result<u64, String> {
+        let (hourly, daily) = self.network_limits()?;
+        let conn = self.conn();
+        let (hour_count, day_count, hour_wait, day_wait): (i64,i64,i64,i64) = conn.query_row(
+            "SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE CreatedAt >= datetime('now','-1 hour')) + (SELECT coalesce(sum(Extra),0) FROM ESF_NetworkExtra WHERE CreatedAt >= datetime('now','-1 hour')),
+                    (SELECT count(*) FROM ESF_ChipAttempt WHERE date(CreatedAt,'-3 hours')=date('now','-3 hours')) + (SELECT coalesce(sum(Extra),0) FROM ESF_NetworkExtra WHERE date(CreatedAt,'-3 hours')=date('now','-3 hours')),
+                    coalesce((SELECT max(1, CAST(strftime('%s',min(CreatedAt)) AS INTEGER)+3601-CAST(strftime('%s','now') AS INTEGER)) FROM (SELECT CreatedAt FROM ESF_ChipAttempt WHERE CreatedAt >= datetime('now','-1 hour') UNION ALL SELECT CreatedAt FROM ESF_NetworkExtra WHERE CreatedAt >= datetime('now','-1 hour'))),3600),
+                    max(1, CAST(strftime('%s',datetime('now','-3 hours','start of day','+1 day','+3 hours')) AS INTEGER)-CAST(strftime('%s','now') AS INTEGER))", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|e| e.to_string())?;
+        Ok((if hour_count.saturating_add(required) > hourly { hour_wait } else { 0 }).max(if day_count.saturating_add(required) > daily { day_wait } else { 0 }) as u64)
+    }
+
+    pub fn reserve_network_extra(&self, attempt_id: i64, parts: usize) -> Result<(), String> {
+        if parts > 1 { self.conn().execute("INSERT INTO ESF_NetworkExtra(AttemptId,Extra) VALUES(?1,?2)", params![attempt_id,(parts-1) as i64]).map_err(|e|e.to_string())?; }
+        Ok(())
+    }
+
+    pub fn set_reply_capture(&self, company: i32, serial: &str, available: bool) -> Result<(), String> {
+        self.conn().execute("INSERT INTO ESF_ReplyCapture(DeviceId,Available) SELECT rowid,?1 FROM ESF_Device WHERE CompanyId=?2 AND (AdbDeviceId=?3 OR EsferaDeviceId=?3 OR CurrentAdbAddress=?3) ON CONFLICT(DeviceId) DO UPDATE SET Available=excluded.Available", params![available,company,serial]).map(|_| ()).map_err(|e|e.to_string())
+    }
+
+    pub fn remember_reply(&self, event_id: &str, company: i32, serial: &str, phone: &str, received_at: &str) -> Result<(), String> {
+        let key = Self::validate_opt_out_phone(phone)?;
+        self.conn().execute("INSERT OR IGNORE INTO ESF_ReplyInbound(EventId,DeviceId,PhoneDigits,ReceivedAt) SELECT ?1,rowid,?2,?3 FROM ESF_Device WHERE CompanyId=?5 AND (AdbDeviceId=?4 OR EsferaDeviceId=?4 OR CurrentAdbAddress=?4) LIMIT 1", params![event_id,key,received_at,serial,company]).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    pub fn reply_status(&self, chip: &Chip, device: &Device) -> Result<NetworkChipStatus, String> {
+        let conn = self.conn();
+        let available: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM ESF_ReplyInbound WHERE DeviceId=?1) AND EXISTS(SELECT 1 FROM ESF_ReplyCapture WHERE DeviceId=?1 AND Available=1)", params![device.id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let (sample,replies): (i64,i64) = conn.query_row("SELECT count(*),coalesce(sum(CASE WHEN EXISTS(SELECT 1 FROM ESF_ReplyInbound r WHERE r.DeviceId=?2 AND r.PhoneDigits=a.PhoneDigits AND r.ReceivedAt>=a.CreatedAt) THEN 1 ELSE 0 END),0) FROM (SELECT PhoneDigits,CreatedAt FROM ESF_ChipAttempt WHERE ChipId=?1 AND Purpose='campaign' AND Outcome='enviado' AND CreatedAt<=datetime('now',?3) AND CreatedAt>coalesce((SELECT UntilAt FROM ESF_ReplyBrake WHERE ChipId=?1),'0000-01-01') ORDER BY AttemptId DESC LIMIT ?4) a", params![chip.id, device.id, format!("-{} hours", REPLY_WAIT_HOURS), REPLY_SAMPLE as i64], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
+        let paused: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM ESF_ReplyBrake WHERE ChipId=?1 AND UntilAt>datetime('now'))", params![chip.id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let state = if paused { "pausado" } else { reply_state(available, sample as usize, replies as usize) };
+        let reason = match state { "pausado" => "Poucas respostas: chip pausado por 24 h para proteger o número", "reduzido" => "Ritmo reduzido por poucas respostas", "indisponivel" => "Taxa de resposta indisponível neste aparelho", _ => "" };
+        Ok(NetworkChipStatus { chip_id: chip.id, device_id: device.id, device_name: device.name.clone(), reply_rate: if available && sample > 0 { Some(replies as f64 * 100.0 / sample as f64) } else { None }, sample: sample as usize, state: state.into(), reason: reason.into() })
+    }
+
+    pub fn apply_reply_brake(&self, chip: &Chip, device: &Device) -> Result<NetworkChipStatus, String> {
+        let conn = self.conn();
+        conn.execute("UPDATE ESF_Chip SET Status='livre',RestrictedUntil=NULL WHERE ChipId=?1 AND Status='pausado' AND RestrictedUntil=(SELECT UntilAt FROM ESF_ReplyBrake WHERE ChipId=?1 AND UntilAt<=datetime('now'))", params![chip.id]).map_err(|e|e.to_string())?;
+        drop(conn);
+        let status = self.reply_status(chip, device)?;
+        if status.state == "pausado" && chip.status == "livre" && chip.restricted_until.is_none() {
+            let conn = self.conn();
+            let until: String = conn.query_row("SELECT datetime('now',?1)", [format!("+{} hours", REPLY_PAUSE_HOURS)], |r| r.get(0)).map_err(|e| e.to_string())?;
+            conn.execute("INSERT INTO ESF_ReplyBrake(ChipId,UntilAt) VALUES(?1,?2) ON CONFLICT(ChipId) DO UPDATE SET UntilAt=excluded.UntilAt", params![chip.id,until]).map_err(|e| e.to_string())?;
+            conn.execute("UPDATE ESF_Chip SET Status='pausado',RestrictedUntil=?2 WHERE ChipId=?1 AND Status='livre'", params![chip.id,until]).map_err(|e| e.to_string())?;
+        }
+        Ok(status)
+    }
+
+    pub fn network_status(&self, company: Option<i32>) -> Result<NetworkStatus, String> {
+        let (hourly,daily) = self.network_limits()?;
+        let (sent_last_hour,sent_today): (i64,i64) = self.conn().query_row("SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE Outcome='enviado' AND CreatedAt>=datetime('now','-1 hour')) + (SELECT coalesce(sum(e.Extra),0) FROM ESF_NetworkExtra e JOIN ESF_ChipAttempt a ON a.AttemptId=e.AttemptId WHERE a.Outcome='enviado' AND e.CreatedAt>=datetime('now','-1 hour')), (SELECT count(*) FROM ESF_ChipAttempt WHERE Outcome='enviado' AND date(CreatedAt,'-3 hours')=date('now','-3 hours')) + (SELECT coalesce(sum(e.Extra),0) FROM ESF_NetworkExtra e JOIN ESF_ChipAttempt a ON a.AttemptId=e.AttemptId WHERE a.Outcome='enviado' AND date(e.CreatedAt,'-3 hours')=date('now','-3 hours'))", [], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
+        let mut chips = Vec::new();
+        for d in self.get_all_devices().into_iter().filter(|d| company.map_or(true, |id| d.company_id == id)) {
+            for chip in self.get_chips(d.id) { chips.push(self.reply_status(&chip,&d)?); }
+        }
+        Ok(NetworkStatus { hourly,daily,sent_last_hour,sent_today,wait_seconds:self.network_limit_wait()?,chips })
+    }
+
     /// Reserva uma tentativa antes de tocar no WhatsApp. Tentativas interrompidas contam como falha.
     pub fn reserve_chip_attempt(&self, chip: &Chip, company_id: i32, campaign_id: i32, phone: &str, confirmation: bool) -> Result<i64, String> {
         if chip.status != "livre" || chip.restricted_until.is_some() {
@@ -2265,6 +2368,10 @@ impl Database {
                 params![chip.id, format!("+{} seconds", seconds)]).map_err(|e| e.to_string())?;
         }
         Ok(id)
+    }
+
+    pub fn extend_chip_cooldown(&self, chip_id: i32, seconds: u64) -> Result<(), String> {
+        self.conn().execute("INSERT INTO ESF_ChipCooldown(ChipId,NextAt) VALUES(?1,datetime('now',?2)) ON CONFLICT(ChipId) DO UPDATE SET NextAt=max(NextAt,excluded.NextAt)", params![chip_id,format!("+{} seconds",seconds)]).map(|_| ()).map_err(|e|e.to_string())
     }
 
     pub fn chip_cooldown_seconds(&self, chip_id: i32) -> Result<u64, String> {
@@ -4083,6 +4190,68 @@ mod opt_out_key_tests {
 mod antiban_tests {
     use super::{Chip, Database};
     use rusqlite::params;
+    #[test]
+    fn limites_de_resposta_e_dados_indisponiveis() {
+        assert_eq!(super::reply_state(false,30,0), "indisponivel");
+        assert_eq!(super::reply_state(true,29,0), "normal");
+        assert_eq!(super::reply_state(true,30,0), "pausado");
+        assert_eq!(super::reply_state(true,30,1), "reduzido");
+        assert_eq!(super::reply_state(true,100,2), "reduzido");
+        assert_eq!(super::reply_state(true,100,5), "normal");
+    }
+    #[test]
+    fn resposta_idempotente_e_amostra_recomeca_apos_pausa() {
+        let path = std::env::temp_dir().join(format!("esfera_resposta_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.conn().execute("INSERT INTO ESF_Device(AdbDeviceId,DeviceName,CompanyId) VALUES('usb1','Teste',1)", []).unwrap();
+        let device = db.get_all_devices().into_iter().find(|d| d.serial == "usb1").unwrap();
+        let chip_id = db.add_chip(device.id, "11999999999", "Teste").unwrap();
+        let chip = db.get_chips(device.id).into_iter().find(|c|c.id == chip_id).unwrap();
+        for i in 0..30 {
+            db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Outcome,CreatedAt) VALUES(?1,1,1,?2,'enviado',datetime('now','-3 hours'))", params![chip_id,format!("1199999{:04}",i)]).unwrap();
+        }
+        assert_eq!(db.reply_status(&chip,&device).unwrap().state,"indisponivel");
+        db.set_reply_capture(1,"usb1",true).unwrap();
+        db.remember_reply("evento",1,"usb1","11988888888","2020-01-01 00:00:00").unwrap();
+        db.remember_reply("evento",1,"usb1","11988888888","2020-01-01 00:00:00").unwrap();
+        let n: i64 = db.conn().query_row("SELECT count(*) FROM ESF_ReplyInbound", [], |r|r.get(0)).unwrap();
+        assert_eq!(n,1);
+        db.set_reply_capture(1,"usb1",false).unwrap();
+        assert_eq!(db.reply_status(&chip,&device).unwrap().state,"indisponivel");
+        db.set_reply_capture(1,"usb1",true).unwrap();
+        assert_eq!(db.apply_reply_brake(&chip,&device).unwrap().state,"pausado");
+        assert_eq!(db.reply_status(&chip,&device).unwrap().sample,0);
+        db.conn().execute("UPDATE ESF_ReplyBrake SET UntilAt=datetime('now','-1 hour') WHERE ChipId=?1",params![chip_id]).unwrap();
+        db.conn().execute("UPDATE ESF_Chip SET RestrictedUntil=datetime('now','-1 hour') WHERE ChipId=?1",params![chip_id]).unwrap();
+        let paused = db.get_chips(device.id).pop().unwrap();
+        assert_eq!(db.apply_reply_brake(&paused,&device).unwrap().state,"normal");
+        assert_eq!(db.get_chips(device.id)[0].status,"livre");
+    }
+    #[test]
+    fn teto_rede_soma_aparelhos_e_reabre_janela() {
+        let path = std::env::temp_dir().join(format!("esfera_rede_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.set_network_limits(2, 3).unwrap();
+        for chip in [1, 2] {
+            db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,CreatedAt) VALUES(?1,?1,?1,'11999999999',datetime('now'))", params![chip]).unwrap();
+        }
+        assert!(db.network_limit_wait().unwrap() > 0);
+        db.conn().execute("DELETE FROM ESF_ChipAttempt WHERE ChipId=2", []).unwrap();
+        assert_eq!(db.network_limit_wait().unwrap(), 0);
+        assert!(db.network_limit_wait_for(2).unwrap() > 0);
+        db.reserve_network_extra(1, 2).unwrap();
+        assert!(db.network_limit_wait().unwrap() > 0);
+        db.conn().execute("DELETE FROM ESF_NetworkExtra", []).unwrap();
+        db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,CreatedAt) VALUES(2,2,2,'11999999999',datetime('now'))", []).unwrap();
+        db.conn().execute("UPDATE ESF_ChipAttempt SET CreatedAt=datetime('now','-2 hours')", []).unwrap();
+        assert_eq!(db.network_limit_wait().unwrap(), 0);
+        db.set_network_limits(3, 3).unwrap();
+        db.conn().execute("UPDATE ESF_ChipAttempt SET CreatedAt=datetime('now')", []).unwrap();
+        db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,CreatedAt) VALUES(3,1,1,'11999999999',datetime('now'))", []).unwrap();
+        assert!(db.network_limit_wait().unwrap() > 0);
+    }
     #[test]
     fn freio_janela_e_limites_persistentes() {
         let path = std::env::temp_dir().join(format!("esfera_antiban_{}.db", std::process::id()));
