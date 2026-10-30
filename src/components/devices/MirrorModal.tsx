@@ -8,7 +8,7 @@ import Modal from "../ui/Modal";
 import Button from "../ui/Button";
 import { FormSection } from "../ui/Field";
 import { SegmentedControl } from "../ui/Tabs";
-import { inputCls } from "./deviceUi";
+import { inputCls, errorText, deviceDisplayName } from "./deviceUi";
 import type { Device } from "../../types";
 import { api } from "../../tauri";
 import {
@@ -58,22 +58,28 @@ export function MirrorModal({
   const [streamMsg, setStreamMsg] = useState<string | null>(null);
   const [textInput, setTextInput] = useState("");
   const [sendingText, setSendingText] = useState(false);
+  const [cameraBusy, setCameraBusy] = useState<null | "back" | "front" | "pc">(null);
   const imgRef = useRef<HTMLImageElement>(null);
+  // Uma captura por vez: pelo Wi-Fi a imagem pode levar mais que o intervalo e os
+  // pedidos se acumulavam no ADB do aparelho (inclusive durante envios).
+  const captureInFlight = useRef(false);
 
   const serial = device.currentAdbAddress || device.serial;
 
   // ---- Frame ADB (preview interno contínuo) ----
   const fetchScreenFrame = useCallback(async () => {
-    if (!isOpen) return;
+    if (!isOpen || captureInFlight.current) return;
+    if (typeof document !== "undefined" && document.hidden) return;
+    captureInFlight.current = true;
     setLoadingFrame(true);
-    setErrorMsg(null);
     try {
       const src = await api<string>("capture_device_screen", { serial });
       setScreenSrc(toImgSrc(src));
+      setErrorMsg(null);
     } catch (e: any) {
-      const msg = typeof e === "string" ? e : e?.message || "Falha ao capturar frame.";
-      setErrorMsg(msg);
+      setErrorMsg(errorText(e, "Não foi possível capturar a tela do aparelho."));
     } finally {
+      captureInFlight.current = false;
       setLoadingFrame(false);
     }
   }, [isOpen, serial]);
@@ -116,9 +122,11 @@ export function MirrorModal({
       } else if (next === "scrcpy_off") {
         msg = await api<string>("launch_scrcpy_stream", { serial, turnScreenOff: true });
       }
-      setStreamMsg(`${msg}\nJanela externa ativa: controle e pré-visualização sincronizados.`);
+      setStreamMsg(`${msg}\nJanela ao vivo aberta no computador: imagem e controle em tempo real.`);
     } catch (e: any) {
-      setErrorMsg(typeof e === "string" ? e : e?.message || "Falha ao iniciar espelhamento.");
+      // Sem janela externa, volta para a pré-visualização (senão a imagem parava de atualizar).
+      setMode("frame");
+      setErrorMsg(errorText(e, "Não foi possível abrir a janela ao vivo."));
     } finally {
       setBusy(false);
     }
@@ -126,29 +134,37 @@ export function MirrorModal({
 
   // ---- Digitação Direta no Android via ADB ----
   const handleSendText = async () => {
-    if (!textInput.trim()) return;
+    if (!textInput.trim() || sendingText) return;
     setSendingText(true);
     try {
       await api("send_adb_input_text", { serial, text: textInput });
       setTextInput("");
       setTimeout(fetchScreenFrame, 300);
     } catch (e: any) {
-      setErrorMsg(typeof e === "string" ? e : e?.message || "Erro ao digitar texto no celular.");
+      setErrorMsg(errorText(e, "Não foi possível digitar o texto no aparelho."));
     } finally {
       setSendingText(false);
     }
   };
 
   const handlePasteClipboard = async () => {
+    let clip = "";
     try {
-      const clip = await navigator.clipboard.readText();
-      if (clip) {
-        setSendingText(true);
-        await api("send_adb_input_text", { serial, text: clip });
-        setTimeout(fetchScreenFrame, 300);
-      }
+      clip = await navigator.clipboard.readText();
     } catch {
-      setErrorMsg("Não foi possível ler a área de transferência.");
+      setErrorMsg("Não foi possível ler a área de transferência do computador.");
+      return;
+    }
+    if (!clip) {
+      setErrorMsg("A área de transferência está vazia.");
+      return;
+    }
+    setSendingText(true);
+    try {
+      await api("send_adb_input_text", { serial, text: clip });
+      setTimeout(fetchScreenFrame, 300);
+    } catch (e: any) {
+      setErrorMsg(errorText(e, "Não foi possível digitar o texto colado no aparelho."));
     } finally {
       setSendingText(false);
     }
@@ -156,46 +172,52 @@ export function MirrorModal({
 
   // ---- Câmera traseira / frontal ----
   const startCamera = async (facing: "back" | "front") => {
-    setBusy(true);
+    setCameraBusy(facing);
     setErrorMsg(null);
     setStreamMsg(null);
     try {
       const msg = await api<string>("launch_camera_stream", { serial, facing });
       setStreamMsg(msg);
     } catch (e: any) {
-      setErrorMsg(typeof e === "string" ? e : e?.message || "Falha ao abrir câmera.");
+      setErrorMsg(errorText(e, "Não foi possível abrir a câmera."));
     } finally {
-      setBusy(false);
+      setCameraBusy(null);
     }
   };
 
-  // ---- Roubar a câmera: injeta a tela do PC na Câmera Virtual do celular ----
+  // ---- Envia a tela do PC para a câmera virtual do aparelho ----
   const stealCamera = async () => {
-    setBusy(true);
+    setCameraBusy("pc");
     setErrorMsg(null);
     setStreamMsg(null);
     try {
       const msg = await api<string>("inject_virtual_camera", { serial, targetType: "full" });
       setStreamMsg(msg);
     } catch (e: any) {
-      setErrorMsg(typeof e === "string" ? e : e?.message || "Falha ao injetar tela do PC.");
+      setErrorMsg(errorText(e, "Não foi possível enviar a tela do PC como câmera."));
     } finally {
-      setBusy(false);
+      setCameraBusy(null);
     }
   };
 
+  // A captura (screencap) tem o tamanho real da tela: o toque usa a mesma escala,
+  // então funciona em 720x1600, 1080x2400 ou com o aparelho deitado.
   const handleImageClick = async (e: React.MouseEvent<HTMLImageElement>) => {
-    if (!imgRef.current) return;
-    const rect = imgRef.current.getBoundingClientRect();
-    const clickX = e.clientX - rect.left;
-    const clickY = e.clientY - rect.top;
-    const normX = Math.round((clickX / rect.width) * 1080);
-    const normY = Math.round((clickY / rect.height) * 2400);
+    const img = imgRef.current;
+    if (!img) return;
+    const rect = img.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const naturalW = img.naturalWidth || 1080;
+    const naturalH = img.naturalHeight || 2400;
+    const x = Math.round(((e.clientX - rect.left) / rect.width) * naturalW);
+    const y = Math.round(((e.clientY - rect.top) / rect.height) * naturalH);
+    const normX = Math.min(Math.max(x, 0), naturalW - 1);
+    const normY = Math.min(Math.max(y, 0), naturalH - 1);
     try {
       await api("send_adb_tap", { serial, x: normX, y: normY });
       setTimeout(fetchScreenFrame, 300);
-    } catch {
-      /* noop */
+    } catch (err: any) {
+      setErrorMsg(errorText(err, "O toque não chegou ao aparelho."));
     }
   };
 
@@ -203,8 +225,17 @@ export function MirrorModal({
     try {
       await api("send_adb_keyevent", { serial, keycode: code });
       setTimeout(fetchScreenFrame, 300);
-    } catch {
-      /* noop */
+    } catch (err: any) {
+      setErrorMsg(errorText(err, "O botão não chegou ao aparelho."));
+    }
+  };
+
+  const openWhatsApp = async () => {
+    try {
+      await api("send_intent_to_display", { serial, url: "https://wa.me/", displayId: 0 });
+      setTimeout(fetchScreenFrame, 600);
+    } catch (err: any) {
+      setErrorMsg(errorText(err, "Não foi possível abrir o WhatsApp no aparelho."));
     }
   };
 
@@ -215,7 +246,7 @@ export function MirrorModal({
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      title={`Controle remoto: ${device.name || device.model}`}
+      title={`Controle remoto: ${deviceDisplayName(device)}`}
       size="xl"
       footer={
         <>
@@ -236,7 +267,7 @@ export function MirrorModal({
               <img
                 ref={imgRef}
                 src={screenSrc}
-                alt="Tela do celular"
+                alt="Tela do aparelho"
                 onClick={handleImageClick}
                 className="max-h-[26rem] w-auto cursor-crosshair rounded-lg border border-white/10"
               />
@@ -254,7 +285,7 @@ export function MirrorModal({
               ) : (
                 <>
                   <MonitorPlay size={24} className="mx-auto mb-2" />
-                  <p>{errorMsg ? "Sem imagem do aparelho" : "Iniciando..."}</p>
+                  <p>{errorMsg ? "Sem imagem do aparelho" : "Conectando à tela..."}</p>
                 </>
               )}
             </div>
@@ -262,18 +293,18 @@ export function MirrorModal({
           {mode !== "frame" && (
             <div className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-white/10 px-2.5 py-1 text-[0.75rem] text-zinc-200">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
-              Janela externa ativa
+              Janela ao vivo aberta no computador
             </div>
           )}
         </div>
 
         {/* Controles */}
         <div className="w-full min-w-0 flex-1 space-y-6">
-          <FormSection title="Digitar no celular" description="O texto é enviado ao campo em foco no aparelho.">
+          <FormSection title="Digitar no aparelho" description="O texto é enviado ao campo em foco no aparelho.">
             <div className="flex gap-2">
               <input
                 type="text"
-                aria-label="Texto para enviar ao celular"
+                aria-label="Texto para enviar ao aparelho"
                 value={textInput}
                 onChange={(e) => setTextInput(e.target.value)}
                 onKeyDown={(e) => {
@@ -302,13 +333,15 @@ export function MirrorModal({
             <SegmentedControl<MirrorMode>
               items={[
                 { id: "frame", label: "Pré-visualização" },
-                { id: "scrcpy", label: "Scrcpy" },
-                { id: "scrcpy_off", label: "Tela apagada" },
+                { id: "scrcpy", label: "Janela ao vivo" },
+                { id: "scrcpy_off", label: "Ao vivo, tela apagada" },
               ]}
               value={mode}
               onChange={(m) => !busy && startMode(m)}
             />
-            <p className="text-[0.75rem] text-secondary">Display virtual indisponível no Scrcpy 2.4 empacotado.</p>
+            <p className="text-[0.75rem] text-secondary">
+              A pré-visualização atualiza a cada poucos segundos. As opções ao vivo abrem uma janela separada no computador; "tela apagada" economiza a bateria do aparelho.
+            </p>
             {busy && (
               <p className="flex items-center gap-1.5 text-[0.75rem] text-secondary">
                 <RefreshCw size={12} className="animate-spin" /> Iniciando...
@@ -333,10 +366,10 @@ export function MirrorModal({
 
           <FormSection title="Câmera" description="Abra a câmera do aparelho ou envie a tela do PC como câmera.">
             <div className="grid grid-cols-2 gap-2">
-              <Button variant="secondary" size="sm" onClick={() => startCamera("back")} loading={busy} icon={<Camera size={12} />}>Câmera traseira</Button>
-              <Button variant="secondary" size="sm" onClick={() => startCamera("front")} loading={busy} icon={<Camera size={12} />}>Câmera frontal</Button>
+              <Button variant="secondary" size="sm" onClick={() => startCamera("back")} loading={cameraBusy === "back"} disabled={!!cameraBusy && cameraBusy !== "back"} icon={<Camera size={12} />}>Câmera traseira</Button>
+              <Button variant="secondary" size="sm" onClick={() => startCamera("front")} loading={cameraBusy === "front"} disabled={!!cameraBusy && cameraBusy !== "front"} icon={<Camera size={12} />}>Câmera frontal</Button>
             </div>
-            <Button variant="secondary" size="sm" onClick={stealCamera} loading={busy} icon={<Video size={12} />} className="w-full">
+            <Button variant="secondary" size="sm" onClick={stealCamera} loading={cameraBusy === "pc"} disabled={!!cameraBusy && cameraBusy !== "pc"} icon={<Video size={12} />} className="w-full">
               Enviar tela do PC como câmera
             </Button>
           </FormSection>
@@ -344,14 +377,7 @@ export function MirrorModal({
           <Button
             variant="secondary"
             size="md"
-            onClick={async () => {
-              try {
-                await api("send_intent_to_display", { serial, url: "https://wa.me/", displayId: 0 });
-                setTimeout(fetchScreenFrame, 600);
-              } catch {
-                /* noop */
-              }
-            }}
+            onClick={openWhatsApp}
             icon={<Sparkles size={13} />}
             className="w-full"
           >
