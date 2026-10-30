@@ -2251,7 +2251,7 @@ function DevicePicker({
       <EmptyState
         icon={<Smartphone size={18} />}
         title="Nenhum aparelho cadastrado"
-        description="Conecte celulares na aba Dispositivos para poder usá-los nos disparos."
+        description="Conecte celulares na tela Aparelhos para poder usá-los nos disparos."
         action={onRefresh && <Button variant="secondary" size="sm" icon={<RefreshCw size={13} />} onClick={onRefresh} loading={refreshing}>Atualizar lista</Button>}
       />
     );
@@ -2486,7 +2486,7 @@ function pauseReasonText(raw: string) {
     return `o WhatsApp de um dos aparelhos indica conta restrita ou banida (${base}). Confira os aparelhos e tire o afetado da campanha antes de retomar.`;
   if (/limite do chip/i.test(r)) return `${base} Retome mais tarde ou inclua mais aparelhos.`;
   if (/freio autom/i.test(r)) return `${base} Revise a lista e a mensagem antes de retomar.`;
-  if (/chip/i.test(r)) return `${base} Ajuste os chips em Dispositivos antes de retomar.`;
+  if (/chip/i.test(r)) return `${base} Ajuste os chips na tela Aparelhos antes de retomar.`;
   return base;
 }
 
@@ -4640,7 +4640,7 @@ function CampaignDetail({
   useActivityVersion();
   const activity = campaignActivity(campaign.id);
   const logs = activity?.logs ?? [];
-  const now = useNow(isRunning || campaign.status === "paused");
+  const now = useNow(true, isRunning ? 15_000 : 60_000);
   const live = liveSummary(campaign, activity, now);
   const onLog = (level: LogLevel, text: string) => appendCampaignLog(campaign.id, level, text);
 
@@ -5052,7 +5052,7 @@ function CampaignDetail({
     checklist.push({
       ok: chipProblems.length === 0,
       label: chipProblems.length ? "Chip com problema" : "Um chip em cada aparelho",
-      detail: chipProblems.length ? `${chipProblems.join(" · ")}. Ajuste em Dispositivos: sem isso a campanha pausa quando chegar a vez dele.` : undefined,
+      detail: chipProblems.length ? `${chipProblems.join(" · ")}. Ajuste na tela Aparelhos: sem isso a campanha pausa quando chegar a vez dele.` : undefined,
     });
   }
   checklist.push({
@@ -5349,7 +5349,7 @@ function CampaignDetail({
           </div>
           {chipProblems.length > 0 && (
             <InlineAlert tone="warning" icon={<AlertTriangle size={15} />} title="Aparelho sem chip ou com mais de um">
-              {chipProblems.join(" · ")}. Cadastre exatamente um chip em cada aparelho (Dispositivos); senão a campanha pausa quando chegar a vez dele.
+              {chipProblems.join(" · ")}. Cadastre exatamente um chip em cada aparelho (tela Aparelhos); senão a campanha pausa quando chegar a vez dele.
             </InlineAlert>
           )}
           {devicesError && devices.length === 0 ? (
