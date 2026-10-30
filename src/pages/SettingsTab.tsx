@@ -10,9 +10,18 @@ import Button from "../components/ui/Button";
 import Toggle from "../components/ui/Toggle";
 import PageHeader from "../components/ui/PageHeader";
 import Field, { FormSection } from "../components/ui/Field";
+import { confirmDialog } from "../components/ui/Modal";
+import { toast } from "../components/ui/ToastContainer";
 import { api, setAppMode as setTauriAppMode, reloadConfig } from "../tauri";
 import type { AppConfig, AiConfig } from "../types";
-import { AI_PROVIDERS, getAiProviderInfo } from "../constants/aiProviders";
+import {
+  AI_PROVIDERS,
+  DEFAULT_AI_MODEL,
+  DEFAULT_AI_PROVIDER,
+  DEFAULT_WHATSAPP_SYSTEM_PROMPT,
+  getAiProviderInfo,
+  normalizeAiProviderId,
+} from "../constants/aiProviders";
 import {
   Save,
   Globe,
@@ -33,9 +42,55 @@ import {
   Plug,
   Copy,
   KeyRound,
+  Loader2,
 } from "lucide-react";
 
 type SettingsSection = "geral" | "notificacoes" | "adb" | "hub" | "ia" | "integracoes" | "seguranca";
+type LoadState = "loading" | "ready" | "error";
+// O que get_ai_provider_keys devolve por provedor. A chave vem vazia (mascarada) no backend novo;
+// hasApiKey é o indicador pedido ao backend (pedidos-L-SET.md) e é usado quando existir.
+type ProviderKeyInfo = { apiKey?: string; endpoint?: string; model?: string; hasApiKey?: boolean };
+
+const DEFAULT_HUB_ADDRESS = "127.0.0.1:8555";
+const KNOWN_MODES = ["empresa", "local", "master"] as const;
+type KnownMode = (typeof KNOWN_MODES)[number];
+const isKnownMode = (m: string): m is KnownMode => (KNOWN_MODES as readonly string[]).includes(m);
+
+// Texto de teste da IA: sem valores (R$ é proibido e o validador recusaria), sem link e sem data.
+const AI_TEST_MESSAGE =
+  "Olá {nome}, tudo bem? Aqui é da central de atendimento. Temos uma proposta para você regularizar a sua pendência. Responda esta mensagem para conversar com a gente.";
+const AI_TEST_CONTACT = "Maria";
+
+/** Texto legível de um erro do backend (string), de um Error ou de um objeto com message. */
+function errText(e: unknown): string {
+  if (typeof e === "string") return e.trim() || "Erro desconhecido.";
+  if (e instanceof Error) return e.message.trim() || "Erro desconhecido.";
+  if (e && typeof e === "object") {
+    const message = (e as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message.trim();
+  }
+  return String(e);
+}
+
+/** Porta TCP válida para servidor local (1024 a 65535) ou null. */
+function parsePort(value: string): number | null {
+  const n = Number(value.trim());
+  return Number.isInteger(n) && n >= 1024 && n <= 65535 ? n : null;
+}
+
+/** Lê o arquivo como base64 sem estourar a pilha (o spread em String.fromCharCode quebra em arquivos grandes). */
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result ?? "");
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("Não foi possível ler o arquivo."));
+    reader.readAsDataURL(file);
+  });
+}
 
 export default function SettingsTab() {
   const { selectedCompanyId, user } = useAuth();
@@ -67,95 +122,198 @@ export default function SettingsTab() {
 
   // Hub config
   const [hubEnabled, setHubEnabled] = useState(false);
-  const [hubAddress, setHubAddress] = useState("127.0.0.1:8555");
+  const [hubAddress, setHubAddress] = useState(DEFAULT_HUB_ADDRESS);
+  // Token digitado agora. O salvo nunca aparece inteiro na tela; em branco = manter o atual.
   const [hubToken, setHubToken] = useState("");
+  // Backend antigo ainda devolve o token: fica só na memória para não ser apagado ao salvar.
+  const loadedHubToken = useRef("");
   const [customIpOverride, setCustomIpOverride] = useState(false);
   const [empresaServerEnabled, setEmpresaServerEnabled] = useState(false);
-  const [empresaServerPort, setEmpresaServerPort] = useState(7777);
+  const [empresaServerPort, setEmpresaServerPort] = useState("7777");
   const [tunnelServerEnabled, setTunnelServerEnabled] = useState(false);
-  const [tunnelServerPort, setTunnelServerPort] = useState(8888);
-  const [appMode, setAppMode] = useState<"local" | "empresa" | "master">("empresa");
+  const [tunnelServerPort, setTunnelServerPort] = useState("8888");
+  // Pode vir "standalone" (padrão de instalação nova): o valor é mantido até o operador trocar.
+  const [appMode, setAppMode] = useState<string>("empresa");
+  const [appConfigLoad, setAppConfigLoad] = useState<LoadState>("loading");
+  const [appConfigError, setAppConfigError] = useState("");
+  const [appConfigReload, setAppConfigReload] = useState(0);
+  const [savingHub, setSavingHub] = useState(false);
   const [hubStatus, setHubStatus] = useState("");
   // Atualizar VPS (self-update remoto, sem SSH) — master only
   const [updatingVps, setUpdatingVps] = useState(false);
-  const [updateVpsMsg, setUpdateVpsMsg] = useState<string | null>(null);
+  const [updateVpsMsg, setUpdateVpsMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // IA / LLM local
-  const [aiProvider, setAiProvider] = useState("openrouter");
-  const [aiModel, setAiModel] = useState("openrouter/free");
+  // IA / LLM
+  const [aiProvider, setAiProvider] = useState(DEFAULT_AI_PROVIDER);
+  const [aiModel, setAiModel] = useState(DEFAULT_AI_MODEL);
   const [aiTemperature, setAiTemperature] = useState("0.7");
   const [aiSystemPrompt, setAiSystemPrompt] = useState("");
+  // Chave digitada agora; a salva não aparece. Em branco = manter a chave salva do provedor.
   const [aiApiKey, setAiApiKey] = useState("");
-  const [aiEndpoint, setAiEndpoint] = useState("https://openrouter.ai/api/v1/chat/completions");
-  const [savedProviderKeys, setSavedProviderKeys] = useState<Record<string, { apiKey: string; endpoint: string; model: string }>>({});
+  const [aiEndpoint, setAiEndpoint] = useState(getAiProviderInfo(DEFAULT_AI_PROVIDER)?.defaultEndpoint ?? "");
+  const [savedProviderKeys, setSavedProviderKeys] = useState<Record<string, ProviderKeyInfo>>({});
+  // Chaves que o backend antigo ainda devolve: nunca vão para a tela, só voltam ao salvar sem chave nova.
+  const loadedKeys = useRef<Record<string, string>>({});
+  const [aiLoad, setAiLoad] = useState<LoadState>("loading");
+  const [aiLoadError, setAiLoadError] = useState("");
+  const [aiReload, setAiReload] = useState(0);
+  const [savingAi, setSavingAi] = useState(false);
   const [aiStatus, setAiStatus] = useState("");
   const [testingAi, setTestingAi] = useState(false);
   const [aiTestResult, setAiTestResult] = useState<{ success: boolean; text: string } | null>(null);
 
-  // Load app config
+  // Configuração da instalação (hub, servidores, modo). Sem ela carregada, Salvar fica bloqueado:
+  // salvar os valores de exemplo por cima da configuração real desligaria o hub ou os servidores.
   useEffect(() => {
     let mounted = true;
+    setAppConfigLoad("loading");
+    setAppConfigError("");
     api<AppConfig>("get_app_config")
       .then((cfg) => {
-        if (!mounted || !cfg) return;
-        setHubEnabled(cfg.hub_enabled);
-        setHubAddress(cfg.hub_address || "127.0.0.1:8555");
-        setHubToken(cfg.hub_token || "");
-        setEmpresaServerEnabled(cfg.empresa_server_enabled);
-        setEmpresaServerPort(cfg.empresa_server_port || 7777);
+        if (!mounted) return;
+        if (!cfg) throw new Error("A configuração veio vazia.");
+        setHubEnabled(Boolean(cfg.hub_enabled));
+        setHubAddress(cfg.hub_address || DEFAULT_HUB_ADDRESS);
+        loadedHubToken.current = cfg.hub_token || "";
+        setHubToken("");
+        setEmpresaServerEnabled(Boolean(cfg.empresa_server_enabled));
+        setEmpresaServerPort(String(cfg.empresa_server_port || 7777));
         setTunnelServerEnabled(cfg.tunnel_server_enabled ?? false);
-        setTunnelServerPort(cfg.tunnel_server_port ?? 8888);
+        setTunnelServerPort(String(cfg.tunnel_server_port || 8888));
         setAppMode(cfg.mode || "empresa");
+        setAppConfigLoad("ready");
       })
       .catch((err) => {
-        console.error("Erro ao carregar app_config:", err);
+        if (!mounted) return;
+        setAppConfigError(errText(err));
+        setAppConfigLoad("error");
       });
-    if (selectedCompanyId) {
-      api<AiConfig | null>("get_ai_config", { companyId: selectedCompanyId })
-        .then((cfg) => {
-          if (!mounted || !cfg) return;
-          setAiProvider(cfg.provider || "openrouter");
-          setAiModel(cfg.model || "openrouter/free");
-          setAiTemperature(String(cfg.temperature ?? 0.7));
-          setAiSystemPrompt(cfg.systemPrompt || "");
-          setAiApiKey(cfg.apiKey || "");
-          setAiEndpoint(cfg.endpoint || "https://openrouter.ai/api/v1/chat/completions");
-        })
-        .catch(() => {});
-
-      api<Record<string, { apiKey: string; endpoint: string; model: string }>>("get_ai_provider_keys", { companyId: selectedCompanyId })
-        .then((keys) => {
-          if (mounted && keys) {
-            setSavedProviderKeys(keys);
-          }
-        })
-        .catch(() => {});
-    }
     return () => { mounted = false; };
-  }, [selectedCompanyId]);
+  }, [appConfigReload]);
+
+  // IA da empresa selecionada. Ao trocar de empresa tudo volta ao padrão antes de carregar:
+  // antes, sem configuração na empresa nova, a tela mantinha (e salvaria) a IA da anterior.
+  useEffect(() => {
+    if (!selectedCompanyId) return;
+    let mounted = true;
+    setAiLoad("loading");
+    setAiLoadError("");
+    setAiStatus("");
+    setAiTestResult(null);
+    setAiApiKey("");
+    loadedKeys.current = {};
+    Promise.all([
+      api<AiConfig | null>("get_ai_config", { companyId: selectedCompanyId }),
+      api<Record<string, ProviderKeyInfo> | null>("get_ai_provider_keys", { companyId: selectedCompanyId }).catch(() => null),
+    ])
+      .then(([cfg, keys]) => {
+        if (!mounted) return;
+        const memo: Record<string, string> = {};
+        const visible: Record<string, ProviderKeyInfo> = {};
+        for (const [rawId, info] of Object.entries(keys ?? {})) {
+          const id = normalizeAiProviderId(rawId);
+          if (info?.apiKey) memo[id] = info.apiKey;
+          visible[id] = {
+            endpoint: info?.endpoint || "",
+            model: info?.model || "",
+            hasApiKey: info?.hasApiKey ?? (info?.apiKey ? true : undefined),
+          };
+        }
+        const provider = normalizeAiProviderId(cfg?.provider || DEFAULT_AI_PROVIDER);
+        if (cfg?.apiKey) {
+          memo[provider] = cfg.apiKey;
+          visible[provider] = { ...visible[provider], hasApiKey: true };
+        }
+        loadedKeys.current = memo;
+        setSavedProviderKeys(visible);
+        const info = getAiProviderInfo(provider);
+        // IA própria: endereço e modelo valem os do cartão IA própria (atualizados também pelo hub).
+        const vps = provider === "vps_ia" ? visible.vps_ia : undefined;
+        setAiProvider(provider);
+        setAiModel(vps?.model || cfg?.model || info?.defaultModel || DEFAULT_AI_MODEL);
+        setAiTemperature(String(cfg?.temperature ?? 0.7));
+        setAiSystemPrompt(cfg?.systemPrompt || "");
+        setAiEndpoint(vps?.endpoint || cfg?.endpoint || info?.defaultEndpoint || "");
+        setAiLoad("ready");
+      })
+      .catch((e) => {
+        if (!mounted) return;
+        setAiLoadError(errText(e));
+        setAiLoad("error");
+      });
+    return () => { mounted = false; };
+  }, [selectedCompanyId, aiReload]);
+
+  const changeAiProvider = (next: string) => {
+    const pInfo = getAiProviderInfo(next);
+    const saved = savedProviderKeys[next];
+    setAiProvider(next);
+    setAiApiKey("");
+    setAiTestResult(null);
+    setAiEndpoint(saved?.endpoint || pInfo?.defaultEndpoint || "");
+    setAiModel(saved?.model || pInfo?.defaultModel || "");
+  };
+
+  // Validação do formulário de IA: devolve o erro de cada campo (vazio = ok).
+  const aiTemperatureValue = Number(aiTemperature.replace(",", "."));
+  const aiTemperatureError =
+    aiTemperature.trim() === "" || !Number.isFinite(aiTemperatureValue) || aiTemperatureValue < 0 || aiTemperatureValue > 1
+      ? "Use um número de 0 a 1 (ex.: 0,7)."
+      : "";
+  const aiEndpointTrim = aiEndpoint.trim();
+  const aiEndpointError =
+    aiProvider === "custom" && !aiEndpointTrim
+      ? "Informe o endereço da API."
+      : aiEndpointTrim && !/^https?:\/\/\S+$/i.test(aiEndpointTrim)
+      ? "O endereço deve começar com http:// ou https://."
+      : "";
+  const aiModelError = !aiModel.trim() && !getAiProviderInfo(aiProvider)?.defaultModel ? "Informe o modelo." : "";
+
+  // Chave que vai para o backend: a digitada agora ou, em branco, a já salva (o backend novo
+  // devolve vazio e preserva a salva; o antigo precisava receber a mesma chave de volta).
+  const aiKeyToSend = () => aiApiKey.trim() || loadedKeys.current[aiProvider] || "";
 
   const handleSaveAi = async () => {
-    if (!selectedCompanyId) return;
+    if (!selectedCompanyId || aiLoad !== "ready") return;
+    const problem = aiTemperatureError || aiEndpointError || aiModelError;
+    if (problem) {
+      setAiStatus(`Falha ao salvar: ${problem}`);
+      return;
+    }
+    const info = getAiProviderInfo(aiProvider);
+    const provider = aiProvider;
+    const model = aiModel.trim() || info?.defaultModel || "";
+    const endpoint = aiEndpointTrim || info?.defaultEndpoint || "";
+    const typedKey = aiApiKey.trim();
+    setSavingAi(true);
+    setAiStatus("");
     try {
       await api("save_ai_config", {
         config: {
           companyId: selectedCompanyId,
-          provider: aiProvider,
-          model: aiModel,
-          temperature: parseFloat(aiTemperature) || 0.7,
+          provider,
+          model,
+          temperature: aiTemperatureValue,
           systemPrompt: aiSystemPrompt,
-          apiKey: aiApiKey,
-          endpoint: aiEndpoint,
+          apiKey: aiKeyToSend(),
+          endpoint,
         },
       });
+      if (typedKey) loadedKeys.current[provider] = typedKey;
       setSavedProviderKeys((prev) => ({
         ...prev,
-        [aiProvider]: { apiKey: aiApiKey, endpoint: aiEndpoint, model: aiModel },
+        [provider]: { endpoint, model, hasApiKey: typedKey ? true : prev[provider]?.hasApiKey },
       }));
-      setAiStatus("Configuração de IA salva com sucesso!");
+      setAiApiKey("");
+      setAiModel(model);
+      setAiEndpoint(endpoint);
+      setAiStatus("Configuração de IA salva.");
+      toast.success("Configuração de IA salva");
     } catch (e) {
-      setAiStatus(`Falha ao salvar configuração de IA: ${String(e)}`);
+      setAiStatus(`Falha ao salvar a configuração de IA: ${errText(e)}`);
+    } finally {
+      setSavingAi(false);
     }
   };
 
@@ -165,43 +323,67 @@ export default function SettingsTab() {
     setAiTestResult(null);
     try {
       const rewritten = await api<string>("rewrite_message_ai", {
-        message: "Olá {nome}! Notamos uma pendência em aberto de R$ 150,00. Pague pelo PIX financeiro@empresa.com ou acesse https://empresa.com/fatura",
-        contactName: "Lucas Silva",
+        message: AI_TEST_MESSAGE,
+        contactName: AI_TEST_CONTACT,
         companyId: selectedCompanyId,
         provider: aiProvider,
-        model: aiModel,
+        model: aiModel.trim(),
         prompt: aiSystemPrompt,
-        apiKey: aiApiKey,
-        endpoint: aiEndpoint,
+        apiKey: aiKeyToSend(),
+        endpoint: aiEndpointTrim,
       });
       setAiTestResult({ success: true, text: rewritten });
     } catch (err) {
-      setAiTestResult({ success: false, text: String(err) });
+      setAiTestResult({ success: false, text: errText(err) });
     } finally {
       setTestingAi(false);
     }
   };
 
+  // Validação da conexão: endereço host:porta e portas dos servidores ligados.
+  const hubAddressTrim = hubAddress.trim();
+  const hubAddressError =
+    hubAddressTrim && !/^[A-Za-z0-9.-]+:\d{1,5}$/.test(hubAddressTrim) ? "Use o formato IP:porta (ex.: 187.77.243.224:8555)." : "";
+  const lanPortError = empresaServerEnabled && parsePort(empresaServerPort) === null ? "Use uma porta de 1024 a 65535." : "";
+  const tunnelPortError = tunnelServerEnabled && parsePort(tunnelServerPort) === null ? "Use uma porta de 1024 a 65535." : "";
+
   const handleSaveAll = async () => {
+    if (appConfigLoad !== "ready") return;
+    const problem = hubAddressError || lanPortError || tunnelPortError;
+    if (problem) {
+      setHubStatus(`Erro ao salvar a conexão: ${problem}`);
+      return;
+    }
+    const address = hubAddressTrim || DEFAULT_HUB_ADDRESS;
+    const typedToken = hubToken.trim();
+    setSavingHub(true);
+    setHubStatus("");
     try {
       const payload: AppConfig = {
         hub_enabled: hubEnabled,
-        hub_address: hubAddress,
-        hub_token: hubToken,
+        hub_address: address,
+        // Em branco: o backend novo mantém o token salvo; o antigo recebe de volta o que mandou.
+        hub_token: typedToken || loadedHubToken.current,
         empresa_server_enabled: empresaServerEnabled,
-        empresa_server_port: empresaServerPort,
+        empresa_server_port: parsePort(empresaServerPort) ?? 7777,
         checkin_server_enabled: true,
         checkin_server_port: 8080,
         tunnel_server_enabled: tunnelServerEnabled,
-        tunnel_server_port: tunnelServerPort,
-        mode: appMode,
+        tunnel_server_port: parsePort(tunnelServerPort) ?? 8888,
+        mode: appMode as AppConfig["mode"],
       };
-      await api("save_app_config", { config: payload, ...payload });
-      setTauriAppMode(appMode);
+      await api("save_app_config", { config: payload });
+      if (typedToken) loadedHubToken.current = typedToken;
+      setHubToken("");
+      setHubAddress(address);
+      setTauriAppMode(isKnownMode(appMode) ? appMode : "local");
       reloadConfig();
-      setHubStatus("Configurações salvas com sucesso!");
-    } catch (err: any) {
-      setHubStatus("Erro ao salvar configurações: " + (err?.message || String(err)));
+      setHubStatus("Conexão salva. Hub e servidores locais passam a usar a configuração nova quando o Esfera for reaberto.");
+      toast.success("Conexão salva");
+    } catch (err) {
+      setHubStatus("Erro ao salvar a conexão: " + errText(err));
+    } finally {
+      setSavingHub(false);
     }
   };
 
@@ -210,20 +392,33 @@ export default function SettingsTab() {
     fileInputRef.current?.click();
   };
   const handleVpsFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const input = e.target;
+    const file = input.files?.[0];
+    input.value = ""; // permite escolher o mesmo arquivo de novo
     if (!file) return;
+    if (!/\.exe$/i.test(file.name) || file.size === 0) {
+      setUpdateVpsMsg({ ok: false, text: "Escolha o arquivo esfera-hub-standalone.exe." });
+      return;
+    }
+    const sizeMb = (file.size / 1048576).toLocaleString("pt-BR", { maximumFractionDigits: 1 });
+    const confirmed = await confirmDialog({
+      title: "Atualizar o servidor do hub?",
+      message: `O arquivo ${file.name} (${sizeMb} MB) será enviado e o hub reinicia com a nova versão. Os aparelhos remotos ficam alguns segundos sem conexão.`,
+      confirmLabel: "Enviar e atualizar",
+      danger: true,
+    });
+    if (!confirmed) return;
     setUpdatingVps(true);
     setUpdateVpsMsg(null);
     try {
-      const buf = await file.arrayBuffer();
-      const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-      const res = await api<string>("update_vps_hub", { base64_bin: b64 });
-      setUpdateVpsMsg(res || "VPS atualizado.");
-    } catch (err: any) {
-      setUpdateVpsMsg("Erro: " + (err?.message || err));
+      const b64 = await fileToBase64(file);
+      // Tauri 2 espera os argumentos em camelCase: base64Bin (base64_bin não chegava ao comando).
+      const res = await api<string>("update_vps_hub", { base64Bin: b64 });
+      setUpdateVpsMsg({ ok: true, text: res || "Servidor atualizado." });
+    } catch (err) {
+      setUpdateVpsMsg({ ok: false, text: "Erro ao atualizar: " + errText(err) });
     } finally {
       setUpdatingVps(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
@@ -248,14 +443,7 @@ export default function SettingsTab() {
         title="Configurações"
         description="Preferências da empresa, conexão, IA e segurança."
         icon={<Settings size={18} />}
-        actions={
-          <Button icon={<Save size={15} />} onClick={handleSaveAll}>
-            Salvar alterações
-          </Button>
-        }
       />
-
-      {hubStatus && <StatusBanner error={hubStatusIsError} message={hubStatus} onClose={() => setHubStatus("")} />}
 
       <div className="flex flex-col md:flex-row gap-6 items-start">
         <nav aria-label="Seções de configurações" className="w-full md:w-56 shrink-0 flex md:flex-col gap-1 overflow-x-auto">
@@ -330,79 +518,114 @@ export default function SettingsTab() {
 
             {activeSection === "hub" && (
               <div className="space-y-8">
-                <FormSection title="Modo de operação" description="Define onde os dados e aparelhos são gerenciados.">
-                  <div className="max-w-xl">
-                    <Field label="Modo" htmlFor="set-mode">
-                      <select id="set-mode" value={appMode} onChange={(e) => setAppMode(e.target.value as "local" | "empresa" | "master")}>
-                        <option value="empresa">Empresa (conecta ao hub na nuvem)</option>
-                        <option value="local">Local (somente esta máquina)</option>
-                        <option value="master">Master (administração remota)</option>
-                      </select>
-                    </Field>
-                  </div>
-                </FormSection>
+                <LoadGate
+                  state={appConfigLoad}
+                  error={appConfigError}
+                  what="a configuração de conexão"
+                  onRetry={() => setAppConfigReload((n) => n + 1)}
+                />
+                {appConfigLoad === "ready" && (
+                  <>
+                    <FormSection title="Modo de operação" description="Define onde os dados e aparelhos são gerenciados. Vale para este computador.">
+                      <div className="max-w-xl">
+                        <Field label="Modo" htmlFor="set-mode">
+                          <select id="set-mode" value={appMode} onChange={(e) => setAppMode(e.target.value)}>
+                            {!isKnownMode(appMode) && (
+                              <option value={appMode}>
+                                {appMode === "standalone" ? "Autônomo (padrão de instalação nova)" : `Atual: ${appMode}`}
+                              </option>
+                            )}
+                            <option value="empresa">Empresa (conecta ao hub na nuvem)</option>
+                            <option value="local">Local (somente esta máquina)</option>
+                            <option value="master">Master (administração remota)</option>
+                          </select>
+                        </Field>
+                      </div>
+                    </FormSection>
 
-                {(appMode === "empresa" || appMode === "master" || isMasterUser) && (
-                  <FormSection title="Hub" description="Endereço e credenciais do servidor central.">
-                    <div className="space-y-4 max-w-xl">
-                      <Field label="Endereço do hub" htmlFor="set-hub-addr">
-                        {!customIpOverride ? (
-                          <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary px-3 py-2">
-                            <span className="flex items-center gap-2 font-mono text-[0.8125rem] text-primary">
-                              <span className="h-2 w-2 rounded-full bg-emerald-400" />
-                              {hubAddress || "127.0.0.1:8555"}
-                              <span className="font-sans text-xs text-tertiary">(padrão local)</span>
-                            </span>
-                            <Button variant="ghost" size="sm" type="button" onClick={() => setCustomIpOverride(true)}>
-                              Alterar
-                            </Button>
-                          </div>
-                        ) : (
-                          <div className="flex items-center gap-2">
-                            <input
-                              id="set-hub-addr"
-                              type="text"
-                              value={hubAddress}
-                              onChange={(e) => setHubAddress(e.target.value)}
-                              placeholder="127.0.0.1:8555"
-                              className="flex-1 font-mono"
-                            />
-                            <Button
-                              variant="secondary"
-                              type="button"
-                              onClick={() => {
-                                setHubAddress("127.0.0.1:8555");
-                                setCustomIpOverride(false);
-                              }}
-                            >
-                              Restaurar padrão
-                            </Button>
-                          </div>
+                    <FormSection title="Hub" description="Servidor central que liga os computadores e os aparelhos remotos.">
+                      <div className="space-y-4 max-w-xl">
+                        <Field label="Endereço do hub" htmlFor="set-hub-addr" error={hubAddressError || undefined}>
+                          {!customIpOverride ? (
+                            <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary px-3 py-2">
+                              <span className="flex min-w-0 items-center gap-2 font-mono text-[0.8125rem] text-primary">
+                                <span className="truncate">{hubAddressTrim || DEFAULT_HUB_ADDRESS}</span>
+                                {(hubAddressTrim || DEFAULT_HUB_ADDRESS) === DEFAULT_HUB_ADDRESS && (
+                                  <span className="font-sans text-xs text-tertiary">(padrão local)</span>
+                                )}
+                              </span>
+                              <Button variant="ghost" size="sm" type="button" onClick={() => setCustomIpOverride(true)}>
+                                Alterar
+                              </Button>
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-2">
+                              <input
+                                id="set-hub-addr"
+                                type="text"
+                                value={hubAddress}
+                                onChange={(e) => setHubAddress(e.target.value)}
+                                placeholder={DEFAULT_HUB_ADDRESS}
+                                spellCheck={false}
+                                className="flex-1 font-mono"
+                              />
+                              <Button
+                                variant="secondary"
+                                type="button"
+                                onClick={() => {
+                                  setHubAddress(DEFAULT_HUB_ADDRESS);
+                                  setCustomIpOverride(false);
+                                }}
+                              >
+                                Restaurar padrão
+                              </Button>
+                            </div>
+                          )}
+                        </Field>
+
+                        <ToggleRow
+                          label="Conexão contínua"
+                          desc="Mantém o sinal de vida com o servidor central em tempo real."
+                          checked={hubEnabled}
+                          onChange={setHubEnabled}
+                        />
+                        {appMode === "local" && hubEnabled && (
+                          <p className="text-xs text-[var(--color-warning)]">
+                            No modo Local a conexão contínua continua ligada. Desligue-a se esta máquina não deve usar o hub.
+                          </p>
                         )}
-                      </Field>
 
-                      <ToggleRow label="Conexão contínua" desc="Mantém sinal de vida em tempo real com o servidor central." checked={hubEnabled} onChange={setHubEnabled} />
-
-                      {(appMode === "master" || appMode === "empresa") && (
-                        <>
+                        {(appMode === "master" || appMode === "empresa") && (
                           <Field
                             label={appMode === "master" ? "Token do hub (master)" : "Token da empresa"}
-                            hint={
+                            hint={`${
                               appMode === "master"
                                 ? "Deve ser o mesmo token mestre configurado no servidor."
                                 : "Sem o token, os celulares remotos não aparecem."
-                            }
+                            } Por segurança o token salvo não aparece aqui; deixe em branco para manter o atual.`}
                             htmlFor="set-hub-token"
                           >
-                            <SecretInput id="set-hub-token" value={hubToken} onChange={setHubToken} placeholder="Cole o token" />
+                            <SecretInput
+                              id="set-hub-token"
+                              value={hubToken}
+                              onChange={setHubToken}
+                              placeholder="Em branco = manter o token salvo"
+                            />
                           </Field>
+                        )}
 
+                        {isMasterUser && (appMode === "master" || appMode === "empresa") && (
                           <div className="flex flex-wrap items-center gap-3 rounded-lg border border-border p-3">
                             <div className="min-w-0 flex-1">
-                              <p className="text-[0.8125rem] font-medium text-primary">Atualizar servidor</p>
-                              <p className="text-xs text-tertiary">Envie o executável do hub para atualizar o servidor remoto.</p>
+                              <p className="text-[0.8125rem] font-medium text-primary">Atualizar servidor do hub</p>
+                              <p className="text-xs text-tertiary">Envie o esfera-hub-standalone.exe para atualizar o servidor remoto. Só o master vê esta opção.</p>
                               {updateVpsMsg && (
-                                <p className="mt-1 text-xs text-secondary break-words">{updateVpsMsg}</p>
+                                <p
+                                  role={updateVpsMsg.ok ? "status" : "alert"}
+                                  className={`mt-1 break-words text-xs ${updateVpsMsg.ok ? "text-[var(--color-success)]" : "text-[var(--color-danger)]"}`}
+                                >
+                                  {updateVpsMsg.text}
+                                </p>
                               )}
                             </div>
                             <Button
@@ -414,169 +637,281 @@ export default function SettingsTab() {
                               onClick={handleUpdateVpsClick}
                               title="Selecione o esfera-hub-standalone.exe para atualizar o servidor remotamente"
                             >
-                              {updatingVps ? "Atualizando..." : "Escolher arquivo"}
+                              {updatingVps ? "Enviando…" : "Escolher arquivo"}
                             </Button>
                             <input ref={fileInputRef} type="file" accept=".exe" className="hidden" onChange={handleVpsFile} />
                           </div>
-                        </>
-                      )}
-                    </div>
-                  </FormSection>
-                )}
-
-                <FormSection title="Servidores locais" description="Acesso pela rede interna e conexão de aparelhos remotos.">
-                  <div className="max-w-xl divide-y divide-border">
-                    {appMode === "empresa" && (
-                      <div className="pb-3">
-                        <ToggleRow label="Servidor na rede local" desc="Permite que colaboradores na mesma rede acessem o painel pelo navegador." checked={empresaServerEnabled} onChange={setEmpresaServerEnabled} />
-                        {empresaServerEnabled && (
-                          <div className="mt-2 w-40">
-                            <Field label="Porta" htmlFor="set-lan-port">
-                              <input id="set-lan-port" type="number" value={empresaServerPort} onChange={(e) => setEmpresaServerPort(parseInt(e.target.value) || 7777)} min={1024} max={65535} className="font-mono" />
-                            </Field>
-                          </div>
                         )}
                       </div>
-                    )}
-                    <div className={appMode === "empresa" ? "pt-3" : ""}>
-                      <ToggleRow label="Túnel reverso de aparelhos" desc="Recebe os aparelhos atrás de NAT ou 4G para mantê-los acessíveis via ADB." checked={tunnelServerEnabled} onChange={setTunnelServerEnabled} />
-                      {tunnelServerEnabled && (
-                        <div className="mt-2 w-40">
-                          <Field label="Porta do túnel" hint="Aponte os aparelhos para IP:porta desta máquina ao instalar o agente." htmlFor="set-tunnel-port">
-                            <input id="set-tunnel-port" type="number" value={tunnelServerPort} onChange={(e) => setTunnelServerPort(parseInt(e.target.value) || 8888)} min={1024} max={65535} className="font-mono" />
-                          </Field>
+                    </FormSection>
+
+                    <FormSection title="Servidores locais" description="Ligam ou desligam quando o Esfera for reaberto.">
+                      <div className="max-w-xl divide-y divide-border">
+                        <div className="pb-3">
+                          <ToggleRow
+                            label="Painel na rede local"
+                            desc="Colaboradores na mesma rede abrem o painel pelo navegador. Qualquer computador dessa rede alcança a porta: ligue só em rede confiável."
+                            checked={empresaServerEnabled}
+                            onChange={setEmpresaServerEnabled}
+                          />
+                          {empresaServerEnabled && (
+                            <div className="mt-2 w-40">
+                              <Field label="Porta" htmlFor="set-lan-port" error={lanPortError || undefined}>
+                                <input
+                                  id="set-lan-port"
+                                  type="number"
+                                  inputMode="numeric"
+                                  value={empresaServerPort}
+                                  onChange={(e) => setEmpresaServerPort(e.target.value)}
+                                  min={1024}
+                                  max={65535}
+                                  className="font-mono"
+                                />
+                              </Field>
+                            </div>
+                          )}
                         </div>
-                      )}
+                        <div className="pt-3">
+                          <ToggleRow
+                            label="Aparelhos fora da rede (túnel)"
+                            desc="Mantém conectados, pelo túnel do agente, os aparelhos que estão no 4G ou em outra rede."
+                            checked={tunnelServerEnabled}
+                            onChange={setTunnelServerEnabled}
+                          />
+                          {tunnelServerEnabled && (
+                            <div className="mt-2 w-40">
+                              <Field
+                                label="Porta do túnel"
+                                hint="Ao instalar o agente, aponte o aparelho para o IP desta máquina e esta porta."
+                                htmlFor="set-tunnel-port"
+                                error={tunnelPortError || undefined}
+                              >
+                                <input
+                                  id="set-tunnel-port"
+                                  type="number"
+                                  inputMode="numeric"
+                                  value={tunnelServerPort}
+                                  onChange={(e) => setTunnelServerPort(e.target.value)}
+                                  min={1024}
+                                  max={65535}
+                                  className="font-mono"
+                                />
+                              </Field>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </FormSection>
+
+                    <div className="space-y-3 border-t border-border pt-5">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <Button icon={<Save size={15} />} onClick={handleSaveAll} loading={savingHub}>
+                          Salvar conexão
+                        </Button>
+                        <p className="text-xs text-tertiary">Vale para este computador. Hub e servidores locais usam a configuração nova quando o Esfera for reaberto.</p>
+                      </div>
+                      {hubStatus && <StatusBanner error={hubStatusIsError} message={hubStatus} onClose={() => setHubStatus("")} />}
                     </div>
-                  </div>
-                </FormSection>
+                  </>
+                )}
               </div>
             )}
 
             {activeSection === "ia" && (
               <FormSection title="Inteligência artificial" description="Provedor usado para reescrever mensagens e variar o texto dos disparos.">
                 <div className="space-y-4 max-w-xl">
-                  <Field label="Provedor" htmlFor="set-ai-provider">
-                    <select
-                      id="set-ai-provider"
-                      value={aiProvider}
-                      onChange={(e) => {
-                        const next = e.target.value;
-                        setAiProvider(next);
-                        const pInfo = getAiProviderInfo(next);
-                        if (savedProviderKeys[next]) {
-                          setAiEndpoint(savedProviderKeys[next].endpoint || pInfo?.defaultEndpoint || "");
-                          setAiModel(savedProviderKeys[next].model || pInfo?.defaultModel || "");
-                          setAiApiKey(savedProviderKeys[next].apiKey || "");
-                        } else if (pInfo) {
-                          setAiEndpoint(pInfo.defaultEndpoint);
-                          setAiModel(pInfo.defaultModel);
-                          setAiApiKey("");
-                        }
-                      }}
-                    >
-                      <optgroup label="Servidor próprio">
-                        {AI_PROVIDERS.filter((p) => p.category === "own_server").map((p) => (
-                          <option key={p.id} value={p.id}>{p.name}</option>
-                        ))}
-                      </optgroup>
-                      <optgroup label="Nuvem gratuita">
-                        {AI_PROVIDERS.filter((p) => p.category === "cloud_free").map((p) => (
-                          <option key={p.id} value={p.id}>{p.name}</option>
-                        ))}
-                      </optgroup>
-                      <optgroup label="Local (offline)">
-                        {AI_PROVIDERS.filter((p) => p.category === "local_free").map((p) => (
-                          <option key={p.id} value={p.id}>{p.name}</option>
-                        ))}
-                      </optgroup>
-                      <optgroup label="Pagos e personalizados">
-                        {AI_PROVIDERS.filter((p) => p.category === "paid_custom").map((p) => (
-                          <option key={p.id} value={p.id}>{p.name}</option>
-                        ))}
-                      </optgroup>
-                    </select>
-                  </Field>
+                  <LoadGate
+                    state={aiLoad}
+                    error={aiLoadError}
+                    what="a configuração de IA"
+                    onRetry={() => setAiReload((n) => n + 1)}
+                  />
+                  {aiLoad === "ready" && (
+                    <>
+                      <Field label="Provedor" htmlFor="set-ai-provider">
+                        <select id="set-ai-provider" value={aiProvider} onChange={(e) => changeAiProvider(e.target.value)}>
+                          {!providerInfo && <option value={aiProvider}>{`Atual: ${aiProvider}`}</option>}
+                          <optgroup label="Servidor próprio">
+                            {AI_PROVIDERS.filter((p) => p.category === "own_server").map((p) => (
+                              <option key={p.id} value={p.id}>{p.name}</option>
+                            ))}
+                          </optgroup>
+                          <optgroup label="Nuvem gratuita">
+                            {AI_PROVIDERS.filter((p) => p.category === "cloud_free").map((p) => (
+                              <option key={p.id} value={p.id}>{p.name}</option>
+                            ))}
+                          </optgroup>
+                          <optgroup label="Neste computador (offline)">
+                            {AI_PROVIDERS.filter((p) => p.category === "local_free").map((p) => (
+                              <option key={p.id} value={p.id}>{p.name}</option>
+                            ))}
+                          </optgroup>
+                          <optgroup label="Pagos e personalizados">
+                            {AI_PROVIDERS.filter((p) => p.category === "paid_custom").map((p) => (
+                              <option key={p.id} value={p.id}>{p.name}</option>
+                            ))}
+                          </optgroup>
+                        </select>
+                      </Field>
 
-                  <Field label="Modelo" htmlFor="set-ai-model">
-                    <input
-                      id="set-ai-model"
-                      type="text"
-                      value={aiModel}
-                      onChange={(e) => setAiModel(e.target.value)}
-                      placeholder="openai/gpt-oss-120b"
-                      className="font-mono"
-                    />
-                    {providerInfo && providerInfo.suggestedModels.length > 0 && (
-                      <div className="flex flex-wrap gap-1.5 pt-1">
-                        {providerInfo.suggestedModels.map((m) => (
-                          <button
-                            key={m.id}
-                            type="button"
-                            onClick={() => setAiModel(m.id)}
-                            className={`rounded-md border px-2 py-1 text-xs transition-colors cursor-pointer ${
-                              aiModel === m.id
-                                ? "border-[var(--color-accent)] bg-[var(--color-accent-glow)] text-primary"
-                                : "border-border text-secondary hover:border-border-strong hover:text-primary"
-                            }`}
+                      <Field label="Modelo" htmlFor="set-ai-model" error={aiModelError || undefined}>
+                        <input
+                          id="set-ai-model"
+                          type="text"
+                          value={aiModel}
+                          onChange={(e) => setAiModel(e.target.value)}
+                          placeholder={providerInfo?.defaultModel || DEFAULT_AI_MODEL}
+                          spellCheck={false}
+                          className="font-mono"
+                        />
+                        {providerInfo && providerInfo.suggestedModels.length > 0 && (
+                          <div className="flex flex-wrap gap-1.5 pt-1">
+                            {providerInfo.suggestedModels.map((m) => (
+                              <button
+                                key={m.id}
+                                type="button"
+                                onClick={() => setAiModel(m.id)}
+                                aria-pressed={aiModel === m.id}
+                                className={`rounded-md border px-2 py-1 text-xs transition-colors cursor-pointer ${
+                                  aiModel === m.id
+                                    ? "border-[var(--color-accent)] bg-[var(--color-accent-glow)] text-primary"
+                                    : "border-border text-secondary hover:border-border-strong hover:text-primary"
+                                }`}
+                              >
+                                {m.name} <span className="text-tertiary">({m.tag})</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </Field>
+
+                      {aiProvider === "vps_ia" ? (
+                        <div className="rounded-lg border border-border bg-secondary px-3 py-2.5 text-[0.8125rem] text-secondary">
+                          <p className="font-medium text-primary">Endereço e token da IA própria</p>
+                          <p className="mt-0.5 break-all font-mono text-xs">{aiEndpointTrim || "Ainda não configurado"}</p>
+                          <p className="mt-1 text-xs text-tertiary">{providerInfo?.keyHint}</p>
+                        </div>
+                      ) : (
+                        <>
+                          <Field
+                            label="Endereço da API"
+                            htmlFor="set-ai-endpoint"
+                            error={aiEndpointError || undefined}
+                            aside={
+                              providerInfo?.defaultEndpoint && aiEndpointTrim !== providerInfo.defaultEndpoint ? (
+                                <button
+                                  type="button"
+                                  onClick={() => setAiEndpoint(providerInfo.defaultEndpoint)}
+                                  className="cursor-pointer underline hover:text-primary"
+                                >
+                                  Usar o padrão
+                                </button>
+                              ) : undefined
+                            }
                           >
-                            {m.name} <span className="text-tertiary">({m.tag})</span>
-                          </button>
-                        ))}
+                            <input
+                              id="set-ai-endpoint"
+                              type="text"
+                              value={aiEndpoint}
+                              onChange={(e) => setAiEndpoint(e.target.value)}
+                              placeholder={providerInfo?.defaultEndpoint || "https://…/v1/chat/completions"}
+                              spellCheck={false}
+                              className="font-mono"
+                            />
+                          </Field>
+
+                          {aiProvider !== "ollama" && aiProvider !== "lmstudio" && (
+                            <Field
+                              label="Chave de API"
+                              hint={`${providerInfo?.keyHint ? `${providerInfo.keyHint} ` : ""}Por segurança a chave salva não aparece aqui; deixe em branco para manter a atual e cole outra só para trocar.`}
+                              htmlFor="set-ai-key"
+                            >
+                              <SecretInput
+                                id="set-ai-key"
+                                value={aiApiKey}
+                                onChange={setAiApiKey}
+                                placeholder={`Em branco = manter a chave salva (${providerInfo?.keyPlaceholder || "sk-..."})`}
+                              />
+                            </Field>
+                          )}
+                        </>
+                      )}
+
+                      <div className="w-48">
+                        <Field label="Criatividade" hint="De 0 (preciso) a 1 (criativo)." htmlFor="set-ai-temp" error={aiTemperatureError || undefined}>
+                          <input
+                            id="set-ai-temp"
+                            type="number"
+                            inputMode="decimal"
+                            step="0.05"
+                            min="0"
+                            max="1"
+                            value={aiTemperature}
+                            onChange={(e) => setAiTemperature(e.target.value)}
+                            className="font-mono"
+                          />
+                        </Field>
                       </div>
-                    )}
-                  </Field>
 
-                  <Field label="Endereço da API" htmlFor="set-ai-endpoint">
-                    <input id="set-ai-endpoint" type="text" value={aiEndpoint} onChange={(e) => setAiEndpoint(e.target.value)} placeholder="https://openrouter.ai/api/v1/chat/completions" className="font-mono" />
-                  </Field>
+                      <Field
+                        label="Instruções para a IA"
+                        hint="Opcional: tom e cuidados da empresa. As regras legais e a proibição de valores valem sempre, mesmo em branco."
+                        htmlFor="set-ai-prompt"
+                        aside={
+                          aiSystemPrompt.trim() !== DEFAULT_WHATSAPP_SYSTEM_PROMPT ? (
+                            <button
+                              type="button"
+                              onClick={() => setAiSystemPrompt(DEFAULT_WHATSAPP_SYSTEM_PROMPT)}
+                              className="cursor-pointer underline hover:text-primary"
+                            >
+                              Usar o texto padrão
+                            </button>
+                          ) : undefined
+                        }
+                      >
+                        <textarea
+                          id="set-ai-prompt"
+                          value={aiSystemPrompt}
+                          onChange={(e) => setAiSystemPrompt(e.target.value)}
+                          rows={4}
+                          placeholder="Ex.: seja cordial e breve, convide o cliente a negociar pelo canal oficial, nunca pressione."
+                          className="resize-y"
+                        />
+                      </Field>
 
-                  {aiProvider !== "ollama" && aiProvider !== "lmstudio" && (
-                    <Field label="Chave de API" hint={providerInfo?.keyHint} htmlFor="set-ai-key">
-                      <SecretInput id="set-ai-key" value={aiApiKey} onChange={setAiApiKey} placeholder={providerInfo?.keyPlaceholder || "sk-..."} />
-                    </Field>
-                  )}
-
-                  <div className="w-40">
-                    <Field label="Criatividade" hint="De 0 (preciso) a 1 (criativo)." htmlFor="set-ai-temp">
-                      <input id="set-ai-temp" type="number" step="0.05" min="0" max="1" value={aiTemperature} onChange={(e) => setAiTemperature(e.target.value)} className="font-mono" />
-                    </Field>
-                  </div>
-
-                  <Field label="Instruções para a IA" hint="Regras de redação aplicadas a todas as mensagens." htmlFor="set-ai-prompt">
-                    <textarea id="set-ai-prompt" value={aiSystemPrompt} onChange={(e) => setAiSystemPrompt(e.target.value)} rows={4} placeholder="Você é um assistente especialista em redação de mensagens para WhatsApp. Seja natural, humano e nunca invente informações." className="resize-none" />
-                  </Field>
-
-                  <div className="flex flex-wrap items-center gap-2 pt-1">
-                    <Button icon={<Save size={15} />} onClick={handleSaveAi}>
-                      Salvar IA
-                    </Button>
-                    <Button variant="secondary" icon={<Play size={14} />} loading={testingAi} onClick={handleTestAi}>
-                      {testingAi ? "Testando..." : "Testar conexão"}
-                    </Button>
-                  </div>
-
-                  {aiTestResult && (
-                    <div
-                      className={`rounded-lg border p-3 text-[0.8125rem] space-y-1 ${
-                        aiTestResult.success
-                          ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                          : "border-red-500/25 bg-red-500/10 text-red-600 dark:text-red-400"
-                      }`}
-                    >
-                      <div className="flex items-center gap-2 font-medium">
-                        {aiTestResult.success ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
-                        {aiTestResult.success ? "Teste concluído" : "Falha no teste"}
+                      <div className="flex flex-wrap items-center gap-2 pt-1">
+                        <Button icon={<Save size={15} />} onClick={handleSaveAi} loading={savingAi}>
+                          Salvar IA
+                        </Button>
+                        <Button variant="secondary" icon={<Play size={14} />} loading={testingAi} onClick={handleTestAi}>
+                          {testingAi ? "Testando…" : "Testar"}
+                        </Button>
                       </div>
-                      <p className="whitespace-pre-wrap text-xs text-secondary">{aiTestResult.text}</p>
-                    </div>
+
+                      {aiTestResult && (
+                        <div
+                          role={aiTestResult.success ? "status" : "alert"}
+                          className={`rounded-lg border p-3 text-[0.8125rem] space-y-1 ${
+                            aiTestResult.success
+                              ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                              : "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
+                          }`}
+                        >
+                          <div className="flex items-center gap-2 font-medium">
+                            {aiTestResult.success ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
+                            {aiTestResult.success ? "Teste concluído" : "Falha no teste"}
+                          </div>
+                          <p className="whitespace-pre-wrap text-xs text-secondary">{aiTestResult.text}</p>
+                        </div>
+                      )}
+
+                      {aiStatus && <StatusBanner error={aiStatusIsError} message={aiStatus} onClose={() => setAiStatus("")} />}
+
+                      <p className="text-xs text-tertiary">
+                        O teste usa os dados da tela (mesmo sem salvar) e um texto de exemplo para “{AI_TEST_CONTACT}”, sem valores e sem link.
+                      </p>
+                    </>
                   )}
-
-                  {aiStatus && <StatusBanner error={aiStatusIsError} message={aiStatus} onClose={() => setAiStatus("")} />}
-
-                  <p className="text-xs text-tertiary">
-                    O Spintax é resolvido no criador de campanhas. Combine Spintax com um modelo gratuito ou local para variar as mensagens sem custo.
-                  </p>
                 </div>
               </FormSection>
             )}
@@ -620,12 +955,41 @@ export default function SettingsTab() {
 }
 
 // ---- Componentes locais ----
+// Carregando / erro com "Tentar de novo". Pronto = não mostra nada (o formulário aparece).
+function LoadGate({ state, error, what, onRetry }: { state: LoadState; error: string; what: string; onRetry: () => void }) {
+  if (state === "ready") return null;
+  if (state === "loading") {
+    return (
+      <p role="status" className="flex items-center gap-2 text-[0.8125rem] text-secondary">
+        <Loader2 size={14} className="animate-spin" />
+        Carregando {what}…
+      </p>
+    );
+  }
+  return (
+    <div
+      role="alert"
+      className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-red-500/25 bg-red-500/10 px-4 py-3 text-[0.8125rem] text-red-700 dark:text-red-400"
+    >
+      <span className="flex min-w-0 items-start gap-2">
+        <AlertCircle size={15} className="mt-0.5 shrink-0" />
+        <span className="break-words">
+          Não foi possível carregar {what}: {error}
+        </span>
+      </span>
+      <Button variant="secondary" size="sm" icon={<RefreshCw size={13} />} onClick={onRetry}>
+        Tentar de novo
+      </Button>
+    </div>
+  );
+}
+
 function StatusBanner({ error, message, onClose }: { error: boolean; message: string; onClose: () => void }) {
   return (
     <div
-      role="status"
+      role={error ? "alert" : "status"}
       className={`flex items-center justify-between gap-3 rounded-lg border px-4 py-2.5 text-[0.8125rem] ${
-        error ? "border-red-500/25 bg-red-500/10 text-red-600 dark:text-red-400" : "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+        error ? "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400" : "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
       }`}
     >
       <span className="flex items-center gap-2 min-w-0">
@@ -943,7 +1307,7 @@ function IntegrationsSection({ companyId, isMaster, canManage }: { companyId: nu
             <div className="min-w-0">
               <p className="text-[0.8125rem] font-medium text-primary">Gemini Web (Conta Google — Sem Chave de API)</p>
               <p className="text-[0.75rem] text-tertiary">
-                Usa o navegador padrão do sistema (Microsoft Edge) com perfil dedicado do Esfera para reescrever mensagens gratuitamente no site do Gemini, logo após o Groq na cadeia de reserva.
+                Reserva opcional e gratuita: usa o Microsoft Edge com um perfil só do Esfera para reescrever no site do Gemini. Entra na cadeia de reserva depois do Groq e da IA própria (VPS); nunca é a IA principal.
               </p>
             </div>
             <span
@@ -1113,13 +1477,15 @@ function NetworkSettings({ canEdit }: { canEdit: boolean }) {
   const [message, setMessage] = useState("");
   const [loadError, setLoadError] = useState("");
   const [saving, setSaving] = useState(false);
+  // Sem os limites reais carregados, Salvar gravaria os números de exemplo (40/200) por cima.
+  const [limitsReady, setLimitsReady] = useState(false);
   useEffect(() => {
     let active = true;
     const refresh = () => api<NetworkStatus>("get_network_status")
       .then(v => { if (active) { setStatus(v); setLoadError(""); } })
       .catch(e => { if (active) setLoadError(`Erro ao consultar a rede: ${String(e)}`); });
     api<{ hourly: number; daily: number }>("get_network_limits")
-      .then(v => { if (active) { setHourly(String(v.hourly)); setDaily(String(v.daily)); } })
+      .then(v => { if (active) { setHourly(String(v.hourly)); setDaily(String(v.daily)); setLimitsReady(true); } })
       .catch(e => { if (active) setMessage(`Erro ao carregar limites: ${String(e)}`); });
     refresh();
     const timer = window.setInterval(refresh, 30000);
@@ -1150,7 +1516,7 @@ function NetworkSettings({ canEdit }: { canEdit: boolean }) {
           <input id="network-day" type="number" min={1} value={daily} disabled={!canEdit} onChange={e => setDaily(e.target.value)} className="font-mono" />
         </Field>
       </div>
-      <Button onClick={save} loading={saving} disabled={!canEdit}>Salvar limites</Button>
+      <Button onClick={save} loading={saving} disabled={!canEdit || !limitsReady}>Salvar limites</Button>
       {message && <p role="status" className="text-sm text-secondary">{message}</p>}
       {loadError && <p role="alert" className="text-sm text-red-500">{loadError}</p>}
       {status && <div className="space-y-1 text-sm text-secondary">
