@@ -51,7 +51,7 @@ const REPLY_PAUSE_HOURS: i64 = 24;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NetworkChipStatus { pub chip_id: i32, pub device_id: i32, pub device_name: String, pub reply_rate: Option<f64>, pub sample: usize, pub state: String, pub reason: String }
+pub struct NetworkChipStatus { pub chip_id: i32, pub device_id: i32, pub device_name: String, pub reply_rate: Option<f64>, pub sample: usize, pub state: String, pub reason: String, pub cooldown_seconds: u64 }
 /// `attempts_*` são as tentativas que o teto conta (cada parte extra soma uma); `sent_*`, só as enviadas.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -622,6 +622,21 @@ impl Database {
         }
     }
 
+    /// Confirma o envio antes da pausa, com gravação síncrona e idempotente.
+    pub fn complete_send_now(&self, phone: &str, campaign_id: i32, contact_id: i32) -> Result<(), String> {
+        let conn = self.conn();
+        Self::with_busy_retry(|| conn.execute_batch("BEGIN IMMEDIATE")).map_err(|e|e.to_string())?;
+        let result = (|| -> rusqlite::Result<()> {
+            let changed = conn.execute("UPDATE ESF_Contact SET Status='sent',SentAt=datetime('now') WHERE ContactId=?1 AND CampaignId=?2 AND Status<>'sent'", params![contact_id,campaign_id])?;
+            if changed > 0 {
+                conn.execute("INSERT OR REPLACE INTO ESF_SentHistory(Phone,CampaignId,SentAt) VALUES(?1,?2,datetime('now'))", params![phone,campaign_id])?;
+                conn.execute("UPDATE ESF_Campaign SET SentContacts=SentContacts+1,UpdatedAt=datetime('now') WHERE CampaignId=?1", params![campaign_id])?;
+            }
+            Ok(())
+        })();
+        match result { Ok(()) => conn.execute_batch("COMMIT").map_err(|e|e.to_string()), Err(e) => { let _ = conn.execute_batch("ROLLBACK"); Err(e.to_string()) } }
+    }
+
     /// Aplica um lote de operações de escrita em UMA transação (single-writer batch)
     pub(crate) fn apply_write_batch(&self, conn: &Connection, ops: &[crate::write_queue::WriteOp]) -> Result<()> {
         if ops.is_empty() {
@@ -933,6 +948,12 @@ impl Database {
             EventId TEXT PRIMARY KEY, CompanyId INTEGER NOT NULL, PhoneDigits TEXT NOT NULL,
             Phone TEXT NOT NULL, Serial TEXT NOT NULL, CampaignId INTEGER, ConfirmationText TEXT NOT NULL DEFAULT ''
         );")?;
+        self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_DeviceOutbox (
+            EventId TEXT PRIMARY KEY, CompanyId INTEGER NOT NULL, Serial TEXT NOT NULL,
+            Line TEXT NOT NULL, Delivered INTEGER NOT NULL DEFAULT 0, NextAt TEXT NOT NULL DEFAULT '1970-01-01',
+            CreatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+        ); CREATE INDEX IF NOT EXISTS idx_device_outbox_pending ON ESF_DeviceOutbox(Delivered,CreatedAt);")?;
+        let _ = self.conn().execute("ALTER TABLE ESF_DeviceOutbox ADD COLUMN NextAt TEXT NOT NULL DEFAULT '1970-01-01'", []);
         // Campos adicionados ao banco já existente sem recriar a fila nem alterar seus registros.
         let _ = self.conn().execute("ALTER TABLE ESF_OptOutConfirm ADD COLUMN CampaignId INTEGER", []);
         let _ = self.conn().execute("ALTER TABLE ESF_OptOutConfirm ADD COLUMN ConfirmationText TEXT NOT NULL DEFAULT ''", []);
@@ -1986,6 +2007,18 @@ impl Database {
         }
     }
 
+    pub fn device_has_open_campaign(&self, company: i32, serial: &str, esfera_id: Option<&str>) -> Result<bool, String> {
+        let conn = self.conn();
+        let mut q = conn.prepare("SELECT SelectedDevices FROM ESF_Campaign WHERE CompanyId=?1 AND ExcluidoEm IS NULL AND Status IN ('running','paused')").map_err(|e|e.to_string())?;
+        let rows = q.query_map(params![company], |r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
+        for row in rows {
+            let text = row.map_err(|e|e.to_string())?;
+            let ids: Vec<String> = serde_json::from_str(&text).map_err(|e|e.to_string())?;
+            if ids.iter().any(|id| id == serial || esfera_id == Some(id.as_str())) { return Ok(true); }
+        }
+        Ok(false)
+    }
+
     pub fn get_campaign_company_id(&self, campaign_id: i32) -> Option<i32> {
         self.conn().query_row(
             "SELECT CompanyId FROM ESF_Campaign WHERE CampaignId=?1 AND ExcluidoEm IS NULL",
@@ -2357,7 +2390,7 @@ impl Database {
         let (sample,replies): (i64,i64) = conn.query_row("SELECT count(*),coalesce(sum(CASE WHEN EXISTS(SELECT 1 FROM ESF_ReplyInbound r WHERE r.DeviceId=?2 AND r.PhoneDigits=a.PhoneDigits AND r.ReceivedAt>=a.CreatedAt) THEN 1 ELSE 0 END),0) FROM (SELECT PhoneDigits,CreatedAt FROM ESF_ChipAttempt WHERE ChipId=?1 AND Purpose='campaign' AND Outcome='enviado' AND CreatedAt<=datetime('now',?3) AND CreatedAt>coalesce((SELECT UntilAt FROM ESF_ReplyBrake WHERE ChipId=?1),'0000-01-01') ORDER BY AttemptId DESC LIMIT ?4) a", params![chip.id, device.id, format!("-{} hours", REPLY_WAIT_HOURS), REPLY_SAMPLE as i64], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
         let paused: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM ESF_ReplyBrake WHERE ChipId=?1 AND UntilAt>datetime('now'))", params![chip.id], |r| r.get(0)).map_err(|e| e.to_string())?;
         let (state, reason) = if paused { ("pausado", REPLY_REASON_PAUSED) } else { reply_state(available, ever_replied, sample as usize, replies as usize) };
-        Ok(NetworkChipStatus { chip_id: chip.id, device_id: device.id, device_name: device.name.clone(), reply_rate: if available && sample > 0 { Some(replies as f64 * 100.0 / sample as f64) } else { None }, sample: sample as usize, state: state.into(), reason: reason.into() })
+        Ok(NetworkChipStatus { chip_id: chip.id, device_id: device.id, device_name: device.name.clone(), reply_rate: if available && sample > 0 { Some(replies as f64 * 100.0 / sample as f64) } else { None }, sample: sample as usize, state: state.into(), reason: reason.into(), cooldown_seconds: conn.query_row("SELECT coalesce(max(0, CAST(strftime('%s',NextAt) AS INTEGER)-CAST(strftime('%s','now') AS INTEGER)),0) FROM ESF_ChipCooldown WHERE ChipId=?1", params![chip.id], |r| r.get(0)).map_err(|e|e.to_string())? })
     }
 
     pub fn apply_reply_brake(&self, chip: &Chip, device: &Device) -> Result<NetworkChipStatus, String> {
@@ -2638,7 +2671,7 @@ impl Database {
         let conn = self.conn();
         conn.execute(
             "UPDATE ESF_Contact SET RetryCount=RetryCount+1,
-             Status=CASE WHEN RetryCount+1 >= 3 THEN 'failed' ELSE 'pending' END
+             Status=CASE WHEN RetryCount+1 >= 3 THEN 'failed' ELSE 'pending' END, SentAt=datetime('now')
              WHERE ContactId=?1 AND CampaignId=?2 AND Status='pending' AND ExcluidoEm IS NULL",
             params![contact_id, campaign_id],
         ).map_err(|e| e.to_string())?;
@@ -2979,6 +3012,40 @@ impl Database {
         };
         let _ = conn.execute_batch("PRAGMA synchronous=NORMAL;");
         outcome
+    }
+
+    /// O lote só é persistido quando todas as linhas são JSON válido.
+    pub fn enqueue_device_batch(&self, company: i32, serial: &str, lines: &str) -> Result<(), String> {
+        use sha2::{Digest, Sha256};
+        let mut rows = Vec::new();
+        for line in lines.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let value: serde_json::Value = serde_json::from_str(line).map_err(|_| "Linha de resposta inválida".to_string())?;
+            if !value.is_object() { return Err("Linha de resposta inválida".into()); }
+            let id = hex::encode(Sha256::digest(format!("{}|{}|{}", company, serial, line).as_bytes()));
+            rows.push((id, line));
+        }
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(|e|e.to_string())?;
+        let result = (|| -> rusqlite::Result<()> {
+            for (id,line) in rows { conn.execute("INSERT OR IGNORE INTO ESF_DeviceOutbox(EventId,CompanyId,Serial,Line) VALUES(?1,?2,?3,?4)", params![id,company,serial,line])?; }
+            Ok(())
+        })();
+        match result { Ok(()) => conn.execute_batch("COMMIT").map_err(|e|e.to_string()), Err(e) => { let _ = conn.execute_batch("ROLLBACK"); Err(e.to_string()) } }
+    }
+
+    pub fn pending_device_messages(&self) -> Result<Vec<(String,i32,String,String)>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT EventId,CompanyId,Serial,Line FROM ESF_DeviceOutbox WHERE Delivered=0 AND NextAt<=datetime('now') ORDER BY rowid LIMIT 100").map_err(|e|e.to_string())?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|e|e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())
+    }
+
+    pub fn defer_device_message(&self, id: &str) -> Result<(), String> {
+        self.conn().execute("UPDATE ESF_DeviceOutbox SET NextAt=datetime('now','+60 seconds') WHERE EventId=?1 AND Delivered=0", params![id]).map(|_| ()).map_err(|e|e.to_string())
+    }
+
+    pub fn acknowledge_device_message(&self, id: &str) -> Result<(), String> {
+        self.conn().execute("UPDATE ESF_DeviceOutbox SET Delivered=1,Line='' WHERE EventId=?1", params![id]).map(|_| ()).map_err(|e|e.to_string())
     }
 
     /// Guarda a origem antes de enviar ao VEXOR; assim uma revisão posterior volta ao aparelho certo.
@@ -3597,44 +3664,16 @@ impl Database {
     // ============================================================
 
     pub fn get_dashboard_kpis(&self, company_id: i32) -> Result<serde_json::Value, String> {
-        let blocked_chips: i32 = self.conn().query_row(
-            "SELECT COUNT(*) FROM ESF_Chip c JOIN ESF_Device d ON c.DeviceId=d.AdbDeviceId
-             WHERE d.CompanyId=?1 AND c.ExcluidoEm IS NULL
-             AND c.Status IN ('banido','restrito_24h','restrito_7d','restrito_custom');",
-            params![company_id],
-            |row| row.get(0),
-        ).unwrap_or(0);
-
-        let config_changes_today: i32 = self.conn().query_row(
-            "SELECT COUNT(*) FROM ESF_AuditLog WHERE CompanyId=?1 AND ExcluidoEm IS NULL
-             AND date(Timestamp) = date('now');",
-            params![company_id],
-            |row| row.get(0),
-        ).unwrap_or(0);
-
-        let sent_today: i32 = self.conn().query_row(
-            "SELECT COUNT(*) FROM ESF_Contact c
-             JOIN ESF_Campaign cam ON c.CampaignId=cam.CampaignId
-             WHERE cam.CompanyId=?1 AND c.Status='sent' AND c.ExcluidoEm IS NULL
-             AND date(c.SentAt) = date('now');",
-            params![company_id],
-            |row| row.get(0),
-        ).unwrap_or(0);
-
-        let total_contacts_pending: i32 = self.conn().query_row(
-            "SELECT COUNT(*) FROM ESF_Contact c
-             JOIN ESF_Campaign cam ON c.CampaignId=cam.CampaignId
-             WHERE cam.CompanyId=?1 AND c.Status='pending' AND c.ExcluidoEm IS NULL;",
-            params![company_id],
-            |row| row.get(0),
-        ).unwrap_or(0);
-
-        Ok(serde_json::json!({
-            "blocked_chips": blocked_chips,
-            "config_changes_today": config_changes_today,
-            "sent_today": sent_today,
-            "pending_contacts": total_contacts_pending,
-        }))
+        let conn = self.conn();
+        let count = |sql: &str| -> Result<i64, String> { conn.query_row(sql, params![company_id], |r| r.get(0)).map_err(|e|e.to_string()) };
+        let blocked = count("SELECT count(*) FROM ESF_Chip c JOIN ESF_Device d ON c.DeviceId=d.rowid WHERE d.CompanyId=?1 AND c.ExcluidoEm IS NULL AND c.Status IN ('banido','restrito_24h','restrito_7d','restrito_custom')")?;
+        let configs = count("SELECT count(*) FROM ESF_AuditLog WHERE CompanyId=?1 AND ExcluidoEm IS NULL AND date(Timestamp,'localtime')=date('now','localtime')")?;
+        let sent = count("SELECT count(*) FROM ESF_Contact c JOIN ESF_Campaign cam ON c.CampaignId=cam.CampaignId WHERE cam.CompanyId=?1 AND c.Status='sent' AND c.ExcluidoEm IS NULL AND date(c.SentAt,'localtime')=date('now','localtime')")?;
+        let pending = count("SELECT count(*) FROM ESF_Contact c JOIN ESF_Campaign cam ON c.CampaignId=cam.CampaignId WHERE cam.CompanyId=?1 AND c.Status='pending' AND c.ExcluidoEm IS NULL")?;
+        let failed = count("SELECT count(*) FROM ESF_Contact c JOIN ESF_Campaign cam ON c.CampaignId=cam.CampaignId WHERE cam.CompanyId=?1 AND c.Status='failed' AND c.ExcluidoEm IS NULL AND date(c.SentAt,'localtime')=date('now','localtime')")?;
+        let optouts = count("SELECT count(*) FROM ESF_OptOut WHERE CompanyId=?1 AND date(CreatedAt,'localtime')=date('now','localtime')")?;
+        let cooling = count("SELECT count(*) FROM ESF_Chip c JOIN ESF_Device d ON c.DeviceId=d.rowid JOIN ESF_ChipCooldown cd ON cd.ChipId=c.ChipId WHERE d.CompanyId=?1 AND c.ExcluidoEm IS NULL AND cd.NextAt>datetime('now')")?;
+        Ok(serde_json::json!({"blockedChips":blocked,"configChangesToday":configs,"sentToday":sent,"pendingContacts":pending,"failedToday":failed,"optOutsToday":optouts,"chipsCoolingDown":cooling,"blocked_chips":blocked,"config_changes_today":configs,"sent_today":sent,"pending_contacts":pending}))
     }
 
     // ============================================================
@@ -4392,6 +4431,7 @@ mod antiban_tests {
         }
         let error = db.reserve_chip_attempt(&chip, 1, 1, "11999990000", false).unwrap_err();
         assert!(error.contains("Freio automático"));
+        assert!(db.reserve_chip_attempt(&chip, 1, 1, "11999990000", true).is_ok());
         db.conn().execute("UPDATE ESF_ChipAttempt SET Outcome='enviado'", []).unwrap();
         for i in 0..3 {
             db.add_opt_out(1, &format!("1199999{:04}", i), "SAIR").unwrap();
@@ -4487,5 +4527,71 @@ mod vps_ia_sync_tests {
         db.delete_ai_provider_key(2, "vps_ia").unwrap();
         assert!(!db.sync_vps_ia_from_hub(2, Some(first)).unwrap());
         assert!(db.get_ai_provider_key(2, "vps_ia").is_none());
+    }
+}
+
+#[cfg(test)]
+mod dashboard_network_regression_tests {
+    use super::*;
+    #[test]
+    fn listas_suprimem_apenas_a_empresa_e_reimportacao_respeita_sair() {
+        let path=std::env::temp_dir().join(format!("esfera_suprime_{}.db",std::process::id()));
+        let _=std::fs::remove_file(&path);
+        let db=Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let other=db.create_company("Outra",5).unwrap();
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId) VALUES('A','Oi',1)",[]).unwrap();
+        let a: i32=db.conn().query_row("SELECT max(CampaignId) FROM ESF_Campaign",[],|r|r.get(0)).unwrap();
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId) VALUES('B','Oi',?1)",params![other.id]).unwrap();
+        let b: i32=db.conn().query_row("SELECT max(CampaignId) FROM ESF_Campaign",[],|r|r.get(0)).unwrap();
+        for id in [a,b] { db.import_contacts(id,vec![("Contato".into(),"11999990001".into())]).unwrap(); }
+        db.add_no_whatsapp(1,"11999990001","Sem conta").unwrap();
+        assert!(db.is_no_whatsapp(1,"11999990001"));
+        assert!(!db.is_no_whatsapp(other.id,"11999990001"));
+        assert_eq!(db.get_contacts(a)[0].status,"no_whatsapp");
+        assert_eq!(db.get_contacts(b)[0].status,"pending");
+        db.add_opt_out(1,"11999990002","SAIR").unwrap();
+        db.import_contacts(a,vec![("Contato".into(),"11999990002".into())]).unwrap();
+        assert!(db.get_contacts(a).iter().any(|c|c.phone=="11999990002" && c.status=="opt_out"));
+    }
+
+    #[test]
+    fn descadastro_falha_fechado_e_confirmacao_restrita_volta_a_fila() {
+        let path=std::env::temp_dir().join(format!("esfera_fechado_{}.db",std::process::id()));
+        let _=std::fs::remove_file(&path);
+        let db=Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.pooled_conn().unwrap().execute("INSERT INTO ESF_OptOutConfirm(CompanyId,PhoneDigits,Phone,Serial,Status) VALUES(1,'11999990001','11999990001','device','sending')",[]).unwrap();
+        db.finish_confirmation(1,"11999990001",false,"CONTA_RESTRITA: teste").unwrap();
+        assert_eq!(db.pending_confirmations().len(),1);
+        db.pooled_conn().unwrap().execute("DROP TABLE ESF_OptOut",[]).unwrap();
+        assert!(db.is_opted_out(1,"11999990001"));
+    }
+
+    #[test]
+    fn indicadores_isolam_empresa_e_refletem_descanso_e_envio_atomico() {
+        let path = std::env::temp_dir().join(format!("esfera_dashboard_rede_{}.db",std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.conn().execute("INSERT INTO ESF_Device(AdbDeviceId,DeviceName,CompanyId) VALUES('dashboard-usb','Teste',1)",[]).unwrap();
+        let device=db.get_devices(1).into_iter().find(|d| d.serial=="dashboard-usb").unwrap();
+        let chip=db.add_chip(device.id,"11999999999","Teste").unwrap();
+        db.set_chip_restriction(chip,"banido","9999-12-31 23:59:59").unwrap();
+        db.extend_chip_cooldown(chip,300).unwrap();
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId) VALUES('Teste','Oi',1)",[]).unwrap();
+        let campaign: i32=db.conn().query_row("SELECT max(CampaignId) FROM ESF_Campaign",[],|r|r.get(0)).unwrap();
+        db.import_contacts(campaign,vec![("Um".into(),"11999990001".into()),("Dois".into(),"11999990002".into())]).unwrap();
+        let contacts=db.get_contacts(campaign);
+        let first=contacts.iter().find(|c|c.phone=="11999990001").unwrap();
+        let second=contacts.iter().find(|c|c.phone=="11999990002").unwrap();
+        db.complete_send_now(&first.phone,campaign,first.id).unwrap();
+        db.complete_send_now(&first.phone,campaign,first.id).unwrap();
+        for _ in 0..3 { db.record_contact_send_failure(campaign,second.id).unwrap(); }
+        db.add_opt_out(1,"11999990003","SAIR").unwrap();
+        let k=db.get_dashboard_kpis(1).unwrap();
+        assert_eq!(k["sentToday"],1); assert_eq!(k["failedToday"],1); assert_eq!(k["blockedChips"],1);
+        assert_eq!(k["chipsCoolingDown"],1); assert_eq!(k["optOutsToday"],1);
+        let state=db.network_status(Some(1)).unwrap();
+        assert!(state.chips.iter().any(|c|c.chip_id==chip && c.cooldown_seconds>0));
+        let sent: i32=db.conn().query_row("SELECT SentContacts FROM ESF_Campaign WHERE CampaignId=?1",params![campaign],|r|r.get(0)).unwrap();
+        assert_eq!(sent,1);
     }
 }
