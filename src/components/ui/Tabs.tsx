@@ -1,5 +1,5 @@
 // Abas horizontais (sublinhado) e controle segmentado (pílulas).
-import type { ReactNode } from "react";
+import type { KeyboardEvent, ReactNode } from "react";
 
 export interface TabItem<T extends string> {
   id: T;
@@ -14,18 +14,50 @@ interface TabsProps<T extends string> {
   value: T;
   onChange: (id: T) => void;
   className?: string;
+  /** Nome do grupo para leitores de tela (ex.: "Seções da campanha"). */
+  ariaLabel?: string;
 }
 
-export function Tabs<T extends string>({ items, value, onChange, className = "" }: TabsProps<T>) {
+// Setas esquerda/direita, Home e End trocam de aba (pulando as desabilitadas).
+function handleArrowKeys<T extends string>(e: KeyboardEvent<HTMLElement>, items: TabItem<T>[], value: T, onChange: (id: T) => void) {
+  const enabled = items.filter((t) => !t.disabled);
+  if (enabled.length === 0) return;
+  const idx = enabled.findIndex((t) => t.id === value);
+  let next: TabItem<T> | undefined;
+  if (e.key === "ArrowRight") next = enabled[(idx + 1) % enabled.length];
+  else if (e.key === "ArrowLeft") next = enabled[(idx - 1 + enabled.length) % enabled.length];
+  else if (e.key === "Home") next = enabled[0];
+  else if (e.key === "End") next = enabled[enabled.length - 1];
+  if (!next) return;
+  const targetId = next.id;
+  e.preventDefault();
+  onChange(targetId);
+  const container = e.currentTarget;
+  window.requestAnimationFrame(() => {
+    container.querySelector<HTMLElement>(`[data-tab-id="${CSS.escape(targetId)}"]`)?.focus();
+  });
+}
+
+export function Tabs<T extends string>({ items, value, onChange, className = "", ariaLabel }: TabsProps<T>) {
+  // Só a aba ativa entra no Tab; se nenhuma estiver ativa, a primeira habilitada recebe o foco.
+  const focusId = items.some((t) => t.id === value && !t.disabled) ? value : items.find((t) => !t.disabled)?.id;
   return (
-    <div role="tablist" className={`flex items-center gap-1 overflow-x-auto border-b border-border ${className}`}>
+    <div
+      role="tablist"
+      aria-label={ariaLabel}
+      onKeyDown={(e) => handleArrowKeys(e, items, value, onChange)}
+      className={`flex items-center gap-1 overflow-x-auto border-b border-border ${className}`}
+    >
       {items.map((t) => {
         const active = t.id === value;
         return (
           <button
             key={t.id}
+            type="button"
             role="tab"
+            data-tab-id={t.id}
             aria-selected={active}
+            tabIndex={t.id === focusId ? 0 : -1}
             disabled={t.disabled}
             onClick={() => onChange(t.id)}
             className={`relative -mb-px inline-flex items-center gap-2 whitespace-nowrap border-b-2 px-3 py-2.5 text-[0.8125rem] font-medium transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 ${
@@ -46,18 +78,26 @@ export function Tabs<T extends string>({ items, value, onChange, className = "" 
   );
 }
 
-export function SegmentedControl<T extends string>({ items, value, onChange, className = "" }: TabsProps<T>) {
+export function SegmentedControl<T extends string>({ items, value, onChange, className = "", ariaLabel }: TabsProps<T>) {
   return (
-    <div className={`inline-flex items-center gap-0.5 rounded-lg border border-border bg-secondary p-0.5 ${className}`}>
+    <div
+      role="group"
+      aria-label={ariaLabel}
+      onKeyDown={(e) => handleArrowKeys(e, items, value, onChange)}
+      className={`inline-flex items-center gap-0.5 rounded-lg border border-border bg-secondary p-0.5 ${className}`}
+    >
       {items.map((t) => {
         const active = t.id === value;
         return (
           <button
             key={t.id}
+            type="button"
+            data-tab-id={t.id}
+            aria-pressed={active}
             disabled={t.disabled}
             onClick={() => onChange(t.id)}
-            className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1 text-[0.75rem] font-medium transition-colors cursor-pointer disabled:opacity-40 ${
-              active ? "bg-card text-primary shadow-sm" : "text-secondary hover:text-primary"
+            className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1 text-[0.75rem] font-medium transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 ${
+              active ? "bg-[var(--color-bg-elevated)] text-primary shadow-sm" : "text-secondary hover:text-primary"
             }`}
           >
             {t.icon}
