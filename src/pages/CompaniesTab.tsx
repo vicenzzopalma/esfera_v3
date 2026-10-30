@@ -16,7 +16,8 @@ import StatCard from "../components/ui/StatCard";
 import EmptyState from "../components/ui/EmptyState";
 import Field from "../components/ui/Field";
 import { api } from "../tauri";
-import { formatDbDate, apiErrorText } from "../hooks/useQueries";
+import { useQueryClient } from "@tanstack/react-query";
+import { formatDbDate, apiErrorText, keys } from "../hooks/useQueries";
 import { toast } from "../components/ui/ToastContainer";
 import type { Company } from "../types";
 import {
@@ -38,6 +39,7 @@ const isCompanyActive = (c: Company & { isActive?: boolean }) => c.status === "a
 export default function CompaniesTab() {
   const { enterCompany } = useAuth();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [searchQuery, setSearchQuery] = useState("");
   const [companiesList, setCompaniesList] = useState<Company[]>([]);
   const [loading, setLoading] = useState(true);
@@ -137,10 +139,15 @@ export default function CompaniesTab() {
       });
       setModalOpen(false);
       toast.success(wasEditing ? `Empresa ${trimmedName} salva.` : `Empresa ${trimmedName} criada.`);
+      // Menu, cabeçalho e rodapé leem a mesma lista: atualiza o nome e o seletor na hora.
+      queryClient.invalidateQueries({ queryKey: keys.companies });
       await loadCompanies();
     } catch (err) {
       setSaveError(apiErrorText(err, "Não foi possível salvar a empresa."));
-      if (created) loadCompanies();
+      if (created) {
+        queryClient.invalidateQueries({ queryKey: keys.companies });
+        loadCompanies();
+      }
     } finally {
       setSaving(false);
     }
