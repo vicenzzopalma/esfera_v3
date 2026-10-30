@@ -748,27 +748,180 @@ export function unknownVariables(text: string): string[] {
   return Array.from(new Set(Array.from(text.matchAll(BRACE_BLOCK)).filter((m) => !isNameVariable(m[1])).map((m) => m[0])));
 }
 
-// A mensagem sai sempre em 3 partes: saudação, corpo e encerramento são obrigatórios.
-export function messageError(greeting: string, body: string, closing: string) {
-  if (!body.trim()) return "Escreva a mensagem que será enviada.";
-  if (!greeting.trim() || !closing.trim()) return "Preencha a saudação e o encerramento: a mensagem sai sempre em 3 partes.";
-  const full = joinMessage(greeting, body, closing);
-  if (/(?:https?:\/\/|www\.|\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/|\b))/i.test(full))
-    return "Remova os links da primeira mensagem para contatos novos, incluindo links wa.me.";
-  return moneyError(full);
+// ---------- Regras da mensagem ----------
+// A mensagem sai sempre em 3 partes (saudação, corpo e encerramento), cada parte como uma mensagem do
+// WhatsApp. Estas regras bloqueiam salvar e iniciar; o motor repete as principais antes de cada envio.
+
+export interface MessageValue {
+  greeting: string;
+  body: string;
+  closing: string;
+  useSpintax: boolean;
 }
 
-// Junta saudação + corpo + encerramento como o motor de disparo faz.
-// Regra da empresa: mensagens não podem citar valores (R$, reais, centavos ou quantias como 350,00).
-// Mesma regra do backend (AiEngine::has_money): R$, reais, %, "R 350", "valor/saldo/parcela... 350", 350,00 / 350.00.
+export type MessageField = "greeting" | "body" | "closing";
+const MESSAGE_FIELDS: MessageField[] = ["greeting", "body", "closing"];
+const FIELD_LABEL: Record<MessageField, string> = { greeting: "Saudação", body: "Mensagem", closing: "Encerramento" };
+
+export const WHATSAPP_LIMIT = 4096;
+export const OPT_OUT_TEXT = "Para deixar de receber mensagens por este canal, responda SAIR.";
+const OPT_OUT_WORD = /\bsair\b/i;
+
+// Link: protocolo, www. ou domínio (empresa.com.br, wa.me/...). E-mail também conta (o motor bloqueia igual).
+const LINK_RE = /(?:https?:\/\/|www\.)\S*|\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b(?:\/\S*)?/i;
+
+// Regra da empresa: mensagens não podem citar valores. Mesma base do backend (AiEngine::has_money): R$, reais,
+// %, "R 350", "valor/saldo/parcela... 350", 350,00 e 350.00 (data 10.10.26 não conta). A tela também barra
+// 1.500 e 1.234,56, "2 mil" e "10x de 50".
 const MONEY_RE =
-  /R\$|RS\$|\bBRL\b|\breais\b|\bcentavos\b|\d+\s*%|\bpor\s*cento\b|\bR\s+\d|\b(valor|valores|saldo|parcelas?|d[ií]vida|d[ée]bito|total|quantia|montante|pre[çc]o|desconto|juros|multa|pague|pagar|pagamento|custa)\b[:\s]*(\S+\s+){0,2}?\d|\d[,.]\d{2}(?![\d./])/i;
-export function moneyError(text: string): string | undefined {
-  return MONEY_RE.test(text)
-    ? "Não é permitido falar de valores. Remova as quantias (R$, reais, 350,00) e direcione o cliente ao canal de negociação."
-    : undefined;
+  /R\$|RS\$|\bBRL\b|\breais\b|\bcentavos\b|\d+\s*%|\bpor\s*cento\b|\bR\s+\d|\b(valor|valores|saldo|parcelas?|d[ií]vida|d[ée]bito|total|quantia|montante|pre[çc]o|desconto|juros|multa|pague|pagar|pagamento|custa)\b[:\s]*(\S+\s+){0,2}?\d|\d,\d{2}(?![\d./])|(?<!\.\d{1,2})\d\.\d{2}(?![\d./])|\b\d{1,3}(?:\.\d{3})+(?:,\d{2})?\b(?![.,/-]\d)|\b\d+(?:[.,]\d+)?\s*(?:mil|milh[õo]es|milh[ãa]o)\b|\b\d{1,2}\s*x\s*(?:de\s*)?\d{2,}/i;
+// Cobrança + número de 3+ dígitos: "você deve 300", "pendência de 1500", "acordo por 900". Substantivo seguido
+// direto do número é identificação ("acordo 123456", "boleto nº 4567"); telefone (0800...) também não conta.
+const MONEY_CONTEXT_RE = /\b(pend[êe]ncias?|acordos?|entrada|vista|quitar|quita[çc][ãa]o|boletos?|faturas?|deve|devendo|d[ée]bitos?)\b((?:\s+\S+){0,3})/gi;
+const MONEY_VERB_RE = /^(deve|devendo|quitar)$/i;
+const MONEY_PREP_RE = /^(de|por|com|em|a|à)$/i;
+const ID_MARKER_RE = /^(n[º°o.]?|n[úu]mero|protocolo|c[óo]digo|contrato|processo|#)$/i;
+
+// Trecho encontrado, estendido até as palavras inteiras ("0.00" -> "350.00"), para o aviso mostrar o que tirar.
+function wholeWords(text: string, start: number, end: number) {
+  while (start > 0 && !/\s/.test(text[start - 1])) start--;
+  while (end < text.length && !/\s/.test(text[end])) end++;
+  return text.slice(start, end).trim().replace(/[.,;:!?)]+$/, "");
 }
 
+export function findLink(text: string): string | undefined {
+  const m = LINK_RE.exec(text);
+  return m ? wholeWords(text, m.index, m.index + m[0].length) : undefined;
+}
+
+export function findMoney(text: string): string | undefined {
+  const m = MONEY_RE.exec(text);
+  if (m) return wholeWords(text, m.index, m.index + m[0].length);
+  for (const k of text.matchAll(MONEY_CONTEXT_RE)) {
+    const words = k[2].trim().split(/\s+/).filter(Boolean);
+    const verb = MONEY_VERB_RE.test(k[1]);
+    for (let i = 0; i < words.length; i++) {
+      if (!/^[1-9]\d{2,}/.test(words[i].replace(/^[^\d]+/, ""))) continue;
+      const prev = i > 0 ? words[i - 1] : "";
+      if (ID_MARKER_RE.test(prev)) break;
+      if (verb || MONEY_PREP_RE.test(prev)) return `${k[1]} ${words.slice(0, i + 1).join(" ")}`.replace(/[.,;:!?)]+$/, "");
+    }
+  }
+  return undefined;
+}
+
+// Bloco de variações mais interno ({a|b}, sem chaves dentro).
+const SPIN_BLOCK = /\{[^{}]*\|[^{}]*\}/;
+
+// O termo aparece em todas as variações? Resolve cada bloco escolhendo uma opção SEM o termo, se houver.
+function alwaysHas(text: string, re: RegExp) {
+  let out = text;
+  let guard = 200;
+  let m: RegExpExecArray | null;
+  while ((m = SPIN_BLOCK.exec(out)) && guard-- > 0) {
+    const options = m[0].slice(1, -1).split("|");
+    const pick = options.find((o) => !re.test(o)) ?? options[0];
+    out = out.slice(0, m.index) + pick + out.slice(m.index + m[0].length);
+  }
+  return re.test(out);
+}
+
+// Correções de um clique.
+export function fixFirstOption(text: string) {
+  let out = text;
+  let guard = 200;
+  let m: RegExpExecArray | null;
+  while ((m = SPIN_BLOCK.exec(out)) && guard-- > 0) out = out.slice(0, m.index) + m[0].slice(1, -1).split("|")[0] + out.slice(m.index + m[0].length);
+  return out;
+}
+
+export function stripUnknownBraces(text: string) {
+  return text.replace(BRACE_BLOCK, (block, inner: string) => (isNameVariable(inner) ? block : inner));
+}
+
+export function withOptOut(closing: string) {
+  const t = closing.trim();
+  return t ? `${t}${/[.!?]$/.test(t) ? "" : "."} ${OPT_OUT_TEXT}` : OPT_OUT_TEXT;
+}
+
+// Texto como o motor monta: partes separadas por linha em branco (cada uma vira uma mensagem).
+export function buildMessageText(greeting: string, body: string, closing: string) {
+  return [greeting, body, closing].filter((t) => t.trim()).join("\n\n");
+}
+
+// Mesma divisão do envio (AdbManager::split_human_parts): linha em branco separa mensagens; quebra simples vira espaço.
+export function splitHumanParts(message: string): string[] {
+  const parts = message
+    .replace(/\r\n/g, "\n")
+    .split("\n\n")
+    .map((p) => p.split(/\s+/).filter(Boolean).join(" "))
+    .filter((p) => p !== "");
+  return parts.length ? parts : message.trim() ? [message.trim()] : [];
+}
+
+export function messagePartCount(v: MessageValue) {
+  return splitHumanParts(resolveFirst(buildMessageText(v.greeting, v.body, v.closing))).length;
+}
+
+export interface FieldIssue {
+  text: string;
+  fix?: "firstOption" | "stripBraces" | "optOut";
+}
+export type MessageIssues = Partial<Record<MessageField, FieldIssue>>;
+
+// partLimit: teto da rede (o menor entre hora e dia). Mensagem com mais partes nunca caberia numa janela.
+export function messageIssues(v: MessageValue, partLimit?: number): MessageIssues {
+  const out: MessageIssues = {};
+  const set = (f: MessageField, issue: FieldIssue) => {
+    if (!out[f]) out[f] = issue;
+  };
+  if (!v.greeting.trim()) set("greeting", { text: "Preencha a saudação: a mensagem sai sempre em 3 partes." });
+  if (!v.body.trim()) set("body", { text: "Escreva a mensagem que será enviada." });
+  if (!v.closing.trim()) set("closing", { text: "Preencha o encerramento: a mensagem sai sempre em 3 partes." });
+  for (const f of MESSAGE_FIELDS) {
+    const text = v[f];
+    if (!text.trim()) continue;
+    const link = findLink(text);
+    if (link)
+      set(f, {
+        text: `Remova “${link}”: a primeira mensagem para contatos novos não pode ter links nem e-mails (inclusive wa.me). Se não for link, coloque um espaço depois do ponto.`,
+      });
+    const money = findMoney(text);
+    if (money) set(f, { text: `Não é permitido falar de valores: “${money}”. Tire a quantia e direcione o cliente ao canal de negociação.` });
+    if (!v.useSpintax && SPIN_BLOCK.test(text))
+      set(f, {
+        text: "Há variações entre chaves, mas as variações automáticas estão desligadas: o contato receberia as chaves. Ative as variações ou fique com uma opção.",
+        fix: "firstOption",
+      });
+    const unknown = unknownVariables(text);
+    if (unknown.length)
+      set(f, {
+        text: `${unknown.join(", ")} sairia como texto: o sistema só preenche o nome do contato ({nome} ou o nome da coluna, como {NOME DEVEDOR}).`,
+        fix: "stripBraces",
+      });
+    if (text.replace(/\r\n/g, "\n").split("\n\n").some((p) => p.length > WHATSAPP_LIMIT))
+      set(f, { text: `Uma parte passa de ${formatNumber(WHATSAPP_LIMIT)} caracteres, o limite de uma mensagem do WhatsApp.` });
+  }
+  if (v.closing.trim() && !out.closing && !alwaysHas(v.closing, OPT_OUT_WORD))
+    set("closing", { text: `Inclua a opção de descadastro em todas as variações, em texto neutro: “${OPT_OUT_TEXT}”`, fix: "optOut" });
+  if (partLimit !== undefined && v.greeting.trim() && v.body.trim() && v.closing.trim()) {
+    const n = messagePartCount(v);
+    if (n > partLimit)
+      set("body", {
+        text: `A mensagem sai em ${n} partes e o teto da rede é de ${partLimit}: ela nunca caberia numa janela de envio. Junte parágrafos (tire linhas em branco) ou aumente o teto em Configurações.`,
+      });
+  }
+  return out;
+}
+
+// Primeiro problema, com o nome do campo (para avisos fora do formulário).
+export function messageError(v: MessageValue, partLimit?: number): string | undefined {
+  const issues = messageIssues(v, partLimit);
+  const f = MESSAGE_FIELDS.find((k) => issues[k]);
+  return f ? `${FIELD_LABEL[f]}: ${issues[f]?.text}` : undefined;
+}
+
+// Junta saudação + corpo + encerramento numa linha (contagem e resumos).
 export function joinMessage(greeting: string, body: string, closing: string) {
   let full = "";
   if (greeting.trim()) full += greeting + " ";
@@ -776,6 +929,48 @@ export function joinMessage(greeting: string, body: string, closing: string) {
   if (closing.trim()) full += " " + closing;
   return full.trim();
 }
+
+// Teto da rede (Configurações → Rede e ritmo), lido uma vez por minuto no máximo.
+export interface NetworkLimits {
+  hourly: number;
+  daily: number;
+}
+let networkLimitsCache: NetworkLimits | null = null;
+let networkLimitsAt = 0;
+let networkLimitsLoading: Promise<NetworkLimits | null> | null = null;
+
+function loadNetworkLimits(): Promise<NetworkLimits | null> {
+  if (networkLimitsCache && Date.now() - networkLimitsAt < 60_000) return Promise.resolve(networkLimitsCache);
+  if (!networkLimitsLoading) {
+    networkLimitsLoading = api<NetworkLimits>("get_network_limits")
+      .then((v) => {
+        networkLimitsCache = v && v.hourly > 0 && v.daily > 0 ? v : null;
+        networkLimitsAt = Date.now();
+        return networkLimitsCache;
+      })
+      .catch(() => null)
+      .finally(() => {
+        networkLimitsLoading = null;
+      });
+  }
+  return networkLimitsLoading;
+}
+
+export function useNetworkLimits() {
+  const [limits, setLimits] = useState<NetworkLimits | null>(networkLimitsCache);
+  useEffect(() => {
+    let alive = true;
+    loadNetworkLimits().then((v) => {
+      if (alive) setLimits(v);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return limits;
+}
+
+export const partLimitOf = (l: NetworkLimits | null) => (l ? Math.min(l.hourly, l.daily) : undefined);
 
 // ---------- Aparelhos ----------
 export const deviceKey = (d: Device) => d.esferaDeviceId || d.serial;
@@ -1120,7 +1315,7 @@ function Stepper<T extends string>({
 // WhatsAppPreview
 // ============================================================
 
-// Pré-visualização estilo conversa de WhatsApp, com geração de variações (spintax).
+// Pré-visualização estilo conversa de WhatsApp: uma bolha por mensagem, como o contato recebe.
 
 const SAMPLE_NAME = "Maria";
 
@@ -1169,7 +1364,8 @@ function WhatsAppPreview({
   useSpintax: boolean;
   aiNote?: boolean;
 }) {
-  const full = joinMessage(greeting, body, closing);
+  // Montada como o motor monta: partes separadas por linha em branco, cada uma vira uma mensagem.
+  const full = buildMessageText(greeting, body, closing);
   const withName = fillSampleName(full, SAMPLE_NAME);
   const combos = useMemo(() => (useSpintax ? spintaxCombinations(withName) : 1), [useSpintax, withName]);
   const live = useSpintax ? resolveFirst(withName) : withName;
@@ -1207,6 +1403,8 @@ function WhatsAppPreview({
   };
 
   const showing = variants.length > 0 && !stale ? variants[index] : live;
+  const parts = showing.trim() ? splitHumanParts(showing) : [];
+  const chars = parts.reduce((n, p) => n + p.length, 0);
 
   return (
     <div className="flex h-full flex-col overflow-hidden rounded-xl border border-border bg-secondary">
@@ -1218,20 +1416,33 @@ function WhatsAppPreview({
         </div>
       </div>
 
-      <div className="flex-1 space-y-2 p-3.5">
-        <ChatBubble text={showing || "Sua mensagem aparecerá aqui."} muted={!showing} />
-        {aiNote && <p className="text-center text-[0.75rem] text-tertiary">Com IA ativa, cada contato recebe uma versão reescrita deste texto.</p>}
+      <div className="flex-1 space-y-1.5 p-3.5">
+        {parts.length ? parts.map((p, i) => <ChatBubble key={i} text={p} />) : <ChatBubble text="Sua mensagem aparecerá aqui." muted />}
+        {aiNote && (
+          <p className="pt-1 text-center text-[0.75rem] text-tertiary">
+            Com IA ativa, cada parte é reescrita por contato. As versões ficam prontas aos poucos; até lá, ou se a IA falhar, sai este texto com as variações.
+          </p>
+        )}
       </div>
 
       <div className="space-y-2 border-t border-border bg-card px-3.5 py-3">
         <div className="flex items-center justify-between gap-2 text-[0.75rem] text-secondary">
-          <span>{full.length} caracteres</span>
+          <span className="tabular-nums" title="Cada parte é uma mensagem do WhatsApp e conta uma vez no teto da rede.">
+            {parts.length
+              ? `${parts.length} ${parts.length === 1 ? "mensagem" : "mensagens seguidas"} · ${formatNumber(chars)} caracteres`
+              : "0 caracteres"}
+          </span>
           {useSpintax && (
             <span className="tabular-nums">
               {combos > 1 ? `${combos >= 1_000_000_000 ? "+1 bi" : formatNumber(combos)} variações possíveis` : "Sem variações"}
             </span>
           )}
         </div>
+        {parts.length > 3 && (
+          <p className="text-[0.75rem] text-amber-700 dark:text-amber-300">
+            Linhas em branco no corpo viram mensagens separadas: cada contato gasta {parts.length} do teto da rede em vez de 3.
+          </p>
+        )}
         {useSpintax && (
           <div className="flex items-center justify-between gap-2">
             <Button size="sm" variant="secondary" icon={<Shuffle size={13} />} onClick={generate} loading={generating} disabled={!full}>
@@ -1306,54 +1517,83 @@ export function ModelSuggestions({ provider, model, onPick }: { provider: string
   );
 }
 
+// Partes como o motor manda para a IA: nome vira {nome}, variações resolvidas, linha em branco separa.
+function aiTestParts(m: MessageValue) {
+  const full = buildMessageText(m.greeting, m.body, m.closing).replace(BRACE_BLOCK, (block, inner: string) => (isNameVariable(inner) ? "{nome}" : block));
+  const mark = "\u0001NOME\u0001";
+  const resolved = m.useSpintax ? resolveSpintaxLocal(full.split("{nome}").join(mark)).split(mark).join("{nome}") : full;
+  return resolved
+    .split("\n\n")
+    .map((p) => p.trim())
+    .filter(Boolean);
+}
+
+type TestPart = { text?: string; error?: string; lostName?: boolean };
+
 function AiFields({
   value,
   onChange,
   companyId,
-  messageForTest,
+  message,
 }: {
   value: AiValue;
   onChange: (patch: Partial<AiValue>) => void;
   companyId: number | null;
-  messageForTest: string;
+  message: MessageValue;
 }) {
+  const uid = useId();
   const [testing, setTesting] = useState(false);
-  const [result, setResult] = useState<{ success: boolean; text: string } | null>(null);
+  // "Parar" só esconde a resposta: o pedido continua na IA até terminar. Até lá o próximo teste espera.
+  const [stopping, setStopping] = useState(false);
+  const [stopped, setStopped] = useState(false);
+  const [result, setResult] = useState<TestPart[] | null>(null);
+  const [testError, setTestError] = useState("");
   // Cada teste ganha um número; "Parar" troca o número e a resposta atrasada é descartada.
   const testRun = useRef(0);
 
   const stopTest = () => {
     testRun.current += 1;
     setTesting(false);
-    setResult({ success: false, text: "Reescrita interrompida." });
+    setStopping(true);
+    setStopped(true);
   };
 
   const handleTest = async () => {
-    const msg = messageForTest.trim();
-    if (!msg) {
-      setResult({ success: false, text: "Escreva a mensagem antes de testar a reescrita com IA." });
+    setStopped(false);
+    setTestError("");
+    if (!message.body.trim()) {
+      setResult(null);
+      setTestError("Escreva a mensagem antes de testar a reescrita com IA.");
       return;
     }
+    const parts = aiTestParts(message);
     const run = ++testRun.current;
     setTesting(true);
     setResult(null);
-    try {
-      const rewritten = await api<string>("rewrite_message_ai", {
-        message: msg,
-        contactName: "Maria",
-        companyId,
-        model: value.aiModel,
-        prompt: value.aiPrompt,
-        provider: value.aiProvider,
-      });
-      if (run !== testRun.current) return;
-      setResult({ success: true, text: rewritten });
-    } catch (error) {
-      if (run !== testRun.current) return;
-      setResult({ success: false, text: String(error) });
-    } finally {
-      if (run === testRun.current) setTesting(false);
+    const settled = await Promise.allSettled(
+      parts.map((part) =>
+        api<string>("rewrite_message_ai", {
+          message: part,
+          contactName: "{nome}",
+          companyId,
+          model: value.aiModel,
+          prompt: value.aiPrompt,
+          provider: value.aiProvider,
+        })
+      )
+    );
+    if (run !== testRun.current) {
+      setStopping(false);
+      return;
     }
+    setResult(
+      settled.map((s, i) =>
+        s.status === "fulfilled"
+          ? { text: s.value.split(/\s+/).filter(Boolean).join(" "), lostName: parts[i].includes("{nome}") && !s.value.includes("{nome}") }
+          : { error: String(s.reason) }
+      )
+    );
+    setTesting(false);
   };
 
   return (
@@ -1362,7 +1602,8 @@ function AiFields({
         <div className="min-w-0">
           <p className="text-[0.8125rem] font-medium text-primary">Reescrever mensagens com IA</p>
           <p className="text-[0.75rem] text-tertiary">
-            A IA reescreve o texto para cada contato de forma humanizada, reduzindo o risco de bloqueio por spam. Se a IA falhar, o texto original é enviado.
+            A IA reescreve cada parte da mensagem com outras palavras para cada contato, o que reduz o risco de bloqueio por spam. As versões ficam
+            prontas aos poucos; até lá, ou se a IA falhar, sai o texto com as variações.
           </p>
         </div>
         <Toggle checked={value.useAI} onChange={(v) => onChange({ useAI: v })} />
@@ -1371,9 +1612,13 @@ function AiFields({
       {value.useAI && (
         <div className="space-y-4 animate-fade-in">
           <div className="grid gap-4 md:grid-cols-2">
-            <Field label="Provedor" htmlFor="cmp-ai-provider" hint="Use o padrão da empresa ou escolha um específico para esta campanha.">
+            <Field
+              label="Provedor"
+              htmlFor={`${uid}-provider`}
+              hint="Use o padrão da empresa ou escolha um para esta campanha. No disparo, se ele falhar, o sistema tenta os outros provedores com chave salva."
+            >
               <select
-                id="cmp-ai-provider"
+                id={`${uid}-provider`}
                 value={value.aiProvider}
                 onChange={(e) => {
                   const val = e.target.value;
@@ -1384,9 +1629,9 @@ function AiFields({
                 <ProviderOptions includeDefault />
               </select>
             </Field>
-            <Field label="Modelo" htmlFor="cmp-ai-model" hint={value.aiProvider ? undefined : "Vazio usa o modelo padrão da empresa."}>
+            <Field label="Modelo" htmlFor={`${uid}-model`} hint={value.aiProvider ? undefined : "Vazio usa o modelo padrão da empresa."}>
               <input
-                id="cmp-ai-model"
+                id={`${uid}-model`}
                 type="text"
                 value={value.aiModel}
                 onChange={(e) => onChange({ aiModel: e.target.value })}
@@ -1397,13 +1642,17 @@ function AiFields({
           </div>
           <ModelSuggestions provider={value.aiProvider} model={value.aiModel} onPick={(id) => onChange({ aiModel: id })} />
 
-          <Field label="Instrução para a IA" htmlFor="cmp-ai-prompt" hint="Opcional. Diga o tom e o que não pode mudar.">
+          <Field
+            label="Instrução para a IA"
+            htmlFor={`${uid}-prompt`}
+            hint="Opcional. Substitui a instrução padrão da empresa nesta campanha; as regras fixas (sem valores, CDC e LGPD) continuam valendo."
+          >
             <textarea
-              id="cmp-ai-prompt"
+              id={`${uid}-prompt`}
               rows={3}
               value={value.aiPrompt}
               onChange={(e) => onChange({ aiPrompt: e.target.value })}
-              placeholder="Reescreva com tom coloquial e direto, mantendo links e chave PIX intactos."
+              placeholder="Ex.: tom cordial e direto, frases curtas, sem gírias."
               className="resize-y"
             />
           </Field>
@@ -1412,11 +1661,13 @@ function AiFields({
             <div className="flex items-center justify-between gap-3">
               <div>
                 <p className="text-[0.8125rem] font-medium text-primary">Testar reescrita</p>
-                <p className="text-[0.75rem] text-tertiary">Gera uma versão da sua mensagem para o contato de exemplo "Maria".</p>
+                <p className="text-[0.75rem] text-tertiary">
+                  Reescreve cada parte separadamente, como no disparo, para o contato de exemplo “{SAMPLE_NAME}”. O teste usa só o provedor escolhido.
+                </p>
               </div>
-              <div className="flex items-center gap-2">
-                <Button size="sm" variant="secondary" icon={<Sparkles size={13} />} onClick={handleTest} loading={testing}>
-                  {testing ? "Gerando…" : "Testar"}
+              <div className="flex shrink-0 items-center gap-2">
+                <Button size="sm" variant="secondary" icon={<Sparkles size={13} />} onClick={handleTest} loading={testing} disabled={stopping}>
+                  {testing ? "Gerando…" : stopping ? "Encerrando…" : "Testar"}
                 </Button>
                 {testing && (
                   <Button size="sm" variant="ghost" onClick={stopTest}>
@@ -1425,14 +1676,36 @@ function AiFields({
                 )}
               </div>
             </div>
-            {result &&
-              (result.success ? (
-                <ChatBubble text={result.text} />
-              ) : (
-                <InlineAlert tone="danger" icon={<AlertCircle size={15} />} title="Não foi possível gerar">
-                  <span className="break-words font-mono text-[0.75rem]">{result.text}</span>
-                </InlineAlert>
-              ))}
+            {stopped && !testing && (
+              <p className="text-[0.75rem] text-tertiary">
+                Teste interrompido.{stopping ? " O pedido ainda está terminando na IA; o próximo teste fica liberado em seguida." : ""}
+              </p>
+            )}
+            {testError && (
+              <InlineAlert tone="warning" icon={<AlertTriangle size={15} />}>
+                {testError}
+              </InlineAlert>
+            )}
+            {result && (
+              <div className="space-y-1.5">
+                {result.map((r, i) =>
+                  r.error ? (
+                    <InlineAlert key={i} tone="danger" icon={<AlertCircle size={15} />} title={`Parte ${i + 1}: não foi possível gerar`}>
+                      <span className="break-words font-mono text-[0.75rem]">{r.error}</span>
+                    </InlineAlert>
+                  ) : (
+                    <div key={i}>
+                      <ChatBubble text={(r.text || "").split("{nome}").join(SAMPLE_NAME)} />
+                      {r.lostName && (
+                        <p className="mt-1 text-right text-[0.6875rem] text-amber-700 dark:text-amber-300">
+                          A IA tirou o nome do contato desta parte; no disparo, esta versão seria descartada.
+                        </p>
+                      )}
+                    </div>
+                  )
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -1444,108 +1717,162 @@ function AiFields({
 // MessageFields
 // ============================================================
 
-// Campos de mensagem (saudação / corpo / encerramento) com spintax e ajuda.
-
-export interface MessageValue {
-  greeting: string;
-  body: string;
-  closing: string;
-  useSpintax: boolean;
-}
-
-const WHATSAPP_LIMIT = 4096;
+// Campos de mensagem (saudação / corpo / encerramento) com spintax, ajuda e correções de um clique.
 
 function Counter({ value, limit }: { value: number; limit?: number }) {
   const over = limit && value > limit;
-  return <span className={`tabular-nums ${over ? "text-red-400" : ""}`}>{limit ? `${value} / ${limit}` : value}</span>;
+  return <span className={`tabular-nums ${over ? "text-red-500 dark:text-red-400" : ""}`}>{limit ? `${value} / ${limit}` : value}</span>;
 }
+
+const FIX_LABEL: Record<NonNullable<FieldIssue["fix"]>, string> = {
+  firstOption: "Ficar com a 1ª opção de cada bloco",
+  stripBraces: "Tirar as chaves",
+  optOut: "Inserir texto padrão",
+};
 
 function MessageFields({
   value,
   onChange,
-  bodyError,
+  showErrors = true,
+  partLimit,
 }: {
   value: MessageValue;
   onChange: (patch: Partial<MessageValue>) => void;
-  bodyError?: string;
+  /** false: esconde só os avisos de campo vazio (aparecem ao tentar avançar). */
+  showErrors?: boolean;
+  partLimit?: number;
 }) {
+  const uid = useId();
   const [helpOpen, setHelpOpen] = useState(false);
+  const greetingRef = useRef<HTMLInputElement>(null);
   const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const closingRef = useRef<HTMLInputElement>(null);
+  const lastField = useRef<MessageField>("body");
+  const issues = messageIssues(value, partLimit);
+  const shown = (f: MessageField) => (showErrors || value[f].trim() ? issues[f] : undefined);
 
+  // Insere {nome} no campo em que o operador estava (a saudação é o lugar mais comum).
   const insertName = () => {
-    const el = bodyRef.current;
+    const f = lastField.current;
+    const el = f === "greeting" ? greetingRef.current : f === "closing" ? closingRef.current : bodyRef.current;
     const token = "{nome}";
+    const text = value[f];
     if (!el) {
-      onChange({ body: value.body + token });
+      onChange({ [f]: text + token } as Partial<MessageValue>);
       return;
     }
-    const start = el.selectionStart ?? value.body.length;
-    const end = el.selectionEnd ?? value.body.length;
-    const next = value.body.slice(0, start) + token + value.body.slice(end);
-    onChange({ body: next });
+    const start = el.selectionStart ?? text.length;
+    const end = el.selectionEnd ?? text.length;
+    onChange({ [f]: text.slice(0, start) + token + text.slice(end) } as Partial<MessageValue>);
     requestAnimationFrame(() => {
       el.focus();
       el.setSelectionRange(start + token.length, start + token.length);
     });
   };
 
-  const total = value.greeting.length + value.body.length + value.closing.length;
-  const unknownVars = unknownVariables(`${value.greeting}\n${value.body}\n${value.closing}`);
+  const applyFix = (f: MessageField, fix: NonNullable<FieldIssue["fix"]>) => {
+    const text = value[f];
+    const next = fix === "firstOption" ? fixFirstOption(text) : fix === "stripBraces" ? stripUnknownBraces(text) : withOptOut(text);
+    onChange({ [f]: next } as Partial<MessageValue>);
+  };
+
+  const errorNode = (f: MessageField) => {
+    const issue = shown(f);
+    if (!issue) return undefined;
+    const fix = issue.fix;
+    return (
+      <>
+        {issue.text}
+        {fix && (
+          <>
+            {" "}
+            <button type="button" onClick={() => applyFix(f, fix)} className="font-medium text-[var(--color-accent-light)] underline-offset-2 hover:underline cursor-pointer">
+              {FIX_LABEL[fix]}
+            </button>
+          </>
+        )}
+      </>
+    );
+  };
+
+  const bodyParts = value.body.replace(/\r\n/g, "\n").split("\n\n").filter((p) => p.trim()).length;
 
   return (
     <div className="space-y-4">
-      <Field label="Saudação" htmlFor="cmp-greeting" aside={<Counter value={value.greeting.length} />} hint="Obrigatória. 1ª das 3 mensagens, antes do corpo.">
+      <Field
+        label="Saudação"
+        htmlFor={`${uid}-greeting`}
+        required
+        error={errorNode("greeting")}
+        aside={<Counter value={value.greeting.length} />}
+        hint="1ª mensagem, antes do corpo."
+      >
         <input
-          id="cmp-greeting"
+          id={`${uid}-greeting`}
+          ref={greetingRef}
           type="text"
           value={value.greeting}
+          onFocus={() => (lastField.current = "greeting")}
           onChange={(e) => onChange({ greeting: e.target.value })}
           placeholder="{Olá|Oi|Bom dia} {nome}, tudo bem?"
+          aria-invalid={Boolean(shown("greeting"))}
         />
       </Field>
 
       <Field
         label="Mensagem"
-        htmlFor="cmp-body"
+        htmlFor={`${uid}-body`}
         required
-        error={bodyError}
-        aside={<Counter value={total} limit={WHATSAPP_LIMIT} />}
-        hint="Não inclua links na primeira mensagem para contatos novos. Chaves PIX saem exatamente como escritas. Não cite valores (R$, reais, %, quantias): a mensagem é bloqueada."
+        error={errorNode("body")}
+        aside={
+          <span className="tabular-nums">
+            {bodyParts > 1 ? `${bodyParts} mensagens · ` : ""}
+            <Counter value={value.body.length} />
+          </span>
+        }
+        hint="Sem links nem e-mails na primeira mensagem para contatos novos. Não cite valores (R$, reais, %, quantias): a mensagem é bloqueada. Linha em branco separa mensagens."
       >
         <textarea
-          id="cmp-body"
+          id={`${uid}-body`}
           ref={bodyRef}
           rows={6}
           value={value.body}
+          onFocus={() => (lastField.current = "body")}
           onChange={(e) => onChange({ body: e.target.value })}
           placeholder="Identificamos uma {pendência|condição especial} no seu cadastro. Podemos conversar sobre a melhor forma de regularizar?"
           className="resize-y"
-          aria-invalid={Boolean(bodyError)}
+          aria-invalid={Boolean(shown("body"))}
         />
       </Field>
       <div className="-mt-2">
         <button
           type="button"
+          onMouseDown={(e) => e.preventDefault()}
           onClick={insertName}
+          title="Insere {nome} no campo em que você está escrevendo"
           className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-[0.75rem] text-secondary transition-colors hover:border-[var(--color-border-strong)] hover:text-[var(--color-text-primary)] cursor-pointer"
         >
           <UserRound size={12} /> Inserir nome do contato
         </button>
       </div>
-      {unknownVars.length > 0 && (
-        <InlineAlert tone="warning" icon={<AlertTriangle size={15} />} title="Variável não reconhecida">
-          {unknownVars.join(", ")} vai sair como texto no disparo. O sistema preenche só o nome do contato: use {"{nome}"} ou o nome da
-          coluna da planilha, como {"{NOME DEVEDOR}"} ou {"{RAZÃO SOCIAL}"}.
-        </InlineAlert>
-      )}
 
-      <Field label="Encerramento" htmlFor="cmp-closing" aside={<Counter value={value.closing.length} />} hint="Assinatura e a opção de descadastro, em texto neutro: “Para deixar de receber mensagens por este canal, responda SAIR.” Nunca associe o SAIR a reconhecimento de dívida ou renúncia a contestação.">
+      <Field
+        label="Encerramento"
+        htmlFor={`${uid}-closing`}
+        required
+        error={errorNode("closing")}
+        aside={<Counter value={value.closing.length} />}
+        hint={`Assinatura e a opção de descadastro, em texto neutro: “${OPT_OUT_TEXT}” Nunca associe o SAIR a reconhecimento de dívida ou renúncia a contestação.`}
+      >
         <input
-          id="cmp-closing"
+          id={`${uid}-closing`}
+          ref={closingRef}
           type="text"
           value={value.closing}
+          onFocus={() => (lastField.current = "closing")}
           onChange={(e) => onChange({ closing: e.target.value })}
-          placeholder="Atenciosamente, {Equipe REALESS|Setor Financeiro}. Para deixar de receber mensagens por este canal, responda SAIR."
+          placeholder={`Atenciosamente, {Equipe REALESS|Setor Financeiro}. ${OPT_OUT_TEXT}`}
+          aria-invalid={Boolean(shown("closing"))}
         />
       </Field>
 
@@ -1553,7 +1880,7 @@ function MessageFields({
         <div className="flex items-center justify-between gap-3 px-3.5 py-3">
           <div className="min-w-0">
             <p className="text-[0.8125rem] font-medium text-primary">Variações automáticas (spintax)</p>
-            <p className="text-[0.75rem] text-tertiary">Cada contato recebe uma combinação diferente do texto.</p>
+            <p className="text-[0.75rem] text-tertiary">Cada contato recebe uma combinação diferente do texto. Desligadas, as chaves sairiam no texto.</p>
           </div>
           <Toggle size="sm" checked={value.useSpintax} onChange={(v) => onChange({ useSpintax: v })} />
         </div>
@@ -1575,6 +1902,7 @@ function MessageFields({
             <p>
               Use <code className="rounded bg-secondary px-1 py-0.5 font-mono text-primary">{"{nome}"}</code> para o nome do contato. Também vale o
               nome da coluna da planilha, como <code className="rounded bg-secondary px-1 py-0.5 font-mono text-primary">{"{NOME DEVEDOR}"}</code>.
+              Outras chaves sem barra não são preenchidas.
             </p>
             <p>Dá para combinar blocos: quanto mais opções, mais natural fica o disparo e menor o risco de bloqueio.</p>
           </div>
@@ -3211,6 +3539,7 @@ function CampaignWizard({
   initialStep?: StepId;
 }) {
   const { selectedCompanyId } = useAuth();
+  const partLimit = partLimitOf(useNetworkLimits());
   const isEdit = Boolean(campaign?.id);
   const [form, setForm] = useState<FormState>(() => initialForm(campaign));
   const [step, setStep] = useState<StepId>(initialStep);
@@ -3256,7 +3585,7 @@ function CampaignWizard({
   const patch = (p: Partial<FormState>) => setForm((f) => ({ ...f, ...p }));
 
   const errors: Partial<Record<StepId, string>> = {
-    message: messageError(form.greeting, form.body, form.closing),
+    message: messageError(form, partLimit),
     sending: delayError(form.delayMin, form.delayMax),
   };
 
@@ -3407,11 +3736,12 @@ function CampaignWizard({
 
         {step === "message" && (
           <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,22rem)]">
-            <FormSection title="Mensagem" description="Saudação, corpo e encerramento são enviados juntos, nesta ordem.">
+            <FormSection title="Mensagem" description="Saudação, corpo e encerramento saem como mensagens seguidas, nesta ordem.">
               <MessageFields
                 value={form}
                 onChange={(p) => patch(p)}
-                bodyError={showErrors.message ? errors.message : undefined}
+                showErrors={Boolean(showErrors.message)}
+                partLimit={partLimit}
               />
             </FormSection>
             <div className="lg:sticky lg:top-0 lg:self-start">
@@ -3426,7 +3756,7 @@ function CampaignWizard({
             description="Opcional. Sem IA, a mensagem é enviada como escrita (com as variações, se ativas)."
             className="max-w-3xl"
           >
-            <AiFields value={form} onChange={(p) => patch(p)} companyId={selectedCompanyId} messageForTest={fullMessage} />
+            <AiFields value={form} onChange={(p) => patch(p)} companyId={selectedCompanyId} message={form} />
           </FormSection>
         )}
 
@@ -3577,6 +3907,7 @@ function CampaignDetail({
   onUpdateCampaign: (updated: Campaign) => void;
 }) {
   const [tab, setTab] = useState<DetailTab>(initialTab);
+  const partLimit = partLimitOf(useNetworkLimits());
   const [draft, setDraft] = useState<Draft>(() => draftFrom(campaign));
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [confirmations, setConfirmations] = useState<{pending: number; sent: number; uncertain: number} | null>(null);
@@ -3704,7 +4035,7 @@ function CampaignDetail({
   };
 
   const saveConfiguration = async (): Promise<boolean> => {
-    const msgError = messageError(draft.greeting, draft.body, draft.closing);
+    const msgError = messageError(draft, partLimit);
     if (msgError) {
       setError(msgError);
       setTab("settings");
@@ -3750,12 +4081,6 @@ function CampaignDetail({
     if (!pending) {
       setError("Importe destinos pendentes antes de iniciar.");
       setTab("contacts");
-      return;
-    }
-    const money = moneyError(joinMessage(draft.greeting, draft.body, draft.closing));
-    if (money) {
-      setError(money);
-      setTab("settings");
       return;
     }
     setBusy("start");
@@ -4060,11 +4385,11 @@ function CampaignDetail({
         <div className="space-y-6">
           <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,22rem)]">
             <div className="space-y-10">
-              <FormSection title="Mensagem" description="Saudação, corpo e encerramento são enviados juntos, nesta ordem.">
+              <FormSection title="Mensagem" description="Saudação, corpo e encerramento saem como mensagens seguidas, nesta ordem.">
                 <MessageFields
                   value={draft}
                   onChange={(p) => patch(p)}
-                  bodyError={messageError(draft.greeting, draft.body, draft.closing)}
+                  partLimit={partLimit}
                 />
               </FormSection>
               <FormSection title="Personalização com IA" description="Opcional. Usa a configuração de IA da empresa quando o provedor fica no padrão.">
@@ -4072,7 +4397,7 @@ function CampaignDetail({
                   value={draft}
                   onChange={(p) => patch(p)}
                   companyId={campaign.companyId}
-                  messageForTest={joinMessage(draft.greeting, draft.body, draft.closing)}
+                  message={draft}
                 />
               </FormSection>
               <FormSection title="Ritmo de envio" description="Intervalos aleatórios entre mensagens deixam o disparo mais natural.">
@@ -4100,7 +4425,7 @@ function CampaignDetail({
                   Descartar
                 </Button>
               )}
-              <Button onClick={handleSaveSettings} loading={busy === "save"} disabled={!settingsDirty || !!delayError(draft.delayMin, draft.delayMax) || !!moneyError(joinMessage(draft.greeting, draft.body, draft.closing))}>
+              <Button onClick={handleSaveSettings} loading={busy === "save"} disabled={!settingsDirty || !!delayError(draft.delayMin, draft.delayMax) || !!messageError(draft, partLimit)}>
                 Salvar configurações
               </Button>
             </div>
