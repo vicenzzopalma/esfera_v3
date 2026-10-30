@@ -16,7 +16,7 @@ const queryClient = new QueryClient({
 });
 
 const rootEl = document.getElementById("root");
-if (!rootEl) throw new Error("Elemento #root nao encontrado no DOM");
+if (!rootEl) throw new Error("Elemento #root não encontrado no DOM");
 ReactDOM.createRoot(rootEl).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
