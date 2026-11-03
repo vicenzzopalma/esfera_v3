@@ -173,6 +173,24 @@ impl HubClient {
         timeout(Duration::from_secs(8), operation).await.map_err(|_| "O hub demorou para responder.".to_string())?
     }
 
+    /// Confere se a conexão está viva: ping e pong em até `wait`. `None` quando outro comando está
+    /// usando a conexão agora (não dá para testar sem atrapalhar; vale o último estado conhecido).
+    pub async fn ping(&self, wait: Duration) -> Option<Result<(), String>> {
+        let _guard = self.command_lock.try_lock().ok()?;
+        let probe = async {
+            self.send(&HubMessage::Ping).await?;
+            loop {
+                match self.read_one().await? {
+                    HubMessage::Pong => return Ok(()),
+                    HubMessage::Ping => self.send(&HubMessage::Pong).await?,
+                    // Resposta atrasada de um comando que já desistiu de esperar.
+                    _ => continue,
+                }
+            }
+        };
+        Some(timeout(wait, probe).await.unwrap_or_else(|_| Err("O hub não respondeu ao teste de conexão.".to_string())))
+    }
+
     pub async fn listen<F>(&self, on_command: F) -> Result<(), String>
     where
         F: Fn(String, serde_json::Value, String) -> Result<serde_json::Value, String>,
@@ -261,5 +279,33 @@ mod vps_tls_tests {
         assert!(usa_certificado_vps("https://187.77.243.224:8443/teste"));
         assert!(!usa_certificado_vps("https://187.77.243.224.outro.example:8443/teste"));
         assert!(!usa_certificado_vps("http://187.77.243.224:11435"));
+    }
+}
+
+#[cfg(test)]
+mod ping_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ping_diferencia_conexao_viva_ocupada_e_caida() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Hub de teste: responde um ping com pong e fecha a conexão.
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (r, mut w) = socket.into_split();
+            let mut line = String::new();
+            BufReader::new(r).read_line(&mut line).await.unwrap();
+            assert!(matches!(deserialize_msg(line.trim().as_bytes()).unwrap(), HubMessage::Ping));
+            w.write_all(&serialize_msg(&HubMessage::Pong).unwrap()).await.unwrap();
+        });
+        let (reader, writer) = TcpStream::connect(addr).await.unwrap().into_split();
+        let client = HubClient { writer: Mutex::new(tokio::io::BufWriter::new(writer)), reader: Mutex::new(BufReader::new(reader)), session_id: None, command_lock: Mutex::new(()) };
+        assert!(matches!(client.ping(Duration::from_secs(3)).await, Some(Ok(()))));
+        let busy = client.command_lock.lock().await;
+        assert!(client.ping(Duration::from_secs(1)).await.is_none(), "conexão em uso não é testada");
+        drop(busy);
+        server.await.unwrap();
+        assert!(matches!(client.ping(Duration::from_secs(3)).await, Some(Err(_))), "hub que fechou a conexão");
     }
 }
