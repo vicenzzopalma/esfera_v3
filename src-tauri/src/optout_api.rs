@@ -231,6 +231,7 @@ mod tests {
             failed_count: 0,
             company_id,
             updated_at: String::new(),
+            pause_reason: None,
         }
     }
 

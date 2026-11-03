@@ -182,6 +182,10 @@ pub struct Campaign {
     pub failed_count: i32,
     pub company_id: i32,
     pub updated_at: String,
+    /// Motivo da pausa automática (TRAVA, conta restrita, link, partes demais...), com o aparelho
+    /// quando houver. Some ao iniciar de novo; ausente quando a pausa não foi do sistema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1273,6 +1277,8 @@ impl Database {
         let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN SelectedDevices TEXT DEFAULT '';", []);
         let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN AiProvider TEXT DEFAULT '';", []);
         let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
+        // Motivo da última pausa automática; vazio quando a campanha não foi pausada pelo sistema.
+        let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN PauseReason TEXT NOT NULL DEFAULT '';", []);
 
         // ESF_AutomationRule
         let _ = self.conn().execute("ALTER TABLE ESF_AutomationRule ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
@@ -2000,7 +2006,7 @@ impl Database {
     pub fn get_campaigns(&self, company_id: i32) -> Vec<Campaign> {
         let conn = self.conn();
         let mut stmt = match conn.prepare_cached(
-            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt, SelectedDevices, AiProvider
+            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt, SelectedDevices, AiProvider, PauseReason
              FROM ESF_Campaign WHERE CompanyId = ?1 AND ExcluidoEm IS NULL"
         ) {
             Ok(s) => s,
@@ -2028,6 +2034,7 @@ impl Database {
                 failed_count: row.get(14)?,
                 company_id: row.get(15)?,
                 updated_at: row.get(16)?,
+                pause_reason: row.get::<_, Option<String>>(19)?.filter(|r| !r.trim().is_empty()),
             })
         });
 
@@ -2086,7 +2093,7 @@ impl Database {
     pub fn get_running_campaigns(&self) -> Result<Vec<Campaign>> {
         let conn = self.pooled_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt, SelectedDevices, AiProvider FROM ESF_Campaign WHERE Status = 'running' AND ExcluidoEm IS NULL"
+            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt, SelectedDevices, AiProvider, PauseReason FROM ESF_Campaign WHERE Status = 'running' AND ExcluidoEm IS NULL"
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -2110,6 +2117,7 @@ impl Database {
                 failed_count: row.get(14)?,
                 company_id: row.get(15)?,
                 updated_at: row.get(16)?,
+                pause_reason: row.get::<_, Option<String>>(19)?.filter(|r| !r.trim().is_empty()),
             })
         })?;
 
@@ -2169,12 +2177,24 @@ impl Database {
         }
     }
 
+    /// Muda o status pela ação do operador ou do motor (iniciar, pausar, parar, concluir) e apaga o
+    /// motivo de pausa automática anterior.
     pub fn set_campaign_status(&self, id: i32, status: &str) -> Result<(), String> {
         self.conn().execute(
-            "UPDATE ESF_Campaign SET Status=?1, UpdatedAt=datetime('now') WHERE CampaignId=?2 AND ExcluidoEm IS NULL;",
+            "UPDATE ESF_Campaign SET Status=?1, PauseReason='', UpdatedAt=datetime('now') WHERE CampaignId=?2 AND ExcluidoEm IS NULL;",
             params![status, id],
         ).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Pausa automática do motor com o motivo, só se a campanha ainda estiver rodando (não passa por
+    /// cima de uma pausa ou parada do operador). Devolve se pausou.
+    pub fn pause_campaign_auto(&self, id: i32, reason: &str) -> Result<bool, String> {
+        let reason: String = reason.trim().chars().take(500).collect();
+        self.conn().execute(
+            "UPDATE ESF_Campaign SET Status='paused', PauseReason=?2, UpdatedAt=datetime('now') WHERE CampaignId=?1 AND Status='running' AND ExcluidoEm IS NULL;",
+            params![id, reason],
+        ).map(|n| n > 0).map_err(|e| e.to_string())
     }
 
     // ============================================================
@@ -4743,5 +4763,32 @@ mod gerenciamento_de_chips_tests {
         assert!(crate::dispatcher::device_operation_lock_for_id(987654).try_lock().is_err());
         drop(guard);
         assert!(crate::dispatcher::device_operation_lock_for_id(987654).try_lock().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod pausa_automatica_tests {
+    use super::{Campaign, Database};
+    #[test]
+    fn motivo_da_pausa_fica_gravado_e_some_ao_iniciar() {
+        let path = std::env::temp_dir().join(format!("esfera_pausa_motivo_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let id = db.create_campaign(&Campaign { id: 0, name: "Teste".into(), greeting: "Olá".into(), message: "Corpo".into(), closing: "SAIR".into(), delay_min: 30, delay_max: 60, use_spintax: false, use_ai: false, ai_model: String::new(), ai_provider: String::new(), ai_prompt: String::new(), device_ids: vec![], status: "draft".into(), contacts_count: 0, sent_count: 0, failed_count: 0, company_id: 1, updated_at: String::new(), pause_reason: None }).unwrap();
+        let campaign = |db: &Database| db.get_campaigns(1).into_iter().find(|c| c.id == id).unwrap();
+        // Só pausa campanha rodando: nunca passa por cima de uma pausa ou parada do operador.
+        assert!(!db.pause_campaign_auto(id, "TRAVA: teste").unwrap());
+        assert_eq!(campaign(&db).pause_reason, None);
+        db.set_campaign_status(id, "running").unwrap();
+        assert!(db.pause_campaign_auto(id, "TRAVA: Cadastre exatamente um chip (aparelho Celular 1)").unwrap());
+        let paused = campaign(&db);
+        assert_eq!((paused.status.as_str(), paused.pause_reason.as_deref()), ("paused", Some("TRAVA: Cadastre exatamente um chip (aparelho Celular 1)")));
+        assert_eq!(serde_json::to_value(&paused).unwrap()["pauseReason"], "TRAVA: Cadastre exatamente um chip (aparelho Celular 1)");
+        // Iniciar de novo limpa o motivo; sem motivo, o campo nem aparece.
+        db.set_campaign_status(id, "running").unwrap();
+        let running = campaign(&db);
+        assert_eq!(running.pause_reason, None);
+        assert!(serde_json::to_value(&running).unwrap().get("pauseReason").is_none());
+        assert!(db.get_running_campaigns().unwrap().iter().any(|c| c.id == id && c.pause_reason.is_none()));
     }
 }
