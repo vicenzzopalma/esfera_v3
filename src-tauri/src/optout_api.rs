@@ -348,4 +348,24 @@ mod tests {
         let r = client.post(format!("{}/api/optout/events", base)).bearer_auth(&master).json(&payload("whatsapp:c:evt-master-2", 999, "+5575988052539")).send().await.unwrap();
         assert_eq!(r.status(), 403, "empresa inexistente nunca é criada implicitamente");
     }
+
+    #[tokio::test]
+    async fn empresa_inativa_continua_recebendo_sair() {
+        let db = temp_db("inativa");
+        let empresa = db.create_company("Empresa Inativa", 5).unwrap();
+        db.update_company(empresa.id, "Empresa Inativa", 5, 10, false).unwrap();
+        assert!(db.company_exists(empresa.id), "inativa continua existindo para o descadastro");
+        let token = db.issue_hub_token(empresa.id, "empresa").unwrap();
+        let master = db.issue_hub_token(0, "master").unwrap();
+        let base = serve(db.clone()).await;
+        let client = reqwest::Client::new();
+        let r = client.post(format!("{}/api/optout/events", base)).bearer_auth(&token).json(&payload("whatsapp:c:evt-inativa-1", empresa.id, "+5575988052539")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "SAIR nunca é recusado por empresa inativa");
+        assert!(db.is_opted_out(empresa.id, "5575988052539"));
+        let r = client.post(format!("{}/api/optout/events", base)).bearer_auth(&master).json(&payload("whatsapp:c:evt-inativa-2", empresa.id, "+5575911112222")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(db.is_opted_out(empresa.id, "5575911112222"));
+        let r = client.get(format!("{}/api/optout/status?companyId={}", base, empresa.id)).bearer_auth(&token).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+    }
 }
