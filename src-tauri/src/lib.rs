@@ -306,6 +306,9 @@ pub fn run() {
             // Users & Roles
             get_users,
             create_user,
+            set_user_active,
+            reset_user_password,
+            update_user_role,
             // Device Assignments & Permissions
             assign_device_to_user,
             unassign_device_from_user,
