@@ -1216,12 +1216,18 @@ fn emit_network_warning(campaign: &crate::db::Campaign, app_handle: &Option<AppH
     }
 }
 
-/// Pausa a campanha e mostra o motivo no log da tela.
-fn pause_campaign_with_reason(db: &Database, campaign: &crate::db::Campaign, app_handle: &Option<AppHandle>, reason: &str) {
-    let _ = db.set_campaign_status(campaign.id, "paused");
-    db.queue_add_log(campaign.company_id, "warning", "Disparador", reason);
+/// Pausa automática: grava o motivo na campanha (sobrevive ao reinício do app; some ao iniciar de
+/// novo), registra no log da empresa e avisa a tela. `device` é o aparelho da tentativa, se houver.
+fn pause_campaign_with_reason(db: &Database, campaign: &crate::db::Campaign, app_handle: &Option<AppHandle>, reason: &str, device: Option<&str>) {
+    let reason = match device {
+        Some(name) if !name.trim().is_empty() => format!("{} (aparelho {})", reason.trim(), name.trim()),
+        _ => reason.trim().to_string(),
+    };
+    let _ = db.pause_campaign_auto(campaign.id, &reason);
+    db.queue_add_log(campaign.company_id, "warning", "Disparador", &format!("Campanha \"{}\" pausada: {}", campaign.name, reason));
     if let Some(handle) = app_handle {
-        let _ = handle.emit("campaign-progress", CampaignProgressEvent::of(campaign, format!("Campanha pausada: {}", reason), "auto_paused"));
+        let event = CampaignProgressEvent::of(campaign, format!("Campanha pausada: {}", reason), "auto_paused");
+        let _ = handle.emit("campaign-progress", CampaignProgressEvent { device_name: device.map(str::to_string), ..event });
     }
 }
 
@@ -1377,14 +1383,14 @@ impl Dispatcher {
 
                     // Sem prova confiável de conversa anterior, tratar o contato como novo.
                     if contains_link(&message_to_send) {
-                        pause_campaign_with_reason(&db_arc, &campaign, &app_handle, "Remova links da primeira mensagem para contatos novos.");
+                        pause_campaign_with_reason(&db_arc, &campaign, &app_handle, "Remova links da primeira mensagem para contatos novos.", None);
                         return;
                     }
 
                     // Mensagem com mais partes que o teto nunca cabe numa janela: pausa em vez de repetir sem fim.
                     if let Ok((hourly, daily)) = db_arc.network_limits() {
                         if let Some(reason) = parts_over_network_limit(AdbManager::split_human_parts(&message_to_send).len(), hourly, daily) {
-                            pause_campaign_with_reason(&db_arc, &campaign, &app_handle, &reason);
+                            pause_campaign_with_reason(&db_arc, &campaign, &app_handle, &reason, None);
                             return;
                         }
                     }
@@ -1411,6 +1417,8 @@ impl Dispatcher {
                     let base_delay_ms = rand::thread_rng().gen_range(low..=high);
                     let mut ritmo_reduzido = false;
                     let mut reply_warning = false;
+                    // Aparelho escolhido nesta tentativa (nome cadastrado), para o motivo de uma pausa.
+                    let mut attempt_device: Option<String> = None;
                     let outcome = if AiEngine::has_money(&message_to_send) {
                         eprintln!("[DISPATCHER] Envio bloqueado para {}: a mensagem cita valores.", phone);
                         SendOutcome::SendFailed("Mensagem cita valores (proibido)".to_string())
@@ -1427,6 +1435,7 @@ impl Dispatcher {
                                 .cloned()
                                 .unwrap_or_else(|| target_dev.serial.clone()), target_dev.id, target_dev.clone())
                         };
+                        attempt_device = Some(target_device.name.clone());
                         // Atualiza a capacidade de captura antes de avaliar uma amostra antiga.
                         let db_capture = db_arc.clone();
                         let serial_capture = serial.clone();
@@ -1629,7 +1638,7 @@ impl Dispatcher {
                         }
                         // Mensagem maior que o teto: pausa com o motivo, em vez de tentar sem fim.
                         if let Some(reason) = error.strip_prefix("PARTES:") {
-                            pause_campaign_with_reason(&db_arc, &campaign, &app_handle, reason.trim());
+                            pause_campaign_with_reason(&db_arc, &campaign, &app_handle, reason.trim(), attempt_device.as_deref());
                             return;
                         }
                         if error.starts_with("REDE:") {
@@ -1654,10 +1663,7 @@ impl Dispatcher {
                             return;
                         }
                         if error.starts_with("TRAVA:") || error.starts_with("CONTA_RESTRITA:") {
-                            let _ = db_arc.set_campaign_status(campaign.id, "paused");
-                            if let Some(ref handle) = app_handle {
-                                let _ = handle.emit("campaign-progress", CampaignProgressEvent::of(&campaign, format!("Campanha pausada: {}", error), "auto_paused"));
-                            }
+                            pause_campaign_with_reason(&db_arc, &campaign, &app_handle, error, attempt_device.as_deref());
                             return;
                         }
                     }
@@ -1686,7 +1692,7 @@ impl Dispatcher {
                         let persisted = spawn_blocking(move || db3.complete_send_now(&phone3, cid, contact_id)).await;
                         if !matches!(persisted, Ok(Ok(()))) {
                             let _ = db_arc.update_contact_status(contact_id, "partial");
-                            pause_campaign_with_reason(&db_arc, &campaign, &app_handle, "Falha ao registrar envio; contato requer revisão.");
+                            pause_campaign_with_reason(&db_arc, &campaign, &app_handle, "Falha ao registrar envio; contato requer revisão.", attempt_device.as_deref());
                             return;
                         }
                         if let Ok(mut m) = RETRY_MESSAGES.lock() { m.remove(&(campaign.id,next_contact.id)); }
@@ -2450,7 +2456,7 @@ mod local_fallback_tests {
         let path=std::env::temp_dir().join(format!("esfera_local_sair_{}.db",std::process::id()));
         let _=std::fs::remove_file(&path);
         let db=Database::init(path.to_string_lossy().as_ref()).unwrap();
-        let campaign=Campaign { id:0, name:"Teste".into(), greeting:"Olá".into(), message:"Teste".into(), closing:"SAIR".into(), delay_min:30, delay_max:60, use_spintax:false, use_ai:false, ai_model:String::new(), ai_provider:String::new(), ai_prompt:String::new(), device_ids:vec![], status:"draft".into(), contacts_count:0, sent_count:0, failed_count:0, company_id:1, updated_at:String::new() };
+        let campaign=Campaign { id:0, name:"Teste".into(), greeting:"Olá".into(), message:"Teste".into(), closing:"SAIR".into(), delay_min:30, delay_max:60, use_spintax:false, use_ai:false, ai_model:String::new(), ai_provider:String::new(), ai_prompt:String::new(), device_ids:vec![], status:"draft".into(), contacts_count:0, sent_count:0, failed_count:0, company_id:1, updated_at:String::new(), pause_reason:None };
         let id=db.create_campaign(&campaign).unwrap();
         db.import_contacts(id,vec![("Pessoa".into(),"5575988052539".into()),("Outra".into(),"5575911112222".into())]).unwrap();
         let old=r#"{"title":"Esfera 5575988052539","text":"SAIIR"}"#;
