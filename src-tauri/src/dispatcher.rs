@@ -417,6 +417,14 @@ fn confirmation_allowed(within_window: bool, device_busy: bool) -> bool {
     within_window && !device_busy
 }
 
+/// Checagem antes de cada parte (e antes de tocar em Enviar). Descadastro e horário (`allowed`)
+/// valem sempre; a campanha rodando só na 1ª chamada, antes de qualquer parte ser digitada:
+/// pausar não corta a mensagem que já começou, a pausa vale a partir do próximo contato.
+fn check_before_parts<'a>(campaign_running: impl Fn() -> bool + 'a, allowed: impl Fn() -> bool + 'a) -> impl Fn() -> bool + 'a {
+    let first = std::cell::Cell::new(true);
+    move || (!first.replace(false) || campaign_running()) && allowed()
+}
+
 /// Janela de envio no horário local do PC: seg-sex 08:00-20:00, sábado 08:00-14:00, domingo fechado.
 pub fn within_send_window() -> bool {
     use chrono::{Datelike, Timelike};
@@ -1413,16 +1421,17 @@ impl Dispatcher {
                             // Garante o contato na agenda; espera só o que falta para o WhatsApp indexar.
                             prepare_temp_contact_for_send(&serial, &phone2);
                             let _ = name_ref;
-                            // Antes de cada parte: dentro do horário, ainda não descadastrado e campanha ainda rodando.
-                            let check = || {
-                                import_opt_out_from_device(&db_last, &serial, company_last)
+                            // Antes de cada parte: dentro do horário e ainda não descadastrado. A campanha
+                            // rodando só conta antes da 1ª parte: pausar não corta a mensagem no meio.
+                            let check = check_before_parts(
+                                || db_last
+                                    .get_running_campaigns()
+                                    .map(|l| l.iter().any(|c| c.id == campaign_last))
+                                    .unwrap_or(false),
+                                || import_opt_out_from_device(&db_last, &serial, company_last)
                                     && within_send_window()
-                                    && !db_last.is_opted_out(company_last, &phone2)
-                                    && db_last
-                                        .get_running_campaigns()
-                                        .map(|l| l.iter().any(|c| c.id == campaign_last))
-                                        .unwrap_or(false)
-                            };
+                                    && !db_last.is_opted_out(company_last, &phone2),
+                            );
                             let result = AdbManager::send_whatsapp_parts(&serial, &phone2, &parts, Some("com.whatsapp"), &check);
                             if let Err(ref e) = result {
                                 if e.starts_with("CONTA_RESTRITA:") {
@@ -2392,6 +2401,20 @@ mod rede_tests {
         let reason = parts_over_network_limit(3, 2, 10).unwrap();
         assert!(reason.starts_with("A mensagem tem 3 partes e o teto da rede por hora é 2: aumente o teto em Configurações → Rede e ritmo"));
         assert!(parts_over_network_limit(2, 2, 10).is_none());
+    }
+    #[test]
+    fn pausar_nao_corta_a_mensagem_no_meio() {
+        let running = std::cell::Cell::new(true);
+        let allowed = std::cell::Cell::new(true);
+        let check = check_before_parts(|| running.get(), || allowed.get());
+        assert!(check(), "antes da 1ª parte, com a campanha rodando");
+        running.set(false);
+        assert!(check(), "pausa no meio da digitação: a mensagem termina");
+        assert!(check(), "e as partes seguintes também saem");
+        allowed.set(false);
+        assert!(!check(), "descadastro ou fim do horário corta entre as partes");
+        let paused_before = check_before_parts(|| false, || true);
+        assert!(!paused_before(), "pausada antes da 1ª parte: nada sai");
     }
     #[tokio::test]
     async fn aparelho_ocupado_solta_o_portao_da_rede() {
