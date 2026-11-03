@@ -224,13 +224,15 @@ pub fn create_company(
     token: String,
     name: String,
     device_limit: i32,
+    user_limit: Option<i32>,
 ) -> Result<Company, String> {
     let session = validate_session(&state.sessions, &token)?;
     if session.role != "master" {
         return Err("Acesso Negado: apenas Master pode criar empresas.".to_string());
     }
-    let db = &state.db;
-    db.create_company(&name, device_limit)
+    let user_limit = user_limit.unwrap_or(10);
+    if user_limit < 1 { return Err("O limite de usuários deve ser de pelo menos 1.".into()); }
+    state.db.create_company_with_user_limit(&name, device_limit, user_limit)
 }
 
 #[tauri::command]
