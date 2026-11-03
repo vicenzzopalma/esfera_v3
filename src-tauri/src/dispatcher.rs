@@ -57,6 +57,19 @@ fn ritmo_seconds(error: &str) -> Option<u64> {
     error.strip_prefix("RITMO:")?.split_whitespace().next()?.parse().ok()
 }
 
+/// Chip no limite por hora ou por dia: o aparelho espera, sem pausar a campanha e sem contar falha.
+fn chip_limit_error(seconds: u64) -> String {
+    format!("LIMITE_CHIP: {} s até o chip liberar", seconds)
+}
+
+fn chip_limit_seconds(error: &str) -> Option<u64> {
+    error.strip_prefix("LIMITE_CHIP:")?.split_whitespace().next()?.parse().ok()
+}
+
+/// Aparelho com o chip em descanso ou no limite sai da rodada por até este tempo; depois o motor
+/// confere de novo (um chip trocado no aparelho volta a enviar sem esperar o prazo do anterior).
+const CHIP_WAIT_RECHECK_SECS: u64 = 300;
+
 /// Mensagem com mais partes que o teto nunca cabe numa janela: devolve o motivo para pausar.
 fn parts_over_network_limit(parts: usize, hourly: i64, daily: i64) -> Option<String> {
     let (limit, period) = if hourly <= daily { (hourly, "por hora") } else { (daily, "por dia") };
@@ -439,6 +452,21 @@ fn send_window_at(day: chrono::Weekday, h: u32) -> bool {
         Weekday::Sat => (8..14).contains(&h),
         _ => (8..20).contains(&h),
     }
+}
+
+/// Janela em `now` (horário local do PC), pela regra de `send_window_at`: (aberta, quando fecha
+/// se aberta, quando abre de novo se fechada).
+pub fn send_window_state_at(now: chrono::NaiveDateTime) -> (bool, Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>) {
+    use chrono::{Datelike, Timelike};
+    let open = send_window_at(now.weekday(), now.hour());
+    let Some(mut t) = now.date().and_hms_opt(now.hour(), 0, 0) else { return (open, None, None) };
+    for _ in 0..(24 * 8) {
+        t += chrono::TimeDelta::hours(1);
+        if send_window_at(t.weekday(), t.hour()) != open {
+            return if open { (true, Some(t), None) } else { (false, None, Some(t)) };
+        }
+    }
+    (open, None, None)
 }
 
 /// Nome do contato temporário: contém o número, para a busca conferir que é a pessoa certa.
@@ -1056,6 +1084,35 @@ pub struct CampaignProgressEvent {
     pub last_contact_phone: String,
     pub delay_used_ms: i32,
     pub status: String,
+    /// Tipo do estado: "sending", "send_error", "completed", "window", "network_turn", "network_cap",
+    /// "network_check", "chip_rest", "chip_limit", "reply_reduced", "reply_paused",
+    /// "reply_unavailable", "device_offline", "device_unavailable" ou "auto_paused".
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Quando a espera termina (ISO 8601 com o fuso do PC), se o motor souber.
+    #[serde(default)]
+    pub until: Option<String>,
+    /// Aparelho da espera ou do aviso, pelo nome cadastrado.
+    #[serde(default)]
+    pub device_name: Option<String>,
+}
+
+impl CampaignProgressEvent {
+    /// Evento com os números atuais da campanha e o tipo do estado.
+    fn of(campaign: &crate::db::Campaign, status: impl Into<String>, kind: &str) -> Self {
+        Self {
+            campaign_id: campaign.id,
+            campaign_name: campaign.name.clone(),
+            sent_count: campaign.sent_count,
+            total_contacts: campaign.contacts_count,
+            last_contact_phone: String::new(),
+            delay_used_ms: 0,
+            status: status.into(),
+            kind: Some(kind.to_string()),
+            until: None,
+            device_name: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1066,29 +1123,97 @@ pub enum SendOutcome {
     SendFailed(String),
 }
 
-/// Pausa a campanha e mostra o motivo no log da tela.
-static LAST_NETWORK_WARNING: std::sync::LazyLock<Mutex<HashMap<i32, String>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Aviso de espera da campanha: repetido no fim do ciclo enquanto nenhum aparelho libera.
+#[derive(Debug, Clone, PartialEq)]
+struct WaitNotice {
+    status: String,
+    kind: &'static str,
+    until: Option<String>,
+    device_name: Option<String>,
+}
 
-fn emit_network_warning(campaign: &crate::db::Campaign, app_handle: &Option<AppHandle>, reason: &str) {
+impl WaitNotice {
+    fn new(status: impl Into<String>, kind: &'static str) -> Self {
+        Self { status: status.into(), kind, until: None, device_name: None }
+    }
+
+    fn on_device(mut self, device_name: &str) -> Self {
+        self.device_name = Some(device_name.to_string());
+        self
+    }
+
+    fn event(&self, campaign: &crate::db::Campaign) -> CampaignProgressEvent {
+        CampaignProgressEvent { until: self.until.clone(), device_name: self.device_name.clone(), ..CampaignProgressEvent::of(campaign, self.status.clone(), self.kind) }
+    }
+}
+
+/// Liberação daqui a `seconds`, arredondada para o minuto seguinte: (ISO 8601 com o fuso do PC,
+/// texto curto: "às 14:06", "amanhã às 08:00" ou "em 05/11 às 08:00").
+fn release_at(now: chrono::DateTime<chrono::Local>, seconds: u64) -> (String, String) {
+    use chrono::Timelike;
+    let at = now + chrono::TimeDelta::try_seconds(seconds.min(30 * 86_400) as i64).unwrap_or_default();
+    let at = if at.second() > 0 || at.nanosecond() > 0 {
+        at.with_nanosecond(0).and_then(|t| t.with_second(0)).map(|t| t + chrono::TimeDelta::minutes(1)).unwrap_or(at)
+    } else { at };
+    let label = if at.date_naive() == now.date_naive() {
+        format!("às {}", at.format("%H:%M"))
+    } else if now.date_naive().succ_opt() == Some(at.date_naive()) {
+        format!("amanhã às {}", at.format("%H:%M"))
+    } else {
+        format!("em {} às {}", at.format("%d/%m"), at.format("%H:%M"))
+    };
+    (at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false), label)
+}
+
+/// Descanso do chip a cada N envios: o aparelho volta sozinho quando o descanso termina.
+fn chip_rest_notice(device_name: &str, seconds: u64) -> WaitNotice {
+    let (until, label) = release_at(chrono::Local::now(), seconds);
+    WaitNotice { until: Some(until), ..WaitNotice::new(format!("Chip em descanso no aparelho {}; libera {}", device_name, label), "chip_rest").on_device(device_name) }
+}
+
+/// Limite do chip por hora ou por dia: o aparelho espera; a campanha segue pelos outros aparelhos.
+fn chip_limit_notice(device_name: &str, seconds: u64) -> WaitNotice {
+    let (until, label) = release_at(chrono::Local::now(), seconds);
+    WaitNotice { until: Some(until), ..WaitNotice::new(format!(
+        "Aparelho temporariamente indisponível: o chip do aparelho {} atingiu o limite de envios e libera {}. Os outros aparelhos continuam.",
+        device_name, label), "chip_limit").on_device(device_name) }
+}
+
+/// Teto da rede atingido: a campanha espera a janela da hora ou do dia reabrir.
+fn network_cap_notice(seconds: u64) -> WaitNotice {
+    let (until, _) = release_at(chrono::Local::now(), seconds);
+    WaitNotice { until: Some(until), ..WaitNotice::new("Teto da rede atingido; aguardando a próxima janela.", "network_cap") }
+}
+
+/// Freio por respostas: tipo do aviso pelo estado do chip.
+fn reply_notice_kind(state: &str) -> &'static str {
+    match state {
+        "pausado" => "reply_paused",
+        "indisponivel" => "reply_unavailable",
+        _ => "reply_reduced",
+    }
+}
+
+/// Último aviso de espera de cada campanha (só é emitido de novo quando muda).
+static LAST_NETWORK_WARNING: std::sync::LazyLock<Mutex<HashMap<i32, WaitNotice>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn emit_network_warning(campaign: &crate::db::Campaign, app_handle: &Option<AppHandle>, notice: WaitNotice) {
     let changed = LAST_NETWORK_WARNING.lock().map(|mut m| {
-        if m.get(&campaign.id).map(String::as_str) == Some(reason) { false } else { m.insert(campaign.id, reason.to_string()); true }
+        if m.get(&campaign.id) == Some(&notice) { false } else { m.insert(campaign.id, notice.clone()); true }
     }).unwrap_or(false);
     if changed {
         if let Some(handle) = app_handle {
-            let _ = handle.emit("campaign-progress", CampaignProgressEvent { campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count, total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0, status: reason.into() });
+            let _ = handle.emit("campaign-progress", notice.event(campaign));
         }
     }
 }
 
+/// Pausa a campanha e mostra o motivo no log da tela.
 fn pause_campaign_with_reason(db: &Database, campaign: &crate::db::Campaign, app_handle: &Option<AppHandle>, reason: &str) {
     let _ = db.set_campaign_status(campaign.id, "paused");
     db.queue_add_log(campaign.company_id, "warning", "Disparador", reason);
     if let Some(handle) = app_handle {
-        let _ = handle.emit("campaign-progress", CampaignProgressEvent {
-            campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
-            total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
-            status: format!("Campanha pausada: {}", reason),
-        });
+        let _ = handle.emit("campaign-progress", CampaignProgressEvent::of(campaign, format!("Campanha pausada: {}", reason), "auto_paused"));
     }
 }
 
@@ -1146,15 +1271,7 @@ impl Dispatcher {
                             let _ = spawn_blocking(move || db_done.set_campaign_status(campaign_id, "completed")).await;
                             cleanup_campaign_contacts(db_arc.clone(), campaign.company_id, campaign.device_ids.clone());
                             if let Some(ref handle) = app_handle {
-                                let _ = handle.emit("campaign-progress", CampaignProgressEvent {
-                                    campaign_id: campaign.id,
-                                    campaign_name: campaign.name.clone(),
-                                    sent_count: campaign.sent_count,
-                                    total_contacts: campaign.contacts_count,
-                                    last_contact_phone: String::new(),
-                                    delay_used_ms: 0,
-                                    status: "completed".to_string(),
-                                });
+                                let _ = handle.emit("campaign-progress", CampaignProgressEvent::of(&campaign, "completed", "completed"));
                             }
                             return;
                         }
@@ -1211,15 +1328,10 @@ impl Dispatcher {
                     // Horário de envio: seg-sex 8h-20h, sáb 8h-14h, domingo não (CDC art. 71: descanso e lazer).
                     if !within_send_window() {
                         if let Some(ref handle) = app_handle {
-                            let _ = handle.emit("campaign-progress", CampaignProgressEvent {
-                                campaign_id: campaign.id,
-                                campaign_name: campaign.name.clone(),
-                                sent_count: campaign.sent_count,
-                                total_contacts: campaign.contacts_count,
-                                last_contact_phone: String::new(),
-                                delay_used_ms: 0,
-                                status: "waiting_window".to_string(),
-                            });
+                            let until = send_window_state_at(chrono::Local::now().naive_local()).2
+                                .and_then(|t| chrono::TimeZone::from_local_datetime(&chrono::Local, &t).earliest())
+                                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+                            let _ = handle.emit("campaign-progress", CampaignProgressEvent { until, ..CampaignProgressEvent::of(&campaign, "waiting_window", "window") });
                         }
                         sleep(Duration::from_secs(60)).await;
                         return;
@@ -1324,7 +1436,7 @@ impl Dispatcher {
                                     if status.state != "normal" {
                                         reply_warning = true;
                                         let limited = NETWORK_LIMITED_CAMPAIGNS.lock().map(|s| s.contains(&campaign.id)).unwrap_or(true);
-                                        if !limited { emit_network_warning(&campaign, &app_handle, &status.reason); }
+                                        if !limited { emit_network_warning(&campaign, &app_handle, WaitNotice::new(status.reason.clone(), reply_notice_kind(&status.state)).on_device(&target_device.name)); }
                                     }
                                     if status.state == "pausado" {
                                         if let Ok(mut unavailable) = DEVICE_UNAVAILABLE_UNTIL.lock() { unavailable.insert(serial.clone(), Instant::now() + std::time::Duration::from_secs(30)); }
@@ -1341,7 +1453,7 @@ impl Dispatcher {
                             Err(_) => {
                         let was_limited = NETWORK_LIMITED_CAMPAIGNS.lock().map(|s| s.contains(&campaign.id)).unwrap_or(true);
                         if !reply_warning && !was_limited {
-                            emit_network_warning(&campaign, &app_handle, "Aguardando vez na rede");
+                            emit_network_warning(&campaign, &app_handle, WaitNotice::new("Aguardando vez na rede", "network_turn"));
                         }
                         NETWORK_SEND_GATE.lock().await
                             }
@@ -1351,18 +1463,32 @@ impl Dispatcher {
                         if wait > 0 {
                             if let Ok(mut limited) = NETWORK_LIMITED_CAMPAIGNS.lock() { limited.insert(campaign.id); }
                             drop(network_guard);
-                            emit_network_warning(&campaign, &app_handle, if limit_result.is_ok() { "Teto da rede atingido; aguardando a próxima janela." } else { "Não foi possível verificar o teto da rede; tentando novamente." });
+                            emit_network_warning(&campaign, &app_handle, if limit_result.is_ok() { network_cap_notice(wait) } else { WaitNotice::new("Não foi possível verificar o teto da rede; tentando novamente.", "network_check") });
                             sleep(Duration::from_secs(wait.min(30))).await;
                             return;
                         }
                         if let Ok(mut limited) = NETWORK_LIMITED_CAMPAIGNS.lock() { limited.remove(&campaign.id); }
                         if let Some(chip) = db_arc.get_chips(device_id).first() {
-                            let cooldown = db_arc.chip_cooldown_seconds(chip.id).unwrap_or(30);
-                            if cooldown > 0 {
+                            let cooldown = db_arc.chip_cooldown_seconds(chip.id);
+                            let resting = *cooldown.as_ref().unwrap_or(&30);
+                            if resting > 0 {
                                 drop(network_guard);
-                                mark_device_unavailable(&serial, cooldown.min(30));
+                                mark_device_unavailable(&serial, resting.min(CHIP_WAIT_RECHECK_SECS));
+                                // Só avisa descanso de verdade; falha ao ler tenta de novo em 30 s, sem aviso.
+                                if cooldown.is_ok() { emit_network_warning(&campaign, &app_handle, chip_rest_notice(&target_device.name, resting)); }
                                 sleep(Duration::from_secs(1)).await;
                                 return;
+                            }
+                            // Limite do chip por hora ou por dia: o aparelho espera, a campanha não pausa.
+                            // Erro ao conferir cai na checagem com o aparelho travado (falha fechada).
+                            if let Ok(wait) = db_arc.chip_limit_wait_seconds(chip) {
+                                if wait > 0 {
+                                    drop(network_guard);
+                                    mark_device_unavailable(&serial, wait.min(CHIP_WAIT_RECHECK_SECS));
+                                    emit_network_warning(&campaign, &app_handle, chip_limit_notice(&target_device.name, wait));
+                                    sleep(Duration::from_secs(1)).await;
+                                    return;
+                                }
                             }
                         }
                         // Aparelho ocupado (ex.: instalando o agente) não segura a rede: o portão já foi
@@ -1405,13 +1531,20 @@ impl Dispatcher {
                             // Descanso do chip não é cumprido aqui, com o portão pego: o contato volta depois.
                             let cooldown = db_last.chip_cooldown_seconds(chip.id).map_err(|e| format!("TRAVA: {}", e))?;
                             if cooldown > 0 { return Err(ritmo_error(cooldown)); }
+                            // Limite do chip por hora ou por dia: espera do aparelho, nunca pausa da campanha.
+                            let limit_wait = db_last.chip_limit_wait_seconds(chip).map_err(|e| format!("TRAVA: {}", e))?;
+                            if limit_wait > 0 { return Err(chip_limit_error(limit_wait)); }
                             let parts = AdbManager::split_human_parts(&msg);
                             let (hourly, daily) = db_last.network_limits().map_err(|e| format!("REDE: falha ao verificar limites: {}", e))?;
                             if let Some(reason) = parts_over_network_limit(parts.len(), hourly, daily) { return Err(format!("PARTES: {}", reason)); }
                             let wait = db_last.network_limit_wait_for(parts.len().max(1) as i64).map_err(|e| format!("REDE: falha ao verificar teto: {}", e))?;
                             if wait > 0 { return Err(format!("REDE: teto da rede atingido para {} partes; aguardando a próxima janela", parts.len())); }
                             let attempt = db_last.reserve_chip_attempt(chip, company_last, campaign_last, &phone2, false)
-                                .map_err(|e| format!("TRAVA: {}", e))?;
+                                .map_err(|e| if e.starts_with("Limite do chip atingido") {
+                                    chip_limit_error(db_last.chip_limit_wait_seconds(chip).unwrap_or(60).max(1))
+                                } else {
+                                    format!("TRAVA: {}", e)
+                                })?;
                             if let Err(e) = db_last.reserve_network_extra(attempt, parts.len()) {
                                 let _ = db_last.finish_chip_attempt(attempt, false);
                                 return Err(format!("REDE: falha ao registrar reserva: {}",e));
@@ -1462,7 +1595,13 @@ impl Dispatcher {
                                 if e.starts_with("APARELHO:") {
                                     if let Ok(mut unavailable) = DEVICE_UNAVAILABLE_UNTIL.lock() { unavailable.insert(failed_serial, Instant::now() + std::time::Duration::from_secs(60)); }
                                 } else if e.starts_with("RITMO:") {
-                                    mark_device_unavailable(&failed_serial, ritmo_seconds(&e).unwrap_or(30).clamp(1, 30));
+                                    let seconds = ritmo_seconds(&e).unwrap_or(30).max(1);
+                                    mark_device_unavailable(&failed_serial, seconds.min(CHIP_WAIT_RECHECK_SECS));
+                                    emit_network_warning(&campaign, &app_handle, chip_rest_notice(&target_device.name, seconds));
+                                } else if e.starts_with("LIMITE_CHIP:") {
+                                    let seconds = chip_limit_seconds(&e).unwrap_or(60).max(1);
+                                    mark_device_unavailable(&failed_serial, seconds.min(CHIP_WAIT_RECHECK_SECS));
+                                    emit_network_warning(&campaign, &app_handle, chip_limit_notice(&target_device.name, seconds));
                                 }
                                 eprintln!("[DISPATCHER] Erro no envio para {}: {}", phone, e);
                                 SendOutcome::SendFailed(e)
@@ -1474,9 +1613,9 @@ impl Dispatcher {
                         }
                     };
                     if let SendOutcome::SendFailed(ref error) = outcome {
-                        // Chip em descanso: o contato volta para a fila, sem contar falha.
-                        if error.starts_with("RITMO:") {
-                            emit_network_warning(&campaign, &app_handle, "Chip em descanso; aguardando disponibilidade.");
+                        // Chip em descanso ou no limite (aviso já emitido): o contato volta para a fila,
+                        // sem contar falha e sem pausar a campanha.
+                        if error.starts_with("RITMO:") || error.starts_with("LIMITE_CHIP:") {
                             sleep(Duration::from_secs(1)).await;
                             return;
                         }
@@ -1488,28 +1627,28 @@ impl Dispatcher {
                         if error.starts_with("REDE:") {
                             if let Ok(mut limited) = NETWORK_LIMITED_CAMPAIGNS.lock() { limited.insert(campaign.id); }
                             let reason = error.trim_start_matches("REDE: ");
-                            emit_network_warning(&campaign, &app_handle, if reason.starts_with("teto da rede atingido") { "Teto da rede atingido; aguardando a próxima janela." } else { reason });
+                            let notice = if reason.starts_with("teto da rede atingido") {
+                                let parts = AdbManager::split_human_parts(&message_to_send).len().max(1) as i64;
+                                network_cap_notice(db_arc.network_limit_wait_for(parts).unwrap_or(30))
+                            } else {
+                                WaitNotice::new(reason, "network_check")
+                            };
+                            emit_network_warning(&campaign, &app_handle, notice);
                             sleep(Duration::from_secs(30)).await;
                             return;
                         }
                         if error.starts_with("APARELHO:") {
                             if let Some(ref handle) = app_handle {
-                                let _ = handle.emit("campaign-progress", CampaignProgressEvent {
-                                    campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
-                                    total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
-                                    status: format!("Aparelho temporariamente indisponível: {}. Tentando outro aparelho; o contato continua pendente.", error.trim_start_matches("APARELHO: ")),
-                                });
+                                let _ = handle.emit("campaign-progress", CampaignProgressEvent::of(&campaign,
+                                    format!("Aparelho temporariamente indisponível: {}. Tentando outro aparelho; o contato continua pendente.", error.trim_start_matches("APARELHO: ")),
+                                    "device_unavailable"));
                             }
                             return;
                         }
                         if error.starts_with("TRAVA:") || error.starts_with("CONTA_RESTRITA:") {
                             let _ = db_arc.set_campaign_status(campaign.id, "paused");
                             if let Some(ref handle) = app_handle {
-                                let _ = handle.emit("campaign-progress", CampaignProgressEvent {
-                                    campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count,
-                                    total_contacts: campaign.contacts_count, last_contact_phone: String::new(), delay_used_ms: 0,
-                                    status: format!("Campanha pausada: {}", error),
-                                });
+                                let _ = handle.emit("campaign-progress", CampaignProgressEvent::of(&campaign, format!("Campanha pausada: {}", error), "auto_paused"));
                             }
                             return;
                         }
@@ -1546,9 +1685,8 @@ impl Dispatcher {
                         if let Ok(mut m) = LAST_NETWORK_WARNING.lock() { m.remove(&campaign.id); }
                         if let Some(ref handle) = app_handle {
                             let _ = handle.emit("campaign-progress", CampaignProgressEvent {
-                                campaign_id: campaign.id, campaign_name: campaign.name.clone(), sent_count: campaign.sent_count + 1,
-                                total_contacts: campaign.contacts_count, last_contact_phone: phone.clone(), delay_used_ms: gaussian_delay_ms,
-                                status: "running".into(),
+                                sent_count: campaign.sent_count + 1, last_contact_phone: phone.clone(), delay_used_ms: gaussian_delay_ms,
+                                ..CampaignProgressEvent::of(&campaign, "running", "sending")
                             });
                         }
                     }
@@ -1595,20 +1733,20 @@ impl Dispatcher {
                     if let Some(ref handle) = app_handle {
                         let sent_count = campaign.sent_count
                             + if matches!(outcome, SendOutcome::Sent) { 1 } else { 0 };
+                        // Sem aparelho livre: repete o último aviso de espera (descanso, limite do chip,
+                        // teto...), com o tipo e o prazo; sem aviso, nenhum aparelho online.
+                        let state = match &outcome {
+                            SendOutcome::NoOnlineDevice => LAST_NETWORK_WARNING.lock().ok()
+                                .and_then(|m| m.get(&campaign.id).map(|n| n.event(&campaign)))
+                                .unwrap_or_else(|| CampaignProgressEvent::of(&campaign, "waiting_device", "device_offline")),
+                            SendOutcome::SendFailed(_) => CampaignProgressEvent::of(&campaign, "send_error", "send_error"),
+                            _ => CampaignProgressEvent::of(&campaign, "running", "sending"),
+                        };
                         let progress = CampaignProgressEvent {
-                            campaign_id: campaign.id,
-                            campaign_name: campaign.name.clone(),
                             sent_count,
-                            total_contacts: campaign.contacts_count,
                             last_contact_phone: next_contact.phone.clone(),
                             delay_used_ms: gaussian_delay_ms,
-                            status: if matches!(outcome, SendOutcome::NoOnlineDevice) {
-                                LAST_NETWORK_WARNING.lock().ok().and_then(|m| m.get(&campaign.id).cloned()).unwrap_or_else(|| "waiting_device".to_string())
-                            } else if matches!(outcome, SendOutcome::SendFailed(_)) {
-                                "send_error".to_string()
-                            } else {
-                                "running".to_string()
-                            },
+                            ..state
                         };
                         let _ = handle.emit("campaign-progress", progress);
                     }
@@ -2401,6 +2539,38 @@ mod rede_tests {
         let reason = parts_over_network_limit(3, 2, 10).unwrap();
         assert!(reason.starts_with("A mensagem tem 3 partes e o teto da rede por hora é 2: aumente o teto em Configurações → Rede e ritmo"));
         assert!(parts_over_network_limit(2, 2, 10).is_none());
+    }
+    #[test]
+    fn limite_do_chip_vira_espera_com_prazo() {
+        use chrono::TimeZone;
+        assert_eq!(chip_limit_seconds(&chip_limit_error(1201)), Some(1201));
+        assert_eq!(chip_limit_seconds("TRAVA: Limite do chip atingido"), None);
+        let at = |s: &str| chrono::Local.from_local_datetime(&chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()).earliest().unwrap();
+        let (iso, label) = release_at(at("2026-06-15 14:03:10"), 125);
+        assert_eq!(label, "às 14:06");
+        assert!(iso.starts_with("2026-06-15T14:06:00"), "{}", iso);
+        assert_eq!(release_at(at("2026-06-15 14:00:00"), 0).1, "às 14:00");
+        assert_eq!(release_at(at("2026-06-15 23:50:00"), 1200).1, "amanhã às 00:10");
+        assert_eq!(release_at(at("2026-06-13 14:00:00"), 2 * 86_400 + 18 * 3600).1, "em 16/06 às 08:00");
+        let notice = chip_limit_notice("Celular 3", 600);
+        assert_eq!((notice.kind, notice.device_name.as_deref()), ("chip_limit", Some("Celular 3")));
+        assert!(notice.until.is_some());
+        // A tela classifica pelo texto enquanto não lê `kind`: "temporariamente indisponível" = espera do aparelho.
+        assert!(notice.status.starts_with("Aparelho temporariamente indisponível"), "{}", notice.status);
+        let rest = chip_rest_notice("Celular 3", 200);
+        assert_eq!(rest.kind, "chip_rest");
+        assert!(rest.status.starts_with("Chip em descanso no aparelho Celular 3; libera às "), "{}", rest.status);
+    }
+    #[test]
+    fn janela_diz_quando_fecha_e_quando_abre() {
+        let t = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap();
+        // 02/11/2026 é segunda-feira; 07/11, sábado; 08/11, domingo.
+        assert_eq!(send_window_state_at(t("2026-11-02 10:30")), (true, Some(t("2026-11-02 20:00")), None));
+        assert_eq!(send_window_state_at(t("2026-11-02 07:59")), (false, None, Some(t("2026-11-02 08:00"))));
+        assert_eq!(send_window_state_at(t("2026-11-02 20:00")), (false, None, Some(t("2026-11-03 08:00"))));
+        assert_eq!(send_window_state_at(t("2026-11-07 13:59")), (true, Some(t("2026-11-07 14:00")), None));
+        assert_eq!(send_window_state_at(t("2026-11-07 14:00")), (false, None, Some(t("2026-11-09 08:00"))));
+        assert_eq!(send_window_state_at(t("2026-11-08 12:00")), (false, None, Some(t("2026-11-09 08:00"))));
     }
     #[test]
     fn pausar_nao_corta_a_mensagem_no_meio() {

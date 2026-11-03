@@ -102,6 +102,38 @@ fn network_wait(hourly: i64, daily: i64, usage: (i64, i64, i64, i64), required: 
         .max(if day_count.saturating_add(required) > daily { day_wait } else { 0 }) as u64
 }
 
+/// Segundos de descanso restantes do chip (0 = livre). A subconsulta garante uma linha: o chip
+/// que nunca descansou não tem linha em ESF_ChipCooldown (sem ela a consulta falhava).
+const CHIP_COOLDOWN_SQL: &str = "SELECT coalesce((SELECT max(0, CAST(strftime('%s',NextAt) AS INTEGER)-CAST(strftime('%s','now') AS INTEGER)) FROM ESF_ChipCooldown WHERE ChipId=?1),0)";
+
+/// Limite do chip por variável de ambiente (do chip ou geral); sem valor válido, o padrão.
+fn chip_config(chip_id: i32, suffix: &str, default: i64) -> i64 {
+    std::env::var(format!("ESFERA_CHIP_{}_{}", chip_id, suffix)).ok()
+        .or_else(|| std::env::var(format!("ESFERA_CHIP_{}", suffix)).ok())
+        .and_then(|v| v.parse::<i64>().ok()).filter(|v| *v > 0).unwrap_or(default)
+}
+
+/// Limites do chip em `now`: (por hora, do dia com aquecimento, segundos até caber mais uma
+/// tentativa; 0 = livre). A hora libera quando a tentativa mais antiga da última hora sai da
+/// janela; o dia, na meia-noite local, pelo mesmo critério do teto da rede.
+fn chip_limit_at(conn: &Connection, chip: &Chip, now: chrono::DateTime<chrono::Utc>) -> std::result::Result<(i64, i64, u64), String> {
+    let hour_limit = chip_config(chip.id, "HOURLY_LIMIT", 10);
+    let day_limit = chip_config(chip.id, "DAILY_LIMIT", 60);
+    let (day_start, next_day) = local_day_bounds(now);
+    let (hour, day, age, hour_wait): (i64, i64, i64, i64) = conn.query_row(
+        "SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?3),
+                (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?4),
+                max(0, CAST(julianday(?5) - julianday(?2) AS INTEGER)),
+                coalesce((SELECT max(1, CAST(strftime('%s',min(CreatedAt)) AS INTEGER)+3601-CAST(strftime('%s',?5) AS INTEGER)) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?3),3600)",
+        params![chip.id, chip.created_at, sql_utc(now - chrono::TimeDelta::hours(1)), sql_utc(day_start), sql_utc(now)],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| e.to_string())?;
+    // O dia de cadastro começa com 15 tentativas; o teto cresce cinco por dia.
+    let warm_limit = (15 + age * 5).min(day_limit);
+    let hour_wait = if hour >= hour_limit { hour_wait.max(1) as u64 } else { 0 };
+    let day_wait = if day >= warm_limit { (next_day - now).num_seconds().max(1) as u64 } else { 0 };
+    Ok((hour_limit, warm_limit, hour_wait.max(day_wait)))
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Device {
@@ -2426,7 +2458,7 @@ impl Database {
         let (sample,replies): (i64,i64) = conn.query_row("SELECT count(*),coalesce(sum(CASE WHEN EXISTS(SELECT 1 FROM ESF_ReplyInbound r WHERE r.DeviceId=?2 AND r.PhoneDigits=a.PhoneDigits AND r.ReceivedAt>=a.CreatedAt) THEN 1 ELSE 0 END),0) FROM (SELECT PhoneDigits,CreatedAt FROM ESF_ChipAttempt WHERE ChipId=?1 AND Purpose='campaign' AND Outcome='enviado' AND CreatedAt<=datetime('now',?3) AND CreatedAt>coalesce((SELECT UntilAt FROM ESF_ReplyBrake WHERE ChipId=?1),'0000-01-01') ORDER BY AttemptId DESC LIMIT ?4) a", params![chip.id, device.id, format!("-{} hours", REPLY_WAIT_HOURS), REPLY_SAMPLE as i64], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
         let paused: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM ESF_ReplyBrake WHERE ChipId=?1 AND UntilAt>datetime('now'))", params![chip.id], |r| r.get(0)).map_err(|e| e.to_string())?;
         let (state, reason) = if paused { ("pausado", REPLY_REASON_PAUSED) } else { reply_state(available, ever_replied, sample as usize, replies as usize) };
-        Ok(NetworkChipStatus { chip_id: chip.id, device_id: device.id, device_name: device.name.clone(), reply_rate: if available && sample > 0 { Some(replies as f64 * 100.0 / sample as f64) } else { None }, sample: sample as usize, state: state.into(), reason: reason.into(), cooldown_seconds: conn.query_row("SELECT coalesce(max(0, CAST(strftime('%s',NextAt) AS INTEGER)-CAST(strftime('%s','now') AS INTEGER)),0) FROM ESF_ChipCooldown WHERE ChipId=?1", params![chip.id], |r| r.get(0)).map_err(|e|e.to_string())? })
+        Ok(NetworkChipStatus { chip_id: chip.id, device_id: device.id, device_name: device.name.clone(), reply_rate: if available && sample > 0 { Some(replies as f64 * 100.0 / sample as f64) } else { None }, sample: sample as usize, state: state.into(), reason: reason.into(), cooldown_seconds: conn.query_row(CHIP_COOLDOWN_SQL, params![chip.id], |r| r.get(0)).map_err(|e|e.to_string())? })
     }
 
     pub fn apply_reply_brake(&self, chip: &Chip, device: &Device) -> Result<NetworkChipStatus, String> {
@@ -2465,29 +2497,20 @@ impl Database {
         self.reserve_attempt(chip, company_id, 0, phone, "manual", chrono::Utc::now())
     }
 
+    /// Segundos até o chip voltar a caber nos limites por hora e por dia (aquecimento); 0 = livre.
+    pub fn chip_limit_wait_seconds(&self, chip: &Chip) -> Result<u64, String> {
+        let conn = self.conn();
+        Ok(chip_limit_at(&conn, chip, chrono::Utc::now())?.2)
+    }
+
     fn reserve_attempt(&self, chip: &Chip, company_id: i32, campaign_id: i32, phone: &str, purpose: &str, now: chrono::DateTime<chrono::Utc>) -> Result<i64, String> {
         let confirmation = purpose == "confirmation";
         if chip.status != "livre" || chip.restricted_until.is_some() {
             return Err("Chip restrito ou indisponível. Verifique o aparelho antes de retomar.".into());
         }
-        let config = |suffix: &str, default: i64| {
-            std::env::var(format!("ESFERA_CHIP_{}_{}", chip.id, suffix)).ok()
-                .or_else(|| std::env::var(format!("ESFERA_CHIP_{}", suffix)).ok())
-                .and_then(|v| v.parse::<i64>().ok()).filter(|v| *v > 0).unwrap_or(default)
-        };
-        let hour_limit = config("HOURLY_LIMIT", 10);
-        let day_limit = config("DAILY_LIMIT", 60);
         let conn = self.conn();
-        // O dia do chip começa na meia-noite local, pelo mesmo critério do teto da rede.
-        let (hour, day, age): (i64, i64, i64) = conn.query_row(
-            "SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?3),
-                    (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?4),
-                    max(0, CAST(julianday(?5) - julianday(?2) AS INTEGER))",
-            params![chip.id, chip.created_at, sql_utc(now - chrono::TimeDelta::hours(1)), sql_utc(local_day_bounds(now).0), sql_utc(now)],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e| e.to_string())?;
-        // O dia de cadastro começa com 15 tentativas; o teto cresce cinco por dia.
-        let warm_limit = (15 + age * 5).min(day_limit);
-        if hour >= hour_limit || day >= warm_limit {
+        let (hour_limit, warm_limit, limit_wait) = chip_limit_at(&conn, chip, now)?;
+        if limit_wait > 0 {
             return Err(format!("Limite do chip atingido: {} por hora e {} por dia (aquecimento).", hour_limit, warm_limit));
         }
         let (count, failed, optouts): (i64, i64, i64) = conn.query_row(
@@ -2500,7 +2523,7 @@ impl Database {
         }
         conn.execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Purpose) VALUES (?1,?2,?3,?4,?5)", params![chip.id,company_id,campaign_id,Self::opt_out_key(phone),purpose]).map_err(|e| e.to_string())?;
         let id = conn.last_insert_rowid();
-        let n = config("BREAK_EVERY", 10);
+        let n = chip_config(chip.id, "BREAK_EVERY", 10);
         let total: i64 = conn.query_row("SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1", params![chip.id], |r| r.get(0)).map_err(|e| e.to_string())?;
         if total % n == 0 {
             use rand::Rng;
@@ -2516,7 +2539,7 @@ impl Database {
     }
 
     pub fn chip_cooldown_seconds(&self, chip_id: i32) -> Result<u64, String> {
-        let seconds: i64 = self.conn().query_row("SELECT coalesce(max(0, CAST(strftime('%s',NextAt) AS INTEGER)-CAST(strftime('%s','now') AS INTEGER)),0) FROM ESF_ChipCooldown WHERE ChipId=?1", params![chip_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let seconds: i64 = self.conn().query_row(CHIP_COOLDOWN_SQL, params![chip_id], |r| r.get(0)).map_err(|e| e.to_string())?;
         Ok(seconds as u64)
     }
 
@@ -4457,6 +4480,44 @@ mod antiban_tests {
         let error = db.reserve_attempt(&chip, 1, 1, "11999990000", "campaign", local_utc("2026-06-15 23:59:30")).unwrap_err();
         assert!(error.contains("Limite do chip"));
         assert!(db.reserve_attempt(&chip, 1, 1, "11999990000", "campaign", local_utc("2026-06-16 00:00:30")).is_ok());
+    }
+    #[test]
+    fn limite_do_chip_informa_quando_libera() {
+        let path = std::env::temp_dir().join(format!("esfera_chip_libera_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let chip = Chip { id: 8, device_id: 1, phone_number: "".into(), chip_name: "".into(), status: "livre".into(), restricted_until: None, created_at: "2020-01-01 00:00:00".into() };
+        let now = local_utc("2026-06-15 12:00:00");
+        assert_eq!(super::chip_limit_at(&db.conn(), &chip, now).unwrap(), (10, 60, 0));
+        // 10 tentativas na última hora, a mais antiga às 11:20: libera às 12:20 (+1 s de folga).
+        for minute in 20..30 {
+            let at = super::sql_utc(local_utc(&format!("2026-06-15 11:{}:00", minute)));
+            db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Outcome,CreatedAt) VALUES(8,1,1,'1199999999','enviado',?1)", params![at]).unwrap();
+        }
+        assert_eq!(super::chip_limit_at(&db.conn(), &chip, now).unwrap().2, 1201);
+        // Com o dia também esgotado, vale a espera maior: a meia-noite local.
+        let early = super::sql_utc(local_utc("2026-06-15 02:00:00"));
+        for _ in 0..50 {
+            db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Outcome,CreatedAt) VALUES(8,1,1,'1199999999','enviado',?1)", params![early]).unwrap();
+        }
+        let midnight = (local_utc("2026-06-16 00:00:00") - now).num_seconds() as u64;
+        assert_eq!(super::chip_limit_at(&db.conn(), &chip, now).unwrap().2, midnight);
+    }
+    #[test]
+    fn chip_que_nunca_descansou_esta_livre() {
+        let path = std::env::temp_dir().join(format!("esfera_chip_sem_descanso_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.conn().execute("INSERT INTO ESF_Device(AdbDeviceId,DeviceName,CompanyId) VALUES('usb-novo','Novo',1)", []).unwrap();
+        let device = db.get_all_devices().into_iter().find(|d| d.serial == "usb-novo").unwrap();
+        let chip_id = db.add_chip(device.id, "75988052539", "Novo").unwrap();
+        let chip = db.get_chips(device.id).into_iter().find(|c| c.id == chip_id).unwrap();
+        // Sem linha em ESF_ChipCooldown: livre (antes a consulta falhava e o chip novo nunca enviava).
+        assert_eq!(db.chip_cooldown_seconds(chip_id).unwrap(), 0);
+        assert_eq!(db.reply_status(&chip, &device).unwrap().cooldown_seconds, 0);
+        assert!(db.network_status(Some(1)).is_ok());
+        db.extend_chip_cooldown(chip_id, 120).unwrap();
+        assert!((110..=120).contains(&db.chip_cooldown_seconds(chip_id).unwrap()));
     }
     #[test]
     fn freio_janela_e_limites_persistentes() {
