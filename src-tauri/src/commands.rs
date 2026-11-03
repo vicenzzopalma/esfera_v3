@@ -1564,13 +1564,14 @@ pub async fn pair_and_connect_adb_device(
 pub fn disconnect_adb_device(state: State<'_, AppState>, token: String, serial: String) -> Result<String, String> {
     authorize_device_serial(&state, &token, &serial)?;
     let result = AdbManager::disconnect_device(&serial)?;
-    let db = &state.db;
-    db.queue_add_log(
-        0,
-        "info",
-        "ADB Engine",
-        &format!("Dispositivo {} desconectado.", serial),
-    );
+    // Log na empresa do aparelho (na empresa 0 ninguém o via), pelo nome cadastrado.
+    let device = state.db.get_all_devices().into_iter().find(|d| d.serial == serial
+        || d.current_adb_address.as_deref() == Some(serial.as_str())
+        || d.esfera_device_id.as_deref() == Some(serial.as_str()));
+    if let Some(device) = device {
+        let label = if device.name.trim().is_empty() { serial.clone() } else { device.name.clone() };
+        state.db.queue_add_log(device.company_id, "info", "ADB Engine", &format!("Aparelho {} desconectado.", label));
+    }
     Ok(result)
 }
 
@@ -1875,11 +1876,12 @@ pub fn soft_delete_automation(
 // ============================================================
 
 #[tauri::command]
-pub fn get_logs(state: State<'_, AppState>, token: String, company_id: i32) -> Result<Vec<crate::db::AuditLog>, String> {
+/// Logs da empresa (mais novos primeiro): `limit` até 1000 (padrão 100) e `beforeId` para
+/// "carregar mais" a partir do último id recebido.
+pub fn get_logs(state: State<'_, AppState>, token: String, company_id: i32, limit: Option<u32>, before_id: Option<i32>) -> Result<Vec<crate::db::AuditLog>, String> {
     let session = validate_session(&state.sessions, &token)?;
     check_company_access(&session, company_id)?;
-    let db = &state.db;
-    Ok(db.get_logs(company_id))
+    Ok(state.db.get_logs_page(company_id, limit.unwrap_or(100), before_id))
 }
 
 #[tauri::command]

@@ -2282,16 +2282,23 @@ impl Database {
     // ============================================================
 
     pub fn get_logs(&self, company_id: i32) -> Vec<AuditLog> {
+        self.get_logs_page(company_id, 100, None)
+    }
+
+    /// Logs da empresa, do mais novo para o mais antigo, até `limit` (no máximo 1000). Com
+    /// `before_id`, continua de onde a página anterior parou ("carregar mais").
+    pub fn get_logs_page(&self, company_id: i32, limit: u32, before_id: Option<i32>) -> Vec<AuditLog> {
         let conn = self.conn();
         let mut stmt = match conn.prepare_cached(
             "SELECT LogId, Timestamp, LogType, Source, Message, CompanyId
-             FROM ESF_AuditLog WHERE CompanyId = ?1 AND ExcluidoEm IS NULL ORDER BY LogId DESC LIMIT 100"
+             FROM ESF_AuditLog WHERE CompanyId = ?1 AND ExcluidoEm IS NULL AND (?2 IS NULL OR LogId < ?2)
+             ORDER BY LogId DESC LIMIT ?3"
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
 
-        let rows = stmt.query_map(params![company_id], |row| {
+        let rows = stmt.query_map(params![company_id, before_id, limit.clamp(1, 1000) as i64], |row| {
             Ok(AuditLog {
                 id: row.get(0)?,
                 timestamp: row.get(1)?,
@@ -4904,5 +4911,26 @@ mod usuarios_tests {
         assert!(db.get_users_by_company(1).iter().all(|u| u.id != colab.id));
         assert!(db.get_users_by_company_with(1, true).iter().any(|u| u.id == colab.id && !u.is_active), "desativado aparece para reativar");
         assert!(db.set_user_active(999_999, true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod logs_tests {
+    use super::Database;
+    #[test]
+    fn logs_paginados_do_mais_novo_ao_mais_antigo() {
+        let path = std::env::temp_dir().join(format!("esfera_logs_pagina_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let outra = db.create_company("Outra", 5).unwrap();
+        for i in 0..5 { db.add_log(outra.id, "info", "Teste", &format!("evento {}", i)).unwrap(); }
+        db.add_log(1, "info", "Teste", "empresa 1").unwrap();
+        let messages = |logs: Vec<super::AuditLog>| logs.into_iter().map(|l| l.message).collect::<Vec<_>>();
+        let first = db.get_logs_page(outra.id, 2, None);
+        let last_id = first[1].id;
+        assert_eq!(messages(first), ["evento 4", "evento 3"]);
+        assert_eq!(messages(db.get_logs_page(outra.id, 2, Some(last_id))), ["evento 2", "evento 1"]);
+        assert_eq!(db.get_logs_page(outra.id, 5000, None).len(), 5, "teto de 1000 e só a empresa pedida");
+        assert_eq!(db.get_logs_page(outra.id, 0, None).len(), 1);
     }
 }
