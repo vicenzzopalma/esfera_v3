@@ -3866,11 +3866,17 @@ impl Database {
     // ============================================================
 
     pub fn get_users_by_company(&self, company_id: i32) -> Vec<User> {
+        self.get_users_by_company_with(company_id, false)
+    }
+
+    /// Usuários da empresa; com `include_inactive`, também os desativados (para reativar).
+    pub fn get_users_by_company_with(&self, company_id: i32, include_inactive: bool) -> Vec<User> {
         let conn = self.conn();
-        let sql = if company_id > 0 {
-            "SELECT UserId, Username, DisplayName, Role, CompanyId, IsActive FROM ESF_User WHERE CompanyId = ?1 AND IsActive = 1 ORDER BY DisplayName ASC"
-        } else {
-            "SELECT UserId, Username, DisplayName, Role, CompanyId, IsActive FROM ESF_User WHERE IsActive = 1 ORDER BY DisplayName ASC"
+        let sql = match (company_id > 0, include_inactive) {
+            (true, false) => "SELECT UserId, Username, DisplayName, Role, CompanyId, IsActive FROM ESF_User WHERE CompanyId = ?1 AND IsActive = 1 ORDER BY DisplayName ASC",
+            (true, true) => "SELECT UserId, Username, DisplayName, Role, CompanyId, IsActive FROM ESF_User WHERE CompanyId = ?1 ORDER BY IsActive DESC, DisplayName ASC",
+            (false, false) => "SELECT UserId, Username, DisplayName, Role, CompanyId, IsActive FROM ESF_User WHERE IsActive = 1 ORDER BY DisplayName ASC",
+            (false, true) => "SELECT UserId, Username, DisplayName, Role, CompanyId, IsActive FROM ESF_User ORDER BY IsActive DESC, DisplayName ASC",
         };
 
         let mut stmt = match conn.prepare_cached(sql) {
@@ -3901,6 +3907,13 @@ impl Database {
         }
     }
 
+    /// Permissões padrão de cada função, iguais a `src/hooks/usePermissions.ts` (ROLE_DEFAULTS):
+    /// gestor tudo; supervisor só o Dashboard; colaborador nada. Todos começam ativos.
+    fn role_default_permissions(role: &str) -> [(&'static str, bool); 5] {
+        let (all, dashboard) = match role { "master" | "gestor" => (true, true), "supervisor" => (false, true), _ => (false, false) };
+        [("allow_all_tabs", all), ("allow_edit_devices", all), ("allow_manage_users", all), ("allow_dashboard", dashboard), ("is_active", true)]
+    }
+
     pub fn create_user_with_role(
         &self,
         user_name: &str,
@@ -3917,13 +3930,30 @@ impl Database {
         };
 
         let hash = hash_password(pass);
-        self.conn().execute(
-            "INSERT INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId, IsActive)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1);",
-            params![user_name, hash, display_name, valid_role, company_id],
-        ).map_err(|e| format!("Erro ao criar usuário: {}", e))?;
-
-        let user_id = self.conn().last_insert_rowid() as i32;
+        // Usuário e permissões padrão da função numa transação, com o id lido na mesma conexão.
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| format!("Erro ao criar usuário: {}", e))?;
+        let created = (|| -> std::result::Result<i32, String> {
+            conn.execute(
+                "INSERT INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId, IsActive)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1);",
+                params![user_name, hash, display_name, valid_role, company_id],
+            ).map_err(|e| format!("Erro ao criar usuário: {}", e))?;
+            let user_id = conn.last_insert_rowid() as i32;
+            for (key, enabled) in Self::role_default_permissions(valid_role) {
+                conn.execute(
+                    "INSERT INTO ESF_Permission (UserId, PermissionKey, Enabled) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(UserId, PermissionKey) DO UPDATE SET Enabled=excluded.Enabled;",
+                    params![user_id, key, if enabled { 1 } else { 0 }],
+                ).map_err(|e| format!("Erro ao gravar as permissões do usuário: {}", e))?;
+            }
+            Ok(user_id)
+        })();
+        let user_id = match created {
+            Ok(id) => { conn.execute_batch("COMMIT;").map_err(|e| { let _ = conn.execute_batch("ROLLBACK;"); format!("Erro ao criar usuário: {}", e) })?; id }
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK;"); return Err(e); }
+        };
+        drop(conn);
 
         Ok(User {
             id: user_id,
@@ -3933,6 +3963,54 @@ impl Database {
             company_id: Some(company_id),
             is_active: true,
         })
+    }
+
+    /// Função e empresa de um usuário (para as travas da gestão de usuários).
+    pub fn user_role_company(&self, user_id: i32) -> Option<(String, Option<i32>)> {
+        self.conn()
+            .query_row("SELECT Role, CompanyId FROM ESF_User WHERE UserId = ?1", params![user_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok()
+    }
+
+    /// Ativa ou desativa o acesso (o login só aceita usuário ativo).
+    pub fn set_user_active(&self, user_id: i32, active: bool) -> Result<(), String> {
+        let n = self.conn()
+            .execute("UPDATE ESF_User SET IsActive = ?1 WHERE UserId = ?2", params![if active { 1 } else { 0 }, user_id])
+            .map_err(|e| e.to_string())?;
+        if n == 0 { return Err("Usuário não encontrado.".into()); }
+        Ok(())
+    }
+
+    /// Troca a senha (guardada só como hash).
+    pub fn reset_user_password(&self, user_id: i32, new_password: &str) -> Result<(), String> {
+        let n = self.conn()
+            .execute("UPDATE ESF_User SET PasswordHash = ?1 WHERE UserId = ?2", params![hash_password(new_password), user_id])
+            .map_err(|e| e.to_string())?;
+        if n == 0 { return Err("Usuário não encontrado.".into()); }
+        Ok(())
+    }
+
+    /// Troca a função e regrava as permissões padrão da nova função (as da função antiga deixariam
+    /// um colaborador promovido sem acesso), tudo numa transação.
+    pub fn update_user_role(&self, user_id: i32, role: &str) -> Result<(), String> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
+        let result = (|| -> std::result::Result<(), String> {
+            let n = conn.execute("UPDATE ESF_User SET Role = ?1 WHERE UserId = ?2", params![role, user_id]).map_err(|e| e.to_string())?;
+            if n == 0 { return Err("Usuário não encontrado.".into()); }
+            for (key, enabled) in Self::role_default_permissions(role) {
+                conn.execute(
+                    "INSERT INTO ESF_Permission (UserId, PermissionKey, Enabled) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(UserId, PermissionKey) DO UPDATE SET Enabled=excluded.Enabled;",
+                    params![user_id, key, if enabled { 1 } else { 0 }],
+                ).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;").map_err(|e| { let _ = conn.execute_batch("ROLLBACK;"); e.to_string() }),
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK;"); Err(e) }
+        }
     }
 
     // ============================================================
@@ -4790,5 +4868,41 @@ mod pausa_automatica_tests {
         assert_eq!(running.pause_reason, None);
         assert!(serde_json::to_value(&running).unwrap().get("pauseReason").is_none());
         assert!(db.get_running_campaigns().unwrap().iter().any(|c| c.id == id && c.pause_reason.is_none()));
+    }
+}
+
+#[cfg(test)]
+mod usuarios_tests {
+    use super::Database;
+    #[test]
+    fn permissoes_padrao_funcao_senha_e_desativacao() {
+        let path = std::env::temp_dir().join(format!("esfera_usuarios_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let perms = |id: i32| db.get_user_permissions(id).into_iter().map(|p| (p.permission_key, p.enabled)).collect::<std::collections::HashMap<_, _>>();
+        // Padrão de cada função, igual ao de usePermissions.ts.
+        let gestor = db.create_user_with_role("g.teste", "123456", "Gestor", "gestor", 1).unwrap();
+        let supervisor = db.create_user_with_role("s.teste", "123456", "Supervisor", "supervisor", 1).unwrap();
+        let colab = db.create_user_with_role("c.teste", "123456", "Colaborador", "colaborador", 1).unwrap();
+        let g = perms(gestor.id);
+        assert_eq!(g.len(), 5);
+        assert!(g.values().all(|on| *on), "gestor: tudo");
+        let s = perms(supervisor.id);
+        assert_eq!((s["allow_dashboard"], s["allow_all_tabs"], s["allow_edit_devices"], s["allow_manage_users"]), (true, false, false, false), "supervisor: só o Dashboard");
+        let c = perms(colab.id);
+        assert_eq!((c["allow_dashboard"], c["allow_all_tabs"], c["is_active"]), (false, false, true), "colaborador: nada");
+        // Promovido: permissões da nova função, não as da antiga.
+        db.update_user_role(colab.id, "gestor").unwrap();
+        assert!(perms(colab.id).values().all(|on| *on));
+        assert_eq!(db.user_role_company(colab.id), Some(("gestor".to_string(), Some(1))));
+        // Senha nova e desativação valem no login.
+        db.reset_user_password(colab.id, "nova-senha").unwrap();
+        assert!(db.authenticate("c.teste", "123456").is_none());
+        assert!(db.authenticate("c.teste", "nova-senha").is_some());
+        db.set_user_active(colab.id, false).unwrap();
+        assert!(db.authenticate("c.teste", "nova-senha").is_none());
+        assert!(db.get_users_by_company(1).iter().all(|u| u.id != colab.id));
+        assert!(db.get_users_by_company_with(1, true).iter().any(|u| u.id == colab.id && !u.is_active), "desativado aparece para reativar");
+        assert!(db.set_user_active(999_999, true).is_err());
     }
 }

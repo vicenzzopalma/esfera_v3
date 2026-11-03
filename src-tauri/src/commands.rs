@@ -4325,10 +4325,94 @@ pub fn get_users(
     state: State<'_, AppState>,
     token: String,
     company_id: i32,
+    include_inactive: Option<bool>,
 ) -> Result<Vec<crate::db::User>, String> {
     let session = validate_session(&state.sessions, &token)?;
     let target_company = if session.role == "master" { company_id } else { session.company_id.unwrap_or(company_id) };
-    Ok(state.db.get_users_by_company(target_company))
+    // Desativados só aparecem para quem pode reativá-los.
+    let include_inactive = include_inactive.unwrap_or(false) && (session.role == "master" || session.role == "gestor");
+    Ok(state.db.get_users_by_company_with(target_company, include_inactive))
+}
+
+/// Travas da gestão de usuários: só master ou gestor; gestor só na própria empresa; só master mexe
+/// em master; ninguém mexe na própria conta (nem se promove). Devolve a sessão e a empresa do alvo.
+fn authorize_user_management(state: &AppState, token: &str, user_id: i32) -> Result<(crate::session::UserSession, i32), String> {
+    let session = validate_session(&state.sessions, token)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Apenas master ou gestor pode gerenciar usuários.".into());
+    }
+    if session.user_id == user_id {
+        return Err("Você não pode alterar a sua própria conta por aqui.".into());
+    }
+    let (target_role, target_company) = state.db.user_role_company(user_id).ok_or_else(|| "Usuário não encontrado.".to_string())?;
+    if target_role == "master" && session.role != "master" {
+        return Err("Somente master pode alterar outro master.".into());
+    }
+    if session.role != "master" && (session.company_id.is_none() || target_company != session.company_id) {
+        return Err("Usuário de outra empresa.".into());
+    }
+    Ok((session, target_company.unwrap_or(0)))
+}
+
+#[tauri::command]
+pub fn set_user_active(state: State<'_, AppState>, token: String, user_id: i32, active: bool) -> Result<(), String> {
+    let (session, company) = authorize_user_management(&state, &token, user_id)?;
+    state.db.set_user_active(user_id, active)?;
+    state.db.queue_add_log(company, "info", "Usuários", &format!("Usuário {} {} por {}.", user_id, if active { "reativado" } else { "desativado" }, session.username));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn reset_user_password(state: State<'_, AppState>, token: String, user_id: i32, new_password: String) -> Result<(), String> {
+    let (session, company) = authorize_user_management(&state, &token, user_id)?;
+    if new_password.chars().count() < 6 {
+        return Err("A senha precisa ter pelo menos 6 caracteres.".into());
+    }
+    state.db.reset_user_password(user_id, &new_password)?;
+    state.db.queue_add_log(company, "info", "Usuários", &format!("Senha do usuário {} trocada por {}.", user_id, session.username));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_user_role(state: State<'_, AppState>, token: String, user_id: i32, role: String) -> Result<(), String> {
+    let (session, company) = authorize_user_management(&state, &token, user_id)?;
+    let role = role.trim().to_lowercase();
+    if !matches!(role.as_str(), "gestor" | "supervisor" | "colaborador") {
+        return Err("Função inválida: use gestor, supervisor ou colaborador.".into());
+    }
+    state.db.update_user_role(user_id, &role)?;
+    state.db.queue_add_log(company, "info", "Usuários", &format!("Usuário {} passou a {} por {}.", user_id, role, session.username));
+    Ok(())
+}
+
+#[cfg(test)]
+mod gestao_de_usuarios_tests {
+    use super::*;
+
+    #[test]
+    fn travas_da_gestao_de_usuarios() {
+        let path = std::env::temp_dir().join(format!("esfera_gestao_usuarios_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Arc::new(Database::init(path.to_string_lossy().as_ref()).unwrap());
+        let outra = db.create_company("Outra", 5).unwrap();
+        let gestor = db.create_user_with_role("g.trava", "123456", "G", "gestor", 1).unwrap();
+        let colab = db.create_user_with_role("c.trava", "123456", "C", "colaborador", 1).unwrap();
+        let de_fora = db.create_user_with_role("f.trava", "123456", "F", "colaborador", outra.id).unwrap();
+        let outro_master = db.create_user_with_role("m.trava", "123456", "M", "master", 1).unwrap();
+        let mut sessions = SessionManager::new();
+        let t_gestor = sessions.create_session(gestor.id, "g.trava", "gestor", Some(1));
+        let t_colab = sessions.create_session(colab.id, "c.trava", "colaborador", Some(1));
+        let t_master = sessions.create_session(1, "vicenzzo.master", "master", None);
+        let state = AppState { db: db.clone(), sessions: Arc::new(Mutex::new(sessions)), hub_client: Arc::new(TokioMutex::new(None)) };
+        assert!(authorize_user_management(&state, &t_gestor, colab.id).is_ok());
+        assert!(authorize_user_management(&state, &t_gestor, gestor.id).unwrap_err().contains("própria conta"));
+        assert!(authorize_user_management(&state, &t_gestor, de_fora.id).unwrap_err().contains("outra empresa"));
+        assert!(authorize_user_management(&state, &t_gestor, outro_master.id).unwrap_err().contains("Somente master"));
+        assert!(authorize_user_management(&state, &t_colab, gestor.id).unwrap_err().contains("Apenas master ou gestor"));
+        assert!(authorize_user_management(&state, &t_master, de_fora.id).is_ok());
+        assert!(authorize_user_management(&state, &t_master, outro_master.id).is_ok());
+        assert!(authorize_user_management(&state, &t_master, 999_999).unwrap_err().contains("não encontrado"));
+    }
 }
 
 #[tauri::command]
