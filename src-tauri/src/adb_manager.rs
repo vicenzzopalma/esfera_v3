@@ -4102,38 +4102,93 @@ impl AdbManager {
         }
     }
 
+    /// Todos os valores `<chave>=<número>` das linhas de um `content query` (uma por linha).
+    fn parse_query_ids(output: &str, key: &str) -> Vec<i64> {
+        let needle = format!("{}=", key);
+        output.lines().filter_map(|line| {
+            // Casa a coluna exata: "_id=" não pode casar dentro de "raw_contact_id=".
+            let at = line.match_indices(&needle).map(|(i, _)| i)
+                .find(|i| *i == 0 || !line[..*i].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))?;
+            line[at + needle.len()..].split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+        }).collect()
+    }
+
+    /// Marcador único gravado no `sourceid` do raw_contact: é por ele que o id do contato
+    /// recém-criado é achado, porque o `content insert` do Android padrão não imprime nada.
+    fn temp_contact_marker(digits: &str) -> String {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let seq = TYPING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("esf-{}-{:x}{:x}", digits, nanos & 0xffff_ffff_ffff, seq)
+    }
+
     /// Insere um contato provisório na agenda do Android (via content provider nativo)
-    /// Retorna o raw_contact_id para rastreamento e exclusão
+    /// Retorna o raw_contact_id para rastreamento e exclusão. Idempotente pelo número canônico:
+    /// se a conta `esfera_temp` já tem esse número, devolve o contato que existe.
     #[allow(dead_code)]
     pub fn insert_temporary_contact(serial: &str, _contact_name: &str, phone: &str) -> Result<Option<i64>, String> {
         static CONTACT_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = CONTACT_WRITES.lock().map_err(|_| "Não foi possível preparar a agenda")?;
+        let _guard = CONTACT_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        let marker = Self::temp_contact_marker(&Self::normalize_target_phone(phone));
+        let result = Self::insert_temporary_contact_with(phone, &marker, &mut |cmd| Self::execute_shell(serial, cmd, 6));
+        if let Err(ref e) = result { eprintln!("[CONTATOS TEMP] {} em {}: {}", phone, serial, e); }
+        result
+    }
+
+    /// Lógica do contato temporário sobre um shell qualquer (o aparelho, ou um simulado nos testes).
+    fn insert_temporary_contact_with(phone: &str, marker: &str, shell: &mut dyn FnMut(&str) -> Result<String, String>) -> Result<Option<i64>, String> {
         let digits = Self::normalize_target_phone(phone);
         if digits.len() < 10 { return Err("Número de telefone não contém dígitos válidos".into()); }
-        let query = format!("content query --uri content://com.android.contacts/data --projection raw_contact_id --where \"account_name='esfera_temp' AND account_type='com.esfera' AND mimetype='vnd.android.cursor.item/phone_v2' AND (data1='+{}' OR data4='+{}')\"", digits, digits);
-        let existing = Self::execute_shell(serial, &query, 6)?;
-        let ids: Vec<i64> = existing.lines().filter_map(|line| line.split("raw_contact_id=").nth(1))
-            .filter_map(|v| v.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()).collect();
-        if ids.len() == 1 { return Ok(Some(ids[0])); }
-        if ids.len() > 1 { return Err("Há contatos temporários duplicados para esse número; confira a agenda".into()); }
+        let query = format!("content query --uri content://com.android.contacts/data --projection raw_contact_id --where \"account_name='{}' AND account_type='{}' AND mimetype='vnd.android.cursor.item/phone_v2' AND (data1='+{}' OR data4='+{}')\"",
+            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME, Self::ESFERA_TEMP_CONTACT_ACCOUNT_TYPE, digits, digits);
+        let existing = shell(&query)?;
+        let ids = Self::parse_query_ids(&existing, "raw_contact_id");
+        if let Some(id) = ids.iter().min().copied() {
+            // Contatos repetidos do mesmo número (sobra de versões antigas) não impedem o envio:
+            // todos levam à mesma conversa no WhatsApp.
+            if ids.len() > 1 { println!("[CONTATOS TEMP] {} contatos temporários para {}; usando o {}.", ids.len(), digits, id); }
+            return Ok(Some(id));
+        }
         if !existing.contains("No result") { return Err("Não foi possível conferir o contato temporário na agenda".into()); }
-        let raw = Self::execute_shell(serial, "content insert --uri content://com.android.contacts/raw_contacts --bind account_name:s:esfera_temp --bind account_type:s:com.esfera", 6)?;
-        let id = Self::parse_inserted_raw_contact_id(&raw).ok_or("O aparelho não confirmou a criação do contato temporário")?;
-        let result = (|| -> Result<(), String> {
+
+        // Apaga o raw_contact (e os dados dele) criado com o marcador; usado em qualquer falha.
+        let delete_marked = format!(
+            "content delete --uri \"content://com.android.contacts/raw_contacts?caller_is_syncadapter=true\" --where \"account_name='{}' AND sourceid='{}'\"",
+            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME, marker);
+        let inserted = shell(&format!(
+            "content insert --uri content://com.android.contacts/raw_contacts --bind account_name:s:{} --bind account_type:s:{} --bind sourceid:s:{}",
+            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME, Self::ESFERA_TEMP_CONTACT_ACCOUNT_TYPE, marker));
+        // O `content insert` não imprime o endereço criado no Android padrão: o id vem da consulta
+        // pelo marcador (também quando o comando falhou depois de gravar).
+        let by_marker = format!("content query --uri content://com.android.contacts/raw_contacts --projection _id --where \"sourceid='{}'\"", marker);
+        let id = match shell(&by_marker).map(|out| Self::parse_query_ids(&out, "_id")) {
+            Ok(found) if found.len() == 1 => found[0],
+            _ => {
+                let _ = shell(&delete_marked);
+                return Err(match inserted {
+                    Err(e) => format!("Não foi possível criar o contato temporário: {}", e),
+                    Ok(_) => "O aparelho não confirmou a criação do contato temporário".into(),
+                });
+            }
+        };
+        let mut fill = || -> Result<(), String> {
             for command in [
                 format!("content insert --uri content://com.android.contacts/data --bind raw_contact_id:i:{} --bind mimetype:s:vnd.android.cursor.item/name --bind data1:s:'Esfera {}' --bind data2:s:'Esfera {}'", id, digits, digits),
                 format!("content insert --uri content://com.android.contacts/data --bind raw_contact_id:i:{} --bind mimetype:s:vnd.android.cursor.item/phone_v2 --bind data1:s:'+{}' --bind data2:i:2 --bind data4:s:'+{}'", id, digits, digits),
             ] {
-                let output = Self::execute_shell(serial, &command, 6)?;
-                if !output.contains("content://com.android.contacts/data/") { return Err("O aparelho não confirmou os dados do contato temporário".into()); }
+                // Sem conferir a saída: o Android padrão não imprime nada; a prova é a consulta abaixo.
+                shell(&command)?;
             }
-            let saved = Self::execute_shell(serial, &query, 6)?;
-            if !saved.lines().any(|line| line.split("raw_contact_id=").nth(1).and_then(|v| v.split(|c: char| !c.is_ascii_digit()).next()).and_then(|v| v.parse::<i64>().ok()) == Some(id)) {
+            let saved = shell(&query)?;
+            if !Self::parse_query_ids(&saved, "raw_contact_id").contains(&id) {
                 return Err("O número do contato temporário não foi confirmado na agenda".into());
             }
             Ok(())
-        })();
-        if let Err(error) = result { let _ = Self::delete_temporary_contact(serial, Some(id)); return Err(error); }
+        };
+        if let Err(error) = fill() {
+            let _ = shell(&delete_marked);
+            let _ = shell(&format!("content delete --uri content://com.android.contacts/data --where raw_contact_id={}; content delete --uri content://com.android.contacts/raw_contacts --where _id={}", id, id));
+            return Err(error);
+        }
         Ok(Some(id))
     }
 
@@ -4400,9 +4455,14 @@ impl AdbManager {
         //    agenda e tenta novamente pela busca local antes de recorrer ao link.
         let mut opened_via_search = Self::wa_open_chat_via_search(serial, pkg, &digits, &tail, screen_w, screen_h)?;
         if !opened_via_search {
-            Self::insert_temporary_contact(serial, &format!("Esfera {}", digits), &digits)?;
-            std::thread::sleep(Duration::from_millis(700));
-            opened_via_search = Self::wa_open_chat_via_search(serial, pkg, &digits, &tail, screen_w, screen_h)?;
+            // Falha ao preparar o contato nunca derruba o envio: segue para o link, como antes.
+            match Self::insert_temporary_contact(serial, &format!("Esfera {}", digits), &digits) {
+                Ok(_) => {
+                    std::thread::sleep(Duration::from_millis(700));
+                    opened_via_search = Self::wa_open_chat_via_search(serial, pkg, &digits, &tail, screen_w, screen_h)?;
+                }
+                Err(e) => eprintln!("[CONTATOS TEMP] Contato de {} não ficou pronto em {} ({}); abrindo pelo link.", digits, serial, e),
+            }
         }
         if !opened_via_search {
             // Abre a conversa vazia: o texto é sempre digitado, nunca pré-preenchido pelo link.
@@ -4461,39 +4521,54 @@ impl AdbManager {
     /// estende a espera para não cancelar a abertura da conversa prematuramente.
     fn wa_entry(serial: &str, pkg: &str) -> Option<UiNode> {
         let started = Instant::now();
-        let mut deadline = started + Duration::from_secs(6);
+        let mut deadline = started + Duration::from_secs(8);
+        // Teto absoluto: carregamento lento estende a espera, mas nunca sem fim.
+        let cap = started + Duration::from_secs(30);
+        let mut reads = 0;
         loop {
-            let xml = Self::ui_dump_until(serial, deadline);
+            // Cada leitura tem fôlego próprio: com o agente fora (uiautomator ~5 s) ainda cabem
+            // várias leituras completas, em vez de uma só e um "a conversa não abriu" falso.
+            let xml = Self::ui_dump_until(serial, Self::read_deadline(deadline, cap));
+            reads += 1;
             if Self::shows_no_whatsapp(&xml) || Self::shows_restricted_account(&xml) { return None; }
             if let Some(n) = Self::ui_nodes(&xml).into_iter()
                 .find(|n| Self::whatsapp_node(n) && n.rid == format!("{}:id/entry", pkg)) { return Some(n); }
-            if Self::shows_loading_or_connecting(&xml) { deadline = started + Duration::from_secs(20); }
-            if Instant::now() >= deadline { return None; }
-            std::thread::sleep(Duration::from_millis(300).min(deadline.saturating_duration_since(Instant::now())));
+            if Self::shows_loading_or_connecting(&xml) { deadline = deadline.max(started + Duration::from_secs(20)); }
+            let now = Instant::now();
+            if now >= cap || (now >= deadline && reads >= 3) { return None; }
+            std::thread::sleep(Duration::from_millis(300));
         }
     }
 
-    /// Só texto de diálogo/status do pacote autorizado. Bolhas nunca classificam a tela.
+    /// Conteúdo de conversa ou texto digitado: bolhas, prévias e resultados (tudo dentro de lista)
+    /// e os campos de mensagem e de busca. Nunca serve para classificar a tela.
+    fn conversation_content(n: &UiNode) -> bool {
+        let id = n.rid.rsplit('/').next().unwrap_or("");
+        Self::is_list(n)
+            || ["entry", "search_input", "search_src_text", "message_text", "caption", "quoted_text",
+                "single_msg_tv", "conversations_row_message"].contains(&id)
+    }
+
+    /// Texto de aviso/status do WhatsApp por EXCLUSÃO: todo texto de nó do pacote autorizado
+    /// (diálogos, faixas, telas de bloqueio, barra de título), menos o conteúdo de conversa e os
+    /// campos digitados. Não depende de ids de diálogo, que mudam entre versões do WhatsApp.
     fn whatsapp_status_text(xml: &str) -> String {
         let nodes = Self::ui_nodes(xml);
-        nodes.iter().filter(|n| Self::whatsapp_node(n) &&
-            ["android:id/message", "android:id/alertTitle", "com.whatsapp:id/alert_dialog_message",
-             "com.whatsapp:id/progress_dialog_message", "com.whatsapp:id/progress_text",
-             "com.whatsapp:id/registration_ban_message", "com.whatsapp:id/registration_text"]
-                .contains(&n.rid.as_str()))
-            .filter(|n| {
-                if n.rid.contains("registration_") { return true; }
-                let mut parent = n.parent;
-                while let Some(i) = parent {
-                    let ancestor = &nodes[i];
-                    if ancestor.rid.ends_with("/message_row") || ancestor.rid.ends_with("/message_container") { return false; }
-                    if ancestor.rid.ends_with("/alert_root") || ancestor.rid.ends_with("/parentPanel") || ancestor.class.contains("Dialog") { return true; }
-                    parent = ancestor.parent;
-                }
-                false
-            })
-            .map(|n| Self::decode_xml_numeric(&n.text).to_lowercase().replace('’', "'"))
-            .collect::<Vec<_>>().join(" ")
+        let excluded = |index: usize| {
+            let mut cursor = Some(index);
+            while let Some(i) = cursor {
+                if Self::conversation_content(&nodes[i]) { return true; }
+                cursor = nodes[i].parent;
+            }
+            false
+        };
+        let text = nodes.iter().enumerate()
+            .filter(|(i, n)| Self::whatsapp_node(n) && !excluded(*i))
+            .flat_map(|(_, n)| [n.text.as_str(), n.description.as_str()])
+            .filter(|t| !t.trim().is_empty())
+            .collect::<Vec<_>>().join(" ");
+        Self::strip_format_chars(&Self::decode_xml_numeric(&text)).to_lowercase().replace('’', "'")
+            .split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// Detecta se o WhatsApp está aguardando resposta da rede ("Buscando...", "Iniciando conversa...", "Conectando...").
@@ -4583,13 +4658,25 @@ impl AdbManager {
             Some(e) => e,
             None => {
                 let dump = Self::ui_dump(serial);
+                // Avisos com prova positiva vêm antes de qualquer contorno: conta restrita pausa a
+                // campanha e marca o chip; número sem WhatsApp vai para a lista "não disparar".
+                if Self::shows_restricted_account(&dump) {
+                    return Err("CONTA_RESTRITA: WhatsApp indica conta restrita ou banida".to_string());
+                }
+                if Self::shows_no_whatsapp(&dump) {
+                    let _ = Self::send_keyevent(serial, 4); // fecha o aviso sem sair do WhatsApp
+                    return Err(format!("SEM_WHATSAPP: o número {} não está no WhatsApp", phone));
+                }
                 // Se o WhatsApp bloqueou o link por detecção de rede lenta ("Não foi possível conectar"),
                 // fecha o alerta e abre a conversa via contato local na agenda (que não exige validação online).
                 if Self::shows_network_error(&dump) && digits.len() >= 8 {
                     let _ = Self::send_keyevent(serial, 4);
                     std::thread::sleep(Duration::from_millis(400));
                     let tail = &digits[digits.len() - 8..];
-                    Self::insert_temporary_contact(serial, &format!("Esfera {}", digits), digits)?;
+                    // Sem o contato a busca ainda pode achar o da preparação; a falha não é fatal.
+                    if let Err(e) = Self::insert_temporary_contact(serial, &format!("Esfera {}", digits), digits) {
+                        eprintln!("[CONTATOS TEMP] Contato de {} não ficou pronto em {} ({}); tentando a busca mesmo assim.", digits, serial, e);
+                    }
                     std::thread::sleep(Duration::from_millis(700));
                     if Self::wa_open_chat_via_search(serial, pkg, digits, tail, screen_w, screen_h).unwrap_or(false) {
                         if let Some(e2) = Self::wa_entry(serial, pkg) {
@@ -4602,12 +4689,7 @@ impl AdbManager {
                     }
                 } else {
                     let focus = Self::wa_focus(serial);
-                    // O WhatsApp avisa "O número ... não está no WhatsApp": lê antes de fechar o aviso.
-                    let no_whatsapp = Self::shows_no_whatsapp(&dump);
                     let _ = Self::send_keyevent(serial, 4); // fecha diálogo/aviso sem sair do WhatsApp
-                    if no_whatsapp {
-                        return Err(format!("SEM_WHATSAPP: o número {} não está no WhatsApp", phone));
-                    }
                     if focus.contains("AppAuthentication") {
                         return Err("WhatsApp bloqueado por senha/biometria: a conversa não abriu".to_string());
                     }
@@ -4626,7 +4708,18 @@ impl AdbManager {
         Self::type_text_human_hpc_opts(serial, text, true, empty)?;
 
         // A mesma árvore confere destinatário, conteúdo e botão imediatamente antes do envio.
-        let before = Self::ui_dump(serial);
+        // Se a leitura veio sem o campo ou sem o botão (tela em transição), relê uma vez.
+        let ready = |xml: &str| {
+            let nodes = Self::ui_nodes(xml);
+            nodes.iter().any(|n| Self::whatsapp_node(n) && n.rid == "com.whatsapp:id/entry")
+                && nodes.iter().any(|n| Self::whatsapp_node(n) && n.rid == "com.whatsapp:id/send" && n.enabled && n.cx > 0 && n.cy > 0)
+        };
+        let mut before = Self::ui_dump(serial);
+        if !ready(&before) {
+            std::thread::sleep(Duration::from_millis(400));
+            let again = Self::ui_dump_uiautomator(serial);
+            if ready(&again) { before = again; }
+        }
         Self::verify_chat_identity(&before, digits)?;
         let nodes = Self::ui_nodes(&before);
         let draft = nodes.iter().find(|n| Self::whatsapp_node(n) && n.rid == "com.whatsapp:id/entry")
@@ -4643,14 +4736,58 @@ impl AdbManager {
         // O segundo toque de proteção do soft_tap é preservado por decisão explícita do dono.
         Self::soft_tap(serial, button.cx, button.cy)
             .map_err(|_| "INCERTO: não foi possível confirmar o toque em Enviar; confira a conversa antes de tentar novamente".to_string())?;
-        let deadline = Instant::now() + Duration::from_secs(18);
-        while Instant::now() < deadline {
-            let after = Self::ui_dump_until(serial, deadline);
-            if Self::sent_on_screen(&before, &after, digits, text) { return Ok(()); }
-            if !after.is_empty() && Self::verify_chat_identity(&after, digits).is_err() { break; }
+        Self::confirm_sent(serial, &before, digits, text)
+    }
+
+    /// Depois do toque em Enviar, separa os casos pela tela:
+    /// - bolha nova com tique: enviada;
+    /// - texto ainda no campo e nenhuma bolha nova: nada saiu, falha comum (o contato volta à fila);
+    /// - relógio na bolha nova: pendente de rede, reconfere até o prazo; continua no WhatsApp, que
+    ///   entrega sozinho quando a rede voltar, então conta como enviada (reenviar duplicaria);
+    /// - campo vazio sem bolha conferida (ids/estrutura desconhecidos): enviada, como antes;
+    /// - INCERTO só com indício de problema: bolha marcada como não enviada, outra conversa na tela,
+    ///   campo com outro texto ou tela ilegível até o fim do prazo. INCERTO nunca é reenviado.
+    fn confirm_sent(serial: &str, before: &str, digits: &str, text: &str) -> Result<(), String> {
+        let tapped = Instant::now();
+        let deadline = tapped + Duration::from_secs(20);
+        let cap = tapped + Duration::from_secs(32);
+        let mut reads = 0;
+        let mut state = SendCheck::Unreadable;
+        let mut since = tapped;
+        loop {
+            let after = Self::ui_dump_until(serial, Self::read_deadline(deadline, cap));
+            reads += 1;
+            let seen = Self::send_check(before, &after, digits, text);
+            // Uma leitura ruim no meio não apaga o que já foi visto (campo vazio, relógio...).
+            let ignore = seen == SendCheck::Unreadable && state != SendCheck::Unreadable;
+            if !ignore && seen != state { state = seen; since = Instant::now(); }
+            if matches!(state, SendCheck::Confirmed | SendCheck::Failed | SendCheck::WrongChat) { break; }
+            let now = Instant::now();
+            // Campo cheio, campo vazio sem bolha e campo com outro texto não mudam sozinhos: 5 s
+            // estáveis bastam. Relógio e tela ilegível esperam o prazo inteiro.
+            let steady = reads >= 2 && now.duration_since(since) >= Duration::from_secs(5);
+            if steady && matches!(state, SendCheck::StillInField | SendCheck::Emptied | SendCheck::OtherText) { break; }
+            if now >= cap || (now >= deadline && reads >= 2) { break; }
             std::thread::sleep(Duration::from_millis(400));
         }
-        Err("INCERTO: o WhatsApp não confirmou uma nova mensagem enviada nesta conversa; confira no aparelho antes de tentar novamente".into())
+        match state {
+            SendCheck::Pending => println!("[ENVIO] Mensagem registrada no WhatsApp de {} e ainda aguardando a rede (relógio); o WhatsApp entrega sozinho.", serial),
+            SendCheck::Emptied => println!("[ENVIO] Campo esvaziou após Enviar em {}; bolha não conferida na tela, contada como enviada.", serial),
+            _ => {}
+        }
+        Self::send_outcome(state)
+    }
+
+    /// Resultado do envio pelo último estado visto (ver `confirm_sent`).
+    fn send_outcome(state: SendCheck) -> Result<(), String> {
+        match state {
+            SendCheck::Confirmed | SendCheck::Pending | SendCheck::Emptied => Ok(()),
+            SendCheck::StillInField => Err("O botão Enviar não respondeu: a mensagem continua no campo".into()),
+            SendCheck::Failed => Err("INCERTO: o WhatsApp marcou a mensagem como não enviada; confira a conversa no aparelho antes de tentar novamente".into()),
+            SendCheck::WrongChat => Err("INCERTO: outra conversa apareceu na tela depois do toque em Enviar; confira no aparelho antes de tentar novamente".into()),
+            SendCheck::OtherText => Err("INCERTO: o campo de mensagem mudou depois do toque em Enviar; confira no aparelho antes de tentar novamente".into()),
+            SendCheck::Unreadable => Err("INCERTO: não foi possível confirmar o envio na tela; confira no aparelho antes de tentar novamente".into()),
+        }
     }
 
     /// Abre a conversa pela busca interna do WhatsApp. Só toca num resultado cuja linha
@@ -4665,15 +4802,11 @@ impl AdbManager {
             if !n.rid.contains("contact_name") {
                 return false;
             }
-            // Um nome qualquer que só contenha os dígitos não serve.
-            let t = n.text.trim();
-            let is_number_only = t.chars().all(|c| c.is_ascii_digit() || " +-()".contains(c));
-            let is_temp_contact = t.strip_prefix("Esfera ").map(|r| r.chars().all(|c| c.is_ascii_digit())).unwrap_or(false);
-            let row = Self::extract_phone_digits(t);
-            (is_number_only || is_temp_contact)
-                && row.len() >= 10
-                && row.ends_with(tail)
-                && crate::db::Database::opt_out_key(&row) == want
+            // Um nome qualquer que só contenha os dígitos não serve: só o número puro ou
+            // "Esfera <número>", sem as marcas invisíveis que o WhatsApp põe em volta do número.
+            Self::header_number(&n.text).map_or(false, |row| {
+                row.len() >= 10 && row.ends_with(tail) && crate::db::Database::opt_out_key(&row) == want
+            })
         })
     }
 
@@ -4744,12 +4877,16 @@ impl AdbManager {
         let d = Self::calculate_gaussian_delay(900, 1200);
         std::thread::sleep(Duration::from_millis(d as u64));
         let deadline = Instant::now() + Duration::from_secs(8);
+        let cap = deadline + Duration::from_secs(10);
+        let mut reads = 0;
         let hit = loop {
-            let results = Self::ui_nodes(&Self::ui_dump_until(serial, deadline));
+            let results = Self::ui_nodes(&Self::ui_dump_until(serial, Self::read_deadline(deadline, cap)));
+            reads += 1;
             if let Some(n) = Self::search_hit(&results, digits, tail) {
                 break Some((n.cx, n.cy));
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= cap || (now >= deadline && reads >= 2) {
                 break None;
             }
             std::thread::sleep(Duration::from_millis(600));
@@ -4777,26 +4914,68 @@ impl AdbManager {
     /// (mesmo XML do uiautomator, em fração de segundo). Reserva: `uiautomator dump`, que leva
     /// ~5 s em aparelhos fracos. Se o agente falhar, fica 60 s sem tentá-lo naquele aparelho.
     fn ui_dump(serial: &str) -> String {
-        Self::ui_dump_until(serial, Instant::now() + Duration::from_secs(12))
+        // Mesmo fôlego de antes: o agente tem o prazo dele e o uiautomator, o seu.
+        Self::ui_dump_until(serial, Instant::now() + Self::AGENT_DUMP_BUDGET + Duration::from_secs(12))
+    }
+
+    /// Prazo da leitura pelo agente: suficiente para aparelho lento responder (o prazo de quem
+    /// chamou nunca encurta abaixo disso a ponto de declarar o agente fora sem culpa dele).
+    const AGENT_DUMP_BUDGET: Duration = Duration::from_secs(6);
+    /// Prazo mínimo de cada leitura nos laços de espera (cabe uma leitura completa do uiautomator).
+    const UI_READ_FLOOR: Duration = Duration::from_secs(7);
+
+    /// Prazo de uma leitura dentro de um laço: nunca menor que `UI_READ_FLOOR`, nem além de `cap`.
+    fn read_deadline(deadline: Instant, cap: Instant) -> Instant {
+        deadline.max(Instant::now() + Self::UI_READ_FLOOR).min(cap)
+    }
+
+    /// Interpreta a resposta do `DUMP_UI`: `Ok(xml)`, `Err(true)` = o agente respondeu e não serve
+    /// (inativo, sem receptor, dados quebrados), `Err(false)` = passageiro (sem janela ativa ou
+    /// tela sem nenhum nó visível, como numa transição).
+    fn agent_dump_reply(out: &str) -> Result<String, bool> {
+        use base64::Engine as _;
+        let Some(line) = out.lines().find(|l| l.contains("Broadcast completed: result=")) else { return Err(true); };
+        let code = line.split("result=").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit() && c != '-').next())
+            .and_then(|c| c.parse::<i32>().ok());
+        if code == Some(3) { return Err(false); }
+        if code != Some(1) { return Err(true); }
+        let xml = line.split("data=\"").nth(1).and_then(|rest| rest.split('"').next())
+            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok())
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        match xml {
+            None => Err(true),
+            Some(xml) if Self::ui_nodes(&xml).is_empty() => Err(!xml.contains("<hierarchy")),
+            Some(xml) => Ok(xml),
+        }
+    }
+
+    /// `Ok(xml)` ou `Err(marcar o agente como fora por 60 s)`. Só por culpa do agente: resposta
+    /// inválida, ou silêncio com o prazo cheio. Prazo curto de quem chamou (sobravam décimos de
+    /// segundo) não marca nada, senão o resto da operação ficaria preso ao uiautomator lento.
+    fn agent_dump_outcome(result: Result<&str, &str>, budget: Duration) -> Result<String, bool> {
+        match result.map(Self::agent_dump_reply) {
+            Ok(Ok(xml)) => Ok(xml),
+            Ok(Err(invalid)) => Err(invalid),
+            Err(_) => Err(budget >= Self::AGENT_DUMP_BUDGET),
+        }
     }
 
     fn ui_dump_until(serial: &str, deadline: Instant) -> String {
-        use base64::Engine as _;
         let skip = UI_DUMP_AGENT_DOWN.lock().ok().and_then(|m| m.get(serial).copied())
             .map(|t| t.elapsed() < Duration::from_secs(60)).unwrap_or(false);
         if !skip {
-            let budget = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(2));
+            let budget = deadline.saturating_duration_since(Instant::now()).min(Self::AGENT_DUMP_BUDGET);
             if !budget.is_zero() {
                 let result = Self::execute_shell_for(serial,
                     "am broadcast -a com.esfera.agent.DUMP_UI -n com.esfera.agent/.TypeTextReceiver", budget);
-                if let Ok(out) = result {
-                    let xml = out.lines().find(|l| l.contains("Broadcast completed: result=1"))
-                        .and_then(|line| line.split("data=\"").nth(1)).and_then(|rest| rest.split('"').next())
-                        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok())
-                        .and_then(|bytes| String::from_utf8(bytes).ok());
-                    if let Some(xml) = xml.filter(|s| !Self::ui_nodes(s).is_empty()) { return xml; }
+                let agent_down = match Self::agent_dump_outcome(result.as_deref().map_err(String::as_str), budget) {
+                    Ok(xml) => return xml,
+                    Err(down) => down,
+                };
+                if agent_down {
+                    if let Ok(mut cache) = UI_DUMP_AGENT_DOWN.lock() { cache.insert(serial.to_string(), Instant::now()); }
+                    println!("[TELA] Leitura pelo agente indisponível em {}; usando uiautomator por 60 s", serial);
                 }
-                if let Ok(mut cache) = UI_DUMP_AGENT_DOWN.lock() { cache.insert(serial.to_string(), Instant::now()); }
             }
         }
         Self::ui_dump_uiautomator_until(serial, deadline)
@@ -4867,6 +5046,29 @@ impl AdbManager {
             || (n.package.is_empty() && n.rid.starts_with("com.whatsapp:id/")))
     }
 
+    /// Tira os caracteres invisíveis de formatação (Unicode Cf: marcas de direção U+200E/U+202A/
+    /// U+202C, espaço de largura zero U+200B, BOM...). O WhatsApp cerca números com essas marcas.
+    fn strip_format_chars(s: &str) -> String {
+        s.chars().filter(|c| !matches!(*c as u32,
+            0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x890..=0x891 | 0x8E2 | 0x180E
+            | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF
+            | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)).collect()
+    }
+
+    /// Número que o cabeçalho da conversa prova: o número puro ou o contato temporário
+    /// "Esfera <número>" (com qualquer formatação dos dígitos). Nome comum não prova número.
+    fn header_number(label: &str) -> Option<String> {
+        let label = Self::strip_format_chars(&Self::decode_xml_numeric(label));
+        let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
+        let number = label.strip_prefix("Esfera ").unwrap_or(&label);
+        let digits = Self::extract_phone_digits(number);
+        (digits.len() >= 8 && number.chars().all(|c| c.is_ascii_digit() || " +-().".contains(c))).then_some(digits)
+    }
+
+    /// Recusa só com PROVA de destinatário errado: grupo ou número diferente no cabeçalho. Contato
+    /// salvo com nome, cabeçalho sem número ou leitura ilegível não provam nada (a busca e o link já
+    /// casaram o número); nesses casos o envio segue, como antes da conferência existir.
     fn verify_chat_identity(xml: &str, phone: &str) -> Result<(), String> {
         let nodes = Self::ui_nodes(xml);
         if nodes.iter().any(|n| Self::whatsapp_node(n) &&
@@ -4875,70 +5077,139 @@ impl AdbManager {
                 .contains(&n.description.to_lowercase().as_str()))) {
             return Err("Envio cancelado: a conversa é um grupo".into());
         }
-        let headers: Vec<_> = nodes.iter().filter(|n| Self::whatsapp_node(n) &&
-            ["com.whatsapp:id/conversation_contact_name", "com.whatsapp:id/conversation_name"]
-                .contains(&n.rid.as_str())).collect();
-        if headers.is_empty() { return Err("Envio cancelado: não foi possível conferir o destinatário no cabeçalho".into()); }
-        let wanted = Self::normalize_target_phone(phone);
-        let matches = headers.iter().all(|header| {
-        let label = header.text.trim();
-        if let Some(number) = label.strip_prefix("Esfera ") {
-            !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) && number == wanted
-        } else {
-            let number_only = label.chars().all(|c| c.is_ascii_digit() || " +-()".contains(c));
-            number_only && wanted.len() >= 10 &&
-                crate::db::Database::opt_out_key(&Self::normalize_target_phone(label)) == crate::db::Database::opt_out_key(&wanted)
-        }
-        });
-        if !matches { return Err("Envio cancelado: o número da conversa não confere com o destinatário".into()); }
+        // Mesma equivalência da busca: DDD + 8 dígitos, com ou sem DDI e nono dígito.
+        let wanted = crate::db::Database::opt_out_key(phone);
+        let other = nodes.iter()
+            .filter(|n| Self::whatsapp_node(n) &&
+                ["com.whatsapp:id/conversation_contact_name", "com.whatsapp:id/conversation_name"].contains(&n.rid.as_str()))
+            .filter_map(|n| Self::header_number(&n.text))
+            .any(|digits| crate::db::Database::opt_out_key(&digits) != wanted);
+        if other { return Err("Envio cancelado: o número da conversa não confere com o destinatário".into()); }
         Ok(())
     }
 
+    /// Campo de mensagem vazio: sem texto (só espaços/marcas invisíveis) ou mostrando a dica.
     fn entry_empty(text: &str) -> bool {
-        text.trim().is_empty() || ["mensagem", "message", "mensaje"].contains(&text.trim().to_lowercase().as_str())
+        let t = Self::strip_format_chars(&Self::decode_xml_numeric(text)).trim().to_lowercase();
+        t.is_empty() || ["mensagem", "message", "mensaje", "digite uma mensagem", "escreva uma mensagem",
+            "type a message", "escribe un mensaje"].contains(&t.as_str())
     }
 
-    /// Só conta bolhas com marcador de saída confirmado na MESMA linha da mensagem.
-    fn outgoing_messages(xml: &str, text: &str) -> usize {
-        let nodes = Self::ui_nodes(xml);
-        nodes.iter().enumerate().filter(|(_, n)| Self::whatsapp_node(n) &&
-            n.rid == "com.whatsapp:id/message_text" && Self::same_text(&n.text, text))
-            .filter(|(index, _)| {
-                let mut cursor = nodes[*index].parent;
-                while let Some(row) = cursor {
-                    if ["com.whatsapp:id/message_row", "com.whatsapp:id/message_container"].contains(&nodes[row].rid.as_str()) {
-                        return nodes.iter().enumerate().any(|(i, status)| {
-                            if !Self::whatsapp_node(status) || status.rid != "com.whatsapp:id/status" { return false; }
-                            let mut parent = nodes[i].parent;
-                            while let Some(p) = parent {
-                                if p == row {
-                                    let value = status.description.to_lowercase();
-                                    let words: Vec<_> = value.split(|c: char| !c.is_alphabetic()).filter(|w| !w.is_empty()).collect();
-                                    if words.iter().any(|w| ["não", "nao", "not", "no", "pending", "pendente", "pendiente", "failed", "falha"].contains(w)) { return false; }
-                                    return ["enviada", "enviado", "entregue", "entregada", "entregado", "lida", "lido", "sent", "delivered", "read", "leído", "leída"]
-                                        .iter().any(|word| words.contains(word));
-                                }
-                                parent = nodes[p].parent;
-                            }
-                            false
-                        });
-                    }
-                    cursor = nodes[row].parent;
-                }
-                false
-            }).count()
+    /// Texto como a bolha mostra: sem os marcadores de formatação do WhatsApp (* _ ~ `), que viram
+    /// negrito/itálico na bolha, sem caracteres invisíveis e com espaços normalizados.
+    fn bubble_norm(s: &str) -> String {
+        Self::strip_format_chars(&Self::decode_xml_numeric(s)).chars()
+            .filter(|c| !matches!(c, '*' | '_' | '~' | '`' | '\u{FE0E}' | '\u{FE0F}'))
+            .collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
+    /// A bolha mostra `text`: inteiro, ou o começo dele antes de "Ler mais" (mensagem longa).
+    fn bubble_matches(bubble: &str, text: &str) -> bool {
+        let (shown, wanted) = (Self::bubble_norm(bubble), Self::bubble_norm(text));
+        if wanted.is_empty() { return false; }
+        if shown == wanted { return true; }
+        let chars: Vec<char> = shown.chars().collect();
+        ["ler mais", "read more", "leer más", "leer mas"].iter().any(|suffix| {
+            let n = suffix.chars().count();
+            if chars.len() <= n || chars[chars.len() - n..].iter().collect::<String>().to_lowercase() != *suffix { return false; }
+            let head: String = chars[..chars.len() - n].iter().collect();
+            let head = head.trim_end().trim_end_matches(|c| c == '…' || c == '.').trim_end();
+            // Começo visível de uma mensagem longa: trecho relevante, não uma palavra solta.
+            head.chars().count() >= 20 && wanted.starts_with(head)
+        })
+    }
+
+    /// Lista/rolagem que reúne várias linhas (conversa, lista de conversas, resultados).
+    fn is_list(n: &UiNode) -> bool {
+        n.rid == "android:id/list" || n.class.contains("ListView") || n.class.contains("RecyclerView")
+    }
+
+    /// Status (relógio/tique) da MESMA bolha, sem depender do id da linha: procura em cada ancestral
+    /// do texto, do mais próximo ao maior que ainda contém só esta bolha (nunca a lista inteira).
+    fn bubble_status(nodes: &[UiNode], index: usize) -> BubbleStatus {
+        let inside = |mut i: usize, ancestor: usize| loop {
+            match nodes[i].parent { Some(p) if p == ancestor => return true, Some(p) => i = p, None => return false }
+        };
+        let mut cursor = nodes[index].parent;
+        while let Some(a) = cursor {
+            if Self::is_list(&nodes[a]) { break; }
+            let bubbles = nodes.iter().enumerate().filter(|(i, n)| n.rid == "com.whatsapp:id/message_text" && inside(*i, a)).count();
+            if bubbles > 1 { break; }
+            if let Some((_, status)) = nodes.iter().enumerate()
+                .find(|(i, n)| Self::whatsapp_node(n) && n.rid.ends_with("/status") && inside(*i, a)) {
+                return Self::status_kind(&status.description);
+            }
+            cursor = nodes[a].parent;
+        }
+        BubbleStatus::Unknown
+    }
+
+    fn status_kind(description: &str) -> BubbleStatus {
+        let value = Self::strip_format_chars(description).to_lowercase();
+        let words: Vec<&str> = value.split(|c: char| !c.is_alphabetic()).filter(|w| !w.is_empty()).collect();
+        let has = |list: &[&str]| words.iter().any(|w| list.contains(w));
+        let sent = has(&["enviada", "enviado", "entregue", "entregada", "entregado", "lida", "lido", "visualizada",
+            "sent", "delivered", "read", "seen", "leído", "leída", "leido", "leida", "visto", "vista"]);
+        if has(&["falha", "falhou", "failed", "erro", "error", "fallido", "falló"]) || (sent && has(&["não", "nao", "not", "no"])) {
+            return BubbleStatus::Failed;
+        }
+        if has(&["pendente", "pending", "pendiente", "aguardando", "waiting", "enviando", "sending"]) { return BubbleStatus::Pending; }
+        if sent { BubbleStatus::Confirmed } else { BubbleStatus::Unknown }
+    }
+
+    /// Bolhas de texto da conversa, de cima para baixo (a última é a mais recente).
+    fn message_bubbles(nodes: &[UiNode]) -> Vec<usize> {
+        let mut list: Vec<usize> = nodes.iter().enumerate()
+            .filter(|(_, n)| Self::whatsapp_node(n) && n.rid == "com.whatsapp:id/message_text").map(|(i, _)| i).collect();
+        list.sort_by_key(|i| nodes[*i].cy);
+        list
+    }
+
+    /// Status da bolha NOVA com `text`: a mais recente da tela é a nossa e não era antes, ou há
+    /// mais bolhas com o texto do que antes. `None` = nenhuma bolha nova reconhecida.
+    fn new_bubble_status(before: &str, after: &str, text: &str) -> Option<BubbleStatus> {
+        let (old, new) = (Self::ui_nodes(before), Self::ui_nodes(after));
+        let (old_list, new_list) = (Self::message_bubbles(&old), Self::message_bubbles(&new));
+        let last = *new_list.last()?;
+        if !Self::bubble_matches(&new[last].text, text) { return None; }
+        let count = |nodes: &[UiNode], list: &[usize]| list.iter().filter(|i| Self::bubble_matches(&nodes[**i].text, text)).count();
+        let was_last = old_list.last().map_or(false, |i| Self::bubble_matches(&old[*i].text, text));
+        (!was_last || count(&new, &new_list) > count(&old, &old_list)).then(|| Self::bubble_status(&new, last))
+    }
+
+    /// Classifica a tela depois do toque em Enviar (`before` = tela com o texto no campo).
+    fn send_check(before: &str, after: &str, phone: &str, text: &str) -> SendCheck {
+        let nodes = Self::ui_nodes(after);
+        if nodes.is_empty() { return SendCheck::Unreadable; }
+        if Self::verify_chat_identity(after, phone).is_err() { return SendCheck::WrongChat; }
+        let Some(entry) = nodes.iter().find(|n| Self::whatsapp_node(n) && n.rid == "com.whatsapp:id/entry") else {
+            return SendCheck::Unreadable;
+        };
+        let bubble = Self::new_bubble_status(before, after, text);
+        if bubble == Some(BubbleStatus::Failed) { return SendCheck::Failed; }
+        if !Self::entry_empty(&entry.text) && Self::same_text(&entry.text, text) { return SendCheck::StillInField; }
+        match bubble {
+            Some(BubbleStatus::Confirmed) => SendCheck::Confirmed,
+            Some(BubbleStatus::Pending) => SendCheck::Pending,
+            // Bolha nova sem status legível: estrutura desconhecida, a mensagem saiu do campo.
+            Some(_) => SendCheck::Emptied,
+            None if Self::entry_empty(&entry.text) => SendCheck::Emptied,
+            None => SendCheck::OtherText,
+        }
+    }
+
+    /// Envio confirmado com prova: bolha nova com tique e o texto fora do campo.
+    #[cfg(test)]
     fn sent_on_screen(before: &str, after: &str, phone: &str, text: &str) -> bool {
-        Self::verify_chat_identity(before, phone).is_ok() && Self::verify_chat_identity(after, phone).is_ok()
-            && Self::ui_nodes(after).iter().any(|n| Self::whatsapp_node(n) &&
-                n.rid == "com.whatsapp:id/entry" && Self::entry_empty(&n.text))
-            && Self::outgoing_messages(after, text) > Self::outgoing_messages(before, text)
+        Self::send_check(before, after, phone, text) == SendCheck::Confirmed
     }
 
-    /// Compara textos ignorando diferenças de espaço/quebra de linha.
+    /// Compara textos ignorando diferenças de espaço/quebra de linha e caracteres invisíveis
+    /// (marcas de direção, seletor de variação de emoji). A pontuação continua valendo.
     fn same_text(a: &str, b: &str) -> bool {
-        let norm = |s: &str| Self::decode_xml_numeric(s).split_whitespace().collect::<Vec<_>>().join(" ");
+        let norm = |s: &str| Self::strip_format_chars(&Self::decode_xml_numeric(s)).chars()
+            .filter(|c| !matches!(c, '\u{FE0E}' | '\u{FE0F}'))
+            .collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
         let nb = norm(b);
         !nb.is_empty() && norm(a) == nb
     }
@@ -5534,49 +5805,373 @@ mod tests {
     }
 }
 
+/// Telas do WhatsApp montadas como o agente as devolve (`DUMP_UI`: mesmos atributos e ordem do
+/// EsferaAccessibilityService), com a estrutura real da conversa: barra com cabeçalho, lista
+/// `android:id/list` com linhas sem id, `main_layout`, texto, hora e status, e o rodapé com o campo.
+#[cfg(test)]
+mod wa_screens {
+    pub fn node(id: &str, class: &str, text: &str, desc: &str, b: [i32; 4], children: &str) -> String {
+        format!(r#"<node index="0" text="{}" resource-id="{}" class="{}" package="com.whatsapp" content-desc="{}" clickable="false" enabled="true" focused="false" editable="false" bounds="[{},{}][{},{}]">{}</node>"#,
+            text, id, class, desc, b[0], b[1], b[2], b[3], children)
+    }
+
+    pub fn hierarchy(root: &str) -> String {
+        format!("<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation=\"0\">{}</hierarchy>", root)
+    }
+
+    /// Uma linha da conversa; `status` None = mensagem recebida (sem tique/relógio).
+    pub fn row(i: usize, text: &str, status: Option<&str>, text_id: &str) -> String {
+        let top = 180 + i as i32 * 130;
+        let status = status.map(|d| node("com.whatsapp:id/status", "android.widget.ImageView", "", d, [650, top + 92, 676, top + 114], "")).unwrap_or_default();
+        let meta = node("com.whatsapp:id/date_wrapper", "android.widget.LinearLayout", "", "", [570, top + 90, 690, top + 116],
+            &format!("{}{}", node("com.whatsapp:id/date", "android.widget.TextView", "14:32", "", [570, top + 92, 640, top + 114], ""), status));
+        let body = node(text_id, "android.widget.TextView", text, "", [120, top + 10, 690, top + 86], "");
+        node("", "android.view.ViewGroup", "", "", [0, top, 720, top + 124],
+            &node("com.whatsapp:id/main_layout", "android.widget.LinearLayout", "", "", [100, top, 710, top + 124], &format!("{}{}", body, meta)))
+    }
+
+    pub fn chat_with(header: &str, rows: &[(&str, Option<&str>)], entry: &str, text_id: &str) -> String {
+        let title = node("com.whatsapp:id/conversation_contact", "android.widget.LinearLayout", "", "", [150, 60, 560, 150], &format!("{}{}",
+            node("com.whatsapp:id/conversation_contact_name", "android.widget.TextView", header, "", [150, 62, 560, 108], ""),
+            node("com.whatsapp:id/conversation_contact_status", "android.widget.TextView", "online", "", [150, 110, 420, 148], "")));
+        let toolbar = node("com.whatsapp:id/toolbar", "android.view.ViewGroup", "", "", [0, 48, 720, 160], &format!("{}{}{}",
+            node("com.whatsapp:id/back", "android.widget.ImageButton", "", "Voltar", [0, 60, 90, 150], ""), title,
+            node("com.whatsapp:id/menuitem_overflow", "android.widget.ImageView", "", "Mais opções", [650, 60, 720, 150], "")));
+        let list = node("android:id/list", "android.widget.ListView", "", "", [0, 160, 720, 1380],
+            &rows.iter().enumerate().map(|(i, (t, s))| row(i, t, *s, text_id)).collect::<String>());
+        let button = if super::AdbManager::entry_empty(entry) {
+            node("com.whatsapp:id/voice_note_btn", "android.widget.ImageButton", "", "Mensagem de voz", [620, 1400, 710, 1490], "")
+        } else {
+            node("com.whatsapp:id/send", "android.widget.ImageButton", "", "Enviar", [620, 1400, 710, 1490], "")
+        };
+        let footer = node("com.whatsapp:id/footer", "android.widget.LinearLayout", "", "", [0, 1390, 720, 1500], &format!("{}{}",
+            node("com.whatsapp:id/entry", "android.widget.EditText", entry, "", [20, 1400, 600, 1490], ""), button));
+        hierarchy(&node("", "android.widget.FrameLayout", "", "", [0, 0, 720, 1600], &format!("{}{}{}", toolbar, list, footer)))
+    }
+
+    pub fn chat(header: &str, rows: &[(&str, Option<&str>)], entry: &str) -> String {
+        chat_with(header, rows, entry, "com.whatsapp:id/message_text")
+    }
+
+    /// Diálogo do WhatsApp sem ids conhecidos (versões novas usam layouts próprios).
+    pub fn dialog(message: &str) -> String {
+        hierarchy(&node("", "android.widget.FrameLayout", "", "", [40, 600, 680, 1000],
+            &node("", "android.widget.LinearLayout", "", "", [40, 600, 680, 1000], &format!("{}{}",
+                node("", "android.widget.TextView", message, "", [80, 640, 640, 860], ""),
+                node("android:id/button1", "android.widget.Button", "OK", "", [500, 880, 640, 960], "")))))
+    }
+}
+
 #[cfg(test)]
 mod send_safety_tests {
-    use super::AdbManager;
+    use super::wa_screens::*;
+    use super::{AdbManager, SendCheck};
 
-    const BEFORE: &str = r#"<hierarchy><node package="com.whatsapp" resource-id="com.whatsapp:id/conversation_contact_name" text="Esfera 5555999998888" bounds="[10,10][400,60]"/><node package="com.whatsapp" resource-id="com.whatsapp:id/entry" text="Olá!" bounds="[0,500][400,600]"/></hierarchy>"#;
-    const AFTER: &str = r#"<hierarchy><node package="com.whatsapp" resource-id="com.whatsapp:id/conversation_contact_name" text="Esfera 5555999998888" bounds="[10,10][400,60]"/><node package="com.whatsapp" resource-id="com.whatsapp:id/message_row" bounds="[100,100][400,300]"><node package="com.whatsapp" resource-id="com.whatsapp:id/message_text" text="Olá!" bounds="[110,120][390,200]"/><node package="com.whatsapp" resource-id="com.whatsapp:id/status" content-desc="Enviada" bounds="[360,200][390,230]"/></node><node package="com.whatsapp" resource-id="com.whatsapp:id/entry" text="Mensagem" bounds="[0,500][400,600]"/></hierarchy>"#;
+    const PHONE: &str = "5575988052539";
+    /// Como o WhatsApp mostra um número sem contato salvo: cercado de marcas de direção.
+    const HEADER: &str = "\u{202A}+55 75 98805-2539\u{202C}";
+    const HISTORY: [(&str, Option<&str>); 2] = [("Bom dia, quem fala?", None), ("Olá! Aqui é da REALESS.", Some("Lida"))];
 
-    #[test]
-    fn identidade_exige_cabecalho_com_numero_completo() {
-        assert!(AdbManager::verify_chat_identity(BEFORE, "5555999998888").is_ok());
-        let duplicate = BEFORE.replace("</hierarchy>", r#"<node package="com.whatsapp" resource-id="com.whatsapp:id/conversation_name" text="+55 55 9999-8888"/></hierarchy>"#);
-        assert!(AdbManager::verify_chat_identity(&duplicate, "5555999998888").is_ok());
-        assert!(AdbManager::verify_chat_identity(BEFORE, "5511999998888").is_err());
-        let message_only = BEFORE.replace("conversation_contact_name", "message_text");
-        assert!(AdbManager::verify_chat_identity(&message_only, "5555999998888").is_err());
-        let group = BEFORE.replace("Esfera 5555999998888", "Grupo Esfera 5555999998888");
-        assert!(AdbManager::verify_chat_identity(&group, "5555999998888").is_err());
-        assert!(AdbManager::verify_chat_identity("", "5555999998888").is_err());
+    fn with(rows: &[(&'static str, Option<&'static str>)]) -> Vec<(&'static str, Option<&'static str>)> {
+        HISTORY.iter().copied().chain(rows.iter().copied()).collect()
     }
 
     #[test]
-    fn confirma_apenas_bolha_nova_de_saida_com_campo_vazio() {
-        assert!(AdbManager::sent_on_screen(BEFORE, AFTER, "5555999998888", "Olá!"));
-        assert!(AdbManager::sent_on_screen(BEFORE, &AFTER.replace("Enviada", "Enviada às 14:32"), "5555999998888", "Olá!"));
-        assert!(!AdbManager::sent_on_screen(BEFORE, &AFTER.replace("Enviada", "Não enviada"), "5555999998888", "Olá!"));
-        assert!(!AdbManager::sent_on_screen(AFTER, AFTER, "5555999998888", "Olá!"));
-        assert!(!AdbManager::sent_on_screen(BEFORE, &AFTER.replace("text=\"Mensagem\"", "text=\"rascunho\""), "5555999998888", "Olá!"));
-        assert!(!AdbManager::sent_on_screen(BEFORE, &AFTER.replace("Enviada", "Pendente"), "5555999998888", "Olá!"));
-        assert!(!AdbManager::sent_on_screen(BEFORE, &AFTER.replace("id/status", "id/time"), "5555999998888", "Olá!"));
-        assert!(!AdbManager::sent_on_screen(BEFORE, AFTER, "5511999998888", "Olá!"));
-        assert!(!AdbManager::sent_on_screen(BEFORE, "", "5555999998888", "Olá!"));
+    fn destinatario_certo_nunca_e_recusado() {
+        let screen = |header: &str| chat(header, &HISTORY, "Mensagem");
+        // Marcas invisíveis em volta do número (U+202A/U+202C, U+200E).
+        assert!(AdbManager::verify_chat_identity(&screen(HEADER), PHONE).is_ok());
+        assert!(AdbManager::verify_chat_identity(&screen("\u{200E}+55 75 8805-2539\u{200E}"), PHONE).is_ok());
+        // Contato antigo com os dígitos crus da planilha e o canônico.
+        assert!(AdbManager::verify_chat_identity(&screen("Esfera 75988052539"), PHONE).is_ok());
+        assert!(AdbManager::verify_chat_identity(&screen("Esfera 5575988052539"), PHONE).is_ok());
+        // Número salvo com nome na agenda: a busca/link já casou o número.
+        assert!(AdbManager::verify_chat_identity(&screen("João Silva"), PHONE).is_ok());
+        // Cabeçalho com id desconhecido ou leitura vazia: nada prova outro número.
+        assert!(AdbManager::verify_chat_identity(&screen(HEADER).replace("conversation_contact_name", "contact_title"), PHONE).is_ok());
+        assert!(AdbManager::verify_chat_identity("", PHONE).is_ok());
+        // DDD 55 (Santa Maria/RS) e DDI 55 juntos.
+        assert!(AdbManager::verify_chat_identity(&screen("\u{202A}+55 55 99999-8888\u{202C}"), "55999998888").is_ok());
+        assert!(AdbManager::verify_chat_identity(&screen("Esfera 5555999998888"), "55999998888").is_ok());
+    }
+
+    #[test]
+    fn destinatario_errado_so_com_prova_positiva() {
+        let screen = |header: &str| chat(header, &HISTORY, "Mensagem");
+        assert!(AdbManager::verify_chat_identity(&screen("\u{202A}+55 11 98805-2539\u{202C}"), PHONE).is_err());
+        assert!(AdbManager::verify_chat_identity(&screen("Esfera 5511988052539"), PHONE).is_err());
+        assert!(AdbManager::verify_chat_identity(&screen("\u{202A}+55 55 99999-8888\u{202C}"), "5511999998888").is_err());
+        let group = screen("Família").replace(r#"content-desc="Voltar""#, r#"content-desc="Dados do grupo""#);
+        assert!(AdbManager::verify_chat_identity(&group, PHONE).is_err());
+    }
+
+    #[test]
+    fn bolha_nova_com_tique_confirma_mesmo_com_negrito_e_marcas() {
+        // A IA usa negrito com asteriscos; a bolha mostra o texto sem eles (e com marca invisível).
+        let typed = "*Olá Maria*, tudo bem? 😊";
+        let before = chat(HEADER, &HISTORY, typed);
+        let after = chat(HEADER, &with(&[("Olá\u{200E} Maria, tudo bem? 😊", Some("Enviada"))]), "Mensagem");
+        assert_eq!(AdbManager::send_check(&before, &after, PHONE, typed), SendCheck::Confirmed);
+        assert!(AdbManager::sent_on_screen(&before, &after, PHONE, typed));
+        let entregue = after.replace("Enviada", "Entregue às 14:32");
+        assert_eq!(AdbManager::send_check(&before, &entregue, PHONE, typed), SendCheck::Confirmed);
+    }
+
+    #[test]
+    fn mensagem_longa_com_ler_mais_confirma_pelo_comeco() {
+        let typed = "A REALESS preparou uma condição especial para regularizar a sua pendência com descontos exclusivos nesta semana. Para conhecer as opções, responda esta mensagem e um atendente vai te explicar tudo com calma, sem compromisso. Caso já tenha resolvido, desconsidere este aviso. Se não quiser mais receber nossos contatos, responda SAIR.";
+        let shown = "A REALESS preparou uma condição especial para regularizar a sua pendência com descontos exclusivos nesta semana. Para conhecer as opções, responda esta… Ler mais";
+        let before = chat(HEADER, &HISTORY, typed);
+        let after = chat(HEADER, &with(&[(shown, Some("Enviada"))]), "Mensagem");
+        assert_eq!(AdbManager::send_check(&before, &after, PHONE, typed), SendCheck::Confirmed);
+        // Trecho curto demais antes de "Ler mais" não basta.
+        let tiny = chat(HEADER, &with(&[("A REALESS… Ler mais", Some("Enviada"))]), "Mensagem");
+        assert_eq!(AdbManager::send_check(&before, &tiny, PHONE, typed), SendCheck::Emptied);
+    }
+
+    #[test]
+    fn campo_cheio_sem_bolha_nova_e_falha_comum() {
+        let typed = "Olá Maria, tudo bem?";
+        let before = chat(HEADER, &HISTORY, typed);
+        assert_eq!(AdbManager::send_check(&before, &before, PHONE, typed), SendCheck::StillInField);
+        // Mensagem igual antiga que rolou para a tela (no alto) não conta como enviada.
+        let old_on_top: Vec<_> = [("Olá Maria, tudo bem?", Some("Lida"))].into_iter().chain(HISTORY).collect();
+        let scrolled = chat(HEADER, &old_on_top, typed);
+        assert_eq!(AdbManager::send_check(&before, &scrolled, PHONE, typed), SendCheck::StillInField);
+    }
+
+    #[test]
+    fn relogio_e_pendente_e_falha_explicita_e_incerta() {
+        let typed = "Olá Maria, tudo bem?";
+        let before = chat(HEADER, &HISTORY, typed);
+        let clock = chat(HEADER, &with(&[(typed, Some("Pendente"))]), "Mensagem");
+        assert_eq!(AdbManager::send_check(&before, &clock, PHONE, typed), SendCheck::Pending);
+        let failed = clock.replace("Pendente", "Não enviada");
+        assert_eq!(AdbManager::send_check(&before, &failed, PHONE, typed), SendCheck::Failed);
+        assert!(!AdbManager::sent_on_screen(&before, &clock, PHONE, typed));
+    }
+
+    #[test]
+    fn campo_vazio_com_estrutura_desconhecida_conta_como_enviado() {
+        let typed = "Olá Maria, tudo bem?";
+        let before = chat_with(HEADER, &HISTORY, typed, "com.whatsapp:id/conversation_text_row");
+        // Ids da bolha mudaram nesta versão do WhatsApp: só o campo vazio fala.
+        let after = chat_with(HEADER, &with(&[(typed, Some("Enviada"))]), "Mensagem", "com.whatsapp:id/conversation_text_row");
+        assert_eq!(AdbManager::send_check(&before, &after, PHONE, typed), SendCheck::Emptied);
+        // Bolha reconhecida mas status sem id conhecido.
+        let before = chat(HEADER, &HISTORY, typed);
+        let no_status = chat(HEADER, &with(&[(typed, Some("Enviada"))]), "Mensagem").replace("com.whatsapp:id/status", "com.whatsapp:id/msg_state");
+        assert_eq!(AdbManager::send_check(&before, &no_status, PHONE, typed), SendCheck::Emptied);
+        // Campo vazio e nenhuma bolha nova legível.
+        let empty = chat(HEADER, &HISTORY, "Mensagem");
+        assert_eq!(AdbManager::send_check(&before, &empty, PHONE, typed), SendCheck::Emptied);
+    }
+
+    #[test]
+    fn indicio_de_problema_vira_incerto() {
+        let typed = "Olá Maria, tudo bem?";
+        let before = chat(HEADER, &HISTORY, typed);
+        let other_text = chat(HEADER, &HISTORY, "rascunho do operador");
+        assert_eq!(AdbManager::send_check(&before, &other_text, PHONE, typed), SendCheck::OtherText);
+        let other_chat = chat("\u{202A}+55 11 98805-2539\u{202C}", &with(&[(typed, Some("Enviada"))]), "Mensagem");
+        assert_eq!(AdbManager::send_check(&before, &other_chat, PHONE, typed), SendCheck::WrongChat);
+        assert_eq!(AdbManager::send_check(&before, "", PHONE, typed), SendCheck::Unreadable);
+        let home = hierarchy(&node("com.whatsapp:id/conversations_list", "androidx.recyclerview.widget.RecyclerView", "", "", [0, 160, 720, 1500], ""));
+        assert_eq!(AdbManager::send_check(&before, &home, PHONE, typed), SendCheck::Unreadable);
+        // Com a bolha nova confirmada, texto alheio no campo não desfaz o envio.
+        let sent_and_draft = chat(HEADER, &with(&[(typed, Some("Enviada"))]), "rascunho do operador");
+        assert_eq!(AdbManager::send_check(&before, &sent_and_draft, PHONE, typed), SendCheck::Confirmed);
+    }
+
+    #[test]
+    fn leitura_do_uiautomator_com_emoji_em_entidades() {
+        // uiautomator: folhas auto-fechadas, visible-to-user e emoji como par surrogate numérico.
+        let typed = "Olá Maria 😊";
+        let before = chat(HEADER, &HISTORY, typed);
+        let after = format!(concat!(
+            "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation=\"0\">",
+            "<node index=\"0\" text=\"\" resource-id=\"\" class=\"android.widget.FrameLayout\" package=\"com.whatsapp\" content-desc=\"\" visible-to-user=\"true\" bounds=\"[0,0][720,1600]\">",
+            "<node index=\"0\" text=\"{}\" resource-id=\"com.whatsapp:id/conversation_contact_name\" class=\"android.widget.TextView\" package=\"com.whatsapp\" content-desc=\"\" visible-to-user=\"true\" bounds=\"[150,62][560,108]\" />",
+            "<node index=\"1\" text=\"\" resource-id=\"android:id/list\" class=\"android.widget.ListView\" package=\"com.whatsapp\" content-desc=\"\" visible-to-user=\"true\" bounds=\"[0,160][720,1380]\">",
+            "<node index=\"0\" text=\"\" resource-id=\"\" class=\"android.view.ViewGroup\" package=\"com.whatsapp\" content-desc=\"\" visible-to-user=\"true\" bounds=\"[0,1200][720,1320]\">",
+            "<node index=\"0\" text=\"Olá Maria &#55357;&#56842;\" resource-id=\"com.whatsapp:id/message_text\" class=\"android.widget.TextView\" package=\"com.whatsapp\" content-desc=\"\" visible-to-user=\"true\" bounds=\"[120,1210][690,1280]\" />",
+            "<node index=\"1\" text=\"\" resource-id=\"com.whatsapp:id/status\" class=\"android.widget.ImageView\" package=\"com.whatsapp\" content-desc=\"Entregue\" visible-to-user=\"true\" bounds=\"[650,1290][676,1312]\" />",
+            "</node></node>",
+            "<node index=\"2\" text=\"Mensagem\" resource-id=\"com.whatsapp:id/entry\" class=\"android.widget.EditText\" package=\"com.whatsapp\" content-desc=\"\" visible-to-user=\"true\" bounds=\"[20,1400][600,1490]\" />",
+            "</node></hierarchy>"), HEADER);
+        assert_eq!(AdbManager::send_check(&before, &after, PHONE, typed), SendCheck::Confirmed);
+    }
+
+    #[test]
+    fn so_campo_cheio_e_reenviado_e_incerto_exige_indicio() {
+        for ok in [SendCheck::Confirmed, SendCheck::Pending, SendCheck::Emptied] {
+            assert_eq!(AdbManager::send_outcome(ok), Ok(()), "{:?}", ok);
+        }
+        // Nada saiu: falha comum, sem o prefixo INCERTO (o dispatcher tenta de novo).
+        let full = AdbManager::send_outcome(SendCheck::StillInField).unwrap_err();
+        assert!(!full.starts_with("INCERTO:"), "{}", full);
+        for doubtful in [SendCheck::Failed, SendCheck::WrongChat, SendCheck::OtherText, SendCheck::Unreadable] {
+            assert!(AdbManager::send_outcome(doubtful).unwrap_err().starts_with("INCERTO:"), "{:?}", doubtful);
+        }
     }
 
     #[test]
     fn texto_preserva_pontuacao_e_decodifica_emoji() {
         assert!(!AdbManager::same_text("Aceita?", "Aceita!"));
         assert!(AdbManager::same_text("Olá  mundo &#55357;&#56842;", "Olá mundo 😊"));
+        // Marcas invisíveis e seletor de variação não mudam a mensagem.
+        assert!(AdbManager::same_text("\u{200E}Olá ❤\u{FE0F} mundo\u{200B}", "Olá ❤ mundo"));
+        assert!(AdbManager::entry_empty("\u{200B}"));
+        assert!(AdbManager::entry_empty("Mensagem"));
+        assert!(!AdbManager::entry_empty("Olá"));
     }
 
     #[test]
     fn pacote_alternativo_e_recusado_antes_de_acessar_aparelho() {
         let result = AdbManager::send_whatsapp_parts("nao_acessar", "5511999998888", &["Olá".into()], Some("com.whatsapp.w4b"), &|| true);
         assert!(result.unwrap_err().contains("com.whatsapp"));
+    }
+}
+
+#[cfg(test)]
+mod temp_contact_tests {
+    use super::AdbManager;
+
+    /// Provedor de contatos simulado com o comportamento do Android padrão: `content insert`
+    /// não imprime nada; só as consultas devolvem linhas.
+    #[derive(Default)]
+    struct Contacts {
+        next_id: i64,
+        rows: Vec<(i64, String, Vec<(String, String)>)>,
+        log: Vec<String>,
+        ignore_insert: bool,
+        drop_phone: bool,
+    }
+
+    fn between<'a>(text: &'a str, start: &str, end: char) -> Option<&'a str> {
+        text.split(start).nth(1).and_then(|rest| rest.split(end).next())
+    }
+
+    impl Contacts {
+        fn found(&self, ids: Vec<i64>, column: &str) -> Result<String, String> {
+            Ok(if ids.is_empty() { "No result found.\n".into() }
+               else { ids.iter().enumerate().map(|(i, id)| format!("Row: {} {}={}\n", i, column, id)).collect() })
+        }
+
+        fn run(&mut self, cmd: &str) -> Result<String, String> {
+            self.log.push(cmd.to_string());
+            if cmd.starts_with("content insert --uri content://com.android.contacts/raw_contacts") {
+                if !self.ignore_insert {
+                    self.next_id += 1;
+                    let marker = between(cmd, "sourceid:s:", ' ').unwrap_or(cmd.rsplit(':').next().unwrap()).to_string();
+                    self.rows.push((self.next_id + 40, marker, Vec::new()));
+                }
+                return Ok(String::new());
+            }
+            if cmd.starts_with("content query --uri content://com.android.contacts/raw_contacts") {
+                let marker = between(cmd, "sourceid='", '\'').unwrap();
+                let ids = self.rows.iter().filter(|r| r.1 == marker).map(|r| r.0).collect();
+                return self.found(ids, "_id");
+            }
+            if cmd.starts_with("content insert --uri content://com.android.contacts/data") {
+                let id: i64 = between(cmd, "raw_contact_id:i:", ' ').unwrap().parse().unwrap();
+                let mime = between(cmd, "mimetype:s:", ' ').unwrap().to_string();
+                let data1 = between(cmd, "data1:s:'", '\'').unwrap().to_string();
+                if !(self.drop_phone && mime.ends_with("phone_v2")) {
+                    if let Some(row) = self.rows.iter_mut().find(|r| r.0 == id) { row.2.push((mime, data1)); }
+                }
+                return Ok(String::new());
+            }
+            if cmd.starts_with("content query --uri content://com.android.contacts/data") {
+                let number = between(cmd, "data1='", '\'').unwrap();
+                let ids = self.rows.iter().filter(|r| r.2.iter().any(|(m, d)| m.ends_with("phone_v2") && d == number)).map(|r| r.0).collect();
+                return self.found(ids, "raw_contact_id");
+            }
+            if cmd.starts_with("content delete") {
+                if let Some(marker) = between(cmd, "sourceid='", '\'') { self.rows.retain(|r| r.1 != marker); }
+                if let Some(id) = between(cmd, "_id=", ';').and_then(|v| v.trim().parse::<i64>().ok()) { self.rows.retain(|r| r.0 != id); }
+                return Ok(String::new());
+            }
+            Err(format!("comando inesperado: {}", cmd))
+        }
+    }
+
+    fn existing(id: i64, number: &str) -> (i64, String, Vec<(String, String)>) {
+        (id, String::new(), vec![("vnd.android.cursor.item/phone_v2".into(), number.into())])
+    }
+
+    #[test]
+    fn cria_contato_no_android_padrao_que_nao_imprime_o_insert() {
+        let mut agenda = Contacts::default();
+        let id = AdbManager::insert_temporary_contact_with("(75) 98805-2539", "esf-5575988052539-a1", &mut |c| agenda.run(c)).unwrap();
+        assert_eq!(id, Some(41));
+        let row = agenda.rows.iter().find(|r| r.0 == 41).unwrap();
+        assert_eq!(row.1, "esf-5575988052539-a1");
+        assert!(row.2.contains(&("vnd.android.cursor.item/name".into(), "Esfera 5575988052539".into())));
+        assert!(row.2.contains(&("vnd.android.cursor.item/phone_v2".into(), "+5575988052539".into())));
+        assert!(agenda.log.iter().any(|c| c.contains("--bind sourceid:s:esf-5575988052539-a1")));
+    }
+
+    #[test]
+    fn reaproveita_contato_existente_e_tolera_duplicados() {
+        let mut agenda = Contacts { rows: vec![existing(7, "+5575988052539")], ..Default::default() };
+        assert_eq!(AdbManager::insert_temporary_contact_with("75988052539", "esf-x", &mut |c| agenda.run(c)).unwrap(), Some(7));
+        assert!(!agenda.log.iter().any(|c| c.starts_with("content insert")));
+        let mut agenda = Contacts { rows: vec![existing(9, "+5575988052539"), existing(4, "+5575988052539")], ..Default::default() };
+        assert_eq!(AdbManager::insert_temporary_contact_with("75988052539", "esf-x", &mut |c| agenda.run(c)).unwrap(), Some(4));
+    }
+
+    #[test]
+    fn falha_apaga_o_orfao_pelo_marcador() {
+        let mut agenda = Contacts { ignore_insert: true, ..Default::default() };
+        assert!(AdbManager::insert_temporary_contact_with("75988052539", "esf-y", &mut |c| agenda.run(c)).is_err());
+        assert!(agenda.log.iter().any(|c| c.starts_with("content delete") && c.contains("sourceid='esf-y'")));
+        let mut agenda = Contacts { drop_phone: true, ..Default::default() };
+        assert!(AdbManager::insert_temporary_contact_with("75988052539", "esf-z", &mut |c| agenda.run(c)).is_err());
+        assert!(agenda.rows.is_empty(), "o raw_contact sem número não pode sobrar na agenda");
+    }
+
+    #[test]
+    fn parse_de_colunas_nao_confunde_id_com_raw_contact_id() {
+        assert_eq!(AdbManager::parse_query_ids("Row: 0 raw_contact_id=12\nRow: 1 raw_contact_id=15\n", "raw_contact_id"), vec![12, 15]);
+        assert!(AdbManager::parse_query_ids("Row: 0 raw_contact_id=12\n", "_id").is_empty());
+        assert_eq!(AdbManager::parse_query_ids("Row: 0 _id=33\n", "_id"), vec![33]);
+        assert!(AdbManager::parse_query_ids("No result found.\n", "_id").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod agent_dump_tests {
+    use super::AdbManager;
+    use std::time::Duration;
+
+    #[test]
+    fn agente_so_fica_fora_por_culpa_dele() {
+        use base64::Engine as _;
+        let xml = super::wa_screens::chat("Esfera 5575988052539", &[], "Mensagem");
+        let ok = format!("Broadcasting: Intent {{ act=com.esfera.agent.DUMP_UI }}\nBroadcast completed: result=1, data=\"{}\"\n",
+            base64::engine::general_purpose::STANDARD.encode(xml.as_bytes()));
+        assert_eq!(AdbManager::agent_dump_outcome(Ok(ok.as_str()), Duration::from_millis(300)), Ok(xml));
+        // Prazo curto de quem chamou: não marca o agente como fora.
+        assert_eq!(AdbManager::agent_dump_outcome(Err("tempo esgotado"), Duration::from_millis(400)), Err(false));
+        // Silêncio com o prazo cheio, acessibilidade inativa, sem receptor ou dados quebrados: fora.
+        assert_eq!(AdbManager::agent_dump_outcome(Err("tempo esgotado"), AdbManager::AGENT_DUMP_BUDGET), Err(true));
+        assert_eq!(AdbManager::agent_dump_outcome(Ok("Broadcast completed: result=2\n"), Duration::from_millis(300)), Err(true));
+        assert_eq!(AdbManager::agent_dump_outcome(Ok("Broadcast completed: result=0\n"), Duration::from_millis(300)), Err(true));
+        assert_eq!(AdbManager::agent_dump_outcome(Ok("Broadcast completed: result=1, data=\"@@@\"\n"), Duration::from_millis(300)), Err(true));
+        // Sem janela ativa ou tela sem nó visível (transição de tela): passageiro.
+        assert_eq!(AdbManager::agent_dump_outcome(Ok("Broadcast completed: result=3\n"), Duration::from_millis(300)), Err(false));
+        let empty = format!("Broadcast completed: result=1, data=\"{}\"\n",
+            base64::engine::general_purpose::STANDARD.encode(super::wa_screens::hierarchy("").as_bytes()));
+        assert_eq!(AdbManager::agent_dump_outcome(Ok(&empty), Duration::from_millis(300)), Err(false));
+    }
+
+    #[test]
+    fn cada_leitura_do_laco_tem_folego_minimo() {
+        let now = std::time::Instant::now();
+        let read = AdbManager::read_deadline(now, now + Duration::from_secs(30));
+        assert!(read >= now + AdbManager::UI_READ_FLOOR - Duration::from_millis(50));
+        assert_eq!(AdbManager::read_deadline(now, now + Duration::from_secs(2)), now + Duration::from_secs(2));
     }
 }
 
@@ -5648,6 +6243,14 @@ mod target_pick_tests {
     }
 }
 
+/// O que a tela mostra depois do toque em Enviar (ver `confirm_sent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendCheck { Confirmed, Pending, Failed, Emptied, StillInField, OtherText, WrongChat, Unreadable }
+
+/// Status mostrado ao lado da bolha de saída.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BubbleStatus { Confirmed, Pending, Failed, Unknown }
+
 /// Nó da árvore de UI (uiautomator) usado para conferir telas do WhatsApp.
 struct UiNode {
     rid: String,
@@ -5695,6 +6298,43 @@ mod no_whatsapp_tests {
         ));
         assert!(!AdbManager::shows_network_error(r#"<node text="Mensagem" />"#));
     }
+
+    #[test]
+    fn avisos_com_ids_desconhecidos_sao_lidos_por_exclusao() {
+        use super::wa_screens::{dialog, chat, hierarchy, node};
+        // Diálogo sem nenhum id conhecido e com o número cercado de marcas de direção.
+        assert!(AdbManager::shows_no_whatsapp(&dialog("O número de telefone \u{202A}+55 11 91234-5678\u{202C} compartilhado por link não está no WhatsApp.")));
+        // Barra de título "Conectando…" na conversa.
+        let connecting = chat("Esfera 5575988052539", &[], "Mensagem").replace("text=\"online\"", "text=\"Conectando…\"");
+        assert!(AdbManager::shows_loading_or_connecting(&connecting));
+        // Tela de conta banida com id próprio da versão.
+        let banned = hierarchy(&node("com.whatsapp:id/ban_info_scroll", "android.widget.ScrollView", "", "", [0, 0, 720, 1600],
+            &node("com.whatsapp:id/ban_info_title", "android.widget.TextView", "Esta conta não pode mais usar o WhatsApp", "", [40, 300, 680, 400], "")));
+        assert!(AdbManager::shows_restricted_account(&banned));
+    }
+
+    #[test]
+    fn texto_de_conversa_e_campos_digitados_nunca_classificam_a_tela() {
+        use super::wa_screens::{chat, hierarchy, node};
+        // Bolhas de clientes na conversa aberta.
+        let bubbles = chat("Esfera 5575988052539", &[
+            ("Meu pai não tem WhatsApp, só esse número", None),
+            ("Esta conta não pode mais usar o WhatsApp?", None),
+            ("Aguarde, verificando aqui", None),
+        ], "Mensagem");
+        assert!(!AdbManager::shows_no_whatsapp(&bubbles));
+        assert!(!AdbManager::shows_restricted_account(&bubbles));
+        assert!(!AdbManager::shows_loading_or_connecting(&bubbles));
+        // Prévias na lista de conversas (RecyclerView, ids da linha desconhecidos).
+        let home = hierarchy(&node("com.whatsapp:id/conversations_list", "androidx.recyclerview.widget.RecyclerView", "", "", [0, 160, 720, 1500],
+            &node("", "android.view.ViewGroup", "", "", [0, 160, 720, 300], &format!("{}{}",
+                node("com.whatsapp:id/conversations_row_contact_name", "android.widget.TextView", "Cliente 12", "", [140, 170, 500, 210], ""),
+                node("com.whatsapp:id/row_preview", "android.widget.TextView", "Esse número não está no WhatsApp, chama no outro", "", [140, 220, 700, 260], "")))));
+        assert!(!AdbManager::shows_no_whatsapp(&home));
+        // Texto digitado no campo.
+        let typed = chat("Esfera 5575988052539", &[], "Verifique sua conexão com o banco antes de pagar");
+        assert!(!AdbManager::shows_network_error(&typed));
+    }
 }
 
 #[cfg(test)]
@@ -5714,6 +6354,17 @@ mod search_hit_tests {
         assert_eq!((hit.cx, hit.cy), (291, 305));
         // Mesmo final com outro DDD não é a mesma pessoa.
         assert!(AdbManager::search_hit(&nodes, "5511991359303", "91359303").is_none());
+    }
+
+    #[test]
+    fn numero_com_marcas_invisiveis_e_contato_antigo_nao_canonico() {
+        let row = |text: &str| format!(r#"<node index="0" text="{}" resource-id="com.whatsapp:id/conversations_row_contact_name" class="android.widget.TextView" package="com.whatsapp" content-desc="" bounds="[140,286][442,324]"></node>"#, text);
+        let hit = |text: &str| AdbManager::search_hit(&AdbManager::ui_nodes(&row(text)), "5575988052539", "88052539").is_some();
+        assert!(hit("\u{202A}+55 75 98805-2539\u{202C}"));
+        assert!(hit("Esfera 75988052539"));
+        assert!(hit("Esfera 5575988052539"));
+        assert!(!hit("Maria 75988052539"));
+        assert!(!hit("\u{202A}+55 11 98805-2539\u{202C}"));
     }
 }
 
