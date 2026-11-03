@@ -269,6 +269,8 @@ static ADB_LIST_CACHE: std::sync::LazyLock<RwLock<(Vec<AdbDeviceInfo>, Instant)>
 static PROVISIONED_IDENTITY_CACHE: std::sync::LazyLock<
     RwLock<std::collections::HashMap<String, (Instant, i32)>>,
 > = std::sync::LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
+/// Auto-cura adiada (aparelho enviando) volta a ser tentada depois deste tempo, não em 30 min.
+const AUTO_HEAL_RETRY_SECS: u64 = 120;
 
 /// Janela máxima permitida em estado "connecting" (subtarefa 3). Um cartão só
 /// pode ficar amarelo por no máximo 15s durante uma tentativa ativa de reconexão
@@ -598,7 +600,17 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                     let cfg = crate::config::load_config();
                     let esfera_cfg_server = AdbManager::resolve_server_url(&s_target, &cfg);
                     std::thread::spawn(move || {
-                        let _ = AdbManager::auto_heal_and_immunize_device(&s_target, comp_id, &esfera_cfg_server);
+                        let Err(e) = AdbManager::auto_heal_and_immunize_device(&s_target, comp_id, &esfera_cfg_server) else { return; };
+                        // Adiada porque o aparelho estava enviando: tenta de novo em ~2 min, não em 30.
+                        if !e.starts_with("Auto-cura adiada") { return; }
+                        if let Ok(mut cache) = PROVISIONED_IDENTITY_CACHE.write() {
+                            if cache.get(&s_target).is_some_and(|(at, cid)| *at == now && *cid == comp_id) {
+                                match now.checked_sub(Duration::from_secs(1800 - AUTO_HEAL_RETRY_SECS)) {
+                                    Some(earlier) => { cache.insert(s_target.clone(), (earlier, comp_id)); }
+                                    None => { cache.remove(&s_target); }
+                                }
+                            }
+                        }
                     });
                 }
             } else if let Ok(mut cache) = PROVISIONED_IDENTITY_CACHE.write() {
