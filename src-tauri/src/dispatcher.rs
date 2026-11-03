@@ -471,7 +471,7 @@ pub fn send_window_state_at(now: chrono::NaiveDateTime) -> (bool, Option<chrono:
 
 /// Nome do contato temporário: contém o número, para a busca conferir que é a pessoa certa.
 pub fn temp_contact_name(phone: &str) -> String {
-    format!("Esfera {}", AdbManager::extract_phone_digits(phone))
+    format!("Esfera {}", AdbManager::normalize_target_phone(phone))
 }
 
 /// Quando cada contato temporário foi salvo ("serial|digitos"), para dar ao WhatsApp o tempo
@@ -489,8 +489,10 @@ static TEMP_CONTACTS_LOAD_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<M
 /// Tempo que o WhatsApp leva para achar na busca um contato recém-salvo.
 const TEMP_CONTACT_INDEX_MS: u64 = 2500;
 
+/// Chave pelo número canônico (com 55), o mesmo do nome salvo no aparelho ("Esfera 55..."): com os
+/// dígitos crus, um contato já salvo parecia novo e o envio esperava a indexação à toa.
 fn temp_key(serial: &str, phone: &str) -> String {
-    format!("{}|{}", serial, AdbManager::extract_phone_digits(phone))
+    format!("{}|{}", serial, AdbManager::normalize_target_phone(phone))
 }
 
 /// Na primeira chamada por aparelho após iniciar o app, carrega uma única vez os contatos
@@ -513,7 +515,7 @@ where
     if let Ok(existing_names) = loader(serial) {
         if let Ok(mut s) = TEMP_CONTACTS.lock() {
             for name in existing_names {
-                let digits = AdbManager::extract_phone_digits(&name);
+                let digits = AdbManager::normalize_target_phone(&name);
                 if !digits.is_empty() {
                     s.insert(format!("{}|{}", serial, digits));
                 }
@@ -2125,6 +2127,19 @@ mod dispatcher_tests {
         let failed=std::panic::catch_unwind(|| ensure_temp_contact_with("test-panic", "11999990002", |_| Ok(vec![]), |_,_,_| -> Result<Option<i64>,String> { panic!("teste") }));
         assert!(failed.is_err());
         assert!(ensure_temp_contact_with("test-panic", "11999990002", |_| Ok(vec![]), |_,_,_| Ok(Some(2))));
+    }
+
+    #[test]
+    fn contato_salvo_com_55_vale_para_numero_sem_55() {
+        let serial = "test-serial-canonico-01";
+        let inserted = AtomicUsize::new(0);
+        let created = ensure_temp_contact_with(serial, "(75) 98805-2539",
+            |_| Ok(vec!["Esfera 5575988052539".to_string()]),
+            |_, _, _| { inserted.fetch_add(1, Ordering::SeqCst); Ok(Some(1)) });
+        assert!(!created);
+        assert_eq!(inserted.load(Ordering::SeqCst), 0, "o contato já salvo não é recriado");
+        assert_eq!(temp_key(serial, "75988052539"), temp_key(serial, "+55 75 98805-2539"));
+        assert_eq!(temp_contact_name("(75) 98805-2539"), "Esfera 5575988052539");
     }
 
     #[test]
