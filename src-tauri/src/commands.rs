@@ -3284,6 +3284,53 @@ pub fn reset_campaign_contacts(state: State<'_, AppState>, token: String, campai
     state.db.reset_campaign_contacts(campaign_id)
 }
 
+/// Intervalo mínimo entre envios: abaixo disso o chip bate o limite por hora em minutos.
+const MIN_CAMPAIGN_DELAY_SECS: i32 = 15;
+
+/// Texto neutro do descadastro, o mesmo que a tela insere.
+const OPT_OUT_TEXT: &str = "Para deixar de receber mensagens por este canal, responda SAIR.";
+
+/// Regras da mensagem da tela (CampaignsTab `messageIssues`) repetidas no backend, com falha
+/// fechada: devolve o primeiro problema, com o nome do campo. `hourly`/`daily` são o teto da rede.
+fn campaign_message_error(campaign: &crate::db::Campaign, hourly: i64, daily: i64) -> Option<String> {
+    use crate::ai_engine::AiEngine;
+    let fields = [("Saudação", &campaign.greeting), ("Mensagem", &campaign.message), ("Encerramento", &campaign.closing)];
+    let mut issues: [Option<String>; 3] = [None, None, None];
+    for (i, (_, text)) in fields.iter().enumerate() {
+        if text.trim().is_empty() {
+            issues[i] = Some(if i == 1 { "escreva a mensagem que será enviada.".to_string() } else { "preencha este campo: a mensagem sai sempre em 3 partes.".to_string() });
+            continue;
+        }
+        if let Some(link) = crate::dispatcher::find_link(text) {
+            issues[i] = Some(format!("remova “{}”: a primeira mensagem para contatos novos não pode ter links nem e-mails (inclusive wa.me).", link));
+        } else if AiEngine::has_money(text) {
+            issues[i] = Some("não é permitido falar de valores (R$, reais, %, quantias ou parcelas). Tire a quantia e direcione o cliente ao canal de negociação.".to_string());
+        } else if !campaign.use_spintax && AiEngine::has_spin_block(text) {
+            issues[i] = Some("há variações entre chaves, mas as variações automáticas estão desligadas: o contato receberia as chaves. Ative as variações ou fique com uma opção.".to_string());
+        } else {
+            let unknown = AiEngine::unknown_variables(text);
+            if !unknown.is_empty() {
+                issues[i] = Some(format!("{} sairia como texto: o sistema só preenche o nome do contato ({{nome}} ou o nome da coluna, como {{NOME DEVEDOR}}).", unknown.join(", ")));
+            }
+        }
+    }
+    // SAIR no pior caso do spintax: em todas as variações do encerramento.
+    if issues[2].is_none() && !AiEngine::optout_in_every_variation(&campaign.closing) {
+        issues[2] = Some(format!("inclua a opção de descadastro em todas as variações, em texto neutro: “{}”", OPT_OUT_TEXT));
+    }
+    // Mais partes que o teto da rede nunca cabem numa janela (o disparo pausaria no 1º envio).
+    if issues[1].is_none() && fields.iter().all(|(_, t)| !t.trim().is_empty()) {
+        let full = [&campaign.greeting, &campaign.message, &campaign.closing].map(|t| t.as_str()).join("\n\n");
+        let parts = crate::adb_manager::AdbManager::split_human_parts(&full).len();
+        issues[1] = crate::dispatcher::parts_over_network_limit(parts, hourly, daily);
+    }
+    fields.iter().zip(issues).find_map(|((label, _), issue)| issue.map(|text| {
+        let mut chars = text.chars();
+        let first = chars.next().map(|c| c.to_uppercase().collect::<String>()).unwrap_or_default();
+        format!("{}: {}{}", label, first, chars.as_str())
+    }))
+}
+
 #[tauri::command]
 pub fn start_campaign(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<(), String> {
     let session = validate_session(&state.sessions, &token)?;
@@ -3299,11 +3346,16 @@ pub fn start_campaign(state: State<'_, AppState>, token: String, campaign_id: i3
     if campaign.greeting.trim().is_empty() || campaign.closing.trim().is_empty() {
         return Err("Preencha a saudação e o encerramento: a mensagem sai sempre em 3 partes.".to_string());
     }
-    if [&campaign.greeting, &campaign.message, &campaign.closing].iter().any(|t| crate::ai_engine::AiEngine::has_money(t)) {
-        return Err("A mensagem cita valores (R$, reais, %, quantias). Remova antes de iniciar.".to_string());
+    // As mesmas regras da tela, com falha fechada: sem conferir o teto da rede, não inicia.
+    let (hourly, daily) = db.network_limits().map_err(|_| "Não foi possível conferir o teto da rede. Tente de novo.".to_string())?;
+    if let Some(problem) = campaign_message_error(&campaign, hourly, daily) {
+        return Err(problem);
     }
-    if campaign.delay_min < 1 || campaign.delay_max < campaign.delay_min {
-        return Err("Intervalo de envio inválido.".to_string());
+    if campaign.delay_min < MIN_CAMPAIGN_DELAY_SECS {
+        return Err(format!("O intervalo mínimo entre envios é de {} segundos: abaixo disso o chip bate o limite por hora em minutos.", MIN_CAMPAIGN_DELAY_SECS));
+    }
+    if campaign.delay_max < campaign.delay_min {
+        return Err("Intervalo de envio inválido: o máximo deve ser maior ou igual ao mínimo.".to_string());
     }
     if campaign.use_ai {
         let config_opt = db.get_ai_config(company_id);
@@ -3344,6 +3396,44 @@ pub fn start_campaign(state: State<'_, AppState>, token: String, campaign_id: i3
     crate::dispatcher::seed_campaign_contacts(state.db.clone(), campaign_id, campaign.company_id, campaign.device_ids.clone());
     crate::dispatcher::Dispatcher::wake();
     Ok(())
+}
+
+#[cfg(test)]
+mod regras_do_inicio_tests {
+    use super::{campaign_message_error, OPT_OUT_TEXT};
+
+    fn campanha(greeting: &str, message: &str, closing: &str, use_spintax: bool) -> crate::db::Campaign {
+        crate::db::Campaign {
+            id: 1, name: "Teste".into(), greeting: greeting.into(), message: message.into(), closing: closing.into(),
+            delay_min: 30, delay_max: 90, use_spintax, use_ai: false, ai_model: String::new(), ai_provider: String::new(),
+            ai_prompt: String::new(), device_ids: vec!["usb1".into()], status: "draft".into(), contacts_count: 0,
+            sent_count: 0, failed_count: 0, company_id: 1, updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn inicio_repete_as_regras_da_tela() {
+        let ok = campanha("Olá {nome}, tudo bem?", "Temos uma condição para regularizar sua pendência.", OPT_OUT_TEXT, false);
+        assert_eq!(campaign_message_error(&ok, 10, 60), None);
+        // Valores, link e e-mail.
+        let e = campaign_message_error(&campanha("Olá {nome}", "Sua pendência de 1500 pode ser quitada.", OPT_OUT_TEXT, false), 10, 60).unwrap();
+        assert!(e.starts_with("Mensagem: Não é permitido falar de valores"), "{}", e);
+        let e = campaign_message_error(&campanha("Olá {nome}", "Fale pelo wa.me/5575988052539", OPT_OUT_TEXT, false), 10, 60).unwrap();
+        assert!(e.starts_with("Mensagem: Remova “wa.me”"), "{}", e);
+        assert!(campaign_message_error(&campanha("Olá {nome}", "Escreva para cobranca@empresa.com.br", OPT_OUT_TEXT, false), 10, 60).unwrap().contains("e-mails"));
+        // Chaves com as variações desligadas e variável que o sistema não preenche.
+        let e = campaign_message_error(&campanha("{Oi|Olá} {nome}", "Corpo", OPT_OUT_TEXT, false), 10, 60).unwrap();
+        assert!(e.starts_with("Saudação: Há variações entre chaves"), "{}", e);
+        assert_eq!(campaign_message_error(&campanha("{Oi|Olá} {nome}", "Corpo", "Responda SAIR.", true), 10, 60), None);
+        let e = campaign_message_error(&campanha("Olá {nome}", "Processo {PROCESSO}", "Responda SAIR.", true), 10, 60).unwrap();
+        assert!(e.starts_with("Mensagem: {PROCESSO} sairia como texto"), "{}", e);
+        // SAIR em todas as variações do encerramento (pior caso do spintax).
+        let e = campaign_message_error(&campanha("Olá {nome}", "Corpo", "{Responda SAIR|Obrigado}.", true), 10, 60).unwrap();
+        assert!(e.starts_with("Encerramento: Inclua a opção de descadastro"), "{}", e);
+        // Mais partes que o teto da rede.
+        let e = campaign_message_error(&ok, 2, 60).unwrap();
+        assert!(e.starts_with("Mensagem: A mensagem tem 3 partes"), "{}", e);
+    }
 }
 
 #[derive(serde::Serialize)]
