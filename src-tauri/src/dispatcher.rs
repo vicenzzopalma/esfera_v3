@@ -71,7 +71,7 @@ fn chip_limit_seconds(error: &str) -> Option<u64> {
 const CHIP_WAIT_RECHECK_SECS: u64 = 300;
 
 /// Mensagem com mais partes que o teto nunca cabe numa janela: devolve o motivo para pausar.
-fn parts_over_network_limit(parts: usize, hourly: i64, daily: i64) -> Option<String> {
+pub(crate) fn parts_over_network_limit(parts: usize, hourly: i64, daily: i64) -> Option<String> {
     let (limit, period) = if hourly <= daily { (hourly, "por hora") } else { (daily, "por dia") };
     (parts as i64 > limit).then(|| format!(
         "A mensagem tem {} partes e o teto da rede {} é {}: aumente o teto em Configurações → Rede e ritmo ou reduza o texto",
@@ -1056,12 +1056,19 @@ fn prefetch_next_message(db_arc: Arc<Database>, campaign: crate::db::Campaign, _
 
 /// Bloqueia URLs na mensagem preparada, inclusive quando inseridas pela IA ou spintax.
 fn contains_link(message: &str) -> bool {
+    find_link(message).is_some()
+}
+
+/// Link, domínio, IP ou e-mail no texto (o trecho encontrado), pela mesma regra do envio.
+pub(crate) fn find_link(message: &str) -> Option<String> {
     let lower = message.to_lowercase();
-    if lower.contains("http://") || lower.contains("https://") || lower.contains("www.") {
-        return true;
+    for marker in ["http://", "https://", "www."] {
+        if let Some(i) = lower.find(marker) {
+            return Some(lower[i..].split_whitespace().next().unwrap_or(marker).to_string());
+        }
     }
     lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
-        .any(|word| {
+        .find(|word| {
             if word.trim_matches('.').parse::<std::net::Ipv4Addr>().is_ok() { return true; }
             let mut pieces = word.trim_matches('.').rsplit('.');
             match (pieces.next(), pieces.next()) {
@@ -1071,6 +1078,7 @@ fn contains_link(message: &str) -> bool {
                 _ => false,
             }
         })
+        .map(|word| word.trim_matches('.').to_string())
 }
 
 const KEEPALIVE_COOLDOWN_SECS: i64 = 90;

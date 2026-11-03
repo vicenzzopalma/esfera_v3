@@ -600,11 +600,122 @@ impl AiEngine {
         }
         // Quantia com centavos: "350,00" ou "350.00" (não confunde com data "10.10.2026" nem "10.10.26").
         let b = text.as_bytes();
-        (1..b.len().saturating_sub(2)).any(|i| {
+        let cents = (1..b.len().saturating_sub(2)).any(|i| {
             (b[i] == b',' || b[i] == b'.')
                 && b[i - 1].is_ascii_digit() && b[i + 1].is_ascii_digit() && b[i + 2].is_ascii_digit()
                 && (i + 3 >= b.len() || !(b[i + 3].is_ascii_digit() || b[i + 3] == b'.' || b[i + 3] == b'/'))
                 && !(b[i] == b'.' && ((i >= 2 && b[i - 2] == b'.') || (i >= 3 && b[i - 3] == b'.')))
+        });
+        // Mesmos casos que a tela barra (CampaignsTab `findMoney`): milhar com ponto, "2 mil",
+        // parcelas e cobrança seguida de quantia.
+        cents
+            || Self::has_thousands_amount(&lower)
+            || Self::has_mil_amount(&lower)
+            || Self::has_installments(&lower)
+            || Self::has_debt_amount(&lower)
+    }
+
+    /// Caractere de palavra como o `\b` do JavaScript (ASCII), para dar o mesmo resultado da tela.
+    fn ascii_word(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+
+    /// Início de número: dígito sem letra ou dígito colado antes.
+    fn number_starts(c: &[char]) -> Vec<usize> {
+        (0..c.len()).filter(|&i| c[i].is_ascii_digit() && (i == 0 || !Self::ascii_word(c[i - 1]))).collect()
+    }
+
+    fn digit_run(c: &[char], from: usize) -> usize {
+        c[from.min(c.len())..].iter().take_while(|ch| ch.is_ascii_digit()).count()
+    }
+
+    /// Milhar com ponto: "1.500", "10.000", "1.234,56". Não conta CPF (123.456.789-00), CNPJ
+    /// (12.345.678/0001-90), CEP (12.345-678) nem data (10.10.2026, 10.10.26).
+    fn has_thousands_amount(text: &str) -> bool {
+        let c: Vec<char> = text.chars().collect();
+        let n = c.len();
+        let digit = |i: usize| i < n && c[i].is_ascii_digit();
+        let word = |i: usize| i < n && Self::ascii_word(c[i]);
+        // Depois da quantia não pode vir ".1", ",1", "/1" nem "-1" (continuação de documento ou data).
+        let free_after = |i: usize| !(i + 1 < n && matches!(c[i], '.' | ',' | '/' | '-') && c[i + 1].is_ascii_digit());
+        Self::number_starts(&c).into_iter().any(|s| {
+            let lead = Self::digit_run(&c, s);
+            if lead > 3 { return false; }
+            // Fim de cada grupo ".ddd" (cada grupo termina fora de palavra).
+            let mut ends = Vec::new();
+            let mut p = s + lead;
+            while p < n && c[p] == '.' && digit(p + 1) && digit(p + 2) && digit(p + 3) && !word(p + 4) {
+                p += 4;
+                ends.push(p);
+            }
+            ends.iter().rev().any(|&end| {
+                let with_cents = end < n && c[end] == ',' && digit(end + 1) && digit(end + 2) && !word(end + 3);
+                (with_cents && free_after(end + 3)) || free_after(end)
+            })
+        })
+    }
+
+    /// Quantia por extenso com número: "2 mil", "1,5 milhão", "3 milhões".
+    fn has_mil_amount(lower: &str) -> bool {
+        let c: Vec<char> = lower.chars().collect();
+        let n = c.len();
+        Self::number_starts(&c).into_iter().any(|s| {
+            let mut p = s + Self::digit_run(&c, s);
+            if p + 1 < n && matches!(c[p], '.' | ',') && c[p + 1].is_ascii_digit() {
+                p += 1 + Self::digit_run(&c, p + 1);
+            }
+            while p < n && c[p].is_whitespace() { p += 1; }
+            let rest: String = c[p..].iter().take(8).collect();
+            ["milhões", "milhoes", "milhão", "milhao", "mil"].iter().any(|w| {
+                let after = p + w.chars().count();
+                rest.starts_with(w) && (after >= n || !Self::ascii_word(c[after]))
+            })
+        })
+    }
+
+    /// Parcelas: "10x de 50", "3 x 200", "12X de 99".
+    fn has_installments(lower: &str) -> bool {
+        let c: Vec<char> = lower.chars().collect();
+        let n = c.len();
+        let skip_spaces = |mut p: usize| { while p < n && c[p].is_whitespace() { p += 1; } p };
+        Self::number_starts(&c).into_iter().any(|s| {
+            let lead = Self::digit_run(&c, s);
+            let p = skip_spaces(s + lead);
+            if lead > 2 || p >= n || c[p] != 'x' { return false; }
+            let p = skip_spaces(p + 1);
+            if Self::digit_run(&c, p) >= 2 { return true; }
+            p + 1 < n && c[p] == 'd' && c[p + 1] == 'e' && Self::digit_run(&c, skip_spaces(p + 2)) >= 2
+        })
+    }
+
+    /// Cobrança seguida de quantia de 3+ dígitos: "deve 300", "pendência de 1500", "acordo por 900".
+    /// Número logo depois do substantivo é identificação ("acordo 123456", "boleto nº 4567"), e
+    /// número que começa com 0 (0800...) não é quantia.
+    fn has_debt_amount(lower: &str) -> bool {
+        const KEYS: [&str; 23] = [
+            "pendência", "pendencia", "pendências", "pendencias", "acordo", "acordos", "entrada", "vista",
+            "quitar", "quitação", "quitacao", "quitaçao", "quitacão", "boleto", "boletos", "fatura", "faturas",
+            "deve", "devendo", "débito", "debito", "débitos", "debitos",
+        ];
+        const VERBS: [&str; 3] = ["deve", "devendo", "quitar"];
+        const PREPS: [&str; 6] = ["de", "por", "com", "em", "a", "à"];
+        const IDS: [&str; 13] = ["n", "nº", "n°", "no", "n.", "número", "numero", "protocolo", "código", "codigo", "contrato", "processo", "#"];
+        let tokens: Vec<&str> = lower.split_whitespace().collect();
+        tokens.iter().enumerate().any(|(i, token)| {
+            // A palavra de cobrança precisa vir inteira e seguida de espaço (como na tela).
+            let key = token.trim_start_matches(|ch: char| !Self::ascii_word(ch));
+            if !KEYS.contains(&key) { return false; }
+            let verb = VERBS.contains(&key);
+            let words = &tokens[i + 1..(i + 4).min(tokens.len())];
+            for (wi, word) in words.iter().enumerate() {
+                let digits = word.trim_start_matches(|ch: char| !ch.is_ascii_digit());
+                let b = digits.as_bytes();
+                if !(b.len() >= 3 && (b'1'..=b'9').contains(&b[0]) && b[1].is_ascii_digit() && b[2].is_ascii_digit()) { continue; }
+                let prev = if wi > 0 { words[wi - 1] } else { "" };
+                if IDS.contains(&prev) { return false; }
+                if verb || PREPS.contains(&prev) { return true; }
+            }
+            false
         })
     }
 
@@ -1781,6 +1892,69 @@ impl AiEngine {
         out
     }
 
+    /// Blocos de chaves sem chave dentro (os mais internos), com o texto de dentro.
+    fn brace_blocks(text: &str) -> Vec<(usize, usize)> {
+        let mut blocks = Vec::new();
+        let mut open = None;
+        for (i, ch) in text.char_indices() {
+            match ch {
+                '{' => open = Some(i),
+                '}' => if let Some(o) = open.take() { blocks.push((o, i)) },
+                _ => {}
+            }
+        }
+        blocks
+    }
+
+    /// Texto com os apelidos do nome trocados por um marcador: o que sobra entre chaves é spintax
+    /// ou variável que o sistema não preenche.
+    fn without_name_variables(text: &str) -> String {
+        Self::normalize_name_variables(text).replace("{nome}", "\u{1}")
+    }
+
+    /// Variáveis que o sistema não preenche ({PROCESSO} sairia como "PROCESSO" ou com as chaves).
+    pub fn unknown_variables(text: &str) -> Vec<String> {
+        let text = Self::without_name_variables(text);
+        let mut out: Vec<String> = Vec::new();
+        for (o, c) in Self::brace_blocks(&text) {
+            let inner = &text[o + 1..c];
+            if !inner.is_empty() && !inner.contains('|') && !out.iter().any(|v| v == &text[o..=c]) {
+                out.push(text[o..=c].to_string());
+            }
+        }
+        out
+    }
+
+    /// Há variações {a|b}? Com o spintax desligado elas sairiam com as chaves.
+    pub fn has_spin_block(text: &str) -> bool {
+        let text = Self::without_name_variables(text);
+        Self::brace_blocks(&text).iter().any(|&(o, c)| text[o + 1..c].contains('|'))
+    }
+
+    /// Palavra inteira, sem diferenciar maiúsculas (limite de palavra ASCII, como na tela).
+    fn has_word(text: &str, word: &str) -> bool {
+        let lower = text.to_lowercase();
+        lower.match_indices(word).any(|(i, _)| {
+            let before = lower[..i].chars().next_back().map_or(false, Self::ascii_word);
+            let after = lower[i + word.len()..].chars().next().map_or(false, Self::ascii_word);
+            !before && !after
+        })
+    }
+
+    /// O SAIR aparece em todas as variações? Resolve cada bloco {a|b} escolhendo, se houver, uma
+    /// opção sem o SAIR (o pior caso do spintax) e confere a palavra no resultado.
+    pub fn optout_in_every_variation(text: &str) -> bool {
+        let mut out = Self::without_name_variables(text);
+        for _ in 0..200 {
+            let Some(&(o, c)) = Self::brace_blocks(&out).first() else { break };
+            let inner = out[o + 1..c].to_string();
+            let options: Vec<&str> = inner.split('|').collect();
+            let pick = options.iter().find(|opt| !Self::has_word(opt, "sair")).unwrap_or(&options[0]).to_string();
+            out.replace_range(o..=c, &pick);
+        }
+        Self::has_word(&out, "sair")
+    }
+
     /// Substitui variáveis de contato ({nome}, {Nome}, etc.) de forma resiliente.
     /// Se o nome for vazio, limpa pontuação residual como espaços antes de vírgula.
     pub fn replace_contact_name(template: &str, contact_name: &str) -> String {
@@ -2400,6 +2574,39 @@ mod has_money_tests {
         );
         assert_eq!(AiEngine::replace_contact_name("Olá {NOME DEVEDOR}!", "PRIME ACABAMENTOS"), "Olá PRIME ACABAMENTOS!");
         assert_eq!(AiEngine::normalize_name_variables("sem chave { aberta"), "sem chave { aberta");
+    }
+
+    #[test]
+    fn mesmos_valores_que_a_tela_barra() {
+        for t in [
+            "1.500", "pague 1.500 hoje", "1.234,56", "saldo em aberto: 10.000", "2 mil", "1,5 milhão", "3 milhões",
+            "10x de 50", "3 x 200", "12X de 99", "deve 300", "você está devendo 450", "pendência de 1500",
+            "acordo por 900", "entrada de 500", "quitação com 2000", "boleto em 350", "fatura de 1200",
+        ] {
+            assert!(AiEngine::has_money(t), "deveria bloquear: {}", t);
+        }
+        for t in [
+            "Prazo até 10.10.26", "vencido em 10.10.2026", "CPF 123.456.789-00", "CNPJ 12.345.678/0001-90",
+            "CEP 44.380-000", "Seu acordo 123456 está pronto", "boleto nº 4567", "acordo nº 98765 disponível",
+            "Ligue 0800 123 4567", "Fatura 0800", "Referente ao contrato 4471", "2 milhas", "faltam 10 dias",
+            "Atenciosamente, Equipe REALESS", "Olá {nome}, tudo bem?",
+        ] {
+            assert!(!AiEngine::has_money(t), "não deveria bloquear: {}", t);
+        }
+    }
+
+    #[test]
+    fn variaveis_chaves_e_sair_em_todas_as_variacoes() {
+        assert_eq!(AiEngine::unknown_variables("Olá {NOME DEVEDOR}, processo {PROCESSO} e {PROCESSO}"), vec!["{PROCESSO}".to_string()]);
+        assert!(AiEngine::unknown_variables("Olá {nome}, {Oi|Olá} {Razão Social}").is_empty());
+        assert!(AiEngine::has_spin_block("{Oi|Olá} {nome}"));
+        assert!(AiEngine::has_spin_block("{Olá {nome}|Oi}"), "variação com o nome dentro também tem chaves");
+        assert!(!AiEngine::has_spin_block("Olá {nome}, tudo bem?"));
+        assert!(AiEngine::optout_in_every_variation("Para deixar de receber mensagens por este canal, responda SAIR."));
+        assert!(AiEngine::optout_in_every_variation("{Att|Abraços}, {nome}. Responda {SAIR|sair} para não receber mais."));
+        assert!(!AiEngine::optout_in_every_variation("{Responda SAIR para não receber mais|Obrigado}."));
+        assert!(!AiEngine::optout_in_every_variation("Atenciosamente, Equipe REALESS"));
+        assert!(!AiEngine::optout_in_every_variation("Saindo agora"), "SAIR tem de ser a palavra inteira");
     }
 
     #[test]
