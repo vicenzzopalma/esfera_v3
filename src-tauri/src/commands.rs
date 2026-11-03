@@ -518,14 +518,19 @@ pub async fn get_devices(state: State<'_, AppState>, token: String, company_id: 
                 let Ok(_gate) = HUB_CONNECT_GATE.try_lock() else { return; };
                 let is_connected = hub_client_clone.lock().await.is_some();
                 if !is_connected {
-                    if let Ok(Ok(client)) = tokio::time::timeout(
+                    match tokio::time::timeout(
                         std::time::Duration::from_secs(4),
                         HubClient::connect(
                             &creds.hub_address, &creds.hub_token, &creds.role,
                             creds.company_id, &creds.company_name,
                         ),
                     ).await {
-                        *hub_client_clone.lock().await = Some(Arc::new(client));
+                        Ok(Ok(client)) => {
+                            *hub_client_clone.lock().await = Some(Arc::new(client));
+                            note_hub_health(true, None);
+                        }
+                        Ok(Err(e)) => { note_hub_health(false, Some(hub_connect_error(&e, &creds.hub_address))); }
+                        Err(_) => { note_hub_health(false, Some("O hub demorou para conectar.".into())); }
                     }
                 }
             });
@@ -4059,15 +4064,140 @@ pub async fn connect_hub(
     let _session = validate_session(&state.sessions, &token)?;
     let creds = get_hub_credentials(state.clone(), token.clone())?;
     let _gate = HUB_CONNECT_GATE.lock().await;
-    let client = tokio::time::timeout(std::time::Duration::from_secs(5), HubClient::connect(
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), HubClient::connect(
         &creds.hub_address,
         &creds.hub_token,
         &creds.role,
         creds.company_id,
         &creds.company_name,
-    )).await.map_err(|_| "O hub demorou para conectar.")??;
+    )).await;
+    let client = match result {
+        Ok(Ok(client)) => client,
+        Ok(Err(e)) => {
+            let message = hub_connect_error(&e, &creds.hub_address);
+            note_hub_health(false, Some(message.clone()));
+            return Err(message);
+        }
+        Err(_) => {
+            note_hub_health(false, Some("O hub demorou para conectar.".into()));
+            return Err("O hub demorou para conectar.".into());
+        }
+    };
     *state.hub_client.lock().await = Some(Arc::new(client));
+    note_hub_health(true, None);
     Ok(())
+}
+
+/// Situação da conexão com o hub para o rodapé e Configurações (o endereço vai sem o token).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HubStatus {
+    connected: bool,
+    hub_address: String,
+    last_error: Option<String>,
+    last_change_utc: Option<String>,
+}
+
+/// Último estado conhecido da conexão com o hub: (conectado, último erro, última mudança em UTC).
+static HUB_HEALTH: std::sync::LazyLock<Mutex<(bool, Option<String>, Option<String>)>> =
+    std::sync::LazyLock::new(|| Mutex::new((false, None, None)));
+
+/// Registra o resultado de uma conexão ou de um teste com o hub. Devolve se mudou de estado.
+fn note_hub_health(connected: bool, error: Option<String>) -> bool {
+    let mut health = HUB_HEALTH.lock().unwrap_or_else(|e| e.into_inner());
+    let changed = health.0 != connected;
+    if changed { health.2 = Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)); }
+    health.0 = connected;
+    if connected { health.1 = None; } else if error.is_some() { health.1 = error; }
+    changed
+}
+
+/// Falha de conexão com o hub em português, sem detalhe técnico do sistema.
+fn hub_connect_error(error: &str, address: &str) -> String {
+    if error.starts_with("Falha ao conectar ao Hub") { format!("Não foi possível conectar ao hub em {}.", address) } else { error.to_string() }
+}
+
+/// Endereço do hub como o app conecta (salvo em Configurações; ambiente e padrão como reserva).
+fn hub_address_in_use(cfg: &AppConfig) -> String {
+    if !cfg.hub_address.trim().is_empty() { cfg.hub_address.trim().to_string() }
+    else { std::env::var("ESFERA_HUB_ADDR").unwrap_or_else(|_| "127.0.0.1:8555".to_string()) }
+}
+
+/// Conexão com o hub agora: testa o socket com ping (até 3 s). Conexão que não responde é solta,
+/// para a próxima leitura dos aparelhos reconectar sozinha. Avisa a mudança no evento `hub-status`.
+#[tauri::command]
+pub async fn get_hub_status(app: tauri::AppHandle, state: State<'_, AppState>, token: String) -> Result<HubStatus, String> {
+    use tauri::Emitter;
+    validate_session(&state.sessions, &token)?;
+    let client = state.hub_client.lock().await.clone();
+    let changed = match client {
+        Some(client) => match client.ping(Duration::from_secs(3)).await {
+            Some(Ok(())) => note_hub_health(true, None),
+            Some(Err(_)) => {
+                let mut slot = state.hub_client.lock().await;
+                if slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &client)) { *slot = None; }
+                note_hub_health(false, Some("A conexão com o hub caiu; o app tenta reconectar sozinho.".into()))
+            }
+            // Outro comando está usando a conexão: ela está em uso, vale o último estado.
+            None => false,
+        },
+        None => note_hub_health(false, None),
+    };
+    let (connected, last_error, last_change_utc) = HUB_HEALTH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let status = HubStatus { connected, hub_address: hub_address_in_use(&config::load_config()), last_error, last_change_utc };
+    if changed { let _ = app.emit("hub-status", status.clone()); }
+    Ok(status)
+}
+
+/// Janela de envio no horário local do PC, pela mesma regra do disparo.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendWindowStatus {
+    open: bool,
+    closes_at_local: Option<String>,
+    next_open_local: Option<String>,
+}
+
+fn send_window_status_at(now: chrono::NaiveDateTime) -> SendWindowStatus {
+    let (open, closes, next) = crate::dispatcher::send_window_state_at(now);
+    SendWindowStatus {
+        open,
+        closes_at_local: closes.map(|t| t.format("%H:%M").to_string()),
+        next_open_local: next.map(|t| t.format("%Y-%m-%dT%H:%M").to_string()),
+    }
+}
+
+/// `{ open, closesAtLocal: "20:00", nextOpenLocal: "2026-11-02T08:00" }`, fonte única da regra
+/// seg–sex 8h–20h, sáb 8h–14h (`dispatcher::send_window_state_at`).
+#[tauri::command]
+pub fn get_send_window(state: State<'_, AppState>, token: String) -> Result<SendWindowStatus, String> {
+    validate_session(&state.sessions, &token)?;
+    Ok(send_window_status_at(chrono::Local::now().naive_local()))
+}
+
+#[cfg(test)]
+mod situacao_hub_e_janela_tests {
+    use super::{hub_connect_error, note_hub_health, send_window_status_at, SendWindowStatus};
+
+    #[test]
+    fn janela_no_formato_da_tela() {
+        let t = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap();
+        assert_eq!(send_window_status_at(t("2026-11-02 10:30")), SendWindowStatus { open: true, closes_at_local: Some("20:00".into()), next_open_local: None });
+        assert_eq!(send_window_status_at(t("2026-11-07 15:00")), SendWindowStatus { open: false, closes_at_local: None, next_open_local: Some("2026-11-09T08:00".into()) });
+    }
+
+    #[test]
+    fn estado_do_hub_registra_queda_e_volta() {
+        note_hub_health(true, None);
+        assert!(note_hub_health(false, Some("A conexão com o hub caiu; o app tenta reconectar sozinho.".into())));
+        assert!(!note_hub_health(false, None), "sem mudança de estado, sem novo aviso");
+        assert_eq!(super::HUB_HEALTH.lock().unwrap().1.as_deref(), Some("A conexão com o hub caiu; o app tenta reconectar sozinho."));
+        assert!(note_hub_health(true, None));
+        let health = super::HUB_HEALTH.lock().unwrap().clone();
+        assert!(health.0 && health.1.is_none() && health.2.is_some());
+        assert_eq!(hub_connect_error("Falha ao conectar ao Hub 1.2.3.4:8555: recusado", "1.2.3.4:8555"), "Não foi possível conectar ao hub em 1.2.3.4:8555.");
+        assert_eq!(hub_connect_error("Autenticação falhou.", "x"), "Autenticação falhou.");
+    }
 }
 
 /// Host do hub para a atualização, a partir do endereço salvo ("host:porta", "[::1]:porta" ou só o
