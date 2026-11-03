@@ -2987,10 +2987,33 @@ impl AdbManager {
         }
     }
 
+    /// Pega a trava do aparelho (a mesma do envio) esperando no máximo `wait`. Nunca fica presa
+    /// atrás de um envio: devolve "aparelho ocupado" quando o prazo acaba.
+    fn lock_device_within(serial: &str, wait: Duration) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+        let lock = crate::dispatcher::device_operation_lock(serial)?;
+        let deadline = Instant::now() + wait;
+        loop {
+            match lock.clone().try_lock_owned() {
+                Ok(guard) => return Ok(guard),
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(250)),
+                Err(_) => return Err("O aparelho está ocupado com um envio ou outra operação agora; tente de novo em instantes".into()),
+            }
+        }
+    }
+
     /// Executa o pipeline completo de Auto-Cura, Provisionamento e Imunidade Total (Zero-Touch)
     pub fn auto_heal_and_immunize_device(serial: &str, company_id: i32, server_url: &str) -> Result<(), String> {
-        let lock = crate::dispatcher::device_operation_lock(serial)?;
-        let _guard = lock.blocking_lock();
+        let _guard = match Self::lock_device_within(serial, Duration::from_secs(10)) {
+            Ok(guard) => guard,
+            Err(e) => {
+                // Aparelho enviando: nada que mexa no adbd, na tela ou no agente. Só o `adb reverse`
+                // (não interrompe o envio) para o agente continuar falando com o desktop.
+                if let Err(re) = Self::setup_reverse_ports(serial, &crate::config::load_config()) {
+                    eprintln!("[AUTO-CURA] Encaminhamento de portas falhou em {}: {}", serial, re);
+                }
+                return Err(format!("Auto-cura adiada em {}: {}", serial, e));
+            }
+        };
         // 1. Se for conexão USB inicial, ativa porta TCP/IP 5555 apenas se service.adb.tcp.port ainda não for 5555.
         // IMPORTANTE: Rodar `adb tcpip 5555` quando já está em 5555 reinicia o gadget USB FunctionFS do adbd,
         // causando som de desconexão/reconexão USB no Windows!
@@ -3051,10 +3074,10 @@ impl AdbManager {
         // desktop ligado agora (127.0.0.1), sem depender de IP. Reaplicado em cada
         // auto-cura e, como o cache de cura é limpo quando o aparelho sai do ADB,
         // em cada reconexão. Vale para USB e Wi-Fi (reverse segue o transporte ADB).
-        {
-            let cfg_reverse = crate::config::load_config();
-            Self::setup_reverse_ports(serial, &cfg_reverse)?;
-        }
+        // A falha fica registrada e volta no fim: os passos seguintes (agente, imunidade, ouvinte do
+        // SAIR) rodam mesmo assim.
+        let reverse = Self::setup_reverse_ports(serial, &crate::config::load_config());
+        if let Err(ref e) = reverse { eprintln!("[AUTO-CURA] Encaminhamento de portas falhou em {}: {}", serial, e); }
 
         // 3. Semeia as chaves ADB do Windows para autorização perpétua
         if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
@@ -3114,7 +3137,7 @@ impl AdbManager {
         // 6. Inicia o serviço em primeiro plano (silencioso, sem abrir Activity)
         let _ = Self::start_agent_service(serial);
 
-        Ok(())
+        reverse.map_err(|e| format!("Auto-cura concluída, mas o encaminhamento de portas falhou: {}", e))
     }
 
     /// Varredura assíncrona ultra-rápida (HPC) na subnet local para auto-adoção de celulares que mudarem de IP via DHCP
@@ -3246,14 +3269,31 @@ impl AdbManager {
             cmd.args(["-s", &candidate, "shell", "getprop ro.serialno; cat /sdcard/.esfera_device_id 2>/dev/null || true"]);
             let budget = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(2));
             if let Ok(out) = run_cmd_timeout(cmd, budget) {
-                if out.status.success() && String::from_utf8_lossy(&out.stdout).lines().any(|id| id.trim() == requested) { matches.push(candidate); }
+                let text = String::from_utf8_lossy(&out.stdout).to_string();
+                if out.status.success() && text.lines().any(|id| id.trim() == requested) {
+                    let hardware = text.lines().next().unwrap_or("").trim().to_string();
+                    matches.push((candidate, hardware));
+                }
             }
         }
+        Self::pick_matched_target(matches)
+    }
+
+    /// Escolhe o transporte entre os que apresentam a identidade pedida. O mesmo celular ligado por
+    /// USB e por Wi-Fi aparece duas vezes com o mesmo `ro.serialno`: vale um só, USB primeiro.
+    /// Aparelhos físicos diferentes com a mesma identidade continuam recusados.
+    fn pick_matched_target(matches: Vec<(String, String)>) -> Result<String, String> {
         match matches.len() {
-            1 => Ok(matches.remove(0)),
-            0 => Err("O aparelho solicitado não está disponível; confira a conexão e a autorização".into()),
-            _ => Err("Mais de um aparelho apresenta essa identidade; confira o cadastro antes de continuar".into()),
+            0 => return Err("O aparelho solicitado não está disponível; confira a conexão e a autorização".into()),
+            1 => return Ok(matches.into_iter().next().map(|(target, _)| target).unwrap_or_default()),
+            _ => {}
         }
+        let hardware = &matches[0].1;
+        if hardware.is_empty() || matches.iter().any(|(_, hw)| hw != hardware) {
+            return Err("Mais de um aparelho apresenta essa identidade; confira o cadastro antes de continuar".into());
+        }
+        let usb = matches.iter().find(|(target, _)| !target.contains(':') && !target.contains('.'));
+        Ok(usb.unwrap_or(&matches[0]).0.clone())
     }
 
     /// Confere o endereço exato do aparelho e reconecta apenas aquele alvo de rede.
@@ -3263,8 +3303,13 @@ impl AdbManager {
         if ready(&Self::list_devices().unwrap_or_default()) { return Ok(()); }
         Self::connect_device(&addr.ip().to_string(), i32::from(addr.port()))
             .map_err(|e| format!("Aparelho Wi-Fi {} indisponível: {}", serial, e))?;
-        if ready(&Self::list_devices().unwrap_or_default()) { Self::setup_reverse_ports(serial, &crate::config::load_config()) }
-        else { Err(format!("Aparelho Wi-Fi {} não ficou disponível no ADB.", serial)) }
+        if !ready(&Self::list_devices().unwrap_or_default()) { return Err(format!("Aparelho Wi-Fi {} não ficou disponível no ADB.", serial)); }
+        // O envio usa o shell do ADB, não o encaminhamento de portas: a falha dele só é registrada
+        // (a auto-cura reaplica) e nunca tira o aparelho do envio.
+        if let Err(e) = Self::setup_reverse_ports(serial, &crate::config::load_config()) {
+            eprintln!("[ADB] Encaminhamento de portas falhou em {} após reconectar: {}", serial, e);
+        }
+        Ok(())
     }
 
     /// Provisiona um dispositivo: gera UUID, injeta ID + config + imunidade, instala APK, inicia serviço
@@ -3282,8 +3327,7 @@ impl AdbManager {
             );
         }
         let target_serial = Self::resolve_target_serial(serial)?;
-        let lock = crate::dispatcher::device_operation_lock(&target_serial)?;
-        let _guard = lock.blocking_lock();
+        let _guard = Self::lock_device_within(&target_serial, Duration::from_secs(3))?;
 
         let device_id = Self::identity_for_first_adoption(&target_serial)?;
         let config = crate::config::load_config();
@@ -3299,15 +3343,23 @@ impl AdbManager {
         Self::inject_device_immunity(&target_serial, Some(&device_id))?;
         let _ = Self::set_device_owner(&target_serial);
 
-        Self::setup_reverse_ports(&target_serial, &config)?;
+        // A falha do encaminhamento de portas não interrompe a instalação do agente; vira aviso no
+        // fim (um erro aqui impediria o cadastro do ESF-ID, que o comando só grava com sucesso).
+        let reverse_warning = match Self::setup_reverse_ports(&target_serial, &config) {
+            Ok(()) => String::new(),
+            Err(e) => {
+                eprintln!("[PROVISIONAMENTO] Encaminhamento de portas falhou em {}: {}", target_serial, e);
+                format!(" — atenção: o encaminhamento de portas falhou ({}); a auto-cura tenta de novo", e)
+            }
+        };
 
         let agent_result = Self::install_agent_apk_unlocked(&target_serial);
         match agent_result {
             Ok(msg) => {
                 let _ = Self::start_agent_service(&target_serial);
                 Ok(format!(
-                    "Provisionado com sucesso: {} (ID: {}) — {}",
-                    target_serial, device_id, msg
+                    "Provisionado com sucesso: {} (ID: {}) — {}{}",
+                    target_serial, device_id, msg, reverse_warning
                 ))
             }
             Err(_e) => {
@@ -3323,8 +3375,8 @@ impl AdbManager {
                 let _ = Self::push_agent_script(&target_serial);
                 let _ = Self::start_agent_script(&target_serial);
                 Ok(format!(
-                    "Provisionado com sucesso: {} (ID: {}) — Script ativo",
-                    target_serial, device_id
+                    "Provisionado com sucesso: {} (ID: {}) — Script ativo{}",
+                    target_serial, device_id, reverse_warning
                 ))
             }
         }
@@ -3479,14 +3531,12 @@ impl AdbManager {
     /// cada reconexão do aparelho. A VPS continua como fallback (no agente).
     pub fn setup_reverse_ports(serial: &str, config: &crate::config::AppConfig) -> Result<(), String> {
         if crate::adb_tcp::is_tunnel_serial(serial) { return Ok(()); }
-        Self::reverse_port(serial, Self::PRESENCE_WS_PORT)?;
-        if config.tunnel_server_enabled {
-            Self::reverse_port(serial, config.tunnel_server_port)?;
-        }
-        if config.checkin_server_enabled {
-            Self::reverse_port(serial, config.checkin_server_port)?;
-        }
-        Ok(())
+        // Uma porta que falha não impede as outras; os erros voltam juntos no fim.
+        let mut ports = vec![Self::PRESENCE_WS_PORT];
+        if config.tunnel_server_enabled { ports.push(config.tunnel_server_port); }
+        if config.checkin_server_enabled { ports.push(config.checkin_server_port); }
+        let errors: Vec<String> = ports.into_iter().filter_map(|port| Self::reverse_port(serial, port).err()).collect();
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
     }
 
     /// Push the shell agent script to device via adb
@@ -3611,8 +3661,7 @@ impl AdbManager {
 
     /// Instala silenciosamente o aplicativo Agente Esfera v3 (.APK) no celular via ADB com auto-reconexão e tratamento de 'device offline'
     pub fn install_agent_apk(serial: &str) -> Result<String, String> {
-        let lock = crate::dispatcher::device_operation_lock(serial)?;
-        let _guard = lock.blocking_lock();
+        let _guard = Self::lock_device_within(serial, Duration::from_secs(3))?;
         Self::install_agent_apk_unlocked(serial)
     }
 
@@ -3741,37 +3790,54 @@ impl AdbManager {
     }
 
     fn restore_agent_services_after_update(serial: &str) -> Result<(), String> {
-        Self::setup_reverse_ports(serial, &crate::config::load_config())?;
-        Self::execute_shell(serial, "appops set --uid com.esfera.agent MANAGE_EXTERNAL_STORAGE allow", 6)?;
-        let current = Self::execute_shell(serial, "settings get secure enabled_accessibility_services", 6)
+        // O encaminhamento de portas é tentado, mas a falha dele não impede religar a acessibilidade
+        // e o ouvinte do SAIR (sem eles o descadastro deixa de ser capturado).
+        let reverse = Self::setup_reverse_ports(serial, &crate::config::load_config());
+        Self::restore_agent_services_with(&mut |cmd| Self::execute_shell(serial, cmd, 6), reverse)
+    }
+
+    /// Passos da restauração sobre um shell qualquer (o aparelho, ou um simulado nos testes).
+    /// `reverse`: resultado do `adb reverse`, devolvido só no fim, depois de todos os passos.
+    fn restore_agent_services_with(shell: &mut dyn FnMut(&str) -> Result<String, String>, reverse: Result<(), String>) -> Result<(), String> {
+        if let Err(ref e) = reverse { eprintln!("[AGENTE] Encaminhamento de portas falhou ({}); seguindo com a restauração.", e); }
+        // Acesso a todos os arquivos (gravação do SAIR em /sdcard) só existe no Android 11+ (SDK 30);
+        // no Android 8–10 o agente grava com a permissão comum de armazenamento. Falha aqui não
+        // interrompe a restauração, como na auto-cura.
+        let sdk = shell("getprop ro.build.version.sdk").ok().and_then(|v| v.trim().parse::<u32>().ok());
+        if sdk.map_or(true, |v| v >= 30) {
+            if let Err(e) = shell("appops set --uid com.esfera.agent MANAGE_EXTERNAL_STORAGE allow") {
+                eprintln!("[AGENTE] Acesso a todos os arquivos não aplicado (Android {:?}): {}", sdk, e);
+            }
+        }
+        let current = shell("settings get secure enabled_accessibility_services")
             .map_err(|e| format!("Agente instalado, mas não foi possível ler a acessibilidade: {}",e))?;
         let current = current.trim();
         if !current.contains(Self::AGENT_ACCESSIBILITY_COMPONENT) {
             let updated = if current.is_empty() || current == "null" { Self::AGENT_ACCESSIBILITY_COMPONENT.to_string() } else { format!("{}:{}",current,Self::AGENT_ACCESSIBILITY_COMPONENT) };
-            Self::execute_shell(serial, &format!("settings put secure enabled_accessibility_services '{}'",Self::shell_quote(&updated)), 6)
+            shell(&format!("settings put secure enabled_accessibility_services '{}'",Self::shell_quote(&updated)))
                 .map_err(|e| format!("Agente instalado, mas não foi possível ativar acessibilidade: {}",e))?;
         }
-        Self::execute_shell(serial, "settings put secure accessibility_enabled 1", 6)
+        shell("settings put secure accessibility_enabled 1")
             .map_err(|e| format!("Agente instalado, mas não foi possível ativar acessibilidade: {}",e))?;
-        let accessibility = Self::execute_shell(serial, "settings get secure enabled_accessibility_services", 6)
+        let accessibility = shell("settings get secure enabled_accessibility_services")
             .map_err(|e| format!("Não foi possível confirmar acessibilidade: {}",e))?;
         if !accessibility.contains(Self::AGENT_ACCESSIBILITY_COMPONENT) { return Err("Agente instalado, mas a acessibilidade não foi confirmada.".into()); }
         const LISTENER: &str = "com.esfera.agent/com.esfera.agent.EsferaOptOutNotificationListener";
         // Android 8 (ex.: Samsung) não tem "cmd notification": o erro é ignorado e cai na gravação direta abaixo.
-        let _ = Self::execute_shell(serial, &format!("cmd notification allow_listener {}", LISTENER), 6);
-        let mut listeners = Self::execute_shell(serial, "settings get secure enabled_notification_listeners", 6)
+        let _ = shell(&format!("cmd notification allow_listener {}", LISTENER));
+        let mut listeners = shell("settings get secure enabled_notification_listeners")
             .map_err(|e| format!("Não foi possível confirmar notificações: {}",e))?;
         if !listeners.contains("com.esfera.agent/") {
             let current = listeners.trim();
             let updated = if current.is_empty() || current == "null" { LISTENER.to_string() } else { format!("{}:{}", current, LISTENER) };
-            let _ = Self::execute_shell(serial, &format!("settings put secure enabled_notification_listeners '{}'", Self::shell_quote(&updated)), 6);
-            listeners = Self::execute_shell(serial, "settings get secure enabled_notification_listeners", 6)
+            let _ = shell(&format!("settings put secure enabled_notification_listeners '{}'", Self::shell_quote(&updated)));
+            listeners = shell("settings get secure enabled_notification_listeners")
                 .map_err(|e| format!("Não foi possível confirmar notificações: {}",e))?;
         }
         if !listeners.contains("com.esfera.agent/") { return Err("Agente instalado, mas o acesso às notificações não foi confirmado.".into()); }
-        Self::execute_shell(serial, "am start-foreground-service -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am startservice -n com.esfera.agent/.EsferaAgentService", 6)
+        shell("am start-foreground-service -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am startservice -n com.esfera.agent/.EsferaAgentService")
             .map_err(|e| format!("Agente instalado, mas o serviço não iniciou: {}",e))?;
-        Ok(())
+        reverse.map_err(|e| format!("Agente restaurado, mas o encaminhamento de portas falhou: {}", e))
     }
 
     /// Monitor de status: marca devices como offline se check-in expirou
@@ -5511,6 +5577,74 @@ mod send_safety_tests {
     fn pacote_alternativo_e_recusado_antes_de_acessar_aparelho() {
         let result = AdbManager::send_whatsapp_parts("nao_acessar", "5511999998888", &["Olá".into()], Some("com.whatsapp.w4b"), &|| true);
         assert!(result.unwrap_err().contains("com.whatsapp"));
+    }
+}
+
+#[cfg(test)]
+mod restore_agent_tests {
+    use super::AdbManager;
+    use std::collections::HashMap;
+
+    /// Shell simulado: Samsung com Android 8 não tem MANAGE_EXTERNAL_STORAGE nem `cmd notification`.
+    struct Android { sdk: u32, settings: HashMap<String, String>, log: Vec<String> }
+
+    impl Android {
+        fn new(sdk: u32) -> Self { Android { sdk, settings: HashMap::new(), log: Vec::new() } }
+        fn run(&mut self, cmd: &str) -> Result<String, String> {
+            self.log.push(cmd.to_string());
+            if cmd == "getprop ro.build.version.sdk" { return Ok(format!("{}\n", self.sdk)); }
+            if cmd.starts_with("appops set") {
+                return if self.sdk >= 30 { Ok(String::new()) } else { Err("Error: Unknown operation string: MANAGE_EXTERNAL_STORAGE".into()) };
+            }
+            if cmd.starts_with("cmd notification") { return Err("cmd: Can't find service: notification".into()); }
+            if let Some(key) = cmd.strip_prefix("settings get secure ") {
+                return Ok(format!("{}\n", self.settings.get(key).cloned().unwrap_or_else(|| "null".into())));
+            }
+            if let Some(rest) = cmd.strip_prefix("settings put secure ") {
+                let (key, value) = rest.split_once(' ').unwrap();
+                self.settings.insert(key.into(), value.trim_matches('\'').into());
+                return Ok(String::new());
+            }
+            if cmd.starts_with("am start-foreground-service") { return Ok("Starting service: Intent { cmp=com.esfera.agent/.EsferaAgentService }\n".into()); }
+            Err(format!("comando inesperado: {}", cmd))
+        }
+    }
+
+    #[test]
+    fn android_8_religa_acessibilidade_e_ouvinte_do_sair() {
+        let mut phone = Android::new(26);
+        assert_eq!(AdbManager::restore_agent_services_with(&mut |c| phone.run(c), Ok(())), Ok(()));
+        assert!(phone.settings["enabled_accessibility_services"].contains(AdbManager::AGENT_ACCESSIBILITY_COMPONENT));
+        assert_eq!(phone.settings["accessibility_enabled"], "1");
+        assert!(phone.settings["enabled_notification_listeners"].contains("com.esfera.agent/com.esfera.agent.EsferaOptOutNotificationListener"));
+        assert!(!phone.log.iter().any(|c| c.contains("MANAGE_EXTERNAL_STORAGE")), "Android 8 não tem essa operação");
+    }
+
+    #[test]
+    fn falha_do_acesso_a_arquivos_ou_do_reverse_nao_interrompe() {
+        let mut phone = Android::new(30);
+        let mut failing = |c: &str| if c.starts_with("appops") { Err("falhou".to_string()) } else { phone.run(c) };
+        assert_eq!(AdbManager::restore_agent_services_with(&mut failing, Ok(())), Ok(()));
+        let mut phone = Android::new(26);
+        let result = AdbManager::restore_agent_services_with(&mut |c| phone.run(c), Err("Reverse tcp:7779 falhou".into()));
+        assert!(result.unwrap_err().contains("encaminhamento de portas"));
+        assert!(phone.settings["enabled_notification_listeners"].contains("EsferaOptOutNotificationListener"));
+        assert!(phone.log.iter().any(|c| c.starts_with("am start-foreground-service")));
+    }
+}
+
+#[cfg(test)]
+mod target_pick_tests {
+    use super::AdbManager;
+    #[test]
+    fn mesmo_celular_por_usb_e_wifi_escolhe_usb() {
+        let m = |list: &[(&str, &str)]| list.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+        assert_eq!(AdbManager::pick_matched_target(m(&[("192.168.1.50:5555", "R58M123ABC"), ("R58M123ABC", "R58M123ABC")])).unwrap(), "R58M123ABC");
+        assert_eq!(AdbManager::pick_matched_target(m(&[("192.168.1.50:5555", "R58M123ABC"), ("adb-R58M123ABC._adb-tls-connect._tcp", "R58M123ABC")])).unwrap(), "192.168.1.50:5555");
+        assert!(AdbManager::pick_matched_target(m(&[("192.168.1.50:5555", "AAA"), ("0082925603", "BBB")])).is_err());
+        assert!(AdbManager::pick_matched_target(m(&[("192.168.1.50:5555", ""), ("0082925603", "")])).is_err());
+        assert_eq!(AdbManager::pick_matched_target(m(&[("0082925603", "")])).unwrap(), "0082925603");
+        assert!(AdbManager::pick_matched_target(Vec::new()).is_err());
     }
 }
 
