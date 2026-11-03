@@ -4191,11 +4191,13 @@ impl Database {
         Ok(token)
     }
 
-    /// Existência de uma empresa ativa (sem depender de colunas calculadas).
+    /// Existência da empresa, ativa ou não (sem depender de colunas calculadas).
+    /// Usada pela API de descadastro e pela configuração do VEXOR: o SAIR é sempre aceito,
+    /// mesmo com a empresa inativa, porque o descadastro é falha fechada.
     pub fn company_exists(&self, company_id: i32) -> bool {
         self.conn()
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM ESF_Company WHERE CompanyId = ?1 AND IsActive = 1);",
+                "SELECT EXISTS(SELECT 1 FROM ESF_Company WHERE CompanyId = ?1);",
                 params![company_id],
                 |r| r.get::<_, bool>(0),
             )
