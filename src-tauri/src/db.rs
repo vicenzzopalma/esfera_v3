@@ -1512,19 +1512,24 @@ impl Database {
     }
 
     pub fn create_company(&self, name: &str, device_limit: i32) -> Result<Company, String> {
-        self.conn()
-            .execute(
-                "INSERT INTO ESF_Company (CompanyName, DeviceLimit) VALUES (?1, ?2)",
-                params![name, device_limit],
-            )
-            .map_err(|e| e.to_string())?;
+        self.create_company_with_user_limit(name, device_limit, 10)
+    }
 
-        let last_id = self.conn().last_insert_rowid() as i32;
+    /// Cria a empresa já com o limite de usuários; o id é lido na mesma conexão do INSERT.
+    pub fn create_company_with_user_limit(&self, name: &str, device_limit: i32, user_limit: i32) -> Result<Company, String> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO ESF_Company (CompanyName, DeviceLimit, UserLimit) VALUES (?1, ?2, ?3)",
+            params![name, device_limit, user_limit],
+        )
+        .map_err(|e| e.to_string())?;
+        let last_id = conn.last_insert_rowid() as i32;
+        drop(conn);
         Ok(Company {
             id: last_id,
             name: name.to_string(),
             device_limit,
-            user_limit: 10,
+            user_limit,
             device_count: 0,
             user_count: 1,
             is_active: true,
@@ -2064,7 +2069,9 @@ impl Database {
     }
 
     pub fn create_campaign(&self, c: &Campaign) -> Result<i32, String> {
-        self.conn().execute(
+        // O id é lido na mesma conexão do INSERT (outra gravação no meio trocaria o last_insert_rowid).
+        let conn = self.conn();
+        conn.execute(
             "INSERT INTO ESF_Campaign (CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, SelectedDevices, AiProvider)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17);",
             params![
@@ -2087,7 +2094,7 @@ impl Database {
                 c.ai_provider,
             ]
         ).map_err(|e| e.to_string())?;
-        Ok(self.conn().last_insert_rowid() as i32)
+        Ok(conn.last_insert_rowid() as i32)
     }
 
     pub fn get_running_campaigns(&self) -> Result<Vec<Campaign>> {
@@ -4332,23 +4339,28 @@ impl Database {
             .unwrap_or(false)
     }
 
-    /// Busca empresa por ID (para obter o nome no Register do hub).
+    /// Busca empresa por ID (para obter o nome no Register do hub). Contagens e status calculados
+    /// como em `get_companies`: a tabela não tem essas colunas e pedi-las fazia a busca falhar.
     pub fn get_company_by_id(&self, company_id: i32) -> Option<Company> {
         self.conn()
             .query_row(
-                "SELECT CompanyId, CompanyName, DeviceLimit, UserLimit, DeviceCount, UserCount, IsActive, Status, CreatedAt FROM ESF_Company WHERE CompanyId = ?1",
+                "SELECT c.CompanyId, c.CompanyName, c.DeviceLimit, c.UserLimit, c.IsActive, c.CreatedAt,
+                        (SELECT COUNT(*) FROM ESF_Device d WHERE d.CompanyId = c.CompanyId),
+                        (SELECT COUNT(*) FROM ESF_User u WHERE u.CompanyId = c.CompanyId)
+                 FROM ESF_Company c WHERE c.CompanyId = ?1",
                 params![company_id],
                 |r| {
+                    let is_active = r.get::<_, i32>(4)? == 1;
                     Ok(Company {
                         id: r.get(0)?,
                         name: r.get(1)?,
                         device_limit: r.get(2)?,
                         user_limit: r.get(3)?,
-                        device_count: r.get(4)?,
-                        user_count: r.get(5)?,
-                        is_active: r.get(6)?,
-                        status: r.get(7)?,
-                        created_at: r.get(8)?,
+                        is_active,
+                        status: if is_active { "active".to_string() } else { "inactive".to_string() },
+                        created_at: r.get(5)?,
+                        device_count: r.get(6)?,
+                        user_count: r.get(7)?,
                     })
                 },
             )
@@ -4932,5 +4944,16 @@ mod logs_tests {
         assert_eq!(messages(db.get_logs_page(outra.id, 2, Some(last_id))), ["evento 2", "evento 1"]);
         assert_eq!(db.get_logs_page(outra.id, 5000, None).len(), 5, "teto de 1000 e só a empresa pedida");
         assert_eq!(db.get_logs_page(outra.id, 0, None).len(), 1);
+    }
+
+    #[test]
+    fn empresa_criada_com_limite_de_usuarios() {
+        let path = std::env::temp_dir().join(format!("esfera_empresa_limite_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let created = db.create_company_with_user_limit("Com Limite", 3, 25).unwrap();
+        let saved = db.get_company_by_id(created.id).unwrap();
+        assert_eq!((saved.name.as_str(), saved.device_limit, saved.user_limit), ("Com Limite", 3, 25));
+        assert_eq!(db.get_company_by_id(db.create_company("Padrão", 2).unwrap().id).unwrap().user_limit, 10);
     }
 }
