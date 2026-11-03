@@ -124,6 +124,16 @@ fn load_adb_key() -> Option<RsaPrivateKey> {
 
 // ------------------------- Handshake -------------------------
 
+/// Prefixo DigestInfo DER do SHA-1. O adbd confere o AUTH com `RSA_verify(NID_sha1, token)`:
+/// o token de 20 bytes é tratado como o resumo SHA-1, então a assinatura cobre
+/// `prefixo ‖ token` (igual ao `RSA_sign(NID_sha1)` do adb oficial). Sem o prefixo o
+/// aparelho recusa sempre e pede a chave de novo.
+const SHA1_DIGEST_INFO: [u8; 15] = [0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14];
+
+fn auth_signature_scheme() -> Pkcs1v15Sign {
+    Pkcs1v15Sign { hash_len: None, prefix: Box::new(SHA1_DIGEST_INFO) }
+}
+
 fn handshake(stream: &mut TcpStream, key: Option<&RsaPrivateKey>, deadline: Instant) -> io::Result<()> {
     let ident = b"host::features=shell_v2\0";
     write_msg(stream, A_CNXN, A_VERSION, MAX_PAYLOAD as u32, ident)?;
@@ -143,9 +153,9 @@ fn handshake(stream: &mut TcpStream, key: Option<&RsaPrivateKey>, deadline: Inst
                         "aparelho exige autenticação e não há chave em ~/.android/adbkey",
                     ));
                 };
-                // Assinatura ADB = RSA private_encrypt PKCS#1 v1.5 cru (sem DigestInfo)
+                // Assinatura ADB = PKCS#1 v1.5 sobre DigestInfo SHA-1 ‖ token (ver SHA1_DIGEST_INFO)
                 let sig = k
-                    .sign(Pkcs1v15Sign::new_unprefixed(), &msg.payload)
+                    .sign(auth_signature_scheme(), &msg.payload)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 write_msg(stream, A_AUTH, A_AUTH_SIGNATURE, 0, &sig)?;
             }
@@ -460,5 +470,46 @@ mod native_protocol_tests {
     #[test]
     fn codigo_de_saida_nao_zero_e_falha() {
         assert!(simulated_command(7).unwrap_err().contains('7'));
+    }
+
+    /// Daemon simulado que confere o AUTH como o adbd: `RSA_verify(NID_sha1, token)`.
+    fn simulated_auth(key: &RsaPrivateKey) -> (io::Result<()>, bool) {
+        let public = key.to_public_key();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            assert_eq!(read_msg(&mut socket).unwrap().cmd, A_CNXN);
+            let token: Vec<u8> = (0..20u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+            write_msg(&mut socket, A_AUTH, A_AUTH_TOKEN, 0, &token).unwrap();
+            let reply = read_msg(&mut socket).unwrap();
+            assert_eq!((reply.cmd, reply.arg0), (A_AUTH, A_AUTH_SIGNATURE));
+            let sha1 = Pkcs1v15Sign { hash_len: Some(20), prefix: Box::new(SHA1_DIGEST_INFO) };
+            let accepted = public.verify(sha1, &token, &reply.payload).is_ok();
+            if accepted {
+                write_msg(&mut socket, A_CNXN, A_VERSION, 4096, b"device::features=shell_v2\0").unwrap();
+            } else {
+                // O adbd pede outro token quando a assinatura não confere.
+                write_msg(&mut socket, A_AUTH, A_AUTH_TOKEN, 0, &token).unwrap();
+            }
+            accepted
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        let result = handshake(&mut stream, Some(key), Instant::now() + Duration::from_secs(5));
+        (result, server.join().unwrap())
+    }
+
+    #[test]
+    fn auth_assinado_com_digestinfo_sha1_e_aceito_pelo_aparelho() {
+        let key = RsaPrivateKey::new(&mut rand::thread_rng(), 512).unwrap();
+        let (result, accepted) = simulated_auth(&key);
+        assert!(accepted, "o daemon simulado recusou a assinatura");
+        assert!(result.is_ok(), "{:?}", result.err());
+        // A assinatura crua (sem o prefixo) é exatamente o que o aparelho real recusava.
+        let token = [7u8; 20];
+        let raw = key.sign(Pkcs1v15Sign::new_unprefixed(), &token).unwrap();
+        let sha1 = Pkcs1v15Sign { hash_len: Some(20), prefix: Box::new(SHA1_DIGEST_INFO) };
+        assert!(key.to_public_key().verify(sha1, &token, &raw).is_err());
     }
 }
