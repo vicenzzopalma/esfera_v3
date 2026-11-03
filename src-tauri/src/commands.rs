@@ -3980,35 +3980,110 @@ pub async fn connect_hub(
     Ok(())
 }
 
-/// Empurra uma atualização do hub-standalone VPS via POST /admin/update.
-/// Recebe o binario em base64. O VPS faz swap + self-restart (sem SSH).
+/// Host do hub para a atualização, a partir do endereço salvo ("host:porta", "[::1]:porta" ou só o
+/// host). Recusa o que não for um host simples (evita mandar o token para outro lugar).
+fn vps_hub_host(address: &str) -> Option<String> {
+    let a = address.trim();
+    let a = a.split_once("://").map(|(_, rest)| rest).unwrap_or(a);
+    let a = a.split('/').next().unwrap_or("");
+    let host = if a.starts_with('[') { &a[..a.find(']')? + 1] } else { a.rsplit_once(':').map(|(h, _)| h).unwrap_or(a) };
+    let valid = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(ip6) => !ip6.is_empty() && ip6.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.'),
+        None => !host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'),
+    };
+    valid.then(|| host.to_string())
+}
+
+/// Endereço e token da atualização do hub: os mesmos com que o app conecta (salvos em
+/// Configurações), com o ambiente e o padrão só como reserva, como em `get_hub_credentials`.
+/// Endereço deste computador é recusado: o check-in local não é o hub da VPS.
+fn vps_hub_update_target(cfg: &config::AppConfig) -> Result<(String, String), String> {
+    let saved_or_env = |saved: &str, envs: &[&str]| Some(saved.trim().to_string()).filter(|v| !v.is_empty())
+        .or_else(|| envs.iter().find_map(|k| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())));
+    let address = saved_or_env(&cfg.hub_address, &["ESFERA_HUB_ADDR"]).unwrap_or_else(|| "127.0.0.1:8555".to_string());
+    let hub_token = saved_or_env(&cfg.hub_token, &["HUB_MASTER_TOKEN", "ESFERA_HUB_TOKEN"]).unwrap_or_else(|| "REMOVED_SECRET".to_string());
+    let host = vps_hub_host(&address).ok_or_else(|| "Endereço do hub inválido. Confira em Configurações.".to_string())?;
+    let local = host.eq_ignore_ascii_case("localhost") || host == "[::1]"
+        || host.parse::<std::net::Ipv4Addr>().map(|ip| ip.is_loopback() || ip.is_unspecified()).unwrap_or(false);
+    if local {
+        return Err("O endereço do hub em Configurações é deste computador. Informe o endereço da VPS para atualizar o hub.".into());
+    }
+    Ok((host, hub_token))
+}
+
+/// Resposta do serviço de atualização do hub em português, sem repetir o corpo da resposta.
+fn vps_hub_update_result(status: u16, host: &str) -> Result<String, String> {
+    match status {
+        200..=299 => Ok("Hub atualizado: ele reinicia com a versão nova.".into()),
+        401 | 403 => Err(format!("O hub recusou o token (HTTP {}). Confira o token do hub em Configurações.", status)),
+        404 | 405 => Err(format!("O endereço {}:8080 não tem o serviço de atualização do hub (HTTP {}). Confira o endereço do hub em Configurações.", host, status)),
+        413 => Err("O hub recusou o arquivo por ser grande demais (HTTP 413).".into()),
+        _ => Err(format!("O servidor do hub recusou a atualização (HTTP {}).", status)),
+    }
+}
+
+/// Empurra uma atualização do hub-standalone VPS via POST /admin/update, no endereço e com o token
+/// salvos em Configurações. Recebe o binário em base64. O VPS faz swap + self-restart (sem SSH).
 #[tauri::command]
 pub async fn update_vps_hub(state: State<'_, AppState>, token: String, base64_bin: String) -> Result<String, String> {
     let session = validate_session(&state.sessions, &token)?;
     if session.role != "master" { return Err("Apenas master pode atualizar o hub.".into()); }
     use base64::Engine as _;
     let bin = base64::engine::general_purpose::STANDARD
-        .decode(&base64_bin)
-        .map_err(|e| format!("Falha ao decodificar base64: {}", e))?;
-    if bin.is_empty() { return Err("Binario vazio.".into()); }
-    let token_master = std::env::var("HUB_MASTER_TOKEN")
-        .unwrap_or_else(|_| "REMOVED_SECRET".to_string());
-    let vps = std::env::var("ESFERA_HUB_ADDR").unwrap_or_else(|_| "127.0.0.1:8555".to_string());
-    let host = vps.split(':').next().unwrap_or("127.0.0.1");
+        .decode(base64_bin.trim())
+        .map_err(|_| "O arquivo não chegou inteiro. Escolha o arquivo de novo.".to_string())?;
+    if bin.is_empty() { return Err("O arquivo do hub está vazio.".into()); }
+    let (host, hub_token) = vps_hub_update_target(&config::load_config())?;
     let url = format!("http://{}:8080/admin/update", host);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|_| "Não foi possível preparar o envio da atualização.".to_string())?;
     let resp = client.post(&url)
-        .header("X-Hub-Token", &token_master)
+        .header("X-Hub-Token", &hub_token)
         .body(bin)
         .send()
         .await
-        .map_err(|e| format!("Falha ao enviar atualizacao ao VPS: {}", e))?;
-    let status = resp.status();
-    let txt = resp.text().await.unwrap_or_default();
-    if status.is_success() {
-        Ok("VPS atualizado. O hub reiniciou com a nova versao.".into())
-    } else {
-        Err(format!("VPS retornou {}: {}", status, txt))
+        .map_err(|e| if e.is_connect() {
+            format!("Não foi possível conectar ao hub em {}:8080. Confira o endereço em Configurações e se a VPS está no ar.", host)
+        } else if e.is_timeout() {
+            "O hub demorou demais para receber o arquivo. Tente de novo.".to_string()
+        } else {
+            // O hub aplica o arquivo e reinicia sem responder: pode ter dado certo, mas não há confirmação.
+            "O hub fechou a conexão sem responder. Se ele reiniciou com a versão nova, volta a conectar em instantes; confira o selo de conexão do hub.".to_string()
+        })?;
+    vps_hub_update_result(resp.status().as_u16(), &host)
+}
+
+#[cfg(test)]
+mod atualizacao_hub_tests {
+    use super::{vps_hub_host, vps_hub_update_result, vps_hub_update_target};
+    use crate::config::AppConfig;
+
+    #[test]
+    fn usa_endereco_e_token_salvos_e_recusa_este_computador() {
+        let cfg = AppConfig { hub_address: " 187.77.243.224:8555 ".into(), hub_token: "segredo".into(), ..AppConfig::default() };
+        assert_eq!(vps_hub_update_target(&cfg).unwrap(), ("187.77.243.224".to_string(), "segredo".to_string()));
+        for local in ["127.0.0.1:8555", "localhost:8555", "0.0.0.0:8555", "[::1]:8555"] {
+            let err = vps_hub_update_target(&AppConfig { hub_address: local.into(), ..AppConfig::default() }).unwrap_err();
+            assert!(err.contains("deste computador"), "{}: {}", local, err);
+        }
+        assert_eq!(vps_hub_host("hub.empresa.com.br:8555").as_deref(), Some("hub.empresa.com.br"));
+        assert_eq!(vps_hub_host("http://hub.empresa.com.br:8555/").as_deref(), Some("hub.empresa.com.br"));
+        assert_eq!(vps_hub_host("[2001:db8::1]:8555").as_deref(), Some("[2001:db8::1]"));
+        assert_eq!(vps_hub_host("hub.empresa.com.br").as_deref(), Some("hub.empresa.com.br"));
+        assert_eq!(vps_hub_host("outro.com@10.0.0.1:8555"), None);
+        assert_eq!(vps_hub_host("  "), None);
+    }
+
+    #[test]
+    fn respostas_em_portugues_sem_repetir_o_corpo() {
+        assert!(vps_hub_update_result(200, "h").is_ok());
+        assert_eq!(vps_hub_update_result(401, "h").unwrap_err(), "O hub recusou o token (HTTP 401). Confira o token do hub em Configurações.");
+        assert!(vps_hub_update_result(404, "h").unwrap_err().contains("h:8080"));
+        assert!(vps_hub_update_result(413, "h").unwrap_err().contains("grande demais"));
+        assert_eq!(vps_hub_update_result(500, "h").unwrap_err(), "O servidor do hub recusou a atualização (HTTP 500).");
     }
 }
 
