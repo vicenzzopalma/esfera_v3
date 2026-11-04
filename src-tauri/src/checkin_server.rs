@@ -1,4 +1,4 @@
-use axum::{Router, routing::post, Json, extract::State};
+use axum::{Router, routing::{get, post}, Json, extract::{ConnectInfo, State}};
 use chrono::Utc;
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -74,6 +74,9 @@ pub async fn start(db: Arc<Database>, port: u16, app_handle: Option<AppHandle>) 
     let state = (db, app_handle);
     let app = Router::new()
         .route("/api/devices/check-in", post(handle_checkin))
+        // Sonda de egresso: devolve o IP de origem da conexão — quando o aparelho
+        // consulta por aqui, o valor observado É a rota real de saída dele.
+        .route("/api/egress", get(handle_egress))
         .with_state(state)
         // Descadastro central (VEXOR -> Esfera): POST /api/optout/events, GET /api/optout/status
         .merge(optout_router);
@@ -87,7 +90,7 @@ pub async fn start(db: Arc<Database>, port: u16, app_handle: Option<AppHandle>) 
         }
     };
 
-    axum::serve(listener, app).await.unwrap_or_else(|e| {
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap_or_else(|e| {
         eprintln!("AVISO: Check-in server encerrado: {}", e);
     });
 }
@@ -136,6 +139,10 @@ pub fn start_udp_broadcast_listener(db: Arc<Database>, app_handle: Option<AppHan
             }
         }
     });
+}
+
+async fn handle_egress(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> String {
+    addr.ip().to_string()
 }
 
 async fn handle_checkin(

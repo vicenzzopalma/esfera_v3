@@ -229,17 +229,102 @@ export function chipStatusView(chip: DeviceChip): { label: string; tone: ChipTon
   }
 }
 
-// Resumo para o card: o disparo exige exatamente um chip cadastrado por aparelho.
+// Resumo para o card. Não há gestão de chips: cada aparelho tem uma linha de envio interna
+// (limites, descanso, conta restrita). Só aparece quando ela impede o envio.
 export function chipSummary(chips: DeviceChip[] | undefined): { label: string; tone: ChipTone; title: string; phone?: string } | null {
-  if (!chips) return null;
-  if (chips.length === 0) {
-    return { label: "Sem chip", tone: "warning", title: "Cadastre o chip em Configurações > Chip. Sem ele o aparelho não entra nos disparos." };
-  }
-  if (chips.length > 1) {
-    return { label: `${chips.length} chips`, tone: "danger", title: "O disparo exige exatamente um chip por aparelho. Deixe só o chip em uso." };
-  }
+  if (!chips || chips.length !== 1) return null;
   const view = chipStatusView(chips[0]);
-  return { label: `Chip ${view.label.toLowerCase()}`, tone: view.tone, title: view.detail, phone: formatPhone(chips[0].phoneNumber) };
+  if (view.canSend) return null;
+  return { label: `Envio ${view.label.toLowerCase()}`, tone: view.tone, title: view.detail.replace("Este chip", "Este aparelho").replace("o chip", "o aparelho") };
+}
+
+// ============================================================
+// Chips do CRM de celulares do VERITAS (somente leitura)
+// ============================================================
+
+// Vem de get_crm_chips. O Esfera só exibe: nada daqui entra no ESF_Chip nem no
+// disparo. O par (número do aparelho, setor) é a única chave em comum.
+export interface CrmChip {
+  id: number;
+  phone: string;
+  name: string;
+  status: string;
+  holder: string;
+  deviceName: string;
+  sector: string;
+  restrictedUntil: string;
+  alarmActive: boolean;
+  whatsappStatus: string;
+  whatsappName: string;
+  whatsappLastSeen: string;
+}
+
+function semAcento(texto: string) {
+  return String(texto || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "");
+}
+
+// Mesma regra do backend (veritas_crm::chip_do_aparelho): o CRM guarda o
+// aparelho como número ("9") mais setor, então "9 Júnior" ≠ "9 Senior".
+export function crmChipsForDevice(todos: CrmChip[] | undefined, deviceNumber: number, sector: string): CrmChip[] {
+  if (!todos || deviceNumber <= 0) return [];
+  const setor = semAcento(sector);
+  if (!setor) return [];
+  return todos.filter((c) => Number(String(c.deviceName).trim()) === deviceNumber && semAcento(c.sector) === setor);
+}
+
+// Chave de cruzamento, a mesma dos dois lados. Agrupar uma vez só mantém a
+// referência de cada lista estável entre renders — o memo dos cards depende disso.
+export function crmDeviceKey(sector: string, deviceNumber: number | string): string {
+  return `${semAcento(String(sector))}|${Number(String(deviceNumber).trim()) || 0}`;
+}
+
+export function crmChipsByDevice(todos: CrmChip[] | undefined): Map<string, CrmChip[]> {
+  const mapa = new Map<string, CrmChip[]>();
+  for (const chip of todos || []) {
+    const numero = Number(String(chip.deviceName).trim());
+    if (!numero || !semAcento(chip.sector)) continue;
+    const chave = crmDeviceKey(chip.sector, numero);
+    const lista = mapa.get(chave);
+    if (lista) lista.push(chip);
+    else mapa.set(chave, [chip]);
+  }
+  return mapa;
+}
+
+export function crmStatusTone(status: string): ChipTone {
+  const s = semAcento(status);
+  if (s.startsWith("livre")) return "success";
+  if (s.startsWith("banido")) return "danger";
+  if (s.startsWith("restrito")) return "warning";
+  if (s.startsWith("em uso")) return "warning";
+  return "neutral";
+}
+
+// Estado da sessão de WhatsApp que o VERITAS reportou ao CRM.
+export function whatsappStatusView(status: string): { label: string; tone: ChipTone; detail: string } {
+  switch (String(status || "").toUpperCase()) {
+    case "CONNECTED":
+      return { label: "WhatsApp conectado", tone: "success", detail: "Sessão ativa no VERITAS." };
+    case "DISCONNECTED":
+      return { label: "WhatsApp desconectado", tone: "danger", detail: "A sessão caiu no VERITAS." };
+    case "OPENING":
+      return { label: "WhatsApp conectando", tone: "warning", detail: "Sessão abrindo no VERITAS." };
+    case "NOT_REGISTERED":
+      return { label: "Sem sessão no VERITAS", tone: "neutral", detail: "O número não tem conexão cadastrada no VERITAS." };
+    default:
+      return { label: "Status desconhecido", tone: "neutral", detail: "O CRM não informou o estado da sessão." };
+  }
+}
+
+// O status do WhatsApp é tão fresco quanto a última sincronia do VERITAS com o
+// CRM — por isso a data aparece junto, em vez de passar por informação de agora.
+export function crmLastSeenText(iso: string): string {
+  const d = parseDbDate(iso);
+  return d ? `lido em ${formatWhen(d)}` : "sem data de leitura";
 }
 
 // ============================================================

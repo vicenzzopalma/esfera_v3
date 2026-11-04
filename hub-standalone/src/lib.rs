@@ -9,6 +9,7 @@ pub mod session_manager;
 pub mod tls_server;
 pub mod mqtt_fallback_server;
 pub mod router;
+pub mod evolution_relay;
 
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpSocket};

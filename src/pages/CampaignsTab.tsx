@@ -240,6 +240,8 @@ export interface ParsedRow {
   raw: string;
   name: string;
   phone: string;
+  /** CNPJ/documento da linha (coluna CNPJ, CPF/CNPJ ou documento), se houver. */
+  document?: string;
   valid: boolean;
   warning?: string;
   reason?: string;
@@ -264,6 +266,8 @@ export interface ParsedImport {
   allColumns: ParsedColumn[];
   nameCol: number;
   phoneCols: number[];
+  /** Coluna de CNPJ/documento reconhecida (-1 = nenhuma). */
+  docCol: number;
   hasHeader: boolean;
 }
 
@@ -356,7 +360,7 @@ export function parseContactsText(text: string, opts: ImportOptions = { phoneMod
     .map((l, i) => ({ line: i + 1, raw: l.trim() }))
     .filter((l) => l.raw !== "");
   if (!source.length) {
-    return { rows: [], lines: 0, columns: "", multiPhone: false, landlines: 0, localCount: 0, allColumns: [], nameCol: -1, phoneCols: [], hasHeader: false };
+    return { rows: [], lines: 0, columns: "", multiPhone: false, landlines: 0, localCount: 0, allColumns: [], nameCol: -1, phoneCols: [], docCol: -1, hasHeader: false };
   }
 
   const ddd = opts.ddd && isValidDdd(opts.ddd) ? opts.ddd : undefined;
@@ -419,12 +423,22 @@ export function parseContactsText(text: string, opts: ImportOptions = { phoneMod
   }
   const nameCol = opts.nameCol !== undefined ? (opts.nameCol < width ? opts.nameCol : -1) : autoName;
 
+  // CNPJ/documento: pelo cabeçalho (CNPJ > documento > CPF) ou, sem cabeçalho, pela coluna com CNPJ formatado.
+  let docCol = -1;
+  if (header) {
+    docCol = header.findIndex((h, j) => j !== nameCol && /\b(cnpj|documento|doc)\b/.test(h));
+    if (docCol < 0) docCol = header.findIndex((h, j) => j !== nameCol && /\bcpf\b/.test(h));
+  } else {
+    const CNPJ_CELL = /^\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}$/;
+    docCol = stats.findIndex((st, j) => j !== nameCol && st.filled > 0 && data.filter((r) => CNPJ_CELL.test((r.cells[j] ?? "").trim())).length * 2 >= st.filled);
+  }
+
   let autoPhones: number[] = [];
   if (header) {
     // Coluna com nome de telefone ainda precisa ter telefones no conteúdo.
     autoPhones = header
       .map((h, j) => {
-        if (j === nameCol || !PHONE_HEADER.test(h) || PHONE_HEADER_EXCLUDE.test(h)) return -1;
+        if (j === nameCol || j === docCol || !PHONE_HEADER.test(h) || PHONE_HEADER_EXCLUDE.test(h)) return -1;
         const st = stats[j];
         return !st.filled || (st.strong + st.local) / st.filled >= 0.3 ? j : -1;
       })
@@ -433,7 +447,7 @@ export function parseContactsText(text: string, opts: ImportOptions = { phoneMod
   if (!autoPhones.length) {
     autoPhones = stats
       .map((st, j) => {
-        if (j === nameCol || !st.filled) return -1;
+        if (j === nameCol || j === docCol || !st.filled) return -1;
         if (header && PHONE_HEADER_EXCLUDE.test(header[j])) return -1;
         // Antes da coluna de nome (ex.: código/processo) só conta celular com DDD na maioria. Depois dela,
         // celular sem DDD também conta, para a prévia pedir o DDD em vez de dizer "sem telefone".
@@ -448,10 +462,11 @@ export function parseContactsText(text: string, opts: ImportOptions = { phoneMod
   const allColumns = stats
     .map((st, j) => ({ index: j, label: label(j), sample: st.sample }))
     .filter((c) => stats[c.index].filled > 0);
-  const ignored = stats.map((st, j) => (st.filled && j !== nameCol && !phoneCols.includes(j) ? label(j) : "")).filter(Boolean);
+  const ignored = stats.map((st, j) => (st.filled && j !== nameCol && j !== docCol && !phoneCols.includes(j) ? label(j) : "")).filter(Boolean);
   const columns = [
     nameCol >= 0 ? `Nome: ${label(nameCol)}` : "Nome: nenhuma coluna (a mensagem sai sem o nome)",
     phoneCols.length ? `Telefone: ${listLabels(phoneCols.map(label))}` : "Telefone: nenhuma coluna reconhecida",
+    docCol >= 0 ? `CNPJ: ${label(docCol)}` : "",
     ignored.length ? `Ignorada: ${listLabels(ignored)}` : "",
   ]
     .filter(Boolean)
@@ -468,11 +483,12 @@ export function parseContactsText(text: string, opts: ImportOptions = { phoneMod
     // Linha só com o telefone (sem separador) numa lista "Nome, Telefone": sem nome.
     const single = r.cells.length === 1;
     const name = (!single && nameCol >= 0 ? r.cells[nameCol] ?? "" : "").trim();
+    const document = (!single && docCol >= 0 ? r.cells[docCol] ?? "" : "").trim();
     const values = (single ? [r.cells[0]] : phoneCols.map((j) => (r.cells[j] ?? "").trim()))
       .filter(Boolean)
       .flatMap((v) => phoneCandidates(v, ddd));
     if (!values.length) {
-      rows.push({ line: r.line, raw: r.raw, name, phone: "", valid: false, reason: "Sem telefone" });
+      rows.push({ line: r.line, raw: r.raw, name, document, phone: "", valid: false, reason: "Sem telefone" });
       continue;
     }
     const found = values.map((v) => ({ v, ...classify(v) }));
@@ -486,7 +502,7 @@ export function parseContactsText(text: string, opts: ImportOptions = { phoneMod
       const same = usable.map((c) => debtorOf.get(optOutKey(c.phone))).find((d) => d !== undefined && d.name === nameKey);
       if (same) {
         for (const c of found) {
-          rows.push({ line: r.line, raw: r.raw, name, phone: c.phone || c.v, valid: false, skipped: true, reason: `Mesmo devedor da linha ${same.line}` });
+          rows.push({ line: r.line, raw: r.raw, name, document, phone: c.phone || c.v, valid: false, skipped: true, reason: `Mesmo devedor da linha ${same.line}` });
         }
         continue;
       }
@@ -495,7 +511,7 @@ export function parseContactsText(text: string, opts: ImportOptions = { phoneMod
     const pool = usable.filter((c) => (c.kind !== "landline" || opts.includeLandlines) && !seen.has(optOutKey(c.phone)));
     const chosen = opts.phoneMode === "one" ? pool.find((c) => c.kind === "mobile") ?? pool[0] : undefined;
     for (const c of found) {
-      const base = { line: r.line, raw: r.raw, name, phone: c.phone || c.v };
+      const base = { line: r.line, raw: r.raw, name, document, phone: c.phone || c.v };
       if (c.kind === "invalid") {
         rows.push({ ...base, valid: false, reason: "Número inválido" });
         continue;
@@ -528,7 +544,7 @@ export function parseContactsText(text: string, opts: ImportOptions = { phoneMod
       }
     }
   }
-  return { rows, lines: data.length, columns, multiPhone, landlines, localCount, allColumns, nameCol, phoneCols, hasHeader };
+  return { rows, lines: data.length, columns, multiPhone, landlines, localCount, allColumns, nameCol, phoneCols, docCol, hasHeader };
 }
 
 // Nome em CAIXA ALTA vira "Maria da Silva" (siglas de empresa como LTDA, ME e S/A ficam como estão).
@@ -2890,6 +2906,59 @@ export function exportCampaignContacts(campaign: Campaign, contacts: Contact[]) 
   );
 }
 
+function formatDocument(raw: string) {
+  const d = raw.replace(/\D/g, "");
+  if (d.length === 14) return d.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5");
+  if (d.length === 11) return d.replace(/^(\d{3})(\d{3})(\d{3})(\d{2})$/, "$1.$2.$3-$4");
+  return raw.trim();
+}
+
+interface SentReportRow {
+  name: string;
+  phone: string;
+  document: string;
+  message: string;
+  sentAt?: string;
+  /** "Enviado", "Recusou (pediu SAIR)" ou "Recusou antes do envio". */
+  situation: string;
+  refusedAt?: string;
+}
+
+/** Planilha dos enviados e de quem recusou: número, nome, CNPJ, situação e a mensagem que saiu. */
+export async function exportSentReport(campaign: Campaign) {
+  let rows: SentReportRow[];
+  try {
+    rows = await api<SentReportRow[]>("get_campaign_sent_report", { campaignId: campaign.id });
+  } catch (e) {
+    toast.error("Não foi possível extrair os enviados", e instanceof Error ? e.message : String(e));
+    return;
+  }
+  if (!rows.length) {
+    toast.info("Nenhum envio ainda", "A planilha sai quando houver contatos enviados nesta campanha.");
+    return;
+  }
+  const stamp = new Date().toISOString().slice(0, 10);
+  const safe = campaign.name.replace(/[\\/:*?"<>|]+/g, " ").trim() || `campanha-${campaign.id}`;
+  downloadCsv(
+    `${safe} - enviados - ${stamp}.csv`,
+    ["Número", "Nome", "CNPJ", "Situação", "Mensagem enviada", "Enviado em", "Recusou em"],
+    rows.map((r) => {
+      const before = r.situation === "Recusou antes do envio";
+      return [
+        formatPhoneBr(r.phone),
+        r.name,
+        r.document ? formatDocument(r.document) : "",
+        r.situation,
+        before ? "(nenhuma: já tinha pedido SAIR)" : r.message || "(não registrada: enviada antes desta versão)",
+        r.sentAt ? formatDate(r.sentAt) : "",
+        r.refusedAt ? formatDate(r.refusedAt) : "",
+      ];
+    })
+  );
+  const refused = rows.filter((r) => r.situation !== "Enviado").length;
+  toast.success("Planilha extraída", `${rows.length - refused} enviados e ${refused} recusas em ${safe} - enviados - ${stamp}.csv, na pasta de downloads.`);
+}
+
 function ContactsPanel({
   campaign,
   contacts,
@@ -2981,6 +3050,9 @@ function ContactsPanel({
           />
           <Button size="sm" variant="secondary" icon={<Download size={13} />} onClick={() => exportCampaignContacts(campaign, contacts)} title="Baixa a lista com a situação de cada contato (CSV para o Excel)">
             Exportar
+          </Button>
+          <Button size="sm" variant="secondary" icon={<FileUp size={13} />} onClick={() => exportSentReport(campaign)} title="Planilha dos enviados e de quem recusou (SAIR): número, nome, CNPJ, situação e a mensagem que saiu (abre no Excel)">
+            Extrair enviados
           </Button>
           <Button size="sm" variant="secondary" icon={<Upload size={13} />} onClick={onImport}>
             Importar contatos
@@ -3279,7 +3351,9 @@ function ContactImportModal({
           .map((c) => [c.contactName || c.name || "", c.phone]);
       }
       const fresh = toImport.map((r) => [showName(r.name), r.phone] as [string, string]);
-      await api("import_campaign_contacts", { campaignId: campaign.id, contacts: [...keep, ...fresh] });
+      // CNPJ na mesma ordem; a fila mantida vai sem documento e o sistema conserva o que já tinha.
+      const documents = [...keep.map(() => ""), ...toImport.map((r) => r.document || "")];
+      await api("import_campaign_contacts", { campaignId: campaign.id, contacts: [...keep, ...fresh], documents });
       onImported({
         imported: fresh.length,
         mode,
@@ -5103,6 +5177,7 @@ function CampaignDetail({
   const menuActions: MenuAction[] = [
     { label: "Importar contatos", icon: <Upload size={14} />, onSelect: onImport },
     { label: "Exportar contatos (CSV)", icon: <Download size={14} />, onSelect: () => exportCampaignContacts(campaign, contacts), disabled: contacts.length === 0 },
+    { label: "Extrair enviados (planilha)", icon: <FileUp size={14} />, onSelect: () => exportSentReport(campaign), disabled: contacts.length === 0 },
     { label: "Reprocessar falhas", icon: <RotateCcw size={14} />, onSelect: () => setConfirm("retry"), disabled: !canRetry },
     { label: "Reiniciar fila", icon: <RotateCcw size={14} />, onSelect: () => setConfirm("reset"), disabled: !canReset },
   ];

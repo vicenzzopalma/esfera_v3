@@ -3,8 +3,8 @@
 // Abas: Geral, Chip, Tela, Rede, Desempenho e Sistema
 // ============================================================
 
-import { type ReactNode, useState, useEffect, useCallback, useRef } from "react";
-import { Loader2, Copy, Check, Sliders, Radio, RefreshCw, Package, Power, Trash2, AlertTriangle, Smartphone, CardSim, Ban, ShieldCheck } from "lucide-react";
+import { type ReactNode, useState, useEffect, useCallback } from "react";
+import { Loader2, Copy, Check, Sliders, Radio, RefreshCw, Package, Power, Trash2, AlertTriangle, Smartphone, Ban, ShieldCheck } from "lucide-react";
 import Badge from "../ui/Badge";
 import Field, { FormSection } from "../ui/Field";
 import { type Device, type SectorType, getConnectionOrigin } from "../../types";
@@ -20,7 +20,13 @@ import {
   formatPhone,
   formatWhen,
   parseDbDate,
+  sectorLabel,
+  crmChipsForDevice,
+  crmStatusTone,
+  crmLastSeenText,
+  whatsappStatusView,
   type DeviceChip,
+  type CrmChip,
 } from "./deviceUi";
 import { describeAgent, type AgentUpdateStatus } from "./DeviceCard";
 import Button from "../ui/Button";
@@ -205,45 +211,27 @@ export function GeneralTab({ device, nameInput, setNameInput, modelInput, setMod
 }
 
 // ============================================================
-// ChipTab — o motor de disparo exige exatamente um chip por aparelho
+// ChipTab — sem gestão de chips: os números vêm do CRM do VERITAS (só leitura).
+// O Esfera mantém sozinho uma linha de envio por aparelho (limites, descanso,
+// conta restrita); aqui ela só aparece quando impede o envio.
 // ============================================================
 
 const CHIP_TONE_BADGE = { success: "success", warning: "warning", danger: "danger", neutral: "neutral" } as const;
 
-function normalizePhone(raw: string) {
-  const digits = raw.replace(/\D/g, "");
-  return digits.length >= 12 && digits.startsWith("55") ? digits.slice(2) : digits;
-}
-
 export function ChipTab({ device, onChanged }: { device: Device; onChanged?: (deviceId: number) => void }) {
   const deviceId = device.id;
-  const [chips, setChips] = useState<DeviceChip[] | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [phone, setPhone] = useState("");
-  const [label, setLabel] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
-  const [pending, setPending] = useState<{ chipId: number; action: "release" | "ban" } | null>(null);
+  const [line, setLine] = useState<DeviceChip | null>(null);
+  const [confirming, setConfirming] = useState(false);
   const [acting, setActing] = useState(false);
-  const reqId = useRef(0);
+  const [msg, setMsg] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    const my = ++reqId.current;
-    if (!deviceId) {
-      setLoading(false);
-      setLoadError("Este aparelho ainda não está salvo no banco. Atualize a lista de aparelhos e abra de novo.");
-      return;
-    }
-    setLoading(true);
-    setLoadError(null);
+    if (!deviceId) return;
     try {
       const list = await api<DeviceChip[]>("get_device_chips", { deviceId });
-      if (my === reqId.current) setChips(Array.isArray(list) ? list : []);
-    } catch (e) {
-      if (my === reqId.current) setLoadError(errorText(e, "Não foi possível carregar o chip deste aparelho."));
-    } finally {
-      if (my === reqId.current) setLoading(false);
+      setLine(Array.isArray(list) && list.length > 0 ? list[0] : null);
+    } catch {
+      setLine(null);
     }
   }, [deviceId]);
 
@@ -251,187 +239,131 @@ export function ChipTab({ device, onChanged }: { device: Device; onChanged?: (de
     load();
   }, [load]);
 
-  const normalized = normalizePhone(phone);
-  const phoneValid = normalized.length === 10 || normalized.length === 11;
-  const phoneError = phone.trim() && !phoneValid ? "Informe DDD + número (10 ou 11 dígitos)." : undefined;
-
-  const register = async () => {
-    if (!phoneValid || saving) return;
-    setSaving(true);
-    setMsg(null);
-    try {
-      await api<number>("add_device_chip", { deviceId, phone: normalized, name: label.trim() });
-      setPhone("");
-      setLabel("");
-      setMsg("Chip cadastrado. O aquecimento começa hoje: o limite diário de envios cresce aos poucos.");
-      await load();
-      onChanged?.(deviceId);
-    } catch (e) {
-      setMsg(`Erro: ${errorText(e, "Não foi possível cadastrar o chip.")}`);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const runPending = async () => {
-    if (!pending) return;
+  const release = async () => {
+    if (!line) return;
     setActing(true);
     setMsg(null);
     try {
-      if (pending.action === "release") {
-        await api("confirm_chip_release", { chipId: pending.chipId });
-        setMsg("Chip liberado. Ele volta a entrar nos disparos.");
-      } else {
-        await api("update_chip_status", { chipId: pending.chipId, status: "banido" });
-        setMsg("Chip marcado como banido. Este aparelho para de enviar com ele.");
-      }
-      setPending(null);
+      await api("confirm_chip_release", { chipId: line.id });
+      setConfirming(false);
+      setMsg("Aparelho liberado. Ele volta a entrar nos disparos.");
       await load();
       onChanged?.(deviceId);
     } catch (e) {
-      setMsg(`Erro: ${errorText(e, "Não foi possível alterar o chip.")}`);
+      setMsg(`Erro: ${errorText(e, "Não foi possível liberar o aparelho.")}`);
     } finally {
       setActing(false);
     }
   };
 
-  if (loading && !chips) {
-    return (
-      <div className="flex items-center gap-2 py-8 text-[0.8125rem] text-secondary">
-        <Loader2 size={14} className="animate-spin" /> Carregando o chip do aparelho…
-      </div>
-    );
-  }
-
-  if (loadError) {
-    return (
-      <div className="space-y-3">
-        <StatusNote text={`Erro: ${loadError}`} />
-        <Button variant="secondary" size="sm" onClick={load} icon={<RefreshCw size={13} />}>
-          Tentar novamente
-        </Button>
-      </div>
-    );
-  }
-
-  const list = chips || [];
+  const view = line ? chipStatusView(line) : null;
+  const blocked = view && !view.canSend;
 
   return (
     <div className="space-y-6">
-      <FormSection
-        title="Chip (linha do WhatsApp)"
-        description="O disparo usa exatamente um chip por aparelho para contar limites, aquecimento e descanso do número."
-      >
-        {list.length === 0 && (
-          <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-[0.8125rem] text-amber-700 dark:text-amber-400">
-            <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-            <span>Nenhum chip cadastrado: este aparelho não entra nos disparos até você cadastrar o número abaixo.</span>
-          </div>
-        )}
-        {list.length > 1 && (
-          <div className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-[0.8125rem] text-red-600 dark:text-red-400">
-            <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-            <span>Há {list.length} chips cadastrados neste aparelho. O disparo exige exatamente um: peça ao suporte para remover o cadastro antigo.</span>
-          </div>
-        )}
-
-        {list.map((chip) => {
-          const view = chipStatusView(chip);
-          const created = parseDbDate(chip.createdAt);
-          const canRelease = ["banido", "restrito_24h", "restrito_7d", "restrito_custom", "em_uso"].includes(chip.status) || (chip.status === "livre" && !!chip.restrictedUntil);
-          const canBan = chip.status !== "banido";
-          return (
-            <div key={chip.id} className="space-y-3 rounded-xl border border-border p-4">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="flex min-w-0 items-center gap-3">
-                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border bg-secondary text-secondary">
-                    <CardSim size={16} />
-                  </div>
-                  <div className="min-w-0">
-                    <p className="truncate font-mono text-sm font-semibold text-primary">{formatPhone(chip.phoneNumber)}</p>
-                    <p className="truncate text-[0.75rem] text-secondary">
-                      {chip.chipName ? `${chip.chipName} · ` : ""}
-                      {created ? `cadastrado ${formatWhen(created)}` : "sem data de cadastro"}
-                    </p>
-                  </div>
-                </div>
-                <Badge variant={CHIP_TONE_BADGE[view.tone]} dot>
-                  {view.label}
-                </Badge>
-              </div>
-              <p className="text-[0.8125rem] text-secondary">{view.detail}</p>
-
-              {pending?.chipId === chip.id ? (
-                pending.action === "release" ? (
-                  <InlineConfirm
-                    question="Liberar este chip para voltar aos disparos?"
-                    detail="Libere só se você conferiu no aparelho que o WhatsApp abre e envia normalmente. Se o número estiver mesmo bloqueado, o Esfera volta a marcá-lo como banido na próxima tentativa."
-                    confirmLabel="Sim, liberar"
-                    danger={false}
-                    busy={acting}
-                    onConfirm={runPending}
-                    onCancel={() => setPending(null)}
-                  />
-                ) : (
-                  <InlineConfirm
-                    question="Marcar este chip como banido?"
-                    detail="O aparelho para de enviar com este chip até alguém liberá-lo aqui."
-                    confirmLabel="Sim, marcar como banido"
-                    busy={acting}
-                    onConfirm={runPending}
-                    onCancel={() => setPending(null)}
-                  />
-                )
-              ) : (
-                (canRelease || canBan) && (
-                  <div className="flex flex-wrap gap-2">
-                    {canRelease && (
-                      <Button variant="secondary" size="sm" icon={<ShieldCheck size={13} />} onClick={() => setPending({ chipId: chip.id, action: "release" })}>
-                        Liberar chip
-                      </Button>
-                    )}
-                    {canBan && (
-                      <Button variant="ghost" size="sm" icon={<Ban size={13} />} onClick={() => setPending({ chipId: chip.id, action: "ban" })}>
-                        Marcar como banido
-                      </Button>
-                    )}
-                  </div>
-                )
-              )}
-            </div>
-          );
-        })}
-      </FormSection>
-
-      {list.length === 0 && (
-        <FormSection title="Cadastrar chip" description="Informe o número do WhatsApp que está neste aparelho.">
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-[1fr_12rem]">
-            <Field label="Número com DDD" htmlFor="chip-phone" required error={phoneError} hint="Ex.: (75) 98805-2539">
-              <input
-                id="chip-phone"
-                type="tel"
-                inputMode="tel"
-                value={phone}
-                onChange={(e) => setPhone(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") register();
-                }}
-                placeholder="(DDD) 9XXXX-XXXX"
-                className={`${inputCls} font-mono`}
+      {blocked && view && (
+        <FormSection title="Envio bloqueado neste aparelho" description={view.detail.replace("Este chip", "Este aparelho").replace("o chip", "o aparelho")}>
+          <Badge variant={CHIP_TONE_BADGE[view.tone]} dot>
+            {view.label}
+          </Badge>
+          {line?.status !== "pausado" &&
+            (confirming ? (
+              <InlineConfirm
+                question="Liberar este aparelho para voltar aos disparos?"
+                detail="Libere só se você conferiu no aparelho que o WhatsApp abre e envia normalmente. Se a conta estiver mesmo bloqueada, o Esfera volta a bloquear o aparelho na próxima tentativa."
+                confirmLabel="Sim, liberar"
+                danger={false}
+                busy={acting}
+                onConfirm={release}
+                onCancel={() => setConfirming(false)}
               />
-            </Field>
-            <Field label="Apelido (opcional)" htmlFor="chip-label">
-              <input id="chip-label" type="text" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Ex.: Vivo 1" className={inputCls} />
-            </Field>
-          </div>
-          <Button variant="primary" size="md" onClick={register} loading={saving} disabled={!phoneValid} icon={<CardSim size={14} />}>
-            Cadastrar chip
-          </Button>
+            ) : (
+              <Button variant="secondary" size="sm" icon={<ShieldCheck size={13} />} onClick={() => setConfirming(true)}>
+                Liberar aparelho
+              </Button>
+            ))}
         </FormSection>
       )}
 
-      <StatusNote text={msg} busy={saving || acting} />
+      <CrmChipsSection device={device} />
+
+      <StatusNote text={msg} busy={acting} />
     </div>
+  );
+}
+
+// Chips do aparelho no CRM de celulares do VERITAS. Só leitura: nada daqui é
+// gravado no Esfera e nenhuma alteração é feita no VERITAS.
+function CrmChipsSection({ device }: { device: Device }) {
+  const [chips, setChips] = useState<CrmChip[] | null>(null);
+  const [erro, setErro] = useState<string | null>(null);
+  const [lendo, setLendo] = useState(false);
+
+  const ler = useCallback(
+    async (forcar = false) => {
+      setLendo(true);
+      try {
+        const todos = await api<CrmChip[]>("get_crm_chips", forcar ? { force: true } : {});
+        setChips(crmChipsForDevice(Array.isArray(todos) ? todos : [], device.deviceNumber, device.sector));
+        setErro(null);
+      } catch (e) {
+        setChips(null);
+        setErro(errorText(e, "CRM de celulares indisponível."));
+      } finally {
+        setLendo(false);
+      }
+    },
+    [device.deviceNumber, device.sector]
+  );
+
+  useEffect(() => {
+    ler();
+  }, [ler]);
+
+  return (
+    <FormSection
+      title="No CRM de celulares (VERITAS)"
+      description={`Números que o CRM tem para o aparelho ${device.deviceNumber} do setor ${sectorLabel(device.sector)}. Somente leitura: nada é alterado no VERITAS.`}
+    >
+      {erro && <StatusNote text={`Erro: ${erro}`} />}
+      {!erro && chips && chips.length === 0 && (
+        <p className="text-[0.8125rem] text-secondary">
+          O CRM não tem nenhum número para este aparelho. Confira se o número do aparelho e o setor são os mesmos nos dois sistemas — é por eles que o cruzamento é feito.
+        </p>
+      )}
+      {(chips || []).map((c) => {
+        const wa = whatsappStatusView(c.whatsappStatus);
+        return (
+          <div key={c.id} className="space-y-2 rounded-xl border border-border p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="truncate font-mono text-sm font-semibold text-primary">{formatPhone(c.phone)}</p>
+                <p className="truncate text-[0.75rem] text-secondary">
+                  {c.name || "sem nome no CRM"}
+                  {c.holder ? ` · com ${c.holder}` : ""}
+                </p>
+              </div>
+              <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                <Badge variant={CHIP_TONE_BADGE[crmStatusTone(c.status)]} dot>
+                  {c.status || "sem status"}
+                </Badge>
+                <Badge variant={CHIP_TONE_BADGE[wa.tone]} dot>
+                  {wa.label}
+                </Badge>
+              </div>
+            </div>
+            <p className="text-[0.8125rem] text-secondary">
+              {wa.detail} {c.whatsappName ? `Conexão "${c.whatsappName}". ` : ""}
+              <span className="text-tertiary">({crmLastSeenText(c.whatsappLastSeen)})</span>
+            </p>
+            {c.alarmActive && <p className="text-[0.8125rem] text-amber-700 dark:text-amber-400">Alarme ativo no CRM para este número.</p>}
+          </div>
+        );
+      })}
+      <Button variant="secondary" size="sm" onClick={() => ler(true)} loading={lendo} icon={<RefreshCw size={13} />}>
+        Ler o CRM de novo
+      </Button>
+    </FormSection>
   );
 }
 
@@ -567,6 +499,257 @@ interface NetworkTabProps {
   setVpsUrl: (v: string) => void;
 }
 
+// ============================================================
+// Isolamento de rede por aparelho — gerenciador central
+// Perfil próprio, lote de N confirmações com verificação do IP
+// de saída medido DE DENTRO do aparelho, e pausa só deste aparelho.
+// ============================================================
+
+interface NetProfile {
+  deviceId: number; mode: string; proxyUrl: string; allowedEgressIps: string;
+  batchSize: number; status: string; pauseReason: string;
+  vpnPackage: string; vpnTunnel: string; lockdown: boolean;
+  lastEgressIp: string; lastEgressAt: string; lastEgressResult: string; consecutiveFailures: number;
+}
+interface NetCheck { checkId: number; checkedAt: string; observedIp: string; mode: string; appliedRoute: string; phase: string; result: string; detail: string }
+interface NetStatus {
+  profile: NetProfile;
+  lastCheck: NetCheck | null;
+  openBatch: { batchId: number; confirmed: number; failed: number; uncertain: number; target: number } | null;
+  recentBatches: { batchId: number; startedAt: string; closedAt: string; confirmed: number; failed: number; uncertain: number; egressIp: string; verification: string }[];
+  recentChecks: NetCheck[];
+}
+
+const NETWORK_MODES: { id: string; label: string; desc: string }[] = [
+  { id: "direto", label: "Direto (fila compartilhada)", desc: "Sem rota própria: o aparelho divide a fila conservadora com os demais e não recebe portão dedicado." },
+  { id: "wireguard", label: "WireGuard always-on (recomendado)", desc: "VPN sempre ativa com bloqueio de conexões fora dela. É o único arranjo que captura todo o tráfego do Android, WhatsApp incluído, e a verificação confirma a rota de dentro do aparelho." },
+  { id: "socks5", label: "Proxy SOCKS5/HTTP (alternativa)", desc: "Grava o proxy no sistema, mas o WhatsApp não honra proxy de sistema: isto NÃO controla o tráfego dele. Serve só onde o app respeita o proxy, e aqui nunca é tratado como prova de rota." },
+];
+
+const PHASE_LABEL: Record<string, string> = {
+  pre_lote: "antes do lote",
+  fim_lote: "fim do lote",
+  manual: "manual",
+};
+
+export function NetworkIsolationSection({ device }: { device: Device }) {
+  const online = isOnlineStatus(device.status);
+  const [st, setSt] = useState<NetStatus | null>(null);
+  const [mode, setMode] = useState("direto");
+  const [proxyUrl, setProxyUrl] = useState("");
+  const [allowed, setAllowed] = useState("");
+  const [vpnPackage, setVpnPackage] = useState("com.wireguard.android");
+  const [vpnTunnel, setVpnTunnel] = useState("");
+  const [lockdown, setLockdown] = useState(true);
+  const [batchSize, setBatchSize] = useState(10);
+  const [saving, setSaving] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+
+  const reload = useCallback(async () => {
+    try {
+      const res = await api<NetStatus>("get_device_network_status", { deviceId: device.id });
+      setSt(res);
+      const p = res.profile;
+      setMode(p.mode); setProxyUrl(p.proxyUrl); setAllowed(p.allowedEgressIps);
+      setVpnPackage(p.vpnPackage || "com.wireguard.android"); setVpnTunnel(p.vpnTunnel);
+      setLockdown(p.lockdown); setBatchSize(p.batchSize);
+    } catch { /* a tela continua com o último estado conhecido */ }
+  }, [device.id]);
+  useEffect(() => { reload(); }, [reload]);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api<NetProfile>("set_network_profile", {
+        deviceId: device.id, mode, proxyUrl, allowedEgressIps: allowed, batchSize,
+        vpnPackage, vpnTunnel, lockdown,
+      });
+      setStatus("Perfil salvo. Use \"Aplicar no aparelho\" para ligar a rota e conferir o IP de saída de dentro dele.");
+      await reload();
+    } catch (e: any) {
+      setStatus(`Erro: ${errText(e, "Não foi possível salvar o perfil de rede.")}`);
+    } finally { setSaving(false); }
+  };
+
+  const applyRoute = async () => {
+    setApplying(true);
+    try {
+      const r = await api<NetCheck>("apply_device_network_route", { deviceId: device.id });
+      setStatus(`Rota aplicada e conferida: IP ${r.observedIp || "—"} — ${r.result}${r.detail ? ` (${r.detail})` : ""}`);
+    } catch (e: any) {
+      setStatus(`Erro: ${errText(e, "Não foi possível aplicar a rota no aparelho.")}`);
+    } finally { setApplying(false); await reload(); }
+  };
+
+  const checkNow = async () => {
+    setChecking(true);
+    try {
+      const r = await api<{ observedIp: string; result: string; detail: string }>("check_device_egress_now", { deviceId: device.id });
+      setStatus(`Verificação: IP ${r.observedIp || "—"} — ${r.result}${r.detail ? ` (${r.detail})` : ""}`);
+    } catch (e: any) {
+      setStatus(`Erro: ${errText(e, "Não foi possível verificar a rota agora.")}`);
+    } finally { setChecking(false); await reload(); }
+  };
+
+  const setPaused = async (paused: boolean) => {
+    try {
+      await api(paused ? "pause_device_network" : "resume_device_network", { deviceId: device.id, reason: undefined });
+      await reload();
+    } catch (e: any) { setStatus(`Erro: ${errText(e, "Falha ao alterar a pausa de rede.")}`); }
+  };
+
+  const p = st?.profile;
+  const paused = p ? p.status !== "ativo" : false;
+  const modeInfo = NETWORK_MODES.find((m) => m.id === mode);
+
+  return (
+    <FormSection
+      title="Isolamento de rede por aparelho"
+      description="Este aparelho só divide a fila com os demais se estiver em modo direto. Configurar um proxy NÃO prova que o tráfego do WhatsApp passou por ele: a verdade é o IP público lido de dentro do aparelho a cada lote."
+    >
+      <div className="space-y-3">
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-secondary/40 px-3 py-2">
+          <div className="min-w-0">
+            <p className="text-[0.8125rem] font-medium text-primary">Estado da rede deste aparelho</p>
+            <p className="mt-0.5 text-[0.75rem] text-secondary">
+              {p ? (
+                <>
+                  <Badge variant={paused ? "danger" : mode === "direto" ? "neutral" : "success"}>
+                    {mode === "direto" ? "Fila compartilhada" : paused ? p.status.replace("_", " ") : "Rota isolada"}
+                  </Badge>{" "}
+                  Egresso {p.lastEgressIp || "desconhecido"} ({p.lastEgressResult || "sem verificação"}
+                  {(() => { const d = p.lastEgressAt ? parseDbDate(p.lastEgressAt) : null; return d ? ` — ${formatWhen(d)}` : ""; })()})
+                </>
+              ) : "Carregando..."}
+            </p>
+            {paused && p?.pauseReason && <p className="mt-1 break-words text-[0.75rem] text-red-500">{p.pauseReason}</p>}
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <Button variant="secondary" size="sm" icon={<Radio size={13} />} onClick={checkNow} loading={checking} disabled={!online}>
+              Verificar agora
+            </Button>
+            {paused ? (
+              <Button variant="secondary" size="sm" icon={<ShieldCheck size={13} />} onClick={() => setPaused(false)} disabled={!online}>
+                Retomar
+              </Button>
+            ) : (
+              <Button variant="secondary" size="sm" icon={<Ban size={13} />} onClick={() => setPaused(true)}>
+                Pausar
+              </Button>
+            )}
+          </div>
+        </div>
+
+        <Field label="Modo de rede" htmlFor="cfg-net-mode">
+          <select id="cfg-net-mode" value={mode} onChange={(e) => setMode(e.target.value)} className={inputCls}>
+            {NETWORK_MODES.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+          </select>
+          {modeInfo && <p className="mt-1 text-[0.75rem] text-secondary">{modeInfo.desc}</p>}
+        </Field>
+
+        {mode === "wireguard" && (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="App de VPN (pacote Android)" htmlFor="cfg-net-vpnpkg">
+                <input id="cfg-net-vpnpkg" type="text" value={vpnPackage} onChange={(e) => setVpnPackage(e.target.value)} placeholder="com.wireguard.android" className={`${inputCls} font-mono`} />
+              </Field>
+              <Field label="Túnel a subir (opcional)" htmlFor="cfg-net-tunnel">
+                <input id="cfg-net-tunnel" type="text" value={vpnTunnel} onChange={(e) => setVpnTunnel(e.target.value)} placeholder="esfera" className={`${inputCls} font-mono`} />
+              </Field>
+            </div>
+            <SettingRow title="Bloquear conexões fora da VPN (lockdown)" description="Sem isso, o Android deixa o tráfego sair direto quando o túnel cai. Exigido para a rota ser considerada íntegra.">
+              <Toggle checked={lockdown} onChange={setLockdown} />
+            </SettingRow>
+          </>
+        )}
+
+        {mode === "socks5" && (
+          <Field label="Endereço do proxy" htmlFor="cfg-net-proxy">
+            <input id="cfg-net-proxy" type="text" value={proxyUrl} onChange={(e) => setProxyUrl(e.target.value)} placeholder="http://usuario:senha@host:8080" className={`${inputCls} font-mono`} />
+          </Field>
+        )}
+
+        {mode !== "direto" && (
+          <Field label="IPs de saída autorizados (separados por vírgula; vazio = só registrar)" htmlFor="cfg-net-ips">
+            <input id="cfg-net-ips" type="text" value={allowed} onChange={(e) => setAllowed(e.target.value)} placeholder="203.0.113.7, 203.0.113.8" className={`${inputCls} font-mono`} />
+          </Field>
+        )}
+
+        <Field label="Envios confirmados por lote (verificação da rota)" htmlFor="cfg-net-batch">
+          <input id="cfg-net-batch" type="number" min={1} max={1000} value={batchSize} onChange={(e) => setBatchSize(Number(e.target.value) || 10)} className={inputCls} />
+          <p className="mt-1 text-[0.75rem] text-secondary">Só envios confirmados contam. A cada {batchSize} o lote fecha, a rota é conferida de dentro do aparelho e o lote seguinte só começa com a verificação aprovada.</p>
+        </Field>
+
+        {st?.openBatch && (
+          <div className="rounded-lg border border-border px-3 py-2 text-[0.75rem] text-secondary">
+            Lote em andamento #{st.openBatch.batchId}: {st.openBatch.confirmed}/{st.openBatch.target} confirmados
+            {" · "}{st.openBatch.failed} falhas{st.openBatch.uncertain ? ` · ${st.openBatch.uncertain} incertos` : ""}
+            <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-secondary/30">
+              <div className="h-full rounded-full bg-green-500 transition-all" style={{ width: `${Math.min(100, (st.openBatch.confirmed / Math.max(1, st.openBatch.target)) * 100)}%` }} />
+            </div>
+          </div>
+        )}
+
+        {st && st.recentBatches.length > 0 && (
+          <div className="max-h-36 overflow-y-auto rounded-lg border border-border">
+            <table className="w-full text-[0.72rem] text-secondary">
+              <thead className="sticky top-0 bg-secondary/20 text-left">
+                <tr><th className="px-2 py-1">Lote</th><th className="px-2 py-1">Confirmados</th><th className="px-2 py-1">Falhas</th><th className="px-2 py-1">Egresso</th><th className="px-2 py-1">Verificação</th></tr>
+              </thead>
+              <tbody>
+                {st.recentBatches.map((b) => (
+                  <tr key={b.batchId} className="border-t border-border/50">
+                    <td className="px-2 py-1">#{b.batchId}</td>
+                    <td className="px-2 py-1">{b.confirmed}</td>
+                    <td className="px-2 py-1">{b.failed}{b.uncertain ? ` (+${b.uncertain} incertos)` : ""}</td>
+                    <td className="px-2 py-1 font-mono">{b.egressIp || "—"}</td>
+                    <td className={`px-2 py-1 ${b.verification === "vazamento" ? "text-red-500" : b.verification === "ok" ? "text-green-500" : ""}`}>{b.verification}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {st && st.recentChecks.length > 0 && (
+          <div className="max-h-36 overflow-y-auto rounded-lg border border-border">
+            <table className="w-full text-[0.72rem] text-secondary">
+              <thead className="sticky top-0 bg-secondary/20 text-left">
+                <tr><th className="px-2 py-1">Quando</th><th className="px-2 py-1">Fase</th><th className="px-2 py-1">IP observado</th><th className="px-2 py-1">Resultado</th></tr>
+              </thead>
+              <tbody>
+                {st.recentChecks.map((c) => {
+                  const d = parseDbDate(c.checkedAt);
+                  return (
+                    <tr key={c.checkId} className="border-t border-border/50">
+                      <td className="px-2 py-1">{d ? formatWhen(d) : c.checkedAt}</td>
+                      <td className="px-2 py-1">{PHASE_LABEL[c.phase] || c.phase}</td>
+                      <td className="px-2 py-1 font-mono">{c.observedIp || "—"}</td>
+                      <td className={`px-2 py-1 ${c.result === "vazamento" ? "text-red-500" : c.result === "ok" ? "text-green-500" : "text-amber-500"}`} title={c.detail}>{c.result}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div className="flex flex-wrap gap-2">
+          <Button variant="primary" size="md" onClick={save} loading={saving}>Salvar perfil</Button>
+          {mode !== "direto" && (
+            <Button variant="secondary" size="md" icon={<ShieldCheck size={14} />} onClick={applyRoute} loading={applying} disabled={!online}>
+              Aplicar no aparelho e conferir
+            </Button>
+          )}
+        </div>
+        <StatusNote text={status} busy={saving || checking || applying} />
+      </div>
+    </FormSection>
+  );
+}
+
 export function NetworkTab({ device, serial, vpsUrl, setVpsUrl }: NetworkTabProps) {
   const [status, setStatus] = useState<string | null>(null);
   const [pinging, setPinging] = useState(false);
@@ -646,6 +829,8 @@ export function NetworkTab({ device, serial, vpsUrl, setVpsUrl }: NetworkTabProp
           </SettingRow>
         </div>
       </FormSection>
+
+      <NetworkIsolationSection device={device} />
 
       <StatusNote text={status} busy={pinging || reactivating} />
     </div>
@@ -1086,7 +1271,7 @@ export function DeviceConfigModal({ isOpen, onClose, device, initialTab = "gener
         <Tabs<ConfigTab>
           items={[
             { id: "general", label: "Geral" },
-            { id: "chip", label: "Chip" },
+            { id: "chip", label: "Chips" },
             { id: "display", label: "Tela" },
             { id: "network", label: "Rede" },
             { id: "performance", label: "Desempenho" },

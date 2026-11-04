@@ -2114,7 +2114,8 @@ mod comandos_de_chip_tests {
         change_device_chip(&state,&allowed,id,Some(("11999990002","B"))).unwrap();
         assert_eq!(db.get_chips(d.id)[0].phone_number,"11999990002");
         change_device_chip(&state,&allowed,id,None).unwrap();
-        assert!(db.get_chips(d.id).is_empty());
+        // Sem o cadastro removido, o aparelho segue com a linha própria criada sozinha.
+        assert_ne!(db.get_chips(d.id)[0].id, id);
     }
 }
 
@@ -2248,10 +2249,33 @@ pub fn import_campaign_contacts(
     token: String,
     campaign_id: i32,
     contacts: Vec<(String, String)>,
+    documents: Option<Vec<String>>,
 ) -> Result<(), String> {
     authorize_campaign(&state, &token, campaign_id)?;
     let db = &state.db;
-    db.import_contacts(campaign_id, contacts)
+    // CNPJ/documento por linha, na mesma ordem dos contatos (opcional).
+    let documents = documents.unwrap_or_default();
+    let rows = contacts.into_iter().enumerate()
+        .map(|(i, (name, phone))| (name, phone, documents.get(i).cloned().unwrap_or_default()))
+        .collect();
+    db.import_contacts_with_documents(campaign_id, rows)
+}
+
+/// Registro de prova do histórico no Konfiansa: cada conversa, se foi gravada, onde e o erro.
+#[tauri::command]
+pub fn get_konfiansa_histories(state: State<'_, AppState>, token: String, limit: Option<i64>) -> Result<Vec<crate::db::KonfiansaHistoryRow>, String> {
+    let session = validate_session(&state.sessions, &token)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Somente master e gestor veem o histórico gravado no Konfiansa.".into());
+    }
+    state.db.list_konfiansa_histories(limit.unwrap_or(200).clamp(1, 2000))
+}
+
+/// Relatório da campanha: número, nome, CNPJ e a mensagem que saiu, só dos enviados.
+#[tauri::command]
+pub fn get_campaign_sent_report(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<Vec<crate::db::SentReportRow>, String> {
+    authorize_campaign(&state, &token, campaign_id)?;
+    state.db.sent_report(campaign_id)
 }
 
 #[tauri::command]
@@ -2486,6 +2510,40 @@ pub async fn force_reconnect_all_adb(token: String, state: State<'_, AppState>) 
     tauri::async_runtime::spawn_blocking(move || {
         AdbManager::force_reconnect_all_adb(&state_db)
     }).await.map_err(|e| e.to_string())?
+}
+
+/// Força a conexão ADB de um aparelho só, sob demanda, sem mexer nos outros:
+/// não reinicia o servidor ADB e não varre a sub-rede.
+#[tauri::command]
+pub async fn force_adb_connect_device(
+    state: State<'_, AppState>,
+    token: String,
+    serial: String,
+    company_id: i32,
+) -> Result<String, String> {
+    log_connect(&format!("[CONNECT] ipc_entered fn=force_adb_connect_device serial={} company_id={}", serial, company_id));
+    let session = validate_session(&state.sessions, &token)?;
+    check_company_access(&session, company_id)?;
+    let state_db = state.db.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let alvo = serial.trim().to_string();
+        let dev = state_db
+            .get_devices(company_id)
+            .into_iter()
+            .find(|d| {
+                d.serial == alvo
+                    || d.esfera_device_id.as_deref() == Some(alvo.as_str())
+                    || d.ip == alvo
+                    || d.current_adb_address.as_deref() == Some(alvo.as_str())
+            })
+            .ok_or_else(|| format!("Aparelho {} não está cadastrado nesta empresa.", alvo))?;
+        let res = AdbManager::force_connect_device(&state_db, &dev);
+        log_connect(&format!("[CONNECT] force_adb_connect_device_end serial={} ok={}", alvo, res.is_ok()));
+        res
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -3412,6 +3470,10 @@ pub fn start_campaign(state: State<'_, AppState>, token: String, campaign_id: i3
     if !db.get_devices(campaign.company_id).iter().any(|d| d.status == "online" && campaign.device_ids.iter().any(|id| d.esfera_device_id.as_deref() == Some(id.as_str()) || d.serial == *id)) {
         return Err("Nenhum dos aparelhos selecionados está online.".to_string());
     }
+    // Iniciar/retomar é a revisão do operador: o freio de falhas recomeça a contar nos aparelhos da campanha.
+    for d in db.get_devices(campaign.company_id).iter().filter(|d| campaign.device_ids.iter().any(|id| d.esfera_device_id.as_deref() == Some(id.as_str()) || d.serial == *id)) {
+        for chip in db.get_chips(d.id) { let _ = db.reset_chip_brake(chip.id); }
+    }
     db.set_campaign_status(campaign_id, "running")?;
     // Salva todos os contatos pendentes na agenda dos aparelhos (busca no WhatsApp sem deep link).
     crate::dispatcher::seed_campaign_contacts(state.db.clone(), campaign_id, campaign.company_id, campaign.device_ids.clone());
@@ -3888,6 +3950,7 @@ pub fn save_app_config(
     tunnel_server_enabled: Option<bool>,
     tunnel_server_port: Option<u16>,
     mode: Option<String>,
+    crm_base_url: Option<String>,
 ) -> Result<(), String> {
     let session = validate_session(&state.sessions, token.as_deref().unwrap_or(""))?;
     if session.role != "master" && session.role != "gestor" { return Err("Apenas gestores podem alterar as configuracoes.".into()); }
@@ -3909,8 +3972,22 @@ pub fn save_app_config(
         if let Some(v) = tunnel_server_enabled { final_cfg.tunnel_server_enabled = v; }
         if let Some(v) = tunnel_server_port { final_cfg.tunnel_server_port = v; }
         if let Some(v) = mode { final_cfg.mode = v; }
+        if let Some(v) = crm_base_url { final_cfg.crm_base_url = v.trim().to_string(); }
     }
     config::save_config(&final_cfg)
+}
+
+/// Chips do CRM de celulares do VERITAS, só para exibir. Leitura pura: nada é
+/// gravado no Esfera e nada do VERITAS é alterado.
+#[tauri::command]
+pub async fn get_crm_chips(
+    state: State<'_, AppState>,
+    token: String,
+    force: Option<bool>,
+) -> Result<Vec<crate::veritas_crm::CrmChip>, String> {
+    validate_session(&state.sessions, &token)?;
+    let base = config::load_config().crm_base_url;
+    crate::veritas_crm::fetch_chips(&base, force.unwrap_or(false)).await
 }
 
 fn authorize_vexor_config(state: &AppState, token: &str, company_id: i32) -> Result<(), String> {
@@ -4619,6 +4696,117 @@ pub fn configure_device_proxy_and_antiban(
 ) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
     AdbManager::configure_device_socks_proxy_and_revoke_bssid(&serial, proxy_url.as_deref())
+}
+
+// ============================================================
+// Isolamento de rede por aparelho — gerenciador central
+// ============================================================
+
+/// Busca o aparelho e confere acesso da sessão (empresa + colaborador designado).
+fn authorize_device_access(state: &State<'_, AppState>, token: &str, device_id: i32) -> Result<crate::db::Device, String> {
+    let session = validate_session(&state.sessions, token)?;
+    let device = state.db.get_all_devices().into_iter().find(|d| d.id == device_id).ok_or("Aparelho nao encontrado.")?;
+    check_company_access(&session, device.company_id)?;
+    if session.role == "colaborador" && !state.db.get_assigned_devices_for_user(session.user_id, device.company_id).iter().any(|d| d.id == device.id) {
+        return Err("Aparelho nao autorizado para este usuario.".into());
+    }
+    Ok(device)
+}
+
+fn device_serial(device: &crate::db::Device) -> String {
+    device.current_adb_address.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| device.serial.clone())
+}
+
+#[tauri::command]
+pub fn get_network_profile(state: State<'_, AppState>, token: String, device_id: i32) -> Result<crate::db::NetworkProfile, String> {
+    authorize_device_access(&state, &token, device_id)?;
+    Ok(state.db.get_network_profile(device_id))
+}
+
+#[tauri::command]
+pub fn set_network_profile(
+    state: State<'_, AppState>,
+    token: String,
+    device_id: i32,
+    mode: String,
+    proxy_url: String,
+    allowed_egress_ips: String,
+    batch_size: i32,
+    vpn_package: String,
+    vpn_tunnel: String,
+    lockdown: bool,
+) -> Result<crate::db::NetworkProfile, String> {
+    let device = authorize_device_access(&state, &token, device_id)?;
+    if !matches!(mode.as_str(), "direto" | "wireguard" | "socks5") {
+        return Err("Modo de rede inválido.".into());
+    }
+    if !(1..=1000).contains(&batch_size) { return Err("O lote deve ser entre 1 e 1000 envios.".into()); }
+    for ip in crate::network_manager::parse_list(&allowed_egress_ips) {
+        if !crate::network_manager::looks_like_ip(&ip) { return Err(format!("IP autorizado inválido: {}", ip)); }
+    }
+    if mode == "socks5" && proxy_url.trim().is_empty() {
+        return Err("Informe o endereço do proxy para o modo SOCKS5.".into());
+    }
+    state.db.upsert_network_profile(device_id, &mode, &proxy_url, &allowed_egress_ips, batch_size, &vpn_package, &vpn_tunnel, lockdown)?;
+    let profile = state.db.get_network_profile(device_id);
+    state.db.queue_add_log(device.company_id, "network", "rede", &format!("Perfil de rede do aparelho {} alterado para modo {} (lote de {} confirmados).", device_id, mode, batch_size));
+    Ok(profile)
+}
+
+/// Aplica no aparelho a rota do perfil (VPN always-on com lockdown, ou proxy) e
+/// verifica em seguida de dentro do aparelho. Erro aqui é informação, não falha
+/// silenciosa: sem prova da rota, o aparelho não envia.
+#[tauri::command]
+pub async fn apply_device_network_route(state: State<'_, AppState>, token: String, device_id: i32) -> Result<crate::db::EgressCheckRow, String> {
+    let device = authorize_device_access(&state, &token, device_id)?;
+    if device.status != "online" { return Err("Aparelho offline: aplicar a rota exige conexão com o aparelho.".into()); }
+    let serial = device_serial(&device);
+    crate::network_manager::apply_and_verify(state.db.clone(), device_id, serial).await
+}
+
+#[tauri::command]
+pub fn pause_device_network(state: State<'_, AppState>, token: String, device_id: i32, reason: Option<String>) -> Result<(), String> {
+    let device = authorize_device_access(&state, &token, device_id)?;
+    let reason = reason.filter(|r| !r.trim().is_empty()).unwrap_or_else(|| "Pausado manualmente pelo operador.".to_string());
+    state.db.set_network_profile_status(device_id, "pausado_manual", &reason)?;
+    state.db.queue_add_log(device.company_id, "network", "rede", &format!("Rede do aparelho {} pausada: {}", device_id, reason));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn resume_device_network(state: State<'_, AppState>, token: String, device_id: i32) -> Result<(), String> {
+    let device = authorize_device_access(&state, &token, device_id)?;
+    state.db.set_network_profile_status(device_id, "ativo", "")?;
+    state.db.queue_add_log(device.company_id, "network", "rede", &format!("Rede do aparelho {} retomada.", device_id));
+    Ok(())
+}
+
+/// Roda a sonda de egresso AGORA, de dentro do aparelho, e devolve o registro.
+#[tauri::command]
+pub async fn check_device_egress_now(state: State<'_, AppState>, token: String, device_id: i32) -> Result<crate::db::EgressCheckRow, String> {
+    let device = authorize_device_access(&state, &token, device_id)?;
+    if device.status != "online" { return Err("Aparelho offline: a verificação exige conexão com o aparelho.".into()); }
+    let serial = device_serial(&device);
+    crate::network_manager::check_device_now(state.db.clone(), device_id, serial).await
+}
+
+/// Estado completo de rede do aparelho para a tela: perfil, última verificação,
+/// progresso do lote aberto e últimos lotes fechados (auditoria).
+#[tauri::command]
+pub fn get_device_network_status(state: State<'_, AppState>, token: String, device_id: i32) -> Result<serde_json::Value, String> {
+    authorize_device_access(&state, &token, device_id)?;
+    let profile = state.db.get_network_profile(device_id);
+    let open = state.db.peek_open_send_batch(device_id).map(|(batch_id, start)| {
+        let (confirmed, failed, uncertain) = state.db.batch_progress(device_id, start);
+        serde_json::json!({ "batchId": batch_id, "confirmed": confirmed, "failed": failed, "uncertain": uncertain, "target": profile.batch_size })
+    });
+    Ok(serde_json::json!({
+        "profile": profile,
+        "lastCheck": state.db.last_egress_check(device_id),
+        "openBatch": open,
+        "recentBatches": state.db.recent_send_batches(device_id, 10),
+        "recentChecks": state.db.recent_egress_checks(device_id, 10),
+    }))
 }
 
 #[tauri::command]

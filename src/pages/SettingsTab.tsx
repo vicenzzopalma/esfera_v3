@@ -2089,7 +2089,7 @@ function IntegrationsSection({
 // ---------- Rede e ritmo ----------
 type NetworkChipState = "normal" | "reduzido" | "pausado" | "indisponivel";
 type NetworkChip = { chipId: number; deviceId: number; deviceName: string; replyRate: number | null; sample: number; state: NetworkChipState; reason: string };
-// attempts* = o que o teto conta (tentativas, inclusive falhas; cada parte extra soma uma); sent* = só enviadas.
+// attempts* = o que o teto conta (envios confirmados e em andamento; cada parte extra soma uma); sent* = só confirmados.
 type NetworkStatus = { hourly: number; daily: number; sentLastHour: number; sentToday: number; attemptsLastHour: number; attemptsToday: number; waitSeconds: number; chips: NetworkChip[] };
 const CHIP_STATE_LABEL: Record<NetworkChipState, string> = { normal: "Normal", reduzido: "Reduzido", pausado: "Pausado", indisponivel: "Indisponível" };
 const CHIP_STATE_BADGE: Record<NetworkChipState, "success" | "warning" | "danger" | "neutral"> = {
@@ -2214,7 +2214,7 @@ function NetworkSettings({ canEdit }: { canEdit: boolean }) {
     <div className="space-y-8">
       <FormSection
         title="Rede e ritmo"
-        description="Teto de tentativas somado de todos os aparelhos deste computador, de todas as empresas. Cada parte da mensagem conta como uma tentativa, mesmo quando o envio falha."
+        description="Teto de envios somado de todos os aparelhos deste computador, de todas as empresas. Cada parte enviada conta uma vez; envio que falha não ocupa o teto."
       >
         <div className="max-w-xl space-y-3">
           {status === null && !statusError && (
@@ -2272,7 +2272,7 @@ function NetworkSettings({ canEdit }: { canEdit: boolean }) {
           {limitsLoad === "ready" && (
             <>
               <div className="grid grid-cols-2 gap-4">
-                <Field label="Tentativas por hora" hint={`Padrão: ${DEFAULT_LIMITS.hourly}.`} htmlFor="network-hour" error={hourlyError || undefined}>
+                <Field label="Envios por hora" hint={`Padrão: ${DEFAULT_LIMITS.hourly}.`} htmlFor="network-hour" error={hourlyError || undefined}>
                   <input
                     id="network-hour"
                     type="number"
@@ -2286,7 +2286,7 @@ function NetworkSettings({ canEdit }: { canEdit: boolean }) {
                   />
                 </Field>
                 <Field
-                  label="Tentativas por dia"
+                  label="Envios por dia"
                   hint={`Padrão: ${DEFAULT_LIMITS.daily}. Igual ou maior que por hora.`}
                   htmlFor="network-day"
                   error={dailyError || undefined}
@@ -2375,11 +2375,11 @@ function UsageMeter({ label, attempts, limit, sent }: { label: string; attempts:
     <div className="space-y-1.5 rounded-lg border border-border p-3">
       <p className="text-xs text-tertiary">{label}</p>
       <p className="text-[0.8125rem] text-secondary">
-        <span className="text-lg font-semibold text-primary">{attempts}</span> de {limit} tentativas
+        <span className="text-lg font-semibold text-primary">{attempts}</span> de {limit} envios
       </p>
       <div
         role="meter"
-        aria-label={`${label}: ${attempts} de ${limit} tentativas`}
+        aria-label={`${label}: ${attempts} de ${limit} envios`}
         aria-valuemin={0}
         aria-valuemax={limit}
         aria-valuenow={Math.min(attempts, limit)}

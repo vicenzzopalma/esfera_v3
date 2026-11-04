@@ -13,6 +13,7 @@ pub mod config;
 pub mod db;
 mod dispatcher;
 pub mod empresa_server;
+pub mod network_manager;
 pub mod optout_api;
 pub mod hub;
 pub mod hub_client;
@@ -23,6 +24,8 @@ mod session;
 pub mod session_manager;
 mod spintax;
 mod tunnel_server;
+pub mod veritas_crm;
+pub mod konfiansa_history;
 mod write_queue;
 
 use commands::*;
@@ -148,6 +151,7 @@ pub fn run() {
             dispatcher::Dispatcher::start_persistent_adb_keepalive_loop(db_arc_clone.clone());
             dispatcher::Dispatcher::start_opt_out_import_loop(db_arc_clone.clone());
             dispatcher::Dispatcher::start_agent_update_loop(db_arc_clone.clone());
+            konfiansa_history::start(db_arc_clone.clone());
             adb_manager::AdbManager::start_status_monitor(db_arc_clone);
             diag("ETAPA [5] backend/servers iniciados no setup; setup retorna Ok");
             Ok(())
@@ -217,6 +221,8 @@ pub fn run() {
             // Contatos
             get_campaign_contacts,
             import_campaign_contacts,
+            get_campaign_sent_report,
+            get_konfiansa_histories,
             get_pending_contacts,
             update_contact_status,
             set_contact_custom_message,
@@ -236,6 +242,7 @@ pub fn run() {
             link_usb_to_wireless,
             force_enable_wireless_adb,
             force_reconnect_all_adb,
+            force_adb_connect_device,
             inject_all_devices_immunity,
             inject_single_device_immunity,
             pair_and_connect_adb_device,
@@ -325,6 +332,13 @@ pub fn run() {
             end_device_access,
             get_devices_with_active_user_map,
             configure_device_proxy_and_antiban,
+            get_network_profile,
+            set_network_profile,
+            apply_device_network_route,
+            pause_device_network,
+            resume_device_network,
+            check_device_egress_now,
+            get_device_network_status,
             trigger_manual_intent_bezier_dispatch,
             clear_device_temporary_contacts,
             check_git_auto_update,
@@ -332,6 +346,7 @@ pub fn run() {
             // Config
             get_app_config,
             save_app_config,
+            get_crm_chips,
             get_vexor_token_status,
             save_vexor_token,
             test_vexor_token,
