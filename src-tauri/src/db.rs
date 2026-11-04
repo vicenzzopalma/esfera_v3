@@ -57,6 +57,79 @@ pub struct NetworkChipStatus { pub chip_id: i32, pub device_id: i32, pub device_
 #[serde(rename_all = "camelCase")]
 pub struct NetworkStatus { pub hourly: i64, pub daily: i64, pub sent_last_hour: i64, pub sent_today: i64, pub attempts_last_hour: i64, pub attempts_today: i64, pub wait_seconds: u64, pub chips: Vec<NetworkChipStatus> }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkProfile {
+    pub device_id: i32,
+    pub mode: String,
+    pub proxy_url: String,
+    pub allowed_egress_ips: String,
+    pub batch_size: i32,
+    pub status: String,
+    pub pause_reason: String,
+    pub vpn_package: String,
+    pub vpn_tunnel: String,
+    pub lockdown: bool,
+    pub last_egress_ip: String,
+    pub last_egress_at: String,
+    pub last_egress_result: String,
+    pub consecutive_failures: i64,
+}
+
+/// Lote de auditoria: a verificação de rota acontece a cada 10 envios CONFIRMADOS.
+pub const DEFAULT_BATCH_SIZE: i32 = 10;
+/// Pacote padrão do app WireGuard (open source) usado no modo always-on.
+pub const DEFAULT_VPN_PACKAGE: &str = "com.wireguard.android";
+
+impl NetworkProfile {
+    pub fn default_for(device_id: i32) -> Self {
+        Self { device_id, mode: "direto".into(), proxy_url: String::new(),
+            allowed_egress_ips: String::new(), batch_size: DEFAULT_BATCH_SIZE,
+            status: "ativo".into(), pause_reason: String::new(),
+            vpn_package: DEFAULT_VPN_PACKAGE.into(), vpn_tunnel: String::new(), lockdown: true,
+            last_egress_ip: String::new(), last_egress_at: String::new(), last_egress_result: String::new(),
+            consecutive_failures: 0 }
+    }
+    /// O isolamento exige uma rota própria configurada; 'direto' (ou vazio) usa o portão compartilhado.
+    pub fn is_isolated(&self) -> bool {
+        matches!(self.mode.as_str(), "wireguard" | "socks5")
+    }
+    /// Só o modo VPN captura todo o tráfego do Android. O SOCKS5 depende de o app honrar
+    /// o proxy do sistema — o WhatsApp não honra —, então ele nunca é tratado como prova de rota.
+    pub fn captures_all_traffic(&self) -> bool {
+        self.mode == "wireguard"
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressCheckRow {
+    pub check_id: i64,
+    pub checked_at: String,
+    pub observed_ip: String,
+    pub expected_ips: String,
+    pub mode: String,
+    pub applied_route: String,
+    /// Em que momento a verificação rodou: 'pre_lote', 'fim_lote' ou 'manual'.
+    pub phase: String,
+    pub result: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendBatchRow {
+    pub batch_id: i64,
+    pub started_at: String,
+    pub closed_at: String,
+    pub confirmed: i64,
+    pub failed: i64,
+    pub uncertain: i64,
+    pub egress_ip: String,
+    pub verification: String,
+    pub company_id: i32,
+}
+
 const REPLY_REASON_PAUSED: &str = "Poucas respostas: chip pausado por 24 h para proteger o número";
 const REPLY_REASON_SLOW: &str = "Ritmo reduzido por poucas respostas";
 const REPLY_REASON_NONE_YET: &str = "Nenhuma resposta captada ainda neste aparelho; confira se as notificações do WhatsApp chegam ao celular";
@@ -120,15 +193,14 @@ fn chip_limit_at(conn: &Connection, chip: &Chip, now: chrono::DateTime<chrono::U
     let hour_limit = chip_config(chip.id, "HOURLY_LIMIT", 10);
     let day_limit = chip_config(chip.id, "DAILY_LIMIT", 60);
     let (day_start, next_day) = local_day_bounds(now);
-    let (hour, day, age, hour_wait): (i64, i64, i64, i64) = conn.query_row(
-        "SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?3),
-                (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?4),
-                max(0, CAST(julianday(?5) - julianday(?2) AS INTEGER)),
-                coalesce((SELECT max(1, CAST(strftime('%s',min(CreatedAt)) AS INTEGER)+3601-CAST(strftime('%s',?5) AS INTEGER)) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?3),3600)",
-        params![chip.id, chip.created_at, sql_utc(now - chrono::TimeDelta::hours(1)), sql_utc(day_start), sql_utc(now)],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| e.to_string())?;
-    // O dia de cadastro começa com 15 tentativas; o teto cresce cinco por dia.
-    let warm_limit = (15 + age * 5).min(day_limit);
+    let (hour, day, hour_wait): (i64, i64, i64) = conn.query_row(
+        "SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?2),
+                (SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?3),
+                coalesce((SELECT max(1, CAST(strftime('%s',min(CreatedAt)) AS INTEGER)+3601-CAST(strftime('%s',?4) AS INTEGER)) FROM ESF_ChipAttempt WHERE ChipId=?1 AND CreatedAt >= ?2),3600)",
+        params![chip.id, sql_utc(now - chrono::TimeDelta::hours(1)), sql_utc(day_start), sql_utc(now)],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|e| e.to_string())?;
+    // Sem rampa de aquecimento: os números vêm do CRM do VERITAS e já estão aquecidos.
+    let warm_limit = day_limit;
     let hour_wait = if hour >= hour_limit { hour_wait.max(1) as u64 } else { 0 };
     let day_wait = if day >= warm_limit { (next_day - now).num_seconds().max(1) as u64 } else { 0 };
     Ok((hour_limit, warm_limit, hour_wait.max(day_wait)))
@@ -237,6 +309,20 @@ pub struct Contact {
     pub phone: String,
     pub status: String,
     pub sent_at: Option<String>,
+}
+
+/// Linha do relatório de enviados (planilha).
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SentReportRow {
+    pub name: String,
+    pub phone: String,
+    pub document: String,
+    pub message: String,
+    pub sent_at: Option<String>,
+    /// "Enviado", "Recusou (pediu SAIR)" ou "Recusou antes do envio".
+    pub situation: String,
+    pub refused_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -892,7 +978,8 @@ impl Database {
             CompanyId INTEGER NOT NULL, CampaignId INTEGER NOT NULL, PhoneDigits TEXT NOT NULL,
             Outcome TEXT NOT NULL DEFAULT 'iniciado', CreatedAt TEXT NOT NULL DEFAULT (datetime('now'))
         ); CREATE INDEX IF NOT EXISTS idx_chip_attempt ON ESF_ChipAttempt(ChipId, AttemptId DESC);
-        CREATE TABLE IF NOT EXISTS ESF_ChipCooldown (ChipId INTEGER PRIMARY KEY, NextAt TEXT NOT NULL);")?;
+        CREATE TABLE IF NOT EXISTS ESF_ChipCooldown (ChipId INTEGER PRIMARY KEY, NextAt TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS ESF_ChipBrakeReset (ChipId INTEGER PRIMARY KEY, AfterAttemptId INTEGER NOT NULL);")?;
 
         let _ = self.conn().execute("ALTER TABLE ESF_ChipAttempt ADD COLUMN Purpose TEXT NOT NULL DEFAULT 'campaign'", []);
         self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_NetworkLimits (
@@ -904,6 +991,75 @@ impl Database {
         CREATE TABLE IF NOT EXISTS ESF_ReplyBrake (ChipId INTEGER PRIMARY KEY, UntilAt TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS ESF_ReplyCapture (DeviceId INTEGER PRIMARY KEY, Available INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS ESF_NetworkExtra (AttemptId INTEGER PRIMARY KEY, Extra INTEGER NOT NULL, CreatedAt TEXT NOT NULL DEFAULT (datetime('now')));")?;
+
+        // Banco de variações da IA por versão do texto da campanha: sobrevive ao reinício do app.
+        self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_AiVariant (
+            CampaignId INTEGER NOT NULL, Fingerprint TEXT NOT NULL, PartIndex INTEGER NOT NULL, Text TEXT NOT NULL,
+            CreatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (CampaignId, Fingerprint, PartIndex, Text)
+        );")?;
+
+        // Isolamento de rede por aparelho: perfil próprio por dispositivo, lotes auditáveis de
+        // envio confirmados e histórico de verificação de IP de saída (egresso).
+        self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_NetworkProfile (
+            DeviceId INTEGER PRIMARY KEY,
+            Mode TEXT NOT NULL DEFAULT 'direto',
+            ProxyUrl TEXT NOT NULL DEFAULT '',
+            ProxyPool TEXT NOT NULL DEFAULT '',
+            AllowedEgressIps TEXT NOT NULL DEFAULT '',
+            RotateOnBatch INTEGER NOT NULL DEFAULT 0,
+            BatchSize INTEGER NOT NULL DEFAULT 10,
+            Status TEXT NOT NULL DEFAULT 'ativo',
+            PauseReason TEXT NOT NULL DEFAULT '',
+            CurrentProxyIndex INTEGER NOT NULL DEFAULT 0,
+            VpnPackage TEXT NOT NULL DEFAULT 'com.wireguard.android',
+            VpnTunnel TEXT NOT NULL DEFAULT '',
+            Lockdown INTEGER NOT NULL DEFAULT 1,
+            LastEgressIp TEXT NOT NULL DEFAULT '',
+            LastEgressAt TEXT NOT NULL DEFAULT '',
+            LastEgressResult TEXT NOT NULL DEFAULT '',
+            ConsecutiveFailures INTEGER NOT NULL DEFAULT 0,
+            UpdatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS ESF_SendBatch (
+            BatchId INTEGER PRIMARY KEY AUTOINCREMENT,
+            DeviceId INTEGER NOT NULL,
+            CompanyId INTEGER NOT NULL DEFAULT 0,
+            StartAttemptId INTEGER NOT NULL DEFAULT 0,
+            StartAt TEXT NOT NULL DEFAULT (datetime('now')),
+            ClosedAt TEXT,
+            Confirmed INTEGER NOT NULL DEFAULT 0,
+            Failed INTEGER NOT NULL DEFAULT 0,
+            Uncertain INTEGER NOT NULL DEFAULT 0,
+            EgressIp TEXT NOT NULL DEFAULT '',
+            Verification TEXT NOT NULL DEFAULT 'pendente'
+        );
+        CREATE INDEX IF NOT EXISTS idx_send_batch_device ON ESF_SendBatch(DeviceId, BatchId DESC);
+        CREATE TABLE IF NOT EXISTS ESF_EgressCheck (
+            CheckId INTEGER PRIMARY KEY AUTOINCREMENT,
+            DeviceId INTEGER NOT NULL,
+            CheckedAt TEXT NOT NULL DEFAULT (datetime('now')),
+            ObservedIp TEXT NOT NULL DEFAULT '',
+            ExpectedIps TEXT NOT NULL DEFAULT '',
+            Mode TEXT NOT NULL DEFAULT '',
+            AppliedRoute TEXT NOT NULL DEFAULT '',
+            Result TEXT NOT NULL,
+            Detail TEXT NOT NULL DEFAULT '',
+            Phase TEXT NOT NULL DEFAULT 'manual',
+            Reported INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_egress_check_device ON ESF_EgressCheck(DeviceId, CheckId DESC);")?;
+
+        // Colunas acrescentadas depois da primeira versão da tabela (bancos já existentes).
+        for alter in [
+            "ALTER TABLE ESF_NetworkProfile ADD COLUMN VpnPackage TEXT NOT NULL DEFAULT 'com.wireguard.android'",
+            "ALTER TABLE ESF_NetworkProfile ADD COLUMN VpnTunnel TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE ESF_NetworkProfile ADD COLUMN Lockdown INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE ESF_EgressCheck ADD COLUMN Phase TEXT NOT NULL DEFAULT 'manual'",
+            "ALTER TABLE ESF_EgressCheck ADD COLUMN Reported INTEGER NOT NULL DEFAULT 0",
+        ] {
+            let _ = self.conn().execute(alter, []);
+        }
 
         // 8. ESF_Contact (com custom_message, device_id, retry_count, excluido_em)
         self.conn().execute(
@@ -1302,6 +1458,26 @@ impl Database {
         let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN RetryCount INTEGER DEFAULT 0;", []);
         let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN CustomMessage TEXT DEFAULT '';", []);
         let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN ExcluidoEm TEXT DEFAULT NULL;", []);
+        // CNPJ/documento da planilha e o texto que saiu, para o relatório de enviados.
+        let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN Document TEXT DEFAULT '';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_Contact ADD COLUMN SentMessage TEXT DEFAULT '';", []);
+        // Histórico do WhatsApp do disparo -> Konfiansa: mensagens recebidas da Evolution, o
+        // registro de prova de cada gravação e o ponto até onde já foi lido.
+        let _ = self.conn().execute_batch(
+            "CREATE TABLE IF NOT EXISTS ESF_WaMessage (
+                MsgId TEXT PRIMARY KEY, Ts INTEGER NOT NULL, PhoneKey TEXT NOT NULL, Phone TEXT NOT NULL,
+                FromMe INTEGER NOT NULL, PushName TEXT NOT NULL DEFAULT '', Text TEXT NOT NULL,
+                CampaignId INTEGER NOT NULL DEFAULT 0, HistoryId INTEGER, CreatedAt TEXT NOT NULL DEFAULT (datetime('now')));
+             CREATE INDEX IF NOT EXISTS idx_wa_message_phone ON ESF_WaMessage(PhoneKey, HistoryId, Ts);
+             CREATE TABLE IF NOT EXISTS ESF_KonfiansaHistory (
+                HistoryId INTEGER PRIMARY KEY AUTOINCREMENT, PhoneKey TEXT NOT NULL, Phone TEXT NOT NULL,
+                CampaignId INTEGER NOT NULL DEFAULT 0, Motivo TEXT NOT NULL, FirstTs INTEGER NOT NULL, LastTs INTEGER NOT NULL,
+                Mensagens INTEGER NOT NULL DEFAULT 0, Texto TEXT NOT NULL, Status TEXT NOT NULL DEFAULT 'pendente',
+                Processos TEXT NOT NULL DEFAULT '', Erro TEXT NOT NULL DEFAULT '', Tentativas INTEGER NOT NULL DEFAULT 0,
+                ProximaTentativa TEXT, CreatedAt TEXT NOT NULL DEFAULT (datetime('now')), GravadoEm TEXT);
+             CREATE INDEX IF NOT EXISTS idx_konfiansa_history_status ON ESF_KonfiansaHistory(Status, ProximaTentativa);
+             CREATE TABLE IF NOT EXISTS ESF_EvoCursor (Id INTEGER PRIMARY KEY CHECK (Id = 1), LastTs INTEGER NOT NULL);");
+        let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN KonfiansaCredor INTEGER NOT NULL DEFAULT 0;", []);
         // Limpeza APENAS de dispositivos mockados de testes 'adb-dev-%' (NUNCA deletar conexões reais Wi-Fi/IP)
         let _ = self.conn().execute("DELETE FROM ESF_Device WHERE AdbDeviceId LIKE 'adb-dev-%';", []);
         let _ = self.conn().execute("DELETE FROM ESF_AuditLog WHERE Message LIKE '%adb-dev-%';", []);
@@ -2352,11 +2528,22 @@ impl Database {
             .map(|_| ()).map_err(|e| e.to_string())
     }
 
+    /// Linha de envio do aparelho: o registro interno que conta limites, descanso, freios e
+    /// conta restrita. Não há gestão de chips no Esfera (os números ficam no CRM do VERITAS):
+    /// todo aparelho tem exatamente uma, criada sozinha; com cadastros antigos repetidos,
+    /// vale o mais recente.
     pub fn get_chips(&self, device_id: i32) -> Vec<Chip> {
+        if device_id <= 0 { return vec![]; }
         let conn = self.conn();
+        let _ = conn.execute(
+            "INSERT INTO ESF_Chip (DeviceId, PhoneNumber, ChipName, Status)
+             SELECT ?1, '', 'Linha do aparelho', 'livre'
+             WHERE NOT EXISTS (SELECT 1 FROM ESF_Chip WHERE DeviceId = ?1 AND ExcluidoEm IS NULL)",
+            params![device_id],
+        );
         let mut stmt = match conn.prepare_cached(
             "SELECT ChipId, DeviceId, PhoneNumber, ChipName, Status, RestrictedUntil, CreatedAt
-             FROM ESF_Chip WHERE DeviceId = ?1 AND ExcluidoEm IS NULL ORDER BY ChipId DESC"
+             FROM ESF_Chip WHERE DeviceId = ?1 AND ExcluidoEm IS NULL ORDER BY ChipId DESC LIMIT 1"
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -2448,14 +2635,20 @@ impl Database {
         Ok(network_wait(hourly, daily, self.network_usage_at(now)?, required))
     }
 
-    /// Uso da rede em `now`: tentativas (com as partes extras) na última hora e no dia local, e a
-    /// espera até cada janela reabrir.
+    /// Uso da rede em `now`: mensagens enviadas (com as partes extras) na última hora e no dia
+    /// local, e a espera até cada janela reabrir. Tentativa que falhou não conta; a que ainda está
+    /// saindo ('iniciado') conta até terminar, para dois aparelhos não passarem juntos do teto.
     fn network_usage_at(&self, now: chrono::DateTime<chrono::Utc>) -> Result<(i64, i64, i64, i64), String> {
         let (day_start, next_day) = local_day_bounds(now);
         let (hour_count, day_count, hour_wait): (i64, i64, i64) = self.conn().query_row(
-            "SELECT (SELECT count(*) FROM ESF_ChipAttempt WHERE CreatedAt >= ?1) + (SELECT coalesce(sum(Extra),0) FROM ESF_NetworkExtra WHERE CreatedAt >= ?1),
-                    (SELECT count(*) FROM ESF_ChipAttempt WHERE CreatedAt >= ?2) + (SELECT coalesce(sum(Extra),0) FROM ESF_NetworkExtra WHERE CreatedAt >= ?2),
-                    coalesce((SELECT max(1, CAST(strftime('%s',min(CreatedAt)) AS INTEGER)+3601-CAST(strftime('%s',?3) AS INTEGER)) FROM (SELECT CreatedAt FROM ESF_ChipAttempt WHERE CreatedAt >= ?1 UNION ALL SELECT CreatedAt FROM ESF_NetworkExtra WHERE CreatedAt >= ?1)),3600)",
+            "WITH used AS (
+                SELECT CreatedAt, 1 AS n FROM ESF_ChipAttempt WHERE Outcome IN ('enviado','iniciado') AND CreatedAt >= min(?1,?2)
+                UNION ALL
+                SELECT e.CreatedAt, e.Extra FROM ESF_NetworkExtra e JOIN ESF_ChipAttempt a ON a.AttemptId=e.AttemptId
+                 WHERE a.Outcome IN ('enviado','iniciado') AND e.CreatedAt >= min(?1,?2))
+             SELECT (SELECT coalesce(sum(n),0) FROM used u WHERE u.CreatedAt >= ?1),
+                    (SELECT coalesce(sum(n),0) FROM used u WHERE u.CreatedAt >= ?2),
+                    coalesce((SELECT max(1, CAST(strftime('%s',min(CreatedAt)) AS INTEGER)+3601-CAST(strftime('%s',?3) AS INTEGER)) FROM used u WHERE u.CreatedAt >= ?1),3600)",
             params![sql_utc(now - chrono::TimeDelta::hours(1)), sql_utc(day_start), sql_utc(now)],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|e| e.to_string())?;
         Ok((hour_count, day_count, hour_wait, (next_day - now).num_seconds().max(1)))
@@ -2545,12 +2738,14 @@ impl Database {
         let conn = self.conn();
         let (hour_limit, warm_limit, limit_wait) = chip_limit_at(&conn, chip, now)?;
         if limit_wait > 0 {
-            return Err(format!("Limite do chip atingido: {} por hora e {} por dia (aquecimento).", hour_limit, warm_limit));
+            return Err(format!("Limite do chip atingido: {} por hora e {} por dia.", hour_limit, warm_limit));
         }
         let (count, failed, optouts): (i64, i64, i64) = conn.query_row(
             "SELECT count(*), coalesce(sum(CASE WHEN a.Outcome != 'enviado' THEN 1 ELSE 0 END),0),
                     coalesce(sum(CASE WHEN EXISTS(SELECT 1 FROM ESF_OptOut o WHERE o.CompanyId=a.CompanyId AND o.PhoneDigits=a.PhoneDigits) THEN 1 ELSE 0 END),0)
-             FROM (SELECT CompanyId,PhoneDigits,Outcome FROM ESF_ChipAttempt WHERE ChipId=?1 AND Purpose='campaign' ORDER BY AttemptId DESC LIMIT 20) a",
+             FROM (SELECT CompanyId,PhoneDigits,Outcome FROM ESF_ChipAttempt WHERE ChipId=?1 AND Purpose='campaign'
+                     AND AttemptId > coalesce((SELECT AfterAttemptId FROM ESF_ChipBrakeReset WHERE ChipId=?1),0)
+                   ORDER BY AttemptId DESC LIMIT 20) a",
             params![chip.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e| e.to_string())?;
         if !confirmation && count >= 20 && (failed * 100 > count * 15 || optouts * 100 > count * 10) {
             return Err(format!("Freio automático: nas últimas {} tentativas, {} falhas e {} pedidos de SAIR.", count, failed, optouts));
@@ -2568,6 +2763,17 @@ impl Database {
         Ok(id)
     }
 
+    /// O operador revisou e retomou: o freio de falhas e SAIR passa a contar só as tentativas
+    /// feitas daqui em diante. Sem isso, as 20 últimas nunca mudam (o freio barra tentativas
+    /// novas) e o aparelho fica travado para sempre.
+    pub fn reset_chip_brake(&self, chip_id: i32) -> Result<(), String> {
+        self.conn().execute(
+            "INSERT INTO ESF_ChipBrakeReset(ChipId,AfterAttemptId)
+             VALUES (?1, coalesce((SELECT max(AttemptId) FROM ESF_ChipAttempt WHERE ChipId=?1),0))
+             ON CONFLICT(ChipId) DO UPDATE SET AfterAttemptId=excluded.AfterAttemptId",
+            params![chip_id]).map(|_| ()).map_err(|e| e.to_string())
+    }
+
     pub fn extend_chip_cooldown(&self, chip_id: i32, seconds: u64) -> Result<(), String> {
         self.conn().execute("INSERT INTO ESF_ChipCooldown(ChipId,NextAt) VALUES(?1,datetime('now',?2)) ON CONFLICT(ChipId) DO UPDATE SET NextAt=max(NextAt,excluded.NextAt)", params![chip_id,format!("+{} seconds",seconds)]).map(|_| ()).map_err(|e|e.to_string())
     }
@@ -2580,6 +2786,211 @@ impl Database {
     pub fn finish_chip_attempt(&self, attempt_id: i64, sent: bool) -> Result<(), String> {
         self.conn().execute("UPDATE ESF_ChipAttempt SET Outcome=?1 WHERE AttemptId=?2", params![if sent { "enviado" } else { "falhou" }, attempt_id]).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    // ============================================================
+    // Isolamento de rede por aparelho — perfis, lotes e egresso
+    // ============================================================
+
+    /// Perfil de rede do aparelho. Sem linha na tabela, modo 'direto' com portão compartilhado
+    /// (comportamento antigo): nada muda para quem não configurou isolamento.
+    pub fn get_network_profile(&self, device_id: i32) -> NetworkProfile {
+        self.conn().query_row(
+            "SELECT Mode, ProxyUrl, AllowedEgressIps, BatchSize, Status, PauseReason,
+                    VpnPackage, VpnTunnel, Lockdown,
+                    LastEgressIp, LastEgressAt, LastEgressResult, ConsecutiveFailures
+             FROM ESF_NetworkProfile WHERE DeviceId=?1",
+            params![device_id],
+            |r| Ok(NetworkProfile {
+                device_id,
+                mode: r.get(0)?, proxy_url: r.get(1)?, allowed_egress_ips: r.get(2)?,
+                batch_size: r.get::<_, i64>(3)?.max(1) as i32,
+                status: r.get(4)?, pause_reason: r.get(5)?,
+                vpn_package: r.get(6)?, vpn_tunnel: r.get(7)?, lockdown: r.get::<_, i64>(8)? != 0,
+                last_egress_ip: r.get(9)?, last_egress_at: r.get(10)?, last_egress_result: r.get(11)?,
+                consecutive_failures: r.get(12)?,
+            }),
+        ).unwrap_or_else(|_| NetworkProfile::default_for(device_id))
+    }
+
+    /// Grava o perfil e mantém o estado de pausa/última verificação (não é resetado ao editar).
+    pub fn upsert_network_profile(&self, device_id: i32, mode: &str, proxy_url: &str, allowed_egress_ips: &str, batch_size: i32, vpn_package: &str, vpn_tunnel: &str, lockdown: bool) -> Result<(), String> {
+        let batch_size = batch_size.clamp(1, 1000);
+        let vpn_package = if vpn_package.trim().is_empty() { DEFAULT_VPN_PACKAGE } else { vpn_package.trim() };
+        self.conn().execute(
+            "INSERT INTO ESF_NetworkProfile (DeviceId, Mode, ProxyUrl, AllowedEgressIps, BatchSize, VpnPackage, VpnTunnel, Lockdown, UpdatedAt)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,datetime('now'))
+             ON CONFLICT(DeviceId) DO UPDATE SET
+                Mode=excluded.Mode, ProxyUrl=excluded.ProxyUrl,
+                AllowedEgressIps=excluded.AllowedEgressIps, BatchSize=excluded.BatchSize,
+                VpnPackage=excluded.VpnPackage, VpnTunnel=excluded.VpnTunnel, Lockdown=excluded.Lockdown,
+                UpdatedAt=datetime('now')",
+            params![device_id, mode, proxy_url.trim(), allowed_egress_ips.trim(), batch_size, vpn_package, vpn_tunnel.trim(), lockdown as i64],
+        ).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    pub fn set_network_profile_status(&self, device_id: i32, status: &str, reason: &str) -> Result<(), String> {
+        self.conn().execute(
+            "INSERT INTO ESF_NetworkProfile (DeviceId, Status, PauseReason, UpdatedAt) VALUES (?1,?2,?3,datetime('now'))
+             ON CONFLICT(DeviceId) DO UPDATE SET Status=?2, PauseReason=?3, UpdatedAt=datetime('now')",
+            params![device_id, status, reason],
+        ).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Segundos decorridos desde um instante gravado no banco ('YYYY-MM-DD HH:MM:SS', UTC).
+    /// None quando o valor está vazio ou ilegível — tratado como "sem verificação".
+    pub fn seconds_since(&self, stamp: &str) -> Option<i64> {
+        if stamp.trim().is_empty() { return None; }
+        self.conn().query_row(
+            "SELECT CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s',?1) AS INTEGER)",
+            params![stamp], |r| r.get::<_, Option<i64>>(0),
+        ).ok().flatten()
+    }
+
+    /// Motivo que bloqueia novos envios neste aparelho (pausa manual ou por vazamento); None = livre.
+    pub fn network_send_block_reason(&self, device_id: i32) -> Option<String> {
+        let p = self.get_network_profile(device_id);
+        match p.status.as_str() {
+            "ativo" => None,
+            "pausado_vazamento" => Some(p.pause_reason.clone()),
+            "pausado_manual" => Some(p.pause_reason.clone()),
+            other => Some(format!("estado de rede desconhecido: {}", other)),
+        }
+    }
+
+    pub fn set_profile_egress_result(&self, device_id: i32, observed_ip: &str, result: &str, failures: i64) -> Result<(), String> {
+        self.conn().execute(
+            "UPDATE ESF_NetworkProfile SET LastEgressIp=?1, LastEgressAt=datetime('now'), LastEgressResult=?2, ConsecutiveFailures=?3, UpdatedAt=datetime('now') WHERE DeviceId=?4",
+            params![observed_ip, result, failures, device_id],
+        ).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Maior AttemptId já registrado no chip deste aparelho (0 se não há); marca de corte do lote.
+    pub fn device_max_attempt_id(&self, device_id: i32) -> i64 {
+        self.conn().query_row(
+            "SELECT coalesce(max(a.AttemptId),0) FROM ESF_ChipAttempt a JOIN ESF_Chip c ON c.ChipId=a.ChipId WHERE c.DeviceId=?1",
+            params![device_id], |r| r.get(0)).unwrap_or(0)
+    }
+
+    /// Lote aberto do aparelho; cria um começando na marca atual de tentativas. Assim o progresso
+    /// vive nos ESF_ChipAttempt já persistidos: restart não duplica nem perde contagem.
+    pub fn open_send_batch(&self, device_id: i32, company_id: i32) -> (i64, i64, i64) {
+        // O perfil é lido ANTES de qualquer consulta: conn() guarda a conexão em cache atrás
+        // de um Mutex não reentrante, e um guard vivo no corpo de um `if let` travaria o banco
+        // inteiro ao chamar outro método que também abre conexão.
+        let batch_size = self.get_network_profile(device_id).batch_size as i64;
+        let open = self.conn().query_row(
+            "SELECT BatchId, StartAttemptId FROM ESF_SendBatch WHERE DeviceId=?1 AND ClosedAt IS NULL ORDER BY BatchId DESC LIMIT 1",
+            params![device_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        ).optional().ok().flatten();
+        if let Some((batch_id, start_attempt)) = open {
+            return (batch_id, start_attempt, batch_size);
+        }
+        let start = self.device_max_attempt_id(device_id);
+        let inserted = self.conn().execute(
+            "INSERT INTO ESF_SendBatch (DeviceId, CompanyId, StartAttemptId) VALUES (?1,?2,?3)",
+            params![device_id, company_id, start],
+        ).is_ok();
+        if !inserted { return (0, 0, batch_size); }
+        (self.conn().last_insert_rowid(), start, batch_size)
+    }
+
+    /// Lote aberto do aparelho, sem criar linha (para telas de status).
+    pub fn peek_open_send_batch(&self, device_id: i32) -> Option<(i64, i64)> {
+        self.conn().query_row(
+            "SELECT BatchId, StartAttemptId FROM ESF_SendBatch WHERE DeviceId=?1 AND ClosedAt IS NULL ORDER BY BatchId DESC LIMIT 1",
+            params![device_id], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional().ok().flatten()
+    }
+
+    /// Progresso do lote derivado das tentativas persistidas desde a marca de corte.
+    pub fn batch_progress(&self, device_id: i32, start_attempt_id: i64) -> (i64, i64, i64) {
+        self.conn().query_row(
+            "SELECT coalesce(sum(CASE WHEN a.Outcome='enviado' THEN 1 ELSE 0 END),0),
+                    coalesce(sum(CASE WHEN a.Outcome='falhou' THEN 1 ELSE 0 END),0),
+                    coalesce(sum(CASE WHEN a.Outcome='iniciado' THEN 1 ELSE 0 END),0)
+             FROM ESF_ChipAttempt a JOIN ESF_Chip c ON c.ChipId=a.ChipId
+             WHERE c.DeviceId=?1 AND a.AttemptId>?2",
+            params![device_id, start_attempt_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        ).unwrap_or((0, 0, 0))
+    }
+
+    /// Fecha o lote com o balanço do momento e o resultado da verificação de rota.
+    pub fn close_send_batch(&self, batch_id: i64, egress_ip: &str, verification: &str) -> Result<(), String> {
+        let device_id: i32 = self.conn().query_row("SELECT DeviceId FROM ESF_SendBatch WHERE BatchId=?1", params![batch_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?.unwrap_or(0);
+        let start: i64 = self.conn().query_row("SELECT StartAttemptId FROM ESF_SendBatch WHERE BatchId=?1", params![batch_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?.unwrap_or(0);
+        let (confirmed, failed, uncertain) = self.batch_progress(device_id, start);
+        self.conn().execute(
+            "UPDATE ESF_SendBatch SET ClosedAt=datetime('now'), Confirmed=?1, Failed=?2, Uncertain=?3, EgressIp=?4, Verification=?5 WHERE BatchId=?6 AND ClosedAt IS NULL",
+            params![confirmed, failed, uncertain, egress_ip, verification, batch_id],
+        ).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Grava a verificação de rota. `phase` diz quando ela rodou: 'pre_lote' (antes de liberar
+    /// o lote seguinte), 'fim_lote' (no fechamento) ou 'manual' (botão da tela).
+    pub fn record_egress_check(&self, device_id: i32, observed_ip: &str, expected_ips: &str, mode: &str, applied_route: &str, phase: &str, result: &str, detail: &str) -> i64 {
+        let ok = self.conn().execute(
+            "INSERT INTO ESF_EgressCheck (DeviceId, ObservedIp, ExpectedIps, Mode, AppliedRoute, Phase, Result, Detail) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![device_id, observed_ip, expected_ips, mode, applied_route, phase, result, detail],
+        ).is_ok();
+        if ok { self.conn().last_insert_rowid() } else { 0 }
+    }
+
+    pub fn last_egress_check(&self, device_id: i32) -> Option<EgressCheckRow> {
+        self.conn().query_row(
+            "SELECT CheckId, CheckedAt, ObservedIp, ExpectedIps, Mode, AppliedRoute, Phase, Result, Detail
+             FROM ESF_EgressCheck WHERE DeviceId=?1 ORDER BY CheckId DESC LIMIT 1",
+            params![device_id],
+            |r| Ok(EgressCheckRow {
+                check_id: r.get(0)?, checked_at: r.get(1)?, observed_ip: r.get(2)?, expected_ips: r.get(3)?,
+                mode: r.get(4)?, applied_route: r.get(5)?, phase: r.get(6)?, result: r.get(7)?, detail: r.get(8)?,
+            }),
+        ).optional().ok().flatten()
+    }
+
+    /// Verificações ainda não enviadas ao hub VPS (o hub é o registro central da auditoria).
+    /// Nenhum dado de contato entra aqui: só aparelho, IP de saída, modo e veredito.
+    pub fn unreported_egress_checks(&self, limit: i64) -> Vec<(i64, i32, EgressCheckRow)> {
+        let conn = self.conn();
+        let mut stmt = match conn.prepare(
+            "SELECT CheckId, DeviceId, CheckedAt, ObservedIp, ExpectedIps, Mode, AppliedRoute, Phase, Result, Detail
+             FROM ESF_EgressCheck WHERE Reported=0 ORDER BY CheckId ASC LIMIT ?1",
+        ) { Ok(s) => s, Err(_) => return vec![] };
+        stmt.query_map(params![limit], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i32>(1)?, EgressCheckRow {
+            check_id: r.get(0)?, checked_at: r.get(2)?, observed_ip: r.get(3)?, expected_ips: r.get(4)?,
+            mode: r.get(5)?, applied_route: r.get(6)?, phase: r.get(7)?, result: r.get(8)?, detail: r.get(9)?,
+        }))).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
+    }
+
+    pub fn mark_egress_check_reported(&self, check_id: i64) {
+        let _ = self.conn().execute("UPDATE ESF_EgressCheck SET Reported=1 WHERE CheckId=?1", params![check_id]);
+    }
+
+    /// Histórico de verificações do aparelho, para a auditoria na tela.
+    pub fn recent_egress_checks(&self, device_id: i32, limit: i64) -> Vec<EgressCheckRow> {
+        let conn = self.conn();
+        let mut stmt = match conn.prepare(
+            "SELECT CheckId, CheckedAt, ObservedIp, ExpectedIps, Mode, AppliedRoute, Phase, Result, Detail
+             FROM ESF_EgressCheck WHERE DeviceId=?1 ORDER BY CheckId DESC LIMIT ?2",
+        ) { Ok(s) => s, Err(_) => return vec![] };
+        stmt.query_map(params![device_id, limit], |r| Ok(EgressCheckRow {
+            check_id: r.get(0)?, checked_at: r.get(1)?, observed_ip: r.get(2)?, expected_ips: r.get(3)?,
+            mode: r.get(4)?, applied_route: r.get(5)?, phase: r.get(6)?, result: r.get(7)?, detail: r.get(8)?,
+        })).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
+    }
+
+    /// Últimos lotes fechados do aparelho, para auditoria na tela.
+    pub fn recent_send_batches(&self, device_id: i32, limit: i64) -> Vec<SendBatchRow> {
+        let conn = self.conn();
+        let mut stmt = match conn.prepare(
+            "SELECT BatchId, StartAt, coalesce(ClosedAt,''), Confirmed, Failed, Uncertain, EgressIp, Verification, CompanyId
+             FROM ESF_SendBatch WHERE DeviceId=?1 ORDER BY BatchId DESC LIMIT ?2",
+        ) { Ok(s) => s, Err(_) => return vec![] };
+        stmt.query_map(params![device_id, limit], |r| Ok(SendBatchRow {
+            batch_id: r.get(0)?, started_at: r.get(1)?, closed_at: r.get(2)?,
+            confirmed: r.get(3)?, failed: r.get(4)?, uncertain: r.get(5)?,
+            egress_ip: r.get(6)?, verification: r.get(7)?, company_id: r.get(8)?,
+        })).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
     }
 
     pub fn update_chip_status(&self, chip_id: i32, status: &str) -> Result<(), String> {
@@ -2725,6 +3136,12 @@ impl Database {
     }
 
     pub fn import_contacts(&self, campaign_id: i32, contacts_list: Vec<(String, String)>) -> Result<(), String> {
+        self.import_contacts_with_documents(campaign_id, contacts_list.into_iter().map(|(n, p)| (n, p, String::new())).collect())
+    }
+
+    /// Importa (nome, telefone, CNPJ/documento). Documento vazio herda o que o mesmo número já
+    /// tinha nesta campanha: somar contatos reenvia a fila pendente sem o documento.
+    pub fn import_contacts_with_documents(&self, campaign_id: i32, contacts_list: Vec<(String, String, String)>) -> Result<(), String> {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| e.to_string())?;
         let result = (|| -> Result<()> {
@@ -2732,10 +3149,11 @@ impl Database {
                 "UPDATE ESF_Contact SET ExcluidoEm=datetime('now') WHERE CampaignId=?1 AND Status='pending' AND ExcluidoEm IS NULL;",
                 params![campaign_id],
             )?;
-            for (name, phone) in contacts_list {
+            for (name, phone, document) in contacts_list {
                 conn.execute(
-                    "INSERT INTO ESF_Contact (CampaignId, ContactName, Phone, Status) VALUES (?1, ?2, ?3, 'pending');",
-                    params![campaign_id, name, phone],
+                    "INSERT INTO ESF_Contact (CampaignId, ContactName, Phone, Status, Document) VALUES (?1, ?2, ?3, 'pending',
+                        coalesce(nullif(trim(?4),''), (SELECT Document FROM ESF_Contact WHERE CampaignId=?1 AND Phone=?3 AND Document<>'' ORDER BY ContactId DESC LIMIT 1), ''));",
+                    params![campaign_id, name, phone, document],
                 )?;
             }
             // Reimportação não ressuscita descadastrados: aplica a lista da empresa na hora.
@@ -2750,6 +3168,49 @@ impl Database {
             Ok(()) => conn.execute_batch("COMMIT;").map_err(|e| e.to_string()),
             Err(e) => { let _ = conn.execute_batch("ROLLBACK;"); Err(e.to_string()) }
         }
+    }
+
+    /// Texto exato que saiu para o contato (com o nome e a variação da IA), para o relatório.
+    pub fn set_sent_message(&self, contact_id: i32, message: &str) -> Result<(), String> {
+        self.exec_retry("UPDATE ESF_Contact SET SentMessage=?1 WHERE ContactId=?2;", params![message, contact_id])
+            .map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Relatório da campanha: enviados e quem recusou, com número, nome, CNPJ/documento e a
+    /// mensagem que saiu. "Recusou (pediu SAIR)" = recebeu e está no descadastro da empresa;
+    /// "Recusou antes do envio" = já estava descadastrado e não recebeu nada.
+    pub fn sent_report(&self, campaign_id: i32) -> Result<Vec<SentReportRow>, String> {
+        let conn = self.conn();
+        let company: i32 = conn.query_row("SELECT CompanyId FROM ESF_Campaign WHERE CampaignId=?1", params![campaign_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare("SELECT PhoneDigits, CreatedAt FROM ESF_OptOut WHERE CompanyId=?1").map_err(|e| e.to_string())?;
+        let refused: std::collections::HashMap<String, String> = stmt.query_map(params![company], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .map(|(digits, at)| (Self::opt_out_key(&digits), at))
+            .collect();
+        let mut stmt = conn.prepare(
+            "SELECT ContactName, Phone, coalesce(Document,''), coalesce(SentMessage,''), SentAt, Status FROM ESF_Contact
+             WHERE CampaignId=?1 AND Status IN ('sent','replied','opt_out') AND ExcluidoEm IS NULL ORDER BY SentAt, ContactId").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![campaign_id], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?, r.get::<_, String>(5)?,
+        ))).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (name, phone, document, message, sent_at, status) = row.map_err(|e| e.to_string())?;
+            let refused_at = refused.get(&Self::opt_out_key(&phone)).cloned();
+            let row = if status == "opt_out" {
+                // Bloqueado antes do envio: nada saiu (a data do status não é envio).
+                SentReportRow { name, phone, document, message: String::new(), sent_at: None, situation: "Recusou antes do envio".into(), refused_at }
+            } else if refused_at.is_some() {
+                SentReportRow { name, phone, document, message, sent_at, situation: "Recusou (pediu SAIR)".into(), refused_at }
+            } else {
+                SentReportRow { name, phone, document, message, sent_at, situation: "Enviado".into(), refused_at: None }
+            };
+            out.push(row);
+        }
+        Ok(out)
     }
 
     pub fn update_contact_status(&self, contact_id: i32, status: &str) -> Result<(), String> {
@@ -3611,6 +4072,44 @@ impl Database {
         Ok(())
     }
 
+    /// Guarda as versões de uma rodada da IA (uma por parte) para a versão `fingerprint` do texto
+    /// da campanha. Versão repetida não duplica.
+    pub fn save_ai_variants(&self, campaign_id: i32, fingerprint: u64, parts: &[String]) -> Result<(), String> {
+        let conn = self.conn();
+        let fingerprint = format!("{:016x}", fingerprint);
+        for (index, text) in parts.iter().enumerate() {
+            conn.execute(
+                "INSERT OR IGNORE INTO ESF_AiVariant (CampaignId, Fingerprint, PartIndex, Text) VALUES (?1, ?2, ?3, ?4)",
+                params![campaign_id, fingerprint, index as i64, text],
+            ).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Versões guardadas por parte, na ordem em que a IA as gerou, no máximo `per_part` por parte.
+    /// Vazio quando nada foi guardado para essa versão do texto da campanha.
+    pub fn load_ai_variants(&self, campaign_id: i32, fingerprint: u64, per_part: usize) -> Result<Vec<Vec<String>>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT PartIndex, Text FROM ESF_AiVariant WHERE CampaignId = ?1 AND Fingerprint = ?2 ORDER BY PartIndex, rowid",
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![campaign_id, format!("{:016x}", fingerprint)], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        }).map_err(|e| e.to_string())?;
+        let mut parts: Vec<Vec<String>> = Vec::new();
+        for row in rows {
+            let (index, text) = row.map_err(|e| e.to_string())?;
+            let index = index.max(0) as usize;
+            if parts.len() <= index {
+                parts.resize(index + 1, Vec::new());
+            }
+            if parts[index].len() < per_part {
+                parts[index].push(text);
+            }
+        }
+        Ok(parts)
+    }
+
     /// Aplica atualizacoes do hub somente enquanto a configuracao local coincide
     /// com a ultima versao importada. Edicoes ou remocoes locais prevalecem.
     pub fn sync_vps_ia_from_hub(&self, company_id: i32, incoming: Option<(&str, &str, &str)>) -> Result<bool, String> {
@@ -4409,6 +4908,40 @@ mod opt_out_event_tests {
 }
 
 #[cfg(test)]
+mod ai_variant_tests {
+    use super::Database;
+
+    fn temp_db(tag: &str) -> Database {
+        let path = std::env::temp_dir().join(format!("esfera_ai_variant_db_{}_{}.db", tag, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Database::init(path.to_string_lossy().as_ref()).expect("db")
+    }
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn variacoes_voltam_por_parte_e_so_da_mesma_versao_da_campanha() {
+        let db = temp_db("pool");
+        db.save_ai_variants(7, 0xabc, &v(&["Oi {nome}", "Corpo A"])).unwrap();
+        // Corpo repetido na segunda rodada não duplica.
+        db.save_ai_variants(7, 0xabc, &v(&["Olá {nome}", "Corpo A"])).unwrap();
+        // Texto da campanha editado (outra versão) e outra campanha ficam separados.
+        db.save_ai_variants(7, 0xdef, &v(&["Versão antiga", "Corpo antigo"])).unwrap();
+        db.save_ai_variants(8, 0xabc, &v(&["Outra campanha", "Corpo X"])).unwrap();
+
+        assert_eq!(
+            db.load_ai_variants(7, 0xabc, 12).unwrap(),
+            vec![v(&["Oi {nome}", "Olá {nome}"]), v(&["Corpo A"])]
+        );
+        // Teto por parte: fica com as primeiras, na ordem em que a IA gerou.
+        assert_eq!(db.load_ai_variants(7, 0xabc, 1).unwrap(), vec![v(&["Oi {nome}"]), v(&["Corpo A"])]);
+        assert!(db.load_ai_variants(9, 0xabc, 12).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
 mod opt_out_key_tests {
     use super::Database;
     #[test]
@@ -4955,5 +5488,436 @@ mod logs_tests {
         let saved = db.get_company_by_id(created.id).unwrap();
         assert_eq!((saved.name.as_str(), saved.device_limit, saved.user_limit), ("Com Limite", 3, 25));
         assert_eq!(db.get_company_by_id(db.create_company("Padrão", 2).unwrap().id).unwrap().user_limit, 10);
+    }
+}
+
+#[cfg(test)]
+mod linha_do_aparelho_tests {
+    use super::*;
+
+    fn db(nome: &str) -> Database {
+        let path = std::env::temp_dir().join(format!("esfera_linha_{}_{}.db", nome, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.conn().execute("INSERT INTO ESF_Device(AdbDeviceId,DeviceName,CompanyId) VALUES('linha1','Teste',1)", []).unwrap();
+        db
+    }
+
+    #[test]
+    fn aparelho_sem_chip_ganha_uma_linha_propria_e_sempre_a_mesma() {
+        let db = db("sem_chip");
+        let device = db.get_all_devices().into_iter().find(|d| d.serial == "linha1").unwrap();
+        let first = db.get_chips(device.id);
+        assert_eq!(first.len(), 1);
+        assert_eq!((first[0].status.as_str(), first[0].restricted_until.is_none()), ("livre", true));
+        assert_eq!(db.get_chips(device.id)[0].id, first[0].id);
+    }
+
+    #[test]
+    fn aparelho_com_varios_chips_antigos_usa_um_so() {
+        let db = db("varios");
+        let device = db.get_all_devices().into_iter().find(|d| d.serial == "linha1").unwrap();
+        db.add_chip(device.id, "11999990001", "A").unwrap();
+        let newest = db.add_chip(device.id, "11999990002", "B").unwrap();
+        let chips = db.get_chips(device.id);
+        assert_eq!(chips.len(), 1);
+        assert_eq!(chips[0].id, newest);
+    }
+
+    #[test]
+    fn linha_nova_ja_tem_o_limite_cheio_sem_aquecimento() {
+        let db = db("aquecido");
+        let device = db.get_all_devices().into_iter().find(|d| d.serial == "linha1").unwrap();
+        let chip = db.get_chips(device.id).remove(0);
+        // 15 tentativas espalhadas no dia (fora da última hora): antes travava no 1º dia.
+        for i in 0..15 {
+            db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Outcome,CreatedAt) VALUES(?1,1,1,?2,'enviado',?3)",
+                params![chip.id, format!("1199{:06}", i), sql_utc(chrono::Utc::now() - chrono::TimeDelta::minutes(61 + i))]).unwrap();
+        }
+        let (hora, dia, espera) = chip_limit_at(&db.conn(), &chip, chrono::Utc::now()).unwrap();
+        assert_eq!((hora, dia), (10, 60));
+        // Pode falhar só perto da meia-noite local (tentativas do dia anterior não contam).
+        assert_eq!(espera, 0);
+    }
+}
+
+#[cfg(test)]
+mod freio_retomada_tests {
+    use super::*;
+
+    #[test]
+    fn retomar_zera_o_freio_e_so_falhas_novas_voltam_a_travar() {
+        let path = std::env::temp_dir().join(format!("esfera_freio_retomada_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        let chip = Chip { id: 1, device_id: 1, phone_number: "".into(), chip_name: "".into(), status: "livre".into(), restricted_until: None, created_at: "2020-01-01 00:00:00".into() };
+        let add = |n: usize, outcome: &str| for i in 0..n {
+            db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Outcome,CreatedAt) VALUES(1,1,1,?1,?2,datetime('now','-2 days'))",
+                params![format!("1198{:03}{:04}", n, i), outcome]).unwrap();
+        };
+        add(6, "falhou");
+        add(14, "enviado");
+        assert!(db.reserve_chip_attempt(&chip, 1, 1, "11999990000", false).unwrap_err().contains("Freio automático"));
+        // O operador revisou e retomou: as tentativas antigas saem da conta.
+        db.reset_chip_brake(1).unwrap();
+        let id = db.reserve_chip_attempt(&chip, 1, 1, "11999990000", false).unwrap();
+        db.finish_chip_attempt(id, true).unwrap();
+        // Falhas novas demais voltam a acionar o freio.
+        db.conn().execute("DELETE FROM ESF_ChipCooldown", []).unwrap();
+        for i in 0..20 {
+            db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Outcome,CreatedAt) VALUES(1,1,1,?1,?2,datetime('now','-2 days'))",
+                params![format!("1197{:06}", i), if i < 5 { "falhou" } else { "enviado" }]).unwrap();
+        }
+        assert!(db.reserve_chip_attempt(&chip, 1, 1, "11999990000", false).unwrap_err().contains("Freio automático"));
+    }
+}
+
+#[cfg(test)]
+mod relatorio_envios_tests {
+    use super::*;
+
+    #[test]
+    fn relatorio_tem_numero_nome_cnpj_e_mensagem_so_dos_enviados() {
+        let path = std::env::temp_dir().join(format!("esfera_relatorio_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId,Status) VALUES('C','Oi',1,'paused')", []).unwrap();
+        let campaign: i32 = db.conn().query_row("SELECT max(CampaignId) FROM ESF_Campaign", [], |r| r.get(0)).unwrap();
+        db.import_contacts_with_documents(campaign, vec![
+            ("Ana".into(), "11999990001".into(), "12.345.678/0001-90".into()),
+            ("Bia".into(), "11999990002".into(), "".into()),
+        ]).unwrap();
+        // Reimportar somando (a fila pendente volta sem documento) não perde o CNPJ já lido.
+        db.import_contacts(campaign, vec![("Ana".into(), "11999990001".into()), ("Bia".into(), "11999990002".into())]).unwrap();
+        let ana = db.get_contacts(campaign).into_iter().find(|c| c.phone == "11999990001").unwrap();
+        db.complete_send_now("11999990001", campaign, ana.id).unwrap();
+        db.set_sent_message(ana.id, "Oi Ana, tudo bem?\n\nCorpo.").unwrap();
+        let rows = db.sent_report(campaign).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].name.as_str(), rows[0].phone.as_str(), rows[0].document.as_str(), rows[0].message.as_str()),
+            ("Ana", "11999990001", "12.345.678/0001-90", "Oi Ana, tudo bem?\n\nCorpo."));
+        assert!(rows[0].sent_at.is_some());
+        assert_eq!((rows[0].situation.as_str(), rows[0].refused_at.is_none()), ("Enviado", true));
+    }
+
+    #[test]
+    fn relatorio_separa_enviados_de_quem_recusou() {
+        let path = std::env::temp_dir().join(format!("esfera_relatorio_recusa_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId,Status) VALUES('C','Oi',1,'paused')", []).unwrap();
+        let campaign: i32 = db.conn().query_row("SELECT max(CampaignId) FROM ESF_Campaign", [], |r| r.get(0)).unwrap();
+        // Carla já tinha pedido SAIR antes: entra como descadastrada e não recebe nada.
+        db.add_opt_out(1, "11999990003", "SAIR").unwrap();
+        db.import_contacts(campaign, vec![("Ana".into(), "11999990001".into()), ("Bia".into(), "5511999990002".into()), ("Carla".into(), "11999990003".into())]).unwrap();
+        for c in db.get_contacts(campaign).into_iter().filter(|c| c.status == "pending") {
+            db.complete_send_now(&c.phone, campaign, c.id).unwrap();
+            db.set_sent_message(c.id, &format!("Oi {}", c.contact_name)).unwrap();
+        }
+        // Bia recebeu e respondeu SAIR depois (o número vem em outro formato).
+        db.add_opt_out(1, "(11) 99999-0002", "SAIR").unwrap();
+        let rows = db.sent_report(campaign).unwrap();
+        let get = |name: &str| rows.iter().find(|r| r.name == name).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(get("Ana").situation, "Enviado");
+        assert_eq!((get("Bia").situation.as_str(), get("Bia").message.as_str()), ("Recusou (pediu SAIR)", "Oi Bia"));
+        assert!(get("Bia").refused_at.is_some());
+        assert_eq!((get("Carla").situation.as_str(), get("Carla").message.as_str()), ("Recusou antes do envio", ""));
+    }
+}
+
+#[cfg(test)]
+mod teto_por_envios_tests {
+    use super::*;
+
+    #[test]
+    fn teto_da_rede_conta_envios_e_nao_tentativas_que_falharam() {
+        let path = std::env::temp_dir().join(format!("esfera_teto_envios_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.set_network_limits(4, 100).unwrap();
+        let add = |outcome: &str, extra: i64| {
+            db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Outcome,CreatedAt) VALUES(1,1,1,'1199999999',?1,datetime('now','-10 minutes'))", params![outcome]).unwrap();
+            let id = db.conn().last_insert_rowid();
+            if extra > 0 {
+                db.conn().execute("INSERT INTO ESF_NetworkExtra(AttemptId,Extra,CreatedAt) VALUES(?1,?2,datetime('now','-10 minutes'))", params![id, extra]).unwrap();
+            }
+        };
+        // Muitas falhas (com as partes que não saíram) não ocupam o teto.
+        for _ in 0..10 { add("falhou", 3); }
+        assert_eq!(db.network_limit_wait().unwrap(), 0);
+        // Um envio de 4 partes enche o teto de 4 por hora.
+        add("enviado", 3);
+        assert!(db.network_limit_wait().unwrap() > 0);
+        let status = db.network_status(None).unwrap();
+        assert_eq!(status.attempts_last_hour, 4);
+    }
+
+    #[test]
+    fn envio_em_andamento_ocupa_o_teto_ate_terminar() {
+        let path = std::env::temp_dir().join(format!("esfera_teto_andamento_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.set_network_limits(1, 100).unwrap();
+        db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits) VALUES(1,1,1,'1199999999')", []).unwrap();
+        let id = db.conn().last_insert_rowid();
+        // Outro aparelho não pode passar do teto enquanto este envio está saindo.
+        assert!(db.network_limit_wait().unwrap() > 0);
+        // Falhou: a vaga volta.
+        db.finish_chip_attempt(id, false).unwrap();
+        assert_eq!(db.network_limit_wait().unwrap(), 0);
+    }
+}
+
+// ============================================================
+// Histórico do WhatsApp do disparo -> Konfiansa (registro de prova)
+// ============================================================
+
+/// Mensagem da Evolution guardada para o histórico (só de contatos disparados pelo Esfera).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaMessageRow {
+    pub msg_id: String,
+    pub ts: i64,
+    pub phone_key: String,
+    pub phone: String,
+    pub from_me: bool,
+    pub push_name: String,
+    pub text: String,
+    pub campaign_id: i32,
+}
+
+/// Uma conversa enviada (ou a enviar) ao Konfiansa e o que aconteceu com ela.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KonfiansaHistoryRow {
+    pub history_id: i64,
+    pub phone_key: String,
+    pub phone: String,
+    pub campaign_id: i32,
+    /// "silencio" (1 h sem mensagens) ou "recusa" (pediu SAIR).
+    pub motivo: String,
+    pub first_ts: i64,
+    pub last_ts: i64,
+    pub mensagens: i64,
+    pub texto: String,
+    /// pendente | gravado | erro | sem_processo
+    pub status: String,
+    /// "CodProcesso#CodHistorico" separados por ";".
+    pub processos: String,
+    pub erro: String,
+    pub tentativas: i64,
+    pub created_at: String,
+    pub gravado_em: Option<String>,
+}
+
+/// Contato já disparado: campanha mais recente, nome, telefone e primeiro envio (unix).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DispatchedContact {
+    pub campaign_id: i32,
+    pub name: String,
+    pub phone: String,
+    pub first_sent_ts: i64,
+}
+
+const KONFIANSA_HISTORY_COLS: &str = "HistoryId,PhoneKey,Phone,CampaignId,Motivo,FirstTs,LastTs,Mensagens,Texto,Status,Processos,Erro,Tentativas,CreatedAt,GravadoEm";
+
+impl Database {
+    pub fn evo_cursor(&self) -> Option<i64> {
+        self.conn().query_row("SELECT LastTs FROM ESF_EvoCursor WHERE Id=1", [], |r| r.get(0)).ok()
+    }
+
+    pub fn set_evo_cursor(&self, ts: i64) -> Result<(), String> {
+        self.conn().execute("INSERT INTO ESF_EvoCursor(Id,LastTs) VALUES(1,?1) ON CONFLICT(Id) DO UPDATE SET LastTs=excluded.LastTs", params![ts])
+            .map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Contatos que o Esfera de fato enviou, pela chave do telefone (DDD + 8 dígitos).
+    pub fn dispatched_contacts(&self) -> Result<std::collections::HashMap<String, DispatchedContact>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT CampaignId, ContactName, Phone, CAST(strftime('%s', SentAt) AS INTEGER) FROM ESF_Contact
+             WHERE ExcluidoEm IS NULL AND SentAt IS NOT NULL AND Status IN ('sent','replied','partial') ORDER BY SentAt").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))
+            .map_err(|e| e.to_string())?;
+        let mut map: std::collections::HashMap<String, DispatchedContact> = std::collections::HashMap::new();
+        for row in rows {
+            let (campaign_id, name, phone, ts) = row.map_err(|e| e.to_string())?;
+            let key = Self::opt_out_key(&phone);
+            if key.len() < 10 { continue; }
+            // Ordenado por envio: vale a campanha mais recente; o primeiro envio é o mais antigo.
+            let first = map.get(&key).map(|c| c.first_sent_ts).unwrap_or(ts);
+            map.insert(key, DispatchedContact { campaign_id, name, phone, first_sent_ts: first.min(ts) });
+        }
+        Ok(map)
+    }
+
+    /// Guarda as mensagens (a mesma mensagem nunca entra duas vezes). Devolve quantas eram novas.
+    pub fn store_wa_messages(&self, msgs: &[WaMessageRow]) -> Result<usize, String> {
+        let conn = self.conn();
+        let mut n = 0;
+        for m in msgs {
+            n += conn.execute(
+                "INSERT OR IGNORE INTO ESF_WaMessage(MsgId,Ts,PhoneKey,Phone,FromMe,PushName,Text,CampaignId) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![m.msg_id, m.ts, m.phone_key, m.phone, m.from_me, m.push_name, m.text, m.campaign_id]).map_err(|e| e.to_string())?;
+        }
+        Ok(n)
+    }
+
+    /// Conversas com mensagens ainda fora de um histórico: (chave, telefone, campanha, 1ª, última, quantidade).
+    pub fn open_wa_conversations(&self) -> Result<Vec<(String, String, i32, i64, i64, i64)>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT PhoneKey, max(Phone), max(CampaignId), min(Ts), max(Ts), count(*) FROM ESF_WaMessage
+             WHERE HistoryId IS NULL GROUP BY PhoneKey").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>>>().map_err(|e| e.to_string())
+    }
+
+    /// O número pediu SAIR depois de `since_ts` (unix)?
+    pub fn opted_out_since(&self, phone_key: &str, since_ts: i64) -> bool {
+        self.conn().query_row(
+            "SELECT 1 FROM ESF_OptOut WHERE PhoneDigits=?1 AND CAST(strftime('%s', CreatedAt) AS INTEGER) >= ?2 LIMIT 1",
+            params![phone_key, since_ts], |_| Ok(())).is_ok()
+    }
+
+    pub fn open_wa_messages(&self, phone_key: &str) -> Result<Vec<WaMessageRow>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT MsgId,Ts,PhoneKey,Phone,FromMe,PushName,Text,CampaignId FROM ESF_WaMessage
+             WHERE PhoneKey=?1 AND HistoryId IS NULL ORDER BY Ts, MsgId").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![phone_key], |r| Ok(WaMessageRow {
+            msg_id: r.get(0)?, ts: r.get(1)?, phone_key: r.get(2)?, phone: r.get(3)?, from_me: r.get(4)?,
+            push_name: r.get(5)?, text: r.get(6)?, campaign_id: r.get(7)?,
+        })).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>>>().map_err(|e| e.to_string())
+    }
+
+    /// Fecha a conversa num histórico pendente e liga a ele exatamente estas mensagens.
+    pub fn create_konfiansa_history(&self, msgs: &[WaMessageRow], motivo: &str, texto: &str) -> Result<i64, String> {
+        let first = msgs.first().ok_or("conversa sem mensagens")?;
+        let last = msgs.last().unwrap();
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<i64> {
+            conn.execute(
+                "INSERT INTO ESF_KonfiansaHistory(PhoneKey,Phone,CampaignId,Motivo,FirstTs,LastTs,Mensagens,Texto) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![first.phone_key, first.phone, last.campaign_id, motivo, first.ts, last.ts, msgs.len() as i64, texto])?;
+            let id = conn.last_insert_rowid();
+            for m in msgs {
+                conn.execute("UPDATE ESF_WaMessage SET HistoryId=?1 WHERE MsgId=?2 AND HistoryId IS NULL", params![id, m.msg_id])?;
+            }
+            Ok(id)
+        })();
+        match result {
+            Ok(id) => { conn.execute_batch("COMMIT").map_err(|e| e.to_string())?; Ok(id) }
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK"); Err(e.to_string()) }
+        }
+    }
+
+    fn konfiansa_history_rows(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<KonfiansaHistoryRow>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params, |r| Ok(KonfiansaHistoryRow {
+            history_id: r.get(0)?, phone_key: r.get(1)?, phone: r.get(2)?, campaign_id: r.get(3)?, motivo: r.get(4)?,
+            first_ts: r.get(5)?, last_ts: r.get(6)?, mensagens: r.get(7)?, texto: r.get(8)?, status: r.get(9)?,
+            processos: r.get(10)?, erro: r.get(11)?, tentativas: r.get(12)?, created_at: r.get(13)?, gravado_em: r.get(14)?,
+        })).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>>>().map_err(|e| e.to_string())
+    }
+
+    /// Históricos a gravar agora: pendentes e erros cuja nova tentativa já venceu.
+    pub fn konfiansa_histories_due(&self) -> Result<Vec<KonfiansaHistoryRow>, String> {
+        self.konfiansa_history_rows(&format!(
+            "SELECT {} FROM ESF_KonfiansaHistory WHERE Status IN ('pendente','erro') AND Tentativas < 20
+             AND (ProximaTentativa IS NULL OR ProximaTentativa <= datetime('now')) ORDER BY HistoryId LIMIT 20", KONFIANSA_HISTORY_COLS), &[])
+    }
+
+    pub fn list_konfiansa_histories(&self, limit: i64) -> Result<Vec<KonfiansaHistoryRow>, String> {
+        self.konfiansa_history_rows(&format!("SELECT {} FROM ESF_KonfiansaHistory ORDER BY HistoryId DESC LIMIT ?1", KONFIANSA_HISTORY_COLS), &[&limit])
+    }
+
+    /// Resultado da gravação. Erro volta a tentar com espera crescente (2, 4, 8... até 60 min).
+    pub fn finish_konfiansa_history(&self, id: i64, status: &str, processos: &str, erro: &str) -> Result<(), String> {
+        let erro: String = erro.chars().take(1000).collect();
+        let sql = if status == "erro" {
+            "UPDATE ESF_KonfiansaHistory SET Status=?2, Processos=?3, Erro=?4, Tentativas=Tentativas+1,
+               ProximaTentativa=datetime('now', '+' || min(60, 2 << min(Tentativas, 5)) || ' minutes') WHERE HistoryId=?1"
+        } else {
+            "UPDATE ESF_KonfiansaHistory SET Status=?2, Processos=?3, Erro=?4, Tentativas=Tentativas+1, ProximaTentativa=NULL,
+               GravadoEm=CASE WHEN ?2='gravado' THEN datetime('now') ELSE GravadoEm END WHERE HistoryId=?1"
+        };
+        self.conn().execute(sql, params![id, status, processos, erro]).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    pub fn campaign_konfiansa_credor(&self, campaign_id: i32) -> i32 {
+        self.conn().query_row("SELECT KonfiansaCredor FROM ESF_Campaign WHERE CampaignId=?1", params![campaign_id], |r| r.get(0)).unwrap_or(0)
+    }
+
+    pub fn set_campaign_konfiansa_credor(&self, campaign_id: i32, credor: i32) -> Result<(), String> {
+        self.conn().execute("UPDATE ESF_Campaign SET KonfiansaCredor=?2 WHERE CampaignId=?1", params![campaign_id, credor])
+            .map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Telefones já enviados da campanha (amostra para descobrir o credor no Konfiansa).
+    pub fn campaign_sent_phones(&self, campaign_id: i32, limit: i64) -> Vec<String> {
+        let conn = self.conn();
+        let Ok(mut stmt) = conn.prepare("SELECT Phone FROM ESF_Contact WHERE CampaignId=?1 AND ExcluidoEm IS NULL AND Status IN ('sent','replied','partial') ORDER BY SentAt DESC LIMIT ?2") else { return vec![]; };
+        stmt.query_map(params![campaign_id, limit], |r| r.get::<_, String>(0)).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod historico_konfiansa_db_tests {
+    use super::*;
+
+    fn msg(id: &str, ts: i64, from_me: bool, text: &str) -> WaMessageRow {
+        WaMessageRow { msg_id: id.into(), ts, phone_key: "1191703561".into(), phone: "5511991703561".into(), from_me,
+            push_name: if from_me { "Realess".into() } else { "Mel".into() }, text: text.into(), campaign_id: 16 }
+    }
+
+    #[test]
+    fn mensagens_sem_duplicar_e_historico_com_prova() {
+        let path = std::env::temp_dir().join(format!("esfera_hist_konf_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(db.store_wa_messages(&[msg("a", 100, true, "Oi"), msg("b", 160, false, "Olá")]).unwrap(), 2);
+        assert_eq!(db.store_wa_messages(&[msg("a", 100, true, "Oi")]).unwrap(), 0);
+        let open = db.open_wa_conversations().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!((open[0].3, open[0].4, open[0].5), (100, 160, 2));
+        let msgs = db.open_wa_messages("1191703561").unwrap();
+        let id = db.create_konfiansa_history(&msgs, "silencio", "texto").unwrap();
+        assert!(db.open_wa_conversations().unwrap().is_empty());
+        assert_eq!(db.konfiansa_histories_due().unwrap().len(), 1);
+        db.finish_konfiansa_history(id, "erro", "", "Konfiansa fora do ar").unwrap();
+        // Erro espera a próxima tentativa; não volta na hora.
+        assert!(db.konfiansa_histories_due().unwrap().is_empty());
+        db.finish_konfiansa_history(id, "gravado", "2600064762#6", "").unwrap();
+        let row = &db.list_konfiansa_histories(10).unwrap()[0];
+        assert_eq!((row.status.as_str(), row.processos.as_str(), row.tentativas), ("gravado", "2600064762#6", 2));
+        assert!(row.gravado_em.is_some());
+        // Mensagem nova depois do histórico abre outra conversa.
+        db.store_wa_messages(&[msg("c", 9000, false, "Ok")]).unwrap();
+        assert_eq!(db.open_wa_messages("1191703561").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn contatos_disparados_pela_chave_do_telefone() {
+        let path = std::env::temp_dir().join(format!("esfera_hist_disp_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId,Status) VALUES('C','Oi',1,'running')", []).unwrap();
+        let c: i32 = db.conn().query_row("SELECT max(CampaignId) FROM ESF_Campaign", [], |r| r.get(0)).unwrap();
+        db.import_contacts(c, vec![("Ana".into(), "+5511991703561".into()), ("Bia".into(), "+5511999990002".into())]).unwrap();
+        let ana = db.get_contacts(c).into_iter().find(|x| x.contact_name == "Ana").unwrap();
+        db.complete_send_now(&ana.phone, c, ana.id).unwrap();
+        let map = db.dispatched_contacts().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["1191703561"].name, "Ana");
+        db.add_opt_out(1, "11991703561", "SAIR").unwrap();
+        assert!(db.opted_out_since("1191703561", 0));
+        assert!(!db.opted_out_since("1191703561", i64::MAX));
+        db.set_campaign_konfiansa_credor(c, 598).unwrap();
+        assert_eq!(db.campaign_konfiansa_credor(c), 598);
     }
 }

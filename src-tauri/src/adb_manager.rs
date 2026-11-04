@@ -706,6 +706,9 @@ pub struct IdentityProbe {
 
 impl AdbManager {
     pub const DEFAULT_WHATSAPP_PACKAGE: &'static str = "com.whatsapp";
+    pub const BUSINESS_WHATSAPP_PACKAGE: &'static str = "com.whatsapp.w4b";
+    /// Apps por onde o disparo pode sair: o envio segue o que estiver aberto no aparelho.
+    pub const WHATSAPP_PACKAGES: [&'static str; 2] = [Self::DEFAULT_WHATSAPP_PACKAGE, Self::BUSINESS_WHATSAPP_PACKAGE];
     #[allow(dead_code)]
     pub const ESFERA_TEMP_CONTACT_ACCOUNT_NAME: &'static str = "esfera_temp";
     #[allow(dead_code)]
@@ -4408,9 +4411,11 @@ impl AdbManager {
         package: Option<&str>,
         should_continue: &dyn Fn() -> bool,
     ) -> Result<(), String> {
-        let pkg = package.unwrap_or(Self::DEFAULT_WHATSAPP_PACKAGE);
-        if pkg != Self::DEFAULT_WHATSAPP_PACKAGE {
-            return Err("Envio permitido somente no WhatsApp oficial (com.whatsapp)".into());
+        // Pacote explícito só pode ser um dos WhatsApp; sem pacote, segue o que estiver aberto.
+        if let Some(p) = package {
+            if !Self::WHATSAPP_PACKAGES.contains(&p) {
+                return Err("Envio permitido somente no WhatsApp (com.whatsapp ou com.whatsapp.w4b)".into());
+            }
         }
         let digits = Self::normalize_target_phone(phone);
         if digits.len() < 8 {
@@ -4420,6 +4425,7 @@ impl AdbManager {
             return Err("Mensagem vazia".to_string());
         }
         let tail = digits[digits.len() - 8..].to_string();
+        let pkg = package.unwrap_or_else(|| Self::active_whatsapp(serial));
 
         let (screen_w, screen_h) = {
             let (w, h) = Self::get_device_screen_size(serial);
@@ -4430,13 +4436,14 @@ impl AdbManager {
         //    lista (o 1º "voltar" às vezes só fecha o teclado); nunca sai do WhatsApp.
         for _ in 0..4 {
             let focus_raw = Self::wa_focus(serial);
-            if focus_raw.contains(pkg) && Self::shows_restricted_account(&Self::ui_dump(serial)) {
+            let in_app = Self::focus_in(&focus_raw, pkg);
+            if in_app && Self::shows_restricted_account(&Self::ui_dump(serial)) {
                 return Err("CONTA_RESTRITA: WhatsApp indica conta restrita ou banida".to_string());
             }
-            if focus_raw.contains(pkg) && focus_raw.contains("HomeActivity") {
+            if in_app && focus_raw.contains("HomeActivity") {
                 break;
             }
-            if !focus_raw.contains(pkg) {
+            if !in_app {
                 let bring_fg = format!("monkey -p {} -c android.intent.category.LAUNCHER 1", pkg);
                 let _ = Self::execute_shell(serial, &bring_fg, 3);
                 let d = Self::calculate_gaussian_delay(500, 800);
@@ -4503,7 +4510,7 @@ impl AdbManager {
 
     /// Abre somente o número no pacote autorizado; o texto sempre é digitado.
     fn wa_open_link(serial: &str, pkg: &str, digits: &str) -> Result<(), String> {
-        if pkg != Self::DEFAULT_WHATSAPP_PACKAGE { return Err("Use somente com.whatsapp para o envio".into()); }
+        if !Self::WHATSAPP_PACKAGES.contains(&pkg) { return Err("Use somente o WhatsApp (normal ou Business) para o envio".into()); }
         let url = format!("https://api.whatsapp.com/send?phone={}", digits);
         let cmd = format!(
             "am start -a android.intent.action.VIEW -p {} -d '{}'",
@@ -4711,8 +4718,8 @@ impl AdbManager {
         // Se a leitura veio sem o campo ou sem o botão (tela em transição), relê uma vez.
         let ready = |xml: &str| {
             let nodes = Self::ui_nodes(xml);
-            nodes.iter().any(|n| Self::whatsapp_node(n) && n.rid == "com.whatsapp:id/entry")
-                && nodes.iter().any(|n| Self::whatsapp_node(n) && n.rid == "com.whatsapp:id/send" && n.enabled && n.cx > 0 && n.cy > 0)
+            nodes.iter().any(|n| Self::whatsapp_node(n) && Self::wa_rid(n, "entry"))
+                && nodes.iter().any(|n| Self::whatsapp_node(n) && Self::wa_rid(n, "send") && n.enabled && n.cx > 0 && n.cy > 0)
         };
         let mut before = Self::ui_dump(serial);
         if !ready(&before) {
@@ -4722,14 +4729,14 @@ impl AdbManager {
         }
         Self::verify_chat_identity(&before, digits)?;
         let nodes = Self::ui_nodes(&before);
-        let draft = nodes.iter().find(|n| Self::whatsapp_node(n) && n.rid == "com.whatsapp:id/entry")
+        let draft = nodes.iter().find(|n| Self::whatsapp_node(n) && Self::wa_rid(n, "entry"))
             .ok_or("O campo da mensagem não está disponível; envio cancelado")?;
         let confirmation = text == crate::dispatcher::OPT_OUT_CONFIRMATION_TEXT;
         if (confirmation && Self::decode_xml_numeric(&draft.text) != text)
             || (!confirmation && !Self::same_text(&draft.text, text)) {
             return Err("O texto no campo não confere com a mensagem; envio cancelado".into());
         }
-        let button = nodes.iter().find(|n| Self::whatsapp_node(n) && n.rid == "com.whatsapp:id/send"
+        let button = nodes.iter().find(|n| Self::whatsapp_node(n) && Self::wa_rid(n, "send")
             && n.enabled && n.cx > 0 && n.cy > 0)
             .ok_or("O botão Enviar não está disponível; envio cancelado")?;
         if !should_continue() { return Err("CANCELADO: descadastro ou campanha interrompida antes de enviar".into()); }
@@ -4910,6 +4917,35 @@ impl AdbManager {
         Self::execute_shell(serial, "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'", 3).unwrap_or_default()
     }
 
+    /// O app está em primeiro plano. Compara "pacote/" porque "com.whatsapp" é prefixo de
+    /// "com.whatsapp.w4b" (as atividades do Business também se chamam com.whatsapp.*).
+    fn focus_in(focus: &str, pkg: &str) -> bool {
+        focus.contains(&format!("{}/", pkg))
+    }
+
+    /// Qual WhatsApp (normal ou Business) está em primeiro plano, se algum.
+    fn whatsapp_in_focus(focus: &str) -> Option<&'static str> {
+        [Self::BUSINESS_WHATSAPP_PACKAGE, Self::DEFAULT_WHATSAPP_PACKAGE].into_iter().find(|p| Self::focus_in(focus, p))
+    }
+
+    /// WhatsApp do disparo neste aparelho: o que está aberto agora; sem nenhum na tela, o último
+    /// visto aberto nele; sem histórico, o normal. Na primeira vez que o Business aparece, garante
+    /// que ele leia a agenda (os contatos temporários "Esfera <número>" são achados pela busca).
+    pub fn active_whatsapp(serial: &str) -> &'static str {
+        static LAST: std::sync::LazyLock<std::sync::Mutex<HashMap<String, &'static str>>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+        let seen = Self::whatsapp_in_focus(&Self::wa_focus(serial));
+        let Some(pkg) = seen else {
+            return LAST.lock().unwrap_or_else(|e| e.into_inner()).get(serial).copied().unwrap_or(Self::DEFAULT_WHATSAPP_PACKAGE);
+        };
+        let changed = LAST.lock().unwrap_or_else(|e| e.into_inner()).insert(serial.to_string(), pkg) != Some(pkg);
+        if changed {
+            println!("[ENVIO] {} usa o {} (aberto na tela)", serial, pkg);
+            Self::grant_whatsapp_contact_permissions(serial, pkg);
+        }
+        pkg
+    }
+
     /// Lê a árvore de UI da tela atual. Caminho rápido: serviço de acessibilidade do agente
     /// (mesmo XML do uiautomator, em fração de segundo). Reserva: `uiautomator dump`, que leva
     /// ~5 s em aparelhos fracos. Se o agente falhar, fica 60 s sem tentá-lo naquele aparelho.
@@ -5041,9 +5077,15 @@ impl AdbManager {
         nodes
     }
 
+    /// Nó visível do WhatsApp normal ou do Business (só um deles está na tela por vez).
     fn whatsapp_node(n: &UiNode) -> bool {
-        n.visible && (n.package == Self::DEFAULT_WHATSAPP_PACKAGE
-            || (n.package.is_empty() && n.rid.starts_with("com.whatsapp:id/")))
+        n.visible && Self::WHATSAPP_PACKAGES.iter().any(|p| n.package == *p
+            || (n.package.is_empty() && n.rid.starts_with(&format!("{}:id/", p))))
+    }
+
+    /// O nó tem o id `<pacote>:id/<id>` de um dos WhatsApp.
+    fn wa_rid(n: &UiNode, id: &str) -> bool {
+        Self::WHATSAPP_PACKAGES.iter().any(|p| n.rid.strip_prefix(p).and_then(|r| r.strip_prefix(":id/")) == Some(id))
     }
 
     /// Tira os caracteres invisíveis de formatação (Unicode Cf: marcas de direção U+200E/U+202A/
@@ -5081,7 +5123,7 @@ impl AdbManager {
         let wanted = crate::db::Database::opt_out_key(phone);
         let other = nodes.iter()
             .filter(|n| Self::whatsapp_node(n) &&
-                ["com.whatsapp:id/conversation_contact_name", "com.whatsapp:id/conversation_name"].contains(&n.rid.as_str()))
+                (Self::wa_rid(n, "conversation_contact_name") || Self::wa_rid(n, "conversation_name")))
             .filter_map(|n| Self::header_number(&n.text))
             .any(|digits| crate::db::Database::opt_out_key(&digits) != wanted);
         if other { return Err("Envio cancelado: o número da conversa não confere com o destinatário".into()); }
@@ -5133,7 +5175,7 @@ impl AdbManager {
         let mut cursor = nodes[index].parent;
         while let Some(a) = cursor {
             if Self::is_list(&nodes[a]) { break; }
-            let bubbles = nodes.iter().enumerate().filter(|(i, n)| n.rid == "com.whatsapp:id/message_text" && inside(*i, a)).count();
+            let bubbles = nodes.iter().enumerate().filter(|(i, n)| Self::wa_rid(n, "message_text") && inside(*i, a)).count();
             if bubbles > 1 { break; }
             if let Some((_, status)) = nodes.iter().enumerate()
                 .find(|(i, n)| Self::whatsapp_node(n) && n.rid.ends_with("/status") && inside(*i, a)) {
@@ -5160,7 +5202,7 @@ impl AdbManager {
     /// Bolhas de texto da conversa, de cima para baixo (a última é a mais recente).
     fn message_bubbles(nodes: &[UiNode]) -> Vec<usize> {
         let mut list: Vec<usize> = nodes.iter().enumerate()
-            .filter(|(_, n)| Self::whatsapp_node(n) && n.rid == "com.whatsapp:id/message_text").map(|(i, _)| i).collect();
+            .filter(|(_, n)| Self::whatsapp_node(n) && Self::wa_rid(n, "message_text")).map(|(i, _)| i).collect();
         list.sort_by_key(|i| nodes[*i].cy);
         list
     }
@@ -5182,7 +5224,7 @@ impl AdbManager {
         let nodes = Self::ui_nodes(after);
         if nodes.is_empty() { return SendCheck::Unreadable; }
         if Self::verify_chat_identity(after, phone).is_err() { return SendCheck::WrongChat; }
-        let Some(entry) = nodes.iter().find(|n| Self::whatsapp_node(n) && n.rid == "com.whatsapp:id/entry") else {
+        let Some(entry) = nodes.iter().find(|n| Self::whatsapp_node(n) && Self::wa_rid(n, "entry")) else {
             return SendCheck::Unreadable;
         };
         let bubble = Self::new_bubble_status(before, after, text);
@@ -5423,6 +5465,143 @@ impl AdbManager {
         Self::cleanup_all_temporary_contacts(serial)
     }
 
+    /// Executa um comando shell no aparelho e devolve a saída padrão como texto.
+    /// Usa o túnel nativo para seriais esfera-agent e o adb binário nos demais.
+    fn run_device_shell(serial: &str, cmd: &str) -> Result<String, String> {
+        if Self::use_native_adb(serial) {
+            let (out, _err, ok) = crate::adb_tcp::exec_shell_bytes(serial, cmd)?;
+            if !ok { return Err("comando shell falhou no aparelho".to_string()); }
+            Ok(String::from_utf8_lossy(&out).to_string())
+        } else {
+            let mut c = create_cmd("adb");
+            c.args(["-s", serial, "shell"]).arg(cmd);
+            let o = run_cmd_timeout(c, Duration::from_secs(15))?;
+            if !o.status.success() {
+                return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
+            }
+            Ok(String::from_utf8_lossy(&o.stdout).to_string())
+        }
+    }
+
+    /// Fontes EXTERNAS e independentes de consulta de IP público. Independentes de
+    /// propósito: o hub da própria rota não serve como fonte, porque atrás da VPN ele
+    /// veria o endereço interno do túnel, não a saída real. O servidor local
+    /// (127.0.0.1 via adb reverse) veria só o IP de LAN.
+    ///
+    /// Nenhum dado do negócio vai nessas consultas: é um GET sem parâmetros, sem
+    /// telefone, sem contato e sem credencial.
+    pub fn egress_target_urls() -> Vec<String> {
+        vec![
+            "https://api.ipify.org".to_string(),
+            "https://ifconfig.me/ip".to_string(),
+            "https://icanhazip.com".to_string(),
+        ]
+    }
+
+    /// Lê o IP público de DENTRO do aparelho — a única prova da rota real.
+    /// toybox wget cobre os Android recentes; curl é o fallback. Um alvo por vez:
+    /// o primeiro que responder um IP vale.
+    pub fn probe_device_egress_ip(serial: &str) -> Result<String, String> {
+        let serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
+        let mut last_err = String::from("nenhum endpoint de egresso respondeu");
+        for url in Self::egress_target_urls() {
+            let cmd = format!(
+                "toybox wget -T 8 -q -O - {q} 2>/dev/null || curl -s -m 8 {q}",
+                q = Self::shell_quote(&url)
+            );
+            match Self::run_device_shell(&serial, &cmd) {
+                Ok(out) => {
+                    let ip = out.lines().map(str::trim).find(|l| crate::network_manager::looks_like_ip(l)).unwrap_or("").to_string();
+                    if !ip.is_empty() { return Ok(ip); }
+                    last_err = format!("{} respondeu algo que não é um IP", url);
+                }
+                Err(e) => last_err = format!("{}: {}", url, e),
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Lê um ajuste global do Android, tratando o literal "null" como vazio.
+    fn read_global_setting(serial: &str, key: &str) -> String {
+        let raw = Self::run_device_shell(serial, &format!("settings get global {}", key))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if raw == "null" { String::new() } else { raw }
+    }
+
+    /// Estado real da rota no aparelho: qual app de VPN está como always-on, se o
+    /// bloqueio fora da VPN (lockdown) está ligado e qual proxy HTTP está gravado.
+    /// É o que permite afirmar que a rota exigida está de fato aplicada.
+    pub fn read_device_route_state(serial: &str) -> crate::network_manager::RouteState {
+        let serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
+        let vpn_app = Self::read_global_setting(&serial, "always_on_vpn_app");
+        let lockdown = Self::read_global_setting(&serial, "always_on_vpn_lockdown") == "1";
+        let http_proxy = {
+            let p = Self::read_global_setting(&serial, "http_proxy");
+            if p == ":0" { String::new() } else { p }
+        };
+        crate::network_manager::RouteState { vpn_app, lockdown, http_proxy }
+    }
+
+    /// Aplica no aparelho a rota que o perfil pede.
+    ///
+    /// - `wireguard`: liga a VPN always-on do app WireGuard (open source) com lockdown,
+    ///   que é o único arranjo que captura TODO o tráfego do Android, WhatsApp incluído,
+    ///   e tenta subir o túnel pelo intent de controle remoto do app. Confere a gravação
+    ///   lendo de volta: se o Android não aceitou o ajuste, devolve erro em vez de fingir.
+    /// - `socks5`: grava o proxy global e nada mais. O WhatsApp não honra proxy de
+    ///   sistema, então isso NUNCA é tratado como controle do tráfego.
+    /// - `direto`: limpa a VPN always-on e o proxy, devolvendo o aparelho ao portão
+    ///   compartilhado.
+    pub fn apply_device_route(serial: &str, profile: &crate::db::NetworkProfile) -> Result<(), String> {
+        let serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
+        match profile.mode.as_str() {
+            "wireguard" => {
+                let pkg = profile.vpn_package.trim();
+                if pkg.is_empty() { return Err("perfil sem pacote de VPN definido".into()); }
+                let installed = Self::run_device_shell(&serial, &format!("pm path {}", pkg))
+                    .map(|o| o.contains("package:"))
+                    .unwrap_or(false);
+                if !installed {
+                    return Err(format!("o app de VPN {} não está instalado no aparelho", pkg));
+                }
+                let lockdown = if profile.lockdown { "1" } else { "0" };
+                let _ = Self::run_device_shell(&serial, &format!(
+                    "settings put global always_on_vpn_app {} ; settings put global always_on_vpn_lockdown {}",
+                    pkg, lockdown));
+                // Sobe o túnel pelo controle remoto do app WireGuard (exige a opção
+                // "Allow remote control apps" ligada no app). Melhor esforço.
+                let tunnel = profile.vpn_tunnel.trim();
+                if !tunnel.is_empty() {
+                    let _ = Self::run_device_shell(&serial, &format!(
+                        "am broadcast -a com.wireguard.android.action.SET_TUNNEL_UP -p {} --es tunnel {}",
+                        pkg, Self::shell_quote(tunnel)));
+                }
+                // A verdade é o que o aparelho devolve, não o que mandamos.
+                let state = Self::read_device_route_state(&serial);
+                if state.vpn_app != pkg {
+                    return Err(format!(
+                        "o Android não aceitou {} como VPN always-on (requer consentimento da VPN no aparelho, ou device owner)", pkg));
+                }
+                if profile.lockdown && !state.lockdown {
+                    return Err("o Android não aceitou o bloqueio de conexões fora da VPN (lockdown)".into());
+                }
+                Ok(())
+            }
+            "socks5" => {
+                let proxy = profile.proxy_url.trim();
+                if proxy.is_empty() { return Err("perfil socks5 sem endereço de proxy".into()); }
+                Self::configure_device_socks_proxy_and_revoke_bssid(&serial, Some(proxy))
+            }
+            _ => {
+                let _ = Self::run_device_shell(&serial,
+                    "settings put global always_on_vpn_app '' ; settings put global always_on_vpn_lockdown 0");
+                Self::configure_device_socks_proxy_and_revoke_bssid(&serial, Some(""))
+            }
+        }
+    }
+
     /// Configura Proxy SOCKS5/HTTP por aparelho via ADB e revoga permissões BSSID Wi-Fi (Anti-Ban)
     pub fn configure_device_socks_proxy_and_revoke_bssid(serial: &str, proxy_url: Option<&str>) -> Result<(), String> {
         // 1. Aplica Proxy Global via ADB se fornecido
@@ -5647,11 +5826,217 @@ impl AdbManager {
             Ok(format!("⚡ Reconexão Wi-Fi Concluída ({} ativos):\n{}", reconnected.len(), reconnected.join("\n")))
         }
     }
+
+    /// Alvos válidos para `adb connect`, em ordem de preferência e sem repetição.
+    /// Só entra endereço IP:porta real: serial de cabo e id de túnel (ESF-...) não
+    /// servem para `adb connect` e gastariam processo do ADB para nada.
+    pub fn connect_targets(dev: &crate::db::Device) -> Vec<String> {
+        fn aceitar(out: &mut Vec<String>, cand: &str) {
+            let alvo = cand.trim();
+            let Some((host, porta)) = alvo.rsplit_once(':') else { return };
+            if host.parse::<std::net::Ipv4Addr>().is_err() { return; }
+            if host == "0.0.0.0" || host == "127.0.0.1" { return; }
+            if !matches!(porta.parse::<u16>(), Ok(p) if p > 0) { return; }
+            let alvo = alvo.to_string();
+            if !out.contains(&alvo) { out.push(alvo); }
+        }
+
+        let mut out = Vec::new();
+        if let Some(addr) = dev.current_adb_address.as_deref() { aceitar(&mut out, addr); }
+        if !dev.ip.is_empty() {
+            let porta = if dev.port > 0 { dev.port } else { 5555 };
+            aceitar(&mut out, &format!("{}:{}", dev.ip, porta));
+            aceitar(&mut out, &format!("{}:5555", dev.ip));
+        }
+        aceitar(&mut out, &dev.serial);
+        out
+    }
+
+    /// Força a conexão ADB de UM aparelho, na ordem: túnel reverso, cabo USB,
+    /// endereços IP conhecidos. Nunca reinicia o servidor ADB — isso derrubaria os
+    /// outros aparelhos — e devolve o motivo exato de cada rota que não respondeu.
+    pub fn force_connect_device(db: &crate::db::Database, dev: &crate::db::Device) -> Result<String, String> {
+        let nome = if dev.name.trim().is_empty() { dev.serial.clone() } else { dev.name.clone() };
+        let mut tentativas: Vec<String> = Vec::new();
+
+        // 1. Túnel reverso: quem abre a conexão é o aparelho, então aqui só se
+        //    confirma que ele responde de verdade; `adb connect` não se aplica.
+        if let Some(eid) = dev.esfera_device_id.as_deref().filter(|e| !e.trim().is_empty()) {
+            if crate::tunnel_server::is_tunnel_active(eid) {
+                match crate::adb_tcp::exec_shell_with_timeout(eid, "echo esfera_ok", Duration::from_secs(6)) {
+                    Ok(saida) if saida.contains("esfera_ok") => {
+                        let _ = db.mark_device_online(dev.id, eid);
+                        return Ok(format!("{} já responde pelo túnel reverso.", nome));
+                    }
+                    Ok(_) => tentativas.push(format!("túnel {}: sessão registrada, mas o aparelho não respondeu ao teste", eid)),
+                    Err(e) => tentativas.push(format!("túnel {}: {}", eid, e)),
+                }
+            } else {
+                tentativas.push(format!("túnel {}: sem sessão ativa (quem inicia é o aparelho)", eid));
+            }
+        }
+
+        // 2. Cabo USB presente: liga a porta TCP e já conecta pelo IP de Wi-Fi.
+        let no_cabo = Self::list_devices()
+            .unwrap_or_default()
+            .into_iter()
+            .any(|d| d.serial == dev.serial && d.state == "device");
+        if no_cabo {
+            let mut prop = create_cmd("adb");
+            prop.args(["-s", &dev.serial, "shell", "setprop", "persist.adb.tcp.port", "5555"]);
+            let _ = run_cmd_timeout(prop, Duration::from_secs(4));
+            let _ = Self::enable_tcpip(&dev.serial, 5555);
+            std::thread::sleep(Duration::from_millis(400));
+            if let Ok(ip) = Self::get_device_wifi_ip(&dev.serial) {
+                if ip.contains('.') && ip != "0.0.0.0" && ip != "127.0.0.1" {
+                    if let Ok(msg) = Self::connect_device(&ip, 5555) {
+                        let alvo = format!("{}:5555", ip);
+                        let id_checkin = dev.esfera_device_id.clone().unwrap_or_else(|| dev.serial.clone());
+                        let agora = chrono::Utc::now().to_rfc3339();
+                        let _ = db.process_checkin(&id_checkin, &alvo, &ip, 5555, &agora, &dev.serial);
+                        return Ok(format!("{}: {}", nome, msg));
+                    }
+                }
+            }
+            return Ok(format!("{} está no cabo USB e a porta 5555 foi ligada; o Wi-Fi ainda não respondeu.", nome));
+        }
+
+        // 3. Endereços conhecidos: só gasta processo de ADB quando o soquete abre.
+        let alvos = Self::connect_targets(dev);
+        if alvos.is_empty() {
+            let extra = if tentativas.is_empty() { String::new() } else { format!("\n{}", tentativas.join("\n")) };
+            return Err(format!(
+                "{} não tem endereço IP conhecido e não está no cabo. Conecte uma vez por IP ou pareamento.{}",
+                nome, extra
+            ));
+        }
+
+        for alvo in &alvos {
+            let Ok(sock) = alvo.parse::<std::net::SocketAddr>() else {
+                tentativas.push(format!("{}: endereço inválido", alvo));
+                continue;
+            };
+            let host = sock.ip().to_string();
+            if std::net::TcpStream::connect_timeout(&sock, Duration::from_millis(700)).is_err() {
+                tentativas.push(format!("{}: porta fechada, aparelho fora da rede ou depuração Wi-Fi desligada", alvo));
+                continue;
+            }
+            // Expurga o soquete zumbi que o Windows guarda antes de reconectar.
+            for forma in [alvo.clone(), host.clone()] {
+                let mut disc = create_cmd("adb");
+                disc.arg("disconnect").arg(&forma);
+                let _ = run_cmd_timeout(disc, Duration::from_secs(2));
+            }
+            match Self::connect_device(&host, sock.port() as i32) {
+                Ok(msg) => {
+                    // Confirma no `adb devices` antes de gravar: "connected to" não
+                    // garante autorização — a chave RSA pode estar pendente no aparelho.
+                    let estado = Self::list_devices()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|d| d.serial == *alvo)
+                        .map(|d| d.state)
+                        .unwrap_or_default();
+                    if estado != "device" {
+                        let visto = if estado.is_empty() { "sem transporte".to_string() } else { estado };
+                        tentativas.push(format!(
+                            "{}: {} — mas o ADB mostra \"{}\". Desbloqueie o aparelho e toque em Permitir na janela de depuração.",
+                            alvo, msg.trim(), visto
+                        ));
+                        continue;
+                    }
+                    let mut serial_hw = String::new();
+                    let mut prop = create_cmd("adb");
+                    prop.args(["-s", alvo, "shell", "getprop", "ro.serialno"]);
+                    if let Ok(o) = run_cmd_timeout(prop, Duration::from_secs(4)) {
+                        serial_hw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    }
+                    let id_checkin = dev
+                        .esfera_device_id
+                        .clone()
+                        .filter(|e| !e.trim().is_empty())
+                        .unwrap_or_else(|| if serial_hw.is_empty() { dev.serial.clone() } else { serial_hw.clone() });
+                    let agora = chrono::Utc::now().to_rfc3339();
+                    let _ = db.process_checkin(&id_checkin, alvo, &host, sock.port(), &agora, &serial_hw);
+                    let _ = db.mark_device_online(dev.id, alvo);
+                    return Ok(format!("{} conectado em {}.", nome, alvo));
+                }
+                Err(e) => tentativas.push(format!("{}: {}", alvo, e)),
+            }
+        }
+
+        Err(format!("Não foi possível conectar {}:\n{}", nome, tentativas.join("\n")))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn aparelho_teste() -> crate::db::Device {
+        crate::db::Device {
+            id: 1,
+            serial: "R58M30ABCDE".into(),
+            name: "Celular 3".into(),
+            brand: "Samsung".into(),
+            model: "A15".into(),
+            ip: String::new(),
+            port: 0,
+            status: "offline".into(),
+            battery: 80,
+            company_id: 1,
+            device_number: 3,
+            sector: "junior".into(),
+            esfera_device_id: None,
+            current_adb_address: None,
+            last_seen_utc: None,
+            via_tunnel: false,
+        }
+    }
+
+    #[test]
+    fn alvos_de_conexao_ignoram_serial_de_cabo_e_id_de_tunel() {
+        let mut dev = aparelho_teste();
+        dev.esfera_device_id = Some("ESF-R58M30ABCDE".into());
+        dev.current_adb_address = Some("ESF-R58M30ABCDE".into());
+        assert!(AdbManager::connect_targets(&dev).is_empty());
+    }
+
+    #[test]
+    fn alvos_de_conexao_preferem_o_endereco_atual_e_nao_repetem() {
+        let mut dev = aparelho_teste();
+        dev.current_adb_address = Some("192.168.1.20:5555".into());
+        dev.ip = "192.168.1.20".into();
+        dev.port = 5555;
+        assert_eq!(AdbManager::connect_targets(&dev), vec!["192.168.1.20:5555".to_string()]);
+    }
+
+    #[test]
+    fn alvos_de_conexao_tentam_porta_do_banco_e_depois_a_5555() {
+        let mut dev = aparelho_teste();
+        dev.ip = "192.168.1.31".into();
+        dev.port = 5037;
+        assert_eq!(
+            AdbManager::connect_targets(&dev),
+            vec!["192.168.1.31:5037".to_string(), "192.168.1.31:5555".to_string()]
+        );
+    }
+
+    #[test]
+    fn alvos_de_conexao_recusam_enderecos_que_nao_levam_a_nada() {
+        let mut dev = aparelho_teste();
+        dev.ip = "0.0.0.0".into();
+        dev.current_adb_address = Some("127.0.0.1:5555".into());
+        dev.serial = "192.168.1.40:0".into();
+        assert!(AdbManager::connect_targets(&dev).is_empty());
+    }
+
+    #[test]
+    fn alvos_de_conexao_aceitam_serial_sem_fio() {
+        let mut dev = aparelho_teste();
+        dev.serial = "192.168.1.77:5555".into();
+        assert_eq!(AdbManager::connect_targets(&dev), vec!["192.168.1.77:5555".to_string()]);
+    }
 
     #[test]
     fn test_whatsapp_package_defaults() {
@@ -5876,6 +6261,22 @@ mod send_safety_tests {
         HISTORY.iter().copied().chain(rows.iter().copied()).collect()
     }
 
+    /// A mesma tela no WhatsApp Business: outro pacote e ids com prefixo `com.whatsapp.w4b:id/`.
+    fn business(xml: &str) -> String {
+        xml.replace("package=\"com.whatsapp\"", "package=\"com.whatsapp.w4b\"").replace("com.whatsapp:id/", "com.whatsapp.w4b:id/")
+    }
+
+    #[test]
+    fn business_confere_destinatario_e_envio_como_o_normal() {
+        let typed = "Olá, tudo bem? Podemos conversar sobre a sua situação?";
+        let before = business(&chat(HEADER, &HISTORY, typed));
+        let after = business(&chat(HEADER, &with(&[(typed, Some("Enviada"))]), "Mensagem"));
+        assert!(AdbManager::sent_on_screen(&before, &after, PHONE, typed));
+        assert_eq!(AdbManager::send_check(&before, &before, PHONE, typed), SendCheck::StillInField);
+        let other = business(&chat("\u{202A}+55 11 98805-2539\u{202C}", &HISTORY, "Mensagem"));
+        assert!(AdbManager::verify_chat_identity(&other, PHONE).is_err());
+    }
+
     #[test]
     fn destinatario_certo_nunca_e_recusado() {
         let screen = |header: &str| chat(header, &HISTORY, "Mensagem");
@@ -6027,9 +6428,23 @@ mod send_safety_tests {
     }
 
     #[test]
-    fn pacote_alternativo_e_recusado_antes_de_acessar_aparelho() {
-        let result = AdbManager::send_whatsapp_parts("nao_acessar", "5511999998888", &["Olá".into()], Some("com.whatsapp.w4b"), &|| true);
-        assert!(result.unwrap_err().contains("com.whatsapp"));
+    fn pacote_fora_do_whatsapp_e_recusado_antes_de_acessar_aparelho() {
+        let result = AdbManager::send_whatsapp_parts("nao_acessar", "5511999998888", &["Olá".into()], Some("com.outro.app"), &|| true);
+        assert!(result.unwrap_err().contains("WhatsApp"));
+    }
+
+    #[test]
+    fn foco_identifica_whatsapp_normal_e_business() {
+        let normal = "  mCurrentFocus=Window{1a u0 com.whatsapp/com.whatsapp.HomeActivity}\n  mFocusedApp=ActivityRecord{2b u0 com.whatsapp/com.whatsapp.HomeActivity t9}";
+        let business = "  mCurrentFocus=Window{1a u0 com.whatsapp.w4b/com.whatsapp.HomeActivity}\n  mFocusedApp=ActivityRecord{2b u0 com.whatsapp.w4b/com.whatsapp.HomeActivity t9}";
+        let launcher = "  mCurrentFocus=Window{1a u0 com.android.launcher3/com.android.launcher3.Launcher}";
+        assert_eq!(AdbManager::whatsapp_in_focus(normal), Some(AdbManager::DEFAULT_WHATSAPP_PACKAGE));
+        assert_eq!(AdbManager::whatsapp_in_focus(business), Some(AdbManager::BUSINESS_WHATSAPP_PACKAGE));
+        assert_eq!(AdbManager::whatsapp_in_focus(launcher), None);
+        // "com.whatsapp" é prefixo de "com.whatsapp.w4b": o Business nunca passa pelo normal.
+        assert!(!AdbManager::focus_in(business, AdbManager::DEFAULT_WHATSAPP_PACKAGE));
+        assert!(AdbManager::focus_in(business, AdbManager::BUSINESS_WHATSAPP_PACKAGE));
+        assert!(!AdbManager::focus_in(normal, AdbManager::BUSINESS_WHATSAPP_PACKAGE));
     }
 }
 

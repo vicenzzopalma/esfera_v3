@@ -120,7 +120,10 @@ pub async fn start(db: Arc<Database>, tls_port: u16) {
 
     let app = Router::new()
         .route("/api/desktop/vps-ia", get(vps_ia_config))
+        .route("/api/desktop/evolution/messages", get(crate::evolution_relay::evolution_messages))
         .route("/api/devices/check-in", post(handle_checkin))
+        .route("/api/egress", get(crate::checkin_server::handle_egress))
+        .route("/api/egress/report", post(crate::checkin_server::handle_egress_report))
         .route("/admin/update", post(handle_update))
         .route("/ws/presence", get(ws_handler_tls))
         .with_state((db, tls_port));
@@ -133,7 +136,7 @@ pub async fn start(db: Arc<Database>, tls_port: u16) {
     let _ = std::io::stdout().flush();
 
     if let Err(e) = axum_server::bind_rustls(addr, rustls_config)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
     {
         eprintln!("TLS: servidor encerrado: {}", e);

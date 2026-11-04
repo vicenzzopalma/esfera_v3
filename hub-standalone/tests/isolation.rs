@@ -156,9 +156,9 @@ async fn reconciliacao_ram_db_protege_device_com_canal_vivo() {
 
     // Device com LastSeenUTC MUITO antigo (não faz check-in há horas).
     let antigo = "2000-01-01T00:00:00+00:00";
-    db.process_checkin("ESF-VIVO", "10.0.0.7:5555", "10.0.0.7", 5555, antigo, EMP_X)
+    db.process_checkin("ESF-VIVO", "10.0.0.7:5555", "10.0.0.7", 5555, antigo, EMP_X, "")
         .unwrap();
-    db.process_checkin("ESF-MORTO", "10.0.0.8:5555", "10.0.0.8", 5555, antigo, EMP_X)
+    db.process_checkin("ESF-MORTO", "10.0.0.8:5555", "10.0.0.8", 5555, antigo, EMP_X, "")
         .unwrap();
 
     // Só ESF-VIVO tem canal vivo em RAM.
@@ -170,6 +170,7 @@ async fn reconciliacao_ram_db_protege_device_com_canal_vivo() {
         last_seen_utc: chrono::Utc::now().to_rfc3339(),
         ip: String::new(),
         current_adb_address: String::new(),
+        assigned_vps_port: 0,
     }];
     db.sync_live_state(&live, 120).unwrap();
 

@@ -609,6 +609,26 @@ impl Database {
             [],
         )?;
 
+        // 10b. ESF_EgressCheck (registro central da auditoria de rede por aparelho).
+        // O hub guarda apenas o veredito da rota: aparelho, IP de saída observado,
+        // modo, fase e detalhe. Nenhum dado de contato, telefone ou credencial.
+        self.conn().execute(
+            "CREATE TABLE IF NOT EXISTS ESF_EgressCheck (
+                CheckId INTEGER PRIMARY KEY AUTOINCREMENT,
+                DeviceId INTEGER NOT NULL,
+                CheckedAt TEXT NOT NULL DEFAULT (datetime('now')),
+                ReceivedAt TEXT NOT NULL DEFAULT (datetime('now')),
+                ObservedIp TEXT NOT NULL DEFAULT '',
+                Mode TEXT NOT NULL DEFAULT '',
+                Phase TEXT NOT NULL DEFAULT '',
+                Result TEXT NOT NULL DEFAULT '',
+                Detail TEXT NOT NULL DEFAULT ''
+            );",
+            [],
+        )?;
+        let _ = self.conn().execute(
+            "CREATE INDEX IF NOT EXISTS idx_hub_egress_device ON ESF_EgressCheck(DeviceId, CheckId DESC)", []);
+
         // 11. ESF_DeviceStatus (bans por pacote por campanha)
         self.conn().execute(
             "CREATE TABLE IF NOT EXISTS ESF_DeviceStatus (
@@ -1150,6 +1170,24 @@ impl Database {
             Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
             Err(_) => vec![],
         }
+    }
+
+    /// Registra no hub o resultado de uma verificação de rota feita pelo desktop.
+    /// Só veredito de rede entra aqui — nunca telefone, contato ou credencial.
+    pub fn record_egress_check(&self, device_id: i32, checked_at: &str, observed_ip: &str, mode: &str, phase: &str, result: &str, detail: &str) -> Result<(), String> {
+        let checked_at = if checked_at.trim().is_empty() { chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string() } else { checked_at.trim().to_string() };
+        self.conn().execute(
+            "INSERT INTO ESF_EgressCheck (DeviceId, CheckedAt, ObservedIp, Mode, Phase, Result, Detail) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            rusqlite::params![device_id, checked_at, observed_ip, mode, phase, result, detail],
+        ).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Quantas verificações com este veredito o hub já registrou para o aparelho.
+    pub fn egress_check_count(&self, device_id: i32, result: &str) -> i64 {
+        self.conn().query_row(
+            "SELECT count(*) FROM ESF_EgressCheck WHERE DeviceId=?1 AND Result=?2",
+            rusqlite::params![device_id, result], |r| r.get(0),
+        ).unwrap_or(0)
     }
 
     pub fn upsert_device(&self, device: &Device) -> Result<(), String> {

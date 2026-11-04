@@ -1,4 +1,4 @@
-use axum::{Router, routing::{post, get}, Json, extract::State, body::Bytes};
+use axum::{Router, routing::{post, get}, Json, extract::{ConnectInfo, State}, body::Bytes};
 use axum::response::IntoResponse;
 use chrono::Utc;
 use serde::Deserialize;
@@ -84,6 +84,12 @@ pub async fn start(db: Arc<Database>, port: u16) {
         // Canal de atualização remota: o agente (self_update) baixa o APK daqui,
         // sem SSH. Serve o arquivo em AGENT_APK_PATH (default ~/esfera_v3/agent_release/esfera_agent.apk).
         .route("/download/agent.apk", get(handle_download_agent))
+        // Diagnóstico: devolve o IP de origem que o hub vê nesta conexão. Não é a
+        // fonte da auditoria — atrás da VPN o hub veria o endereço interno do túnel.
+        .route("/api/egress", get(handle_egress))
+        // Registro central da auditoria: o desktop envia aqui o resultado de cada
+        // verificação de rota (aparelho, IP de saída, modo, fase, veredito).
+        .route("/api/egress/report", post(handle_egress_report))
         .with_state((db, port));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -95,8 +101,54 @@ pub async fn start(db: Arc<Database>, port: u16) {
         }
     };
     println!("Servidor HTTP Check-in (canal KOTLIN) rodando em http://0.0.0.0:{}", port);
-    axum::serve(listener, app).await
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
         .expect("Falha ao iniciar check-in server");
+}
+
+/// Devolve, em texto puro, o IP de origem da conexão — visto pelo hub.
+pub async fn handle_egress(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> String {
+    addr.ip().to_string()
+}
+
+/// Resultado de uma verificação de rota, enviado pelo desktop. Só veredito de
+/// rede: nenhum telefone, contato ou credencial trafega neste endpoint.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressReportPayload {
+    pub device_id: i32,
+    #[serde(default)]
+    pub checked_at: String,
+    #[serde(default)]
+    pub observed_ip: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default)]
+    pub result: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+pub async fn handle_egress_report(
+    State((db, _port)): State<(Arc<Database>, u16)>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<EgressReportPayload>,
+) -> (axum::http::StatusCode, String) {
+    use axum::http::StatusCode;
+    let master_token = std::env::var("HUB_MASTER_TOKEN").unwrap_or_else(|_| "REMOVED_SECRET".to_string());
+    let provided = headers.get("X-Hub-Token").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if provided != master_token {
+        return (StatusCode::UNAUTHORIZED, "token invalido".into());
+    }
+    if payload.device_id <= 0 {
+        return (StatusCode::BAD_REQUEST, "deviceId ausente ou invalido".into());
+    }
+    match db.record_egress_check(payload.device_id, &payload.checked_at, &payload.observed_ip,
+        &payload.mode, &payload.phase, &payload.result, &payload.detail) {
+        Ok(()) => (StatusCode::OK, "ok".into()),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
 }
 
 pub async fn handle_checkin(
@@ -222,4 +274,61 @@ fn dirs_home() -> std::path::PathBuf {
         return std::path::PathBuf::from(h);
     }
     std::path::PathBuf::from(".")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn egress_devolve_o_ip_da_conexao() {
+        let addr: SocketAddr = "203.0.113.9:45678".parse().unwrap();
+        assert_eq!(handle_egress(ConnectInfo(addr)).await, "203.0.113.9");
+        let v6: SocketAddr = "[2001:db8::1]:1".parse().unwrap();
+        assert_eq!(handle_egress(ConnectInfo(v6)).await, "2001:db8::1");
+    }
+
+    fn db_de_teste(tag: &str) -> (Arc<Database>, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("hub_egress_{}_{}.db", tag, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).expect("banco de teste");
+        (Arc::new(db), path)
+    }
+
+    fn payload(device_id: i32, result: &str) -> EgressReportPayload {
+        EgressReportPayload {
+            device_id,
+            checked_at: "2026-11-03 12:00:00".into(),
+            observed_ip: "203.0.113.7".into(),
+            mode: "wireguard".into(),
+            phase: "fim_lote".into(),
+            result: result.into(),
+            detail: String::new(),
+        }
+    }
+
+    /// O registro central só aceita com token e só grava veredito de rede.
+    #[tokio::test]
+    async fn report_exige_token_e_grava_o_veredito() {
+        std::env::set_var("HUB_MASTER_TOKEN", "segredo-de-teste");
+        let (db, path) = db_de_teste("report");
+
+        let mut sem_token = axum::http::HeaderMap::new();
+        sem_token.insert("X-Hub-Token", "errado".parse().unwrap());
+        let (code, _) = handle_egress_report(State((db.clone(), 0u16)), sem_token, Json(payload(7, "ok"))).await;
+        assert_eq!(code, axum::http::StatusCode::UNAUTHORIZED, "token errado não registra nada");
+
+        let mut com_token = axum::http::HeaderMap::new();
+        com_token.insert("X-Hub-Token", "segredo-de-teste".parse().unwrap());
+        let (code, _) = handle_egress_report(State((db.clone(), 0u16)), com_token.clone(), Json(payload(7, "vazamento"))).await;
+        assert_eq!(code, axum::http::StatusCode::OK);
+
+        let (code, _) = handle_egress_report(State((db.clone(), 0u16)), com_token, Json(payload(0, "ok"))).await;
+        assert_eq!(code, axum::http::StatusCode::BAD_REQUEST, "aparelho inválido é recusado");
+
+        assert_eq!(db.egress_check_count(7, "vazamento"), 1, "só o envio autenticado e válido entrou");
+        assert_eq!(db.egress_check_count(7, "ok"), 0, "o envio sem token não deixou rastro");
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
 }

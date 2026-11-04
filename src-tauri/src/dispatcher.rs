@@ -16,8 +16,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, timeout, Duration};
 
 // Sem identificação confiável da sub-rede, todos os aparelhos desta instalação
-// (USB e Wi-Fi) compartilham a mesma fila conservadora.
-static NETWORK_SEND_GATE: std::sync::LazyLock<AsyncMutex<Option<(i32, Instant)>>> =
+// (USB e Wi-Fi) compartilham a mesma fila conservadora. Aparelhos com perfil de
+// rede isolado (network_manager) têm portão próprio e não esperam os demais.
+pub(crate) static NETWORK_SEND_GATE: std::sync::LazyLock<AsyncMutex<Option<(i32, Instant)>>> =
     std::sync::LazyLock::new(|| AsyncMutex::new(None));
 static NETWORK_LIMITED_CAMPAIGNS: std::sync::LazyLock<Mutex<std::collections::HashSet<i32>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
@@ -645,7 +646,7 @@ pub fn cleanup_campaign_contacts(db: Arc<Database>, company_id: i32, device_ids:
 static RETRY_MESSAGES: std::sync::LazyLock<Mutex<HashMap<(i32,i32), (u64,String,String)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static PREFETCHED_MESSAGES: std::sync::LazyLock<Mutex<HashMap<(i32, i32), (u64, tokio::task::JoinHandle<String>)>>> =
+static PREFETCHED_MESSAGES: std::sync::LazyLock<Mutex<HashMap<(i32, i32), (u64, tokio::task::JoinHandle<BuiltMessage>)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Impressão digital do que muda o texto (mensagem, spintax, IA): a pré-carga feita com a versão
@@ -862,9 +863,8 @@ fn schedule_ai_pool(db: Arc<Database>, campaign: crate::db::Campaign) {
                 Ok(Ok(parts)) => {
                     let Ok(workers) = AI_POOL_WORKERS.lock() else { break; };
                     if !workers.is_current(key) { break; }
-                    if let Ok(mut pools) = AI_VARIANT_POOLS.lock() {
-                        pool_store(pools.entry(key).or_default(), parts);
-                    } else { break; }
+                    // Ainda sob a trava: uma versão antiga do texto nunca grava por cima da atual.
+                    store_round(&db, key, parts);
                 }
                 Ok(Err(error)) => { eprintln!("[DISPATCHER IA] Falha ao preencher banco: {}", error); break; }
                 Err(_) => { eprintln!("[DISPATCHER IA] Tempo limite ao preencher banco"); break; }
@@ -878,6 +878,75 @@ fn pooled_ai_message(campaign: &crate::db::Campaign, contact_name: &str) -> Opti
     let mut pools = AI_VARIANT_POOLS.lock().ok()?;
     let parts = pool_take(pools.get_mut(&key)?, None)?;
     Some(AiEngine::replace_contact_name(&parts.join("\n\n"), contact_name))
+}
+
+/// Mensagem montada para um contato. `fallback`: com a IA ligada, saiu o texto original porque
+/// nenhuma IA respondeu no prazo; ainda pode virar variação antes do envio.
+struct BuiltMessage {
+    text: String,
+    fallback: bool,
+}
+
+/// Quanto a montagem espera o banco de variações encher (o mesmo teto da cadeia de IA mais lenta).
+const AI_POOL_WAIT: Duration = Duration::from_secs(180);
+/// Intervalo entre as conferências do banco durante a espera.
+const AI_POOL_POLL: Duration = Duration::from_millis(500);
+
+/// Guarda a rodada da IA no banco de variações da memória e no banco de dados.
+fn store_round(db: &Database, key: (i32, u64), parts: Vec<String>) {
+    if let Ok(mut pools) = AI_VARIANT_POOLS.lock() {
+        pool_store(pools.entry(key).or_default(), parts.clone());
+    }
+    if let Err(e) = db.save_ai_variants(key.0, key.1, &parts) {
+        eprintln!("[DISPATCHER IA] Falha ao guardar as variações da campanha {}: {}", key.0, e);
+    }
+}
+
+/// Texto original da pré-carga (IA atrasada) vira variação se ela ficou pronta até o envio.
+fn upgrade_fallback(campaign: &crate::db::Campaign, contact_name: &str, built: BuiltMessage) -> BuiltMessage {
+    if !built.fallback {
+        return built;
+    }
+    match pooled_ai_message(campaign, contact_name) {
+        Some(text) => BuiltMessage { text, fallback: false },
+        None => built,
+    }
+}
+
+/// Recarrega do banco de dados as variações já geradas para esta versão do texto da campanha
+/// (o banco da memória some quando o app reinicia).
+fn load_pool_from_db(db: &Database, campaign: &crate::db::Campaign) {
+    let key = (campaign.id, campaign_fingerprint(campaign));
+    if AI_VARIANT_POOLS.lock().map(|pools| pools.contains_key(&key)).unwrap_or(true) {
+        return;
+    }
+    match db.load_ai_variants(key.0, key.1, AI_VARIANTS_PER_PART) {
+        Ok(parts) if !parts.is_empty() => {
+            if let Ok(mut pools) = AI_VARIANT_POOLS.lock() {
+                pools.entry(key).or_insert_with(|| VariantPool { parts, used: Default::default() });
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[DISPATCHER IA] Falha ao ler as variações da campanha {}: {}", key.0, e),
+    }
+}
+
+/// Variação da IA para o contato. Com o banco vazio (campanha nova, texto editado, app
+/// reiniciado), espera o preenchimento em vez de mandar o mesmo texto original para todos; a
+/// espera corre durante a pausa entre contatos. None só se nenhuma IA responder no prazo.
+async fn ai_variant_waiting(db: &Arc<Database>, campaign: &crate::db::Campaign, contact_name: &str, wait: Duration) -> Option<String> {
+    load_pool_from_db(db, campaign);
+    let deadline = Instant::now() + wait;
+    loop {
+        schedule_ai_pool(db.clone(), campaign.clone());
+        if let Some(text) = pooled_ai_message(campaign, contact_name) {
+            return Some(text);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        sleep(AI_POOL_POLL.min(deadline.saturating_duration_since(Instant::now()))).await;
+    }
 }
 
 /// Monta a cadeia de reserva de IA:
@@ -994,8 +1063,19 @@ async fn build_message(
     db_arc: Arc<Database>,
     campaign: crate::db::Campaign,
     next_contact: crate::db::Contact,
+    app_handle: Option<AppHandle>,
+) -> BuiltMessage {
+    build_message_with_wait(db_arc, campaign, next_contact, app_handle, AI_POOL_WAIT).await
+}
+
+/// `build_message` com o prazo de espera pela IA explícito.
+async fn build_message_with_wait(
+    db_arc: Arc<Database>,
+    campaign: crate::db::Campaign,
+    next_contact: crate::db::Contact,
     _app_handle: Option<AppHandle>,
-) -> String {
+    wait: Duration,
+) -> BuiltMessage {
     // Monta o texto base: saudação + corpo + despedida, com Spintax resolvido
     let campaign_text = {
         let mut full = String::new();
@@ -1021,12 +1101,15 @@ async fn build_message(
     };
 
     if campaign.use_ai {
-        schedule_ai_pool(db_arc, campaign.clone());
-        pooled_ai_message(&campaign, &next_contact.contact_name)
-            .unwrap_or_else(|| AiEngine::replace_contact_name(&campaign_text, &next_contact.contact_name))
-    } else {
-        AiEngine::replace_contact_name(&campaign_text, &next_contact.contact_name)
+        if let Some(text) = ai_variant_waiting(&db_arc, &campaign, &next_contact.contact_name, wait).await {
+            return BuiltMessage { text, fallback: false };
+        }
+        // Nenhuma IA respondeu no prazo: sai o texto original (regra de sempre), marcado para ser
+        // trocado pela variação se ela ficar pronta antes do envio.
+        eprintln!("[DISPATCHER IA] Nenhuma variação da IA em {} s; texto original para {}.", wait.as_secs(), next_contact.phone);
+        return BuiltMessage { text: AiEngine::replace_contact_name(&campaign_text, &next_contact.contact_name), fallback: true };
     }
+    BuiltMessage { text: AiEngine::replace_contact_name(&campaign_text, &next_contact.contact_name), fallback: false }
 }
 
 /// Pré-carrega o mesmo contato que o laço de envio selecionará.
@@ -1363,25 +1446,34 @@ impl Dispatcher {
                     });
                     // Mensagem: usa a pré-carregada durante a pausa do contato anterior, se houver.
                     let prefetched = if cached.is_none() { PREFETCHED_MESSAGES.lock().ok().and_then(|mut m| m.remove(&(campaign.id, next_contact.id))) } else { None };
-                    let message_to_send = if let Some(text) = cached { text } else { match prefetched {
-                        // Só vale se a campanha não mudou desde a pré-carga (texto, spintax, IA).
-                        Some((fingerprint, handle)) if fingerprint == campaign_fingerprint(&campaign) && handle.is_finished() => match handle.await {
-                            Ok(m) => {
-                                println!("[DISPATCHER] Mensagem de {} já estava pronta (pré-carregada).", next_contact.phone);
-                                m
+                    let message_to_send = if let Some(text) = cached { text } else {
+                        let built = match prefetched {
+                            // Só vale se a campanha não mudou desde a pré-carga (texto, spintax, IA). Se a IA
+                            // ainda está enchendo o banco, espera essa pré-carga em vez de refazer do zero.
+                            Some((fingerprint, handle)) if fingerprint == campaign_fingerprint(&campaign) => match handle.await {
+                                Ok(m) => {
+                                    println!("[DISPATCHER] Mensagem de {} já estava pronta (pré-carregada).", next_contact.phone);
+                                    m
+                                }
+                                Err(_) => build_message(db_arc.clone(), campaign.clone(), next_contact.clone(), app_handle.clone()).await,
+                            },
+                            Some((_, handle)) => {
+                                handle.abort();
+                                println!("[DISPATCHER] Campanha editada depois da pré-carga: refazendo a mensagem de {}.", next_contact.phone);
+                                build_message(db_arc.clone(), campaign.clone(), next_contact.clone(), app_handle.clone()).await
                             }
-                            Err(_) => build_message(db_arc.clone(), campaign.clone(), next_contact.clone(), app_handle.clone()).await,
-                        },
-                        Some((_, handle)) => {
-                            handle.abort();
-                            println!("[DISPATCHER] Campanha editada depois da pré-carga: refazendo a mensagem de {}.", next_contact.phone);
-                            build_message(db_arc.clone(), campaign.clone(), next_contact.clone(), app_handle.clone()).await
+                            None => build_message(db_arc.clone(), campaign.clone(), next_contact.clone(), app_handle.clone()).await,
+                        };
+                        // A IA atrasou e a variação ficou pronta depois: troca o original por ela.
+                        let built = upgrade_fallback(&campaign, &next_contact.contact_name, built);
+                        // O original não fica guardado para a nova tentativa: ela espera a IA de novo.
+                        if !built.fallback {
+                            if let Ok(mut m) = RETRY_MESSAGES.lock() {
+                                m.insert((campaign.id, next_contact.id), (fingerprint, next_contact.contact_name.clone(), built.text.clone()));
+                            }
                         }
-                        None => build_message(db_arc.clone(), campaign.clone(), next_contact.clone(), app_handle.clone()).await,
-                    }};
-                    if let Ok(mut m) = RETRY_MESSAGES.lock() {
-                        m.insert((campaign.id,next_contact.id),(fingerprint,next_contact.contact_name.clone(),message_to_send.clone()));
-                    }
+                        built.text
+                    };
 
                     // Sem prova confiável de conversa anterior, tratar o contato como novo.
                     if contains_link(&message_to_send) {
@@ -1421,6 +1513,9 @@ impl Dispatcher {
                     let mut reply_warning = false;
                     // Aparelho escolhido nesta tentativa (nome cadastrado), para o motivo de uma pausa.
                     let mut attempt_device: Option<String> = None;
+                    // Aparelho que efetivamente enviou, para o gerenciador de rede fechar o lote dele.
+                    let mut send_device_id: i32 = 0;
+                    let mut send_serial = String::new();
                     let outcome = if AiEngine::has_money(&message_to_send) {
                         eprintln!("[DISPATCHER] Envio bloqueado para {}: a mensagem cita valores.", phone);
                         SendOutcome::SendFailed("Mensagem cita valores (proibido)".to_string())
@@ -1437,6 +1532,40 @@ impl Dispatcher {
                                 .cloned()
                                 .unwrap_or_else(|| target_dev.serial.clone()), target_dev.id, target_dev.clone())
                         };
+                        send_device_id = device_id;
+                        send_serial = serial.clone();
+                        // Gerenciador central de rede: aparelho com rota pausada (vazamento ou pausa
+                        // manual) sai desta rodada; os demais aparelhos seguem normalmente.
+                        if let Some(reason) = db_arc.network_send_block_reason(device_id) {
+                            mark_device_unavailable(&serial, 30);
+                            emit_network_warning(&campaign, &app_handle, WaitNotice::new(
+                                format!("Rede deste aparelho pausada: {}", reason), "network_paused")
+                                .on_device(&target_device.name));
+                            sleep(Duration::from_secs(2)).await;
+                            return;
+                        }
+                        // Portão pré-lote: antes de começar um lote novo, a rota do aparelho
+                        // isolado é verificada de dentro dele (IP público, integridade e
+                        // disponibilidade). Sem prova, só este aparelho sai da rodada.
+                        {
+                            let db_pre = db_arc.clone();
+                            let serial_pre = serial.clone();
+                            let company_pre = campaign.company_id;
+                            let liberado = spawn_blocking(move || {
+                                let probe = crate::network_manager::AdbRouteProbe;
+                                crate::network_manager::ensure_route_before_batch(&db_pre, device_id, &serial_pre, company_pre, &probe)
+                            }).await.unwrap_or(false);
+                            if !liberado {
+                                let reason = db_arc.network_send_block_reason(device_id)
+                                    .unwrap_or_else(|| "rota de saída não pôde ser verificada".to_string());
+                                mark_device_unavailable(&serial, 60);
+                                emit_network_warning(&campaign, &app_handle, WaitNotice::new(
+                                    format!("Rede deste aparelho pausada: {}", reason), "network_paused")
+                                    .on_device(&target_device.name));
+                                sleep(Duration::from_secs(2)).await;
+                                return;
+                            }
+                        }
                         attempt_device = Some(target_device.name.clone());
                         // Atualiza a capacidade de captura antes de avaliar uma amostra antiga.
                         let db_capture = db_arc.clone();
@@ -1467,14 +1596,17 @@ impl Dispatcher {
                             }
                         }
 
-                        let network_guard = match NETWORK_SEND_GATE.try_lock() {
+                        // Portão: dedicado ao aparelho com rota isolada verificada; compartilhado
+                        // e conservador para quem está em modo direto (comportamento antigo).
+                        let device_network_gate = crate::network_manager::gate_for(&db_arc, device_id);
+                        let network_guard = match device_network_gate.try_lock() {
                             Ok(guard) => guard,
                             Err(_) => {
                         let was_limited = NETWORK_LIMITED_CAMPAIGNS.lock().map(|s| s.contains(&campaign.id)).unwrap_or(true);
                         if !reply_warning && !was_limited {
                             emit_network_warning(&campaign, &app_handle, WaitNotice::new("Aguardando vez na rede", "network_turn"));
                         }
-                        NETWORK_SEND_GATE.lock().await
+                        device_network_gate.lock().await
                             }
                         };
                         let limit_result = db_arc.network_limit_wait();
@@ -1584,7 +1716,7 @@ impl Dispatcher {
                                     && within_send_window()
                                     && !db_last.is_opted_out(company_last, &phone2),
                             );
-                            let result = AdbManager::send_whatsapp_parts(&serial, &phone2, &parts, Some("com.whatsapp"), &check);
+                            let result = AdbManager::send_whatsapp_parts(&serial, &phone2, &parts, None, &check);
                             if let Err(ref e) = result {
                                 if e.starts_with("CONTA_RESTRITA:") {
                                     let _ = db_last.set_chip_restriction(chip.id, "banido", "9999-12-31 23:59:59");
@@ -1697,6 +1829,10 @@ impl Dispatcher {
                             pause_campaign_with_reason(&db_arc, &campaign, &app_handle, "Falha ao registrar envio; contato requer revisão.", attempt_device.as_deref());
                             return;
                         }
+                        // Texto exato que saiu, para o relatório de enviados (falha aqui não afeta o envio).
+                        if let Err(e) = db_arc.set_sent_message(contact_id, &message_to_send) {
+                            eprintln!("[DISPATCHER] Mensagem enviada a {} não foi registrada no relatório: {}", phone, e);
+                        }
                         if let Ok(mut m) = RETRY_MESSAGES.lock() { m.remove(&(campaign.id,next_contact.id)); }
                         if let Ok(mut m) = LAST_NETWORK_WARNING.lock() { m.remove(&campaign.id); }
                         if let Some(ref handle) = app_handle {
@@ -1704,6 +1840,12 @@ impl Dispatcher {
                                 sent_count: campaign.sent_count + 1, last_contact_phone: phone.clone(), delay_used_ms: gaussian_delay_ms,
                                 ..CampaignProgressEvent::of(&campaign, "running", "sending")
                             });
+                        }
+                        // Borda de lote do gerenciador de rede: a cada N confirmações o lote fecha,
+                        // a rota de saída é verificada de dentro do aparelho e, se não conferir,
+                        // só este aparelho pausa. Falha aqui nunca derruba o envio já concluído.
+                        if send_device_id > 0 {
+                            crate::network_manager::on_confirmed_send(db_arc.clone(), send_device_id, send_serial.clone(), campaign.company_id, app_handle.clone()).await;
                         }
                     }
 
@@ -1786,7 +1928,9 @@ impl Dispatcher {
             let serial = device.current_adb_address.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| device.serial.clone());
             let busy_before = db.get_running_campaigns().map(|cs| cs.iter().any(|c| c.company_id == company && c.device_ids.iter().any(|id| id == &device.serial || device.esfera_device_id.as_deref() == Some(id.as_str())))).unwrap_or(true);
             if !confirmation_allowed(within_send_window(), busy_before) || db.chip_cooldown_seconds(chips[0].id).unwrap_or(u64::MAX) > 0 { continue; }
-            let network_guard = NETWORK_SEND_GATE.lock().await;
+            // Aparelho com rede pausada (vazamento/manual) também não envia confirmação agora.
+            if db.network_send_block_reason(device.id).is_some() { continue; }
+            let network_guard = crate::network_manager::gate_for(&db, device.id).lock().await;
             if db.network_limit_wait().unwrap_or(30) > 0 { continue; }
             // Portão da rede → aparelho; aparelho ocupado solta o portão e a confirmação fica para a próxima rodada.
             let Some((network_guard, _guard)) = lock_device_after_gate(network_guard, device.id) else { continue; };
@@ -1812,7 +1956,7 @@ impl Dispatcher {
                 let _network_guard = network_guard;
                 prepare_temp_contact_for_send(&serial, &phone);
                 let check = || confirmation_allowed(within_send_window(), db2.get_running_campaigns().map(|cs| cs.iter().any(|c| c.company_id == company && c.device_ids.iter().any(|id| id == &device2.serial || device2.esfera_device_id.as_deref() == Some(id.as_str())))).unwrap_or(true));
-                AdbManager::send_whatsapp_parts(&serial, &phone, &[text], Some("com.whatsapp"), &check)
+                AdbManager::send_whatsapp_parts(&serial, &phone, &[text], None, &check)
             }).await;
             let (sent, error) = match result { Ok(Ok(())) => (true,String::new()), Ok(Err(e)) => (false,e), Err(e) => (false,e.to_string()) };
             let _ = db.finish_chip_attempt(attempt,sent);
@@ -2011,12 +2155,14 @@ impl Dispatcher {
 /// Envio manual (comando do botão) na mesma fila da rede que as campanhas. Ordem fixa: portão da rede
 /// → aparelho. Respeita o intervalo na troca de aparelho e o teto da rede (cada parte conta) e registra
 /// a tentativa no chip. Horário e descadastro são conferidos de novo com o aparelho travado e antes de
-/// cada parte; o envio é o mesmo das campanhas (só com.whatsapp, digitado tecla a tecla).
+/// cada parte; o envio é o mesmo das campanhas (WhatsApp aberto no aparelho, digitado tecla a tecla).
 pub async fn send_manual_message(db: Arc<Database>, device: crate::db::Device, serial: String, phone: String, parts: Vec<String>) -> Result<(), String> {
     if parts.iter().all(|p| p.trim().is_empty()) { return Err("Informe a mensagem.".into()); }
+    if let Some(reason) = db.network_send_block_reason(device.id) { return Err(format!("Rede deste aparelho pausada: {}", reason)); }
     let (hourly, daily) = db.network_limits()?;
     if let Some(reason) = parts_over_network_limit(parts.len(), hourly, daily) { return Err(reason); }
-    let network_guard = timeout(Duration::from_secs(MANUAL_GATE_WAIT_SECS), NETWORK_SEND_GATE.lock()).await
+    let gate = crate::network_manager::gate_for(&db, device.id);
+    let network_guard = timeout(Duration::from_secs(MANUAL_GATE_WAIT_SECS), gate.lock()).await
         .map_err(|_| "A rede está ocupada com outros envios. Tente novamente em instantes.".to_string())?;
     let wait = db.network_limit_wait_for(parts.len() as i64)?;
     if wait > 0 { return Err(format!("Teto da rede atingido. Tente novamente em até {} min.", wait.div_ceil(60))); }
@@ -2052,7 +2198,7 @@ pub async fn send_manual_message(db: Arc<Database>, device: crate::db::Device, s
             return Err(format!("Falha ao registrar a tentativa na rede: {}", e));
         }
         prepare_temp_contact_for_send(&serial, &phone);
-        let result = AdbManager::send_whatsapp_parts(&serial, &phone, &parts, Some("com.whatsapp"), &check);
+        let result = AdbManager::send_whatsapp_parts(&serial, &phone, &parts, None, &check);
         if let Err(ref e) = result {
             if e.starts_with("CONTA_RESTRITA:") {
                 let _ = db.set_chip_restriction(chip.id, "banido", "9999-12-31 23:59:59");
@@ -2328,6 +2474,126 @@ mod variant_pool_tests {
         assert!(!chain_disconnected.iter().any(|c| c.provider == "gemini_web"));
 
         let _ = std::fs::remove_file(tmp);
+    }
+}
+
+#[cfg(test)]
+mod ai_wait_tests {
+    use super::*;
+
+    fn temp_db(tag: &str) -> Arc<Database> {
+        let path = std::env::temp_dir().join(format!("esfera_ai_wait_{}_{}.db", tag, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Arc::new(Database::init(path.to_string_lossy().as_ref()).expect("db"))
+    }
+
+    /// Campanha com IA e texto fixo (sem spintax): o original sai como "Oi <nome>\n\nCorpo original".
+    fn campanha(id: i32) -> crate::db::Campaign {
+        crate::db::Campaign {
+            id,
+            name: format!("Teste {}", id),
+            greeting: "Oi {nome}".into(),
+            message: "Corpo original".into(),
+            closing: String::new(),
+            delay_min: 30,
+            delay_max: 90,
+            use_spintax: false,
+            use_ai: true,
+            ai_model: String::new(),
+            ai_provider: "groq".into(),
+            ai_prompt: String::new(),
+            device_ids: vec![],
+            status: "running".into(),
+            contacts_count: 1,
+            sent_count: 0,
+            failed_count: 0,
+            company_id: 1,
+            updated_at: String::new(),
+            pause_reason: None,
+        }
+    }
+
+    fn contato(nome: &str) -> crate::db::Contact {
+        crate::db::Contact {
+            id: 1,
+            campaign_id: 0,
+            contact_name: nome.into(),
+            phone: "5575988052539".into(),
+            status: "pending".into(),
+            sent_at: None,
+        }
+    }
+
+    /// Marca o preenchimento da campanha como em andamento: nenhum teste chama IA de verdade.
+    fn sem_ia_real(campaign: &crate::db::Campaign) -> (i32, u64) {
+        let key = (campaign.id, campaign_fingerprint(campaign));
+        assert!(AI_POOL_WORKERS.lock().unwrap().start(key));
+        key
+    }
+
+    fn guarda_versao(key: (i32, u64), parts: &[&str]) {
+        let mut pools = AI_VARIANT_POOLS.lock().unwrap();
+        pool_store(pools.entry(key).or_default(), parts.iter().map(|p| p.to_string()).collect());
+    }
+
+    #[tokio::test]
+    async fn com_ia_espera_o_banco_encher_em_vez_de_mandar_o_original() {
+        let campaign = campanha(990_001);
+        let key = sem_ia_real(&campaign);
+        let enche = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            guarda_versao(key, &["Olá {nome}", "Corpo reescrito"]);
+        });
+        let built = build_message_with_wait(temp_db("espera"), campaign, contato("Maria"), None, Duration::from_secs(5)).await;
+        enche.await.unwrap();
+        assert_eq!(built.text, "Olá Maria\n\nCorpo reescrito");
+        assert!(!built.fallback);
+    }
+
+    #[tokio::test]
+    async fn sem_ia_no_prazo_sai_o_original_marcado_para_troca() {
+        let campaign = campanha(990_002);
+        sem_ia_real(&campaign);
+        let built = build_message_with_wait(temp_db("prazo"), campaign, contato("Ana"), None, Duration::from_millis(400)).await;
+        assert_eq!(built.text, "Oi Ana\n\nCorpo original");
+        assert!(built.fallback);
+    }
+
+    #[tokio::test]
+    async fn depois_de_reiniciar_usa_as_variacoes_guardadas_no_banco() {
+        let db = temp_db("reinicio");
+        let campaign = campanha(990_003);
+        db.save_ai_variants(campaign.id, campaign_fingerprint(&campaign), &["Olá {nome}".to_string(), "Corpo guardado".to_string()]).unwrap();
+        sem_ia_real(&campaign);
+        let built = build_message_with_wait(db, campaign, contato("Rui"), None, Duration::from_millis(400)).await;
+        assert_eq!(built.text, "Olá Rui\n\nCorpo guardado");
+        assert!(!built.fallback);
+    }
+
+    #[test]
+    fn original_da_pre_carga_vira_variacao_quando_ela_fica_pronta() {
+        let campaign = campanha(990_004);
+        let key = (campaign.id, campaign_fingerprint(&campaign));
+        let original = BuiltMessage { text: "Oi Lia\n\nCorpo original".into(), fallback: true };
+        let mantido = upgrade_fallback(&campaign, "Lia", original);
+        assert_eq!(mantido.text, "Oi Lia\n\nCorpo original");
+        assert!(mantido.fallback);
+        guarda_versao(key, &["Olá {nome}", "Corpo reescrito"]);
+        let trocado = upgrade_fallback(&campaign, "Lia", mantido);
+        assert_eq!(trocado.text, "Olá Lia\n\nCorpo reescrito");
+        assert!(!trocado.fallback);
+        let da_ia = BuiltMessage { text: "Texto da IA".into(), fallback: false };
+        assert_eq!(upgrade_fallback(&campaign, "Lia", da_ia).text, "Texto da IA");
+    }
+
+    #[test]
+    fn rodada_da_ia_fica_na_memoria_e_no_banco() {
+        let db = temp_db("rodada");
+        let key = (990_005, 0xfeed);
+        store_round(&db, key, vec!["Olá {nome}".into(), "Corpo novo".into()]);
+        let esperado = vec![vec!["Olá {nome}".to_string()], vec!["Corpo novo".to_string()]];
+        assert_eq!(AI_VARIANT_POOLS.lock().unwrap().get(&key).map(|p| p.parts.clone()), Some(esperado.clone()));
+        assert_eq!(db.load_ai_variants(990_005, 0xfeed, AI_VARIANTS_PER_PART).unwrap(), esperado);
     }
 }
 

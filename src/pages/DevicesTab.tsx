@@ -21,7 +21,18 @@ import { api } from "../tauri";
 // Sub-componentes modularizados
 import { DeviceCard, DeviceRow, type AgentUpdateStatus } from "../components/devices/DeviceCard";
 import { DeviceToolbar, DeviceHeaderActions, type StatusFilter } from "../components/devices/DeviceToolbar";
-import { isOnlineStatus, deviceKey, deviceDisplayName, errorText, notify, confirmAction, type DeviceChip } from "../components/devices/deviceUi";
+import {
+  isOnlineStatus,
+  deviceKey,
+  deviceDisplayName,
+  errorText,
+  notify,
+  confirmAction,
+  crmChipsByDevice,
+  crmDeviceKey,
+  type DeviceChip,
+  type CrmChip,
+} from "../components/devices/deviceUi";
 import { ConnectDeviceModal } from "../components/devices/ConnectDeviceModal";
 import { DeviceConfigModal, type ConfigTab } from "../components/devices/DeviceConfigModal";
 import { MirrorModal } from "../components/devices/MirrorModal";
@@ -47,6 +58,8 @@ export default function DevicesTab() {
 
 const POLL_MS = 7000;
 const CHIPS_POLL_MS = 60000;
+// O CRM é outro processo: lê com folga, e o backend ainda guarda 60 s em cache.
+const CRM_POLL_MS = 120000;
 const LINK_TIMEOUT_MS = 25000;
 
 // Reaproveita o objeto anterior quando nada mudou: os cards (memo) não redesenham.
@@ -112,6 +125,8 @@ function ManagerDevicesView() {
   const [devicesList, setDevicesList] = useState<Device[]>([]);
   const [agentStatuses, setAgentStatuses] = useState<Record<string, AgentUpdateStatus>>({});
   const [chipsByDevice, setChipsByDevice] = useState<Record<number, DeviceChip[]>>({});
+  const [crmChips, setCrmChips] = useState<CrmChip[]>([]);
+  const [crmError, setCrmError] = useState<string | null>(null);
   const [selectedSerials, setSelectedSerials] = useState<string[]>([]);
   const [permissionRequests, setPermissionRequests] = useState<DevicePermissionRequest[]>([]);
   const [activeUserMap, setActiveUserMap] = useState<
@@ -296,6 +311,32 @@ function ManagerDevicesView() {
     return () => clearInterval(t);
   }, [deviceIdsKey, loadChips]);
 
+  // Chips do CRM de celulares do VERITAS: leitura pura, só para exibir o número
+  // e o status de WhatsApp ao lado de cada aparelho. Com o CRM fora do ar a tela
+  // segue normal — o erro só aparece no painel, sem atrapalhar o resto.
+  const loadCrmChips = useCallback(async (manual = false) => {
+    try {
+      const lista = await api<CrmChip[]>("get_crm_chips", manual ? { force: true } : {});
+      setCrmChips(Array.isArray(lista) ? lista : []);
+      setCrmError(null);
+    } catch (err: any) {
+      setCrmChips([]);
+      setCrmError(errorText(err, "CRM de celulares indisponível."));
+    }
+  }, []);
+
+  useEffect(() => {
+    loadCrmChips();
+    const t = setInterval(() => {
+      if (!document.hidden) loadCrmChips();
+    }, CRM_POLL_MS);
+    return () => clearInterval(t);
+  }, [loadCrmChips]);
+
+  // Agrupa uma vez: cada aparelho recebe sempre a mesma referência de lista e o
+  // memo dos cards continua valendo.
+  const crmByDevice = useMemo(() => crmChipsByDevice(crmChips), [crmChips]);
+
   // Seleção só com aparelhos que ainda existem na lista.
   useEffect(() => {
     setSelectedSerials((prev) => {
@@ -458,6 +499,42 @@ function ManagerDevicesView() {
       setLinkingStatus(`Erro: ${errMsg}`);
       reportIfClosed(false, `Não foi possível conectar ${label}.`, errMsg);
       later(() => setLinkingSerial(null), 4000);
+    }
+  };
+
+  // Botão "Conectar" do card: força o ADB de um aparelho só. O backend tenta, em
+  // ordem, túnel reverso, cabo e os IPs conhecidos, e devolve o motivo de cada
+  // rota que não respondeu — por isso o erro vai inteiro para o aviso.
+  const handleForceAdbConnect = async (device: Device) => {
+    const label = deviceDisplayName(device);
+    if (linkingSerial) {
+      notify("info", "Aguarde: outra conexão está em andamento.");
+      return;
+    }
+    setLinkingSerial(device.serial);
+
+    let timedOut = false;
+    const timeoutId = later(() => {
+      timedOut = true;
+      setLinkingSerial(null);
+      notify("warning", `Sem resposta de ${label}.`, "Tempo esgotado (25 s) ao forçar o ADB.");
+    }, LINK_TIMEOUT_MS);
+
+    try {
+      const result = await api<string>("force_adb_connect_device", {
+        serial: device.serial,
+        companyId: effectiveCompanyId,
+      });
+      cancelLater(timeoutId);
+      if (timedOut) return;
+      setLinkingSerial(null);
+      refreshDevices({ manual: true });
+      notify("success", `${label} conectado.`, prettyResult(result) || undefined);
+    } catch (err: any) {
+      cancelLater(timeoutId);
+      if (timedOut) return;
+      setLinkingSerial(null);
+      notify("danger", `Não foi possível conectar ${label}.`, errorText(err, "O ADB não respondeu."));
     }
   };
 
@@ -718,7 +795,7 @@ function ManagerDevicesView() {
           const devNum = String(device.deviceNumber ?? "");
           const devNumPad = devNum.padStart(2, "0");
           const chipHit =
-            qDigits.length >= 4 && (chipsByDevice[device.id] || []).some((c) => String(c.phoneNumber || "").replace(/\D/g, "").includes(qDigits));
+            qDigits.length >= 4 && (crmByDevice.get(crmDeviceKey(device.sector, device.deviceNumber)) || []).some((c) => String(c.phone || "").replace(/\D/g, "").includes(qDigits));
           return (
             name.toLowerCase().includes(q) ||
             esfId.toLowerCase().includes(q) ||
@@ -742,7 +819,7 @@ function ManagerDevicesView() {
         const nameB = String(b.name || b.model || b.serial || "");
         return nameA.localeCompare(nameB, undefined, { numeric: true, sensitivity: "base" });
       });
-  }, [devicesList, sectorTab, searchQuery, statusFilter, activeUserMap, chipsByDevice]);
+  }, [devicesList, sectorTab, searchQuery, statusFilter, activeUserMap, crmByDevice]);
 
   const stats = useMemo(() => {
     const list = devicesList || [];
@@ -802,6 +879,12 @@ function ManagerDevicesView() {
     []
   );
 
+  // Mesma técnica do forceWireless: a função muda a cada render, o ref mantém o
+  // callback estável e o memo dos cards continua valendo.
+  const forceConnectRef = useRef(handleForceAdbConnect);
+  forceConnectRef.current = handleForceAdbConnect;
+  const forceConnect = useCallback((device: Device) => forceConnectRef.current(device), []);
+
   const resolveTarget = (t: ModalTarget | null) =>
     t ? devicesList.find((d) => deviceKey(d) === t.key) || devicesList.find((d) => d.serial === t.serial) || t.snapshot : null;
   const mirrorDevice = resolveTarget(mirrorTarget);
@@ -839,6 +922,7 @@ function ManagerDevicesView() {
     activeUserDisplayName: activeUserMap[device.serial]?.activeUserDisplayName,
     pendingRequest: pendingByDevice.get(`${device.id}|${device.serial}`),
     chips: device.id > 0 ? chipsByDevice[device.id] : undefined,
+    crmChips: crmByDevice.get(crmDeviceKey(device.sector, device.deviceNumber)),
     linking: linkingSerial === device.serial,
     isSelected: selectedSet.has(device.serial),
     onApproveRequest: handleApproveRequest,
@@ -848,6 +932,7 @@ function ManagerDevicesView() {
     onOpenConfig: openConfig,
     onOpenRegion: openRegion,
     onForceWireless: forceWireless,
+    onForceConnect: forceConnect,
     onOpenDiagnostic: openIdentity,
   });
 
@@ -855,7 +940,7 @@ function ManagerDevicesView() {
     <div className="space-y-6 animate-fade-in pb-8">
       <PageHeader
         title="Aparelhos"
-        description="Status, chip, agente e controle remoto de cada aparelho."
+        description="Status, chips do VERITAS, agente e controle remoto de cada aparelho."
         icon={<Smartphone size={18} />}
         actions={
           <DeviceHeaderActions
@@ -875,6 +960,15 @@ function ManagerDevicesView() {
         <StatCard label="Offline" value={showSkeleton ? "–" : stats.offline} icon={<WifiOff size={14} />} tone="danger" onClick={() => setStatusFilter("offline")} />
         <StatCard label="Em uso" value={showSkeleton ? "–" : stats.inUse} icon={<UserCheck size={14} />} tone="accent" onClick={() => setStatusFilter("inuse")} />
       </div>
+
+      {crmError && (
+        <p className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border border-border bg-secondary/40 px-4 py-2.5 text-[0.8125rem] text-secondary">
+          <span>Números e status de WhatsApp do CRM de celulares não estão sendo exibidos: {crmError}</span>
+          <button type="button" onClick={() => loadCrmChips(true)} className="font-medium text-[var(--color-accent)] underline underline-offset-2 cursor-pointer">
+            Tentar de novo
+          </button>
+        </p>
+      )}
 
       {pendingRequests.length > 0 && (
         <section className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">

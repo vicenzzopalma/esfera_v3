@@ -18,6 +18,15 @@ pub struct AppConfig {
     pub tunnel_server_enabled: bool,
     pub tunnel_server_port: u16,
     pub mode: String,
+    /// Endereço do CRM de celulares do VERITAS ("Gestão de celulares"), lido
+    /// apenas para exibir número e status de WhatsApp de cada aparelho.
+    pub crm_base_url: String,
+    /// Grava no Konfiansa a conversa do WhatsApp do disparo (histórico interno AUTOMÁTICO).
+    pub konfiansa_history_enabled: bool,
+    /// Credenciais do serviço do Konfiansa: ficam só neste arquivo local, nunca no código.
+    pub konfiansa_win_user: String,
+    pub konfiansa_win_pass: String,
+    pub konfiansa_logon: String,
 }
 
 impl Default for AppConfig {
@@ -35,6 +44,11 @@ impl Default for AppConfig {
             tunnel_server_enabled: false,
             tunnel_server_port: 8888,
             mode: "standalone".to_string(),
+            crm_base_url: "http://187.77.243.224:3000".to_string(),
+            konfiansa_history_enabled: true,
+            konfiansa_win_user: String::new(),
+            konfiansa_win_pass: String::new(),
+            konfiansa_logon: String::new(),
         }
     }
 }

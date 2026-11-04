@@ -69,6 +69,8 @@ export function getToken(): string | null {
 const LOCAL_ONLY_COMMANDS = new Set([
   "connect_adb_device",
   "force_enable_wireless_adb",
+  "force_adb_connect_device",
+  "get_crm_chips",
   "pair_and_connect_adb_device",
   "link_usb_to_wireless",
   "get_devices",

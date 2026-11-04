@@ -7,9 +7,22 @@ import type { Device, DevicePermissionRequest } from "../../types";
 import { getConnectionOrigin } from "../../types";
 import Button from "../ui/Button";
 import Badge from "../ui/Badge";
-import { Monitor, Camera, Zap, Copy, Check, Info, Settings2, Bell, User, Hand, CardSim } from "lucide-react";
+import { Monitor, Camera, Zap, Copy, Check, Info, Settings2, Bell, User, Hand, CardSim, Plug, ChevronRight } from "lucide-react";
 import { RowMenu } from "./RowMenu";
-import { StatusDot, BatteryMeter, ORIGIN_LABEL, sectorLabel, deviceDisplayName, chipSummary, type DeviceChip } from "./deviceUi";
+import {
+  StatusDot,
+  BatteryMeter,
+  ORIGIN_LABEL,
+  sectorLabel,
+  deviceDisplayName,
+  chipSummary,
+  formatPhone,
+  crmStatusTone,
+  whatsappStatusView,
+  crmLastSeenText,
+  type DeviceChip,
+  type CrmChip,
+} from "./deviceUi";
 import type { ConfigTab } from "./DeviceConfigModal";
 
 export interface AgentUpdateStatus {
@@ -28,6 +41,7 @@ export interface DeviceItemProps {
   activeUserDisplayName?: string;
   pendingRequest?: DevicePermissionRequest;
   chips?: DeviceChip[];
+  crmChips?: CrmChip[];
   linking?: boolean;
   isSelected: boolean;
   onApproveRequest: (requestId: number) => void;
@@ -37,6 +51,7 @@ export interface DeviceItemProps {
   onOpenConfig: (device: Device, tab?: ConfigTab) => void;
   onOpenRegion: (device: Device) => void;
   onForceWireless: (device: Device) => void;
+  onForceConnect: (device: Device) => void;
   onOpenDiagnostic: (device: Device) => void;
 }
 
@@ -82,16 +97,23 @@ function useDeviceInfo(device: Device) {
       ? device.brand
       : "Android";
   const address = device.currentAdbAddress || device.ip || device.serial;
-  return { isUsbOnly, origin, displayName, model, address };
+  // "offline" aqui é tudo que não está online: o botão de conectar também serve
+  // para 'degraded' e 'connecting', onde o ADB costuma ter caído sem aviso.
+  const isOffline = device.status !== "online";
+  return { isUsbOnly, isOffline, origin, displayName, model, address };
 }
 
-function menuItems(p: DeviceItemProps, isUsbOnly: boolean) {
+function menuItems(p: DeviceItemProps, isUsbOnly: boolean, isOffline = false) {
   const d = p.device;
   return [
     { label: "Detalhes e identidade", icon: <Info size={14} />, onClick: () => p.onOpenDiagnostic(d) },
+    // Na linha offline o botão visível passa a ser "Conectar"; espelhar continua aqui.
+    { label: "Espelhar tela", icon: <Monitor size={14} />, onClick: () => p.onOpenMirror(d), hidden: !isOffline },
     { label: "Configurações", icon: <Settings2 size={14} />, onClick: () => p.onOpenConfig(d) },
-    { label: "Chip do aparelho", icon: <CardSim size={14} />, onClick: () => p.onOpenConfig(d, "chip") },
+    { label: "Chips no VERITAS", icon: <CardSim size={14} />, onClick: () => p.onOpenConfig(d, "chip") },
     { label: "Câmera virtual", icon: <Camera size={14} />, onClick: () => p.onOpenRegion(d) },
+    // Fica sempre à mão: status online no banco não garante transporte ADB vivo.
+    { label: "Forçar conexão ADB", icon: <Plug size={14} />, onClick: () => p.onForceConnect(d), disabled: p.linking },
     { label: "Ativar Wi-Fi", icon: <Zap size={14} />, onClick: () => p.onForceWireless(d), hidden: !isUsbOnly, disabled: p.linking },
   ];
 }
@@ -192,6 +214,39 @@ function AgentStatus({ status }: { status?: AgentUpdateStatus }) {
   );
 }
 
+// Gaveta com os chips que o CRM de celulares do VERITAS tem para este aparelho.
+// Fechada mostra só a contagem; os números aparecem ao clicar. É só leitura.
+function CrmChips({ chips, compact = false }: { chips?: CrmChip[]; compact?: boolean }) {
+  if (!chips || chips.length === 0) return null;
+  return (
+    <details className="group rounded-lg border border-border bg-secondary/40 px-2.5 py-1.5">
+      <summary className="flex cursor-pointer list-none items-center gap-1.5 text-[0.6875rem] font-medium text-tertiary select-none [&::-webkit-details-marker]:hidden">
+        <ChevronRight size={12} className="shrink-0 transition-transform group-open:rotate-90" />
+        <CardSim size={12} className="shrink-0" />
+        {chips.length === 1 ? "1 chip no VERITAS" : `${chips.length} chips no VERITAS`}
+      </summary>
+      <div className="mt-1.5 space-y-1">
+      {chips.map((c) => {
+        const wa = whatsappStatusView(c.whatsappStatus);
+        return (
+          <div key={c.id} className="flex flex-wrap items-center gap-x-1.5 gap-y-1" title={`${c.name || "sem nome"} · ${c.status}. ${wa.detail} (${crmLastSeenText(c.whatsappLastSeen)})`}>
+            <span className="font-mono text-[0.75rem] text-secondary">{formatPhone(c.phone)}</span>
+            <Badge variant={crmStatusTone(c.status)} dot>
+              {c.status || "sem status"}
+            </Badge>
+            {!compact && (
+              <Badge variant={wa.tone} dot>
+                {wa.label}
+              </Badge>
+            )}
+          </div>
+        );
+      })}
+      </div>
+    </details>
+  );
+}
+
 // compact: só a etiqueta (o número fica na dica), para a tabela não alargar.
 function ChipBadge({ chips, onOpen, compact = false }: { chips?: DeviceChip[]; onOpen: () => void; compact?: boolean }) {
   const s = chipSummary(chips);
@@ -209,7 +264,7 @@ function ChipBadge({ chips, onOpen, compact = false }: { chips?: DeviceChip[]; o
 
 export const DeviceCard = memo(function DeviceCard(props: DeviceItemProps) {
   const { device, activeUserDisplayName, pendingRequest, onApproveRequest, onRejectRequest, isSelected, onToggleSelect, onOpenMirror, linking } = props;
-  const { isUsbOnly, origin, displayName, model, address } = useDeviceInfo(device);
+  const { isUsbOnly, isOffline, origin, displayName, model, address } = useDeviceInfo(device);
   const idText = device.esferaDeviceId || device.serial;
 
   return (
@@ -245,6 +300,8 @@ export const DeviceCard = memo(function DeviceCard(props: DeviceItemProps) {
       )}
 
       <ChipBadge chips={props.chips} onOpen={() => props.onOpenConfig(device, "chip")} />
+
+      <CrmChips chips={props.crmChips} />
 
       <AgentStatus status={props.agentStatus} />
 
@@ -294,6 +351,22 @@ export const DeviceCard = memo(function DeviceCard(props: DeviceItemProps) {
           >
             {linking ? "Ativando Wi-Fi…" : "Ativar Wi-Fi"}
           </Button>
+        ) : isOffline ? (
+          <div className="grid grid-cols-2 gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => props.onForceConnect(device)}
+              loading={linking}
+              icon={<Plug size={14} />}
+              title="Tenta o ADB agora: túnel, cabo e os IPs conhecidos do aparelho"
+            >
+              {linking ? "Conectando…" : "Conectar"}
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => onOpenMirror(device)} icon={<Monitor size={14} />} title="Ver e controlar a tela do aparelho">
+              Espelhar
+            </Button>
+          </div>
         ) : (
           <div className="grid grid-cols-2 gap-2">
             <Button variant="primary" size="sm" onClick={() => onOpenMirror(device)} icon={<Monitor size={14} />} title="Ver e controlar a tela do aparelho">
@@ -312,7 +385,7 @@ export const DeviceCard = memo(function DeviceCard(props: DeviceItemProps) {
 // Linha para a visão em lista (densa).
 export const DeviceRow = memo(function DeviceRow(props: DeviceItemProps) {
   const { device, activeUserDisplayName, isSelected, onToggleSelect, onOpenMirror, linking } = props;
-  const { isUsbOnly, origin, displayName, model, address } = useDeviceInfo(device);
+  const { isUsbOnly, isOffline, origin, displayName, model, address } = useDeviceInfo(device);
 
   return (
     <tr className={`transition-colors hover:bg-hover ${isSelected ? "bg-[var(--color-accent-glow)]" : ""}`}>
@@ -334,6 +407,9 @@ export const DeviceRow = memo(function DeviceRow(props: DeviceItemProps) {
         <div className="mt-1">
           <ChipBadge chips={props.chips} onOpen={() => props.onOpenConfig(device, "chip")} compact />
         </div>
+        <div className="mt-1 max-w-[14rem]">
+          <CrmChips chips={props.crmChips} compact />
+        </div>
       </td>
       <td className="px-3 py-2.5">
         <BatteryMeter level={device.battery} />
@@ -351,12 +427,16 @@ export const DeviceRow = memo(function DeviceRow(props: DeviceItemProps) {
             <Button variant="secondary" size="sm" onClick={() => props.onForceWireless(device)} loading={linking} icon={<Zap size={13} />} title="Liga o controle por Wi-Fi para usar o aparelho sem o cabo USB">
               Ativar Wi-Fi
             </Button>
+          ) : isOffline ? (
+            <Button variant="primary" size="sm" onClick={() => props.onForceConnect(device)} loading={linking} icon={<Plug size={13} />} title="Tenta o ADB agora: túnel, cabo e os IPs conhecidos do aparelho">
+              Conectar
+            </Button>
           ) : (
             <Button variant="secondary" size="sm" onClick={() => onOpenMirror(device)} icon={<Monitor size={13} />}>
               Espelhar
             </Button>
           )}
-          <RowMenu items={menuItems(props, isUsbOnly)} />
+          <RowMenu items={menuItems(props, isUsbOnly, isOffline)} />
         </div>
       </td>
     </tr>
