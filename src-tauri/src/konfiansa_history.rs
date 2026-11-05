@@ -23,6 +23,10 @@ pub const OPT_OUT_GRACE_SECS: i64 = 120;
 const POLL_SECS: u64 = 60;
 /// Tipo de histórico "AUTOMÁTICO" no Konfiansa.
 const HISTORICO_TIPO: i32 = 41;
+/// Tipos do histórico externo, por resultado (os mesmos que a equipe usa).
+pub const TIPO_SEM_INTERESSE: i32 = 85;
+pub const TIPO_EM_COBRANCA: i32 = 99;
+pub const TIPO_CONTATO_EFETIVO: i32 = 100;
 const BRIDGE_SOURCE: &str = include_str!("konfiansa_bridge.cs");
 
 // ------------------------------------------------------------------
@@ -76,6 +80,28 @@ pub fn build_text(origem: &str, msgs: &[WaMessageRow]) -> String {
         linhas.push(format!("[{}] {}: {}", quando.format("%H:%M, %d/%m/%Y"), quem, sem_emoji(&m.text)));
     }
     linhas.join("\n")
+}
+
+/// Histórico externo (o credor vê): texto formal do resultado do contato e o tipo dele.
+/// Recusa (pediu SAIR) -> SEM INTERESSE; devedor respondeu -> CONTATO EFETIVO, direcionado ao
+/// negociador; sem resposta -> EM COBRANÇA.
+pub fn build_external(origem: &str, motivo: &str, msgs: &[WaMessageRow]) -> (String, i32) {
+    let destino = msgs.first().map(|m| m.phone.as_str()).unwrap_or("");
+    let quando = msgs.first().map(|m| chrono::DateTime::from_timestamp(m.ts, 0).unwrap_or_default()
+        .with_timezone(&chrono::Local).format("%d/%m/%Y").to_string()).unwrap_or_default();
+    let de = if origem.trim().is_empty() { String::new() } else { format!(", do número {}", fmt_phone(origem)) };
+    let abertura = format!(
+        "Realizado contato com o devedor via WhatsApp em {}{}, para o telefone {}, com o objetivo de dar andamento à regularização do débito.",
+        quando, de, fmt_phone(destino));
+    let respondeu = msgs.iter().any(|m| !m.from_me);
+    let (fecho, tipo) = if motivo == "recusa" {
+        ("O devedor manifestou recusa em prosseguir com a tratativa por este canal e solicitou não receber novas mensagens.", TIPO_SEM_INTERESSE)
+    } else if respondeu {
+        ("O devedor retornou o contato e o atendimento foi direcionado ao negociador responsável para dar continuidade às tratativas.", TIPO_CONTATO_EFETIVO)
+    } else {
+        ("Até o momento não houve retorno do devedor. Permanecemos no aguardo para dar continuidade ao atendimento.", TIPO_EM_COBRANCA)
+    };
+    (format!("{} {}", abertura, fecho), tipo)
 }
 
 /// Hora de fechar a conversa? "recusa" logo após o SAIR; "silencio" após 1 hora parada.
@@ -235,7 +261,27 @@ fn campaign_credor(db: &Database, campaign_id: i32) -> Result<i32, String> {
     Ok(credor)
 }
 
-/// Grava um histórico nos processos do devedor. Devolve (status, processos, erro).
+/// Grava um histórico no processo, uma vez só: o mesmo texto e tipo já gravados (tentativa anterior
+/// que caiu no meio) só devolvem o número existente. Interno fica bloqueado; externo aparece ao credor.
+fn insert_once(processo: i64, tipo: i32, externo: bool, texto: &str, usuario: &str) -> Result<i64, String> {
+    let ext = if externo { 1 } else { 0 };
+    let existente = konfiansa_query(&format!(
+        "SELECT TOP 1 CodProcessoHistorico AS n FROM ProcessoHistorico WHERE CodProcesso={} AND CodProcessoHistoricoTipo={} AND HisExterno={} \
+         AND CAST(DesHistorico AS varchar(max)) = CAST({} AS varchar(max))", processo, tipo, ext, texto))?;
+    if let Some(n) = existente.first().and_then(|x| x.get("n")).and_then(Value::as_i64) { return Ok(n); }
+    let log = format!("{} - {}", chrono::Local::now().format("%d/%m/%Y %H:%M:%S"), usuario);
+    let r = konfiansa_query(&format!(
+        "INSERT INTO ProcessoHistorico (CodProcesso, CodProcessoHistorico, CodProcessoHistoricoTipo, HisExterno, BloHistorico, \
+         DtaHistorico, DesHistorico, UsuHistorico, LogAtualiza) \
+         SELECT {p}, ISNULL(MAX(CodProcessoHistorico),0)+1, {t}, {ext}, {blo}, GETDATE(), {texto}, '{u}', '{log}' \
+         FROM ProcessoHistorico WITH (UPDLOCK, HOLDLOCK) WHERE CodProcesso={p}; \
+         SELECT TOP 1 CodProcessoHistorico AS n FROM ProcessoHistorico WHERE CodProcesso={p} ORDER BY CodProcessoHistorico DESC",
+        p = processo, t = tipo, ext = ext, blo = 1 - ext, texto = texto, u = usuario, log = log))?;
+    r.first().and_then(|x| x.get("n")).and_then(Value::as_i64)
+        .ok_or_else(|| format!("Konfiansa não confirmou o histórico no processo {}.", processo))
+}
+
+/// Grava os históricos (interno e externo) nos processos do devedor. Devolve (status, processos, erro).
 fn write_history(db: &Database, h: &KonfiansaHistoryRow) -> (String, String, String) {
     let credor = match campaign_credor(db, h.campaign_id) { Ok(c) => c, Err(e) => return ("erro".into(), h.processos.clone(), e) };
     let rows = match processes_for(&[h.phone.clone()], Some(credor)) { Ok(r) => r, Err(e) => return ("erro".into(), h.processos.clone(), e) };
@@ -243,34 +289,28 @@ fn write_history(db: &Database, h: &KonfiansaHistoryRow) -> (String, String, Str
     if alvo.is_empty() {
         return ("sem_processo".into(), String::new(), format!("Telefone {} sem processo do credor {} no Konfiansa.", fmt_phone(&h.phone), credor));
     }
-    let texto = sql_text(&sem_emoji(&h.texto));
+    let cfg = crate::config::load_config();
+    // Tudo no usuário do operador no Konfiansa (o mesmo do login da ponte).
+    let usuario: String = cfg.konfiansa_logon.trim().to_uppercase().chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).collect();
+    let usuario = if usuario.is_empty() { "AUTOMACAO".to_string() } else { usuario };
+    let interno = sql_text(&sem_emoji(&h.texto));
+    let externo = (!h.texto_externo.trim().is_empty() && h.tipo_externo > 0)
+        .then(|| sql_text(&sem_emoji(&h.texto_externo)));
     let mut feitos: Vec<String> = Vec::new();
     for p in alvo {
-        // Mesmo texto já gravado neste processo (tentativa anterior que caiu no meio): só registra.
-        let existente = konfiansa_query(&format!(
-            "SELECT TOP 1 CodProcessoHistorico AS n FROM ProcessoHistorico WHERE CodProcesso={} AND CodProcessoHistoricoTipo={} \
-             AND CAST(DesHistorico AS varchar(max)) = CAST({} AS varchar(max))", p.processo, HISTORICO_TIPO, texto));
-        let numero = match existente {
-            Ok(r) if !r.is_empty() => r[0].get("n").and_then(Value::as_i64),
-            Ok(_) => {
-                let log = format!("{} - AUTOMACAO", chrono::Local::now().format("%d/%m/%Y %H:%M:%S"));
-                match konfiansa_query(&format!(
-                    "INSERT INTO ProcessoHistorico (CodProcesso, CodProcessoHistorico, CodProcessoHistoricoTipo, HisExterno, BloHistorico, \
-                     DtaHistorico, DesHistorico, UsuHistorico, LogAtualiza) \
-                     SELECT {p}, ISNULL(MAX(CodProcessoHistorico),0)+1, {t}, 0, 1, GETDATE(), {texto}, 'AUTOMACAO', '{log}' \
-                     FROM ProcessoHistorico WITH (UPDLOCK, HOLDLOCK) WHERE CodProcesso={p}; \
-                     SELECT TOP 1 CodProcessoHistorico AS n FROM ProcessoHistorico WHERE CodProcesso={p} ORDER BY CodProcessoHistorico DESC",
-                    p = p.processo, t = HISTORICO_TIPO, texto = texto, log = log)) {
-                    Ok(r) => r.first().and_then(|x| x.get("n")).and_then(Value::as_i64),
-                    Err(e) => return ("erro".into(), feitos.join(";"), e),
-                }
-            }
+        let n = match insert_once(p.processo, HISTORICO_TIPO, false, &interno, &usuario) {
+            Ok(n) => n,
             Err(e) => return ("erro".into(), feitos.join(";"), e),
         };
-        match numero {
-            Some(n) => feitos.push(format!("{}#{}", p.processo, n)),
-            None => return ("erro".into(), feitos.join(";"), format!("Konfiansa não confirmou o histórico no processo {}.", p.processo)),
+        let mut item = format!("{}#{}", p.processo, n);
+        if let Some(ext) = &externo {
+            match insert_once(p.processo, h.tipo_externo, true, ext, &usuario) {
+                Ok(e) => item.push_str(&format!("+ext{}", e)),
+                Err(e) => return ("erro".into(), feitos.join(";"), e),
+            }
         }
+        feitos.push(item);
     }
     ("gravado".into(), feitos.join(";"), String::new())
 }
@@ -356,7 +396,9 @@ async fn tick(db: &Arc<Database>) -> Result<(), String> {
         if let Some(motivo) = closing_reason(now, last, opted) {
             let conversa = db.open_wa_messages(&key)?;
             if conversa.is_empty() { continue; }
-            let id = db.create_konfiansa_history(&conversa, motivo, &build_text(&conversation_origin(&conversa, &origem), &conversa))?;
+            let numero = conversation_origin(&conversa, &origem);
+            let (externo, tipo) = build_external(&numero, motivo, &conversa);
+            let id = db.create_konfiansa_history_full(&conversa, motivo, &build_text(&numero, &conversa), &externo, tipo)?;
             println!("[KONFIANSA] Conversa de {} fechada ({}): histórico {} pendente.", fmt_phone(&key), motivo, id);
         }
     }
@@ -402,6 +444,24 @@ mod tests {
     fn m(ts: i64, from_me: bool, push: &str, text: &str) -> WaMessageRow {
         WaMessageRow { msg_id: ts.to_string(), ts, phone_key: "1191703561".into(), phone: "5511991703561".into(), from_me,
             push_name: push.into(), text: text.into(), campaign_id: 16, owner: String::new() }
+    }
+
+    #[test]
+    fn externo_formal_por_resultado() {
+        let enviada = m(1793820390, true, "Realess", "Oi");
+        let resposta = m(1793820478, false, "Mel", "Quem fala?");
+        let (sem, t1) = build_external("554796834632", "silencio", &[enviada.clone()]);
+        assert_eq!(t1, TIPO_EM_COBRANCA);
+        assert!(sem.starts_with("Realizado contato com o devedor via WhatsApp em "), "{}", sem);
+        assert!(sem.contains("do número (47) 99683-4632, para o telefone (11) 99170-3561"), "{}", sem);
+        assert!(sem.ends_with("não houve retorno do devedor. Permanecemos no aguardo para dar continuidade ao atendimento."));
+        let (ret, t2) = build_external("554796834632", "silencio", &[enviada.clone(), resposta.clone()]);
+        assert_eq!(t2, TIPO_CONTATO_EFETIVO);
+        assert!(ret.contains("direcionado ao negociador responsável") && !ret.contains("Marcela"));
+        let (rec, t3) = build_external("554796834632", "recusa", &[enviada, resposta]);
+        assert_eq!(t3, TIPO_SEM_INTERESSE);
+        assert!(rec.contains("manifestou recusa"));
+        assert!(!rec.contains("R$"));
     }
 
     #[test]

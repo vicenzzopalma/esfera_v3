@@ -1477,6 +1477,9 @@ impl Database {
         let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN KonfiansaCredor INTEGER NOT NULL DEFAULT 0;", []);
         // Número do WhatsApp que fez o disparo daquela conversa (vai no título do histórico).
         let _ = self.conn().execute("ALTER TABLE ESF_WaMessage ADD COLUMN Owner TEXT NOT NULL DEFAULT '';", []);
+        // Histórico externo (visível ao credor): texto formal do resultado e o tipo do Konfiansa.
+        let _ = self.conn().execute("ALTER TABLE ESF_KonfiansaHistory ADD COLUMN TextoExterno TEXT NOT NULL DEFAULT '';", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_KonfiansaHistory ADD COLUMN TipoExterno INTEGER NOT NULL DEFAULT 0;", []);
         // Limpeza APENAS de dispositivos mockados de testes 'adb-dev-%' (NUNCA deletar conexões reais Wi-Fi/IP)
         let _ = self.conn().execute("DELETE FROM ESF_Device WHERE AdbDeviceId LIKE 'adb-dev-%';", []);
         let _ = self.conn().execute("DELETE FROM ESF_AuditLog WHERE Message LIKE '%adb-dev-%';", []);
@@ -5708,6 +5711,9 @@ pub struct KonfiansaHistoryRow {
     pub tentativas: i64,
     pub created_at: String,
     pub gravado_em: Option<String>,
+    /// Histórico externo formal ('' = não gravar) e o tipo dele no Konfiansa.
+    pub texto_externo: String,
+    pub tipo_externo: i32,
 }
 
 /// Contato já disparado: campanha mais recente, nome, telefone e primeiro envio (unix).
@@ -5719,7 +5725,7 @@ pub struct DispatchedContact {
     pub first_sent_ts: i64,
 }
 
-const KONFIANSA_HISTORY_COLS: &str = "HistoryId,PhoneKey,Phone,CampaignId,Motivo,FirstTs,LastTs,Mensagens,Texto,Status,Processos,Erro,Tentativas,CreatedAt,GravadoEm";
+const KONFIANSA_HISTORY_COLS: &str = "HistoryId,PhoneKey,Phone,CampaignId,Motivo,FirstTs,LastTs,Mensagens,Texto,Status,Processos,Erro,Tentativas,CreatedAt,GravadoEm,TextoExterno,TipoExterno";
 
 impl Database {
     pub fn evo_cursor(&self) -> Option<i64> {
@@ -5794,14 +5800,19 @@ impl Database {
 
     /// Fecha a conversa num histórico pendente e liga a ele exatamente estas mensagens.
     pub fn create_konfiansa_history(&self, msgs: &[WaMessageRow], motivo: &str, texto: &str) -> Result<i64, String> {
+        self.create_konfiansa_history_full(msgs, motivo, texto, "", 0)
+    }
+
+    /// Como `create_konfiansa_history`, com o histórico externo formal junto.
+    pub fn create_konfiansa_history_full(&self, msgs: &[WaMessageRow], motivo: &str, texto: &str, texto_externo: &str, tipo_externo: i32) -> Result<i64, String> {
         let first = msgs.first().ok_or("conversa sem mensagens")?;
         let last = msgs.last().unwrap();
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
         let result = (|| -> Result<i64> {
             conn.execute(
-                "INSERT INTO ESF_KonfiansaHistory(PhoneKey,Phone,CampaignId,Motivo,FirstTs,LastTs,Mensagens,Texto) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![first.phone_key, first.phone, last.campaign_id, motivo, first.ts, last.ts, msgs.len() as i64, texto])?;
+                "INSERT INTO ESF_KonfiansaHistory(PhoneKey,Phone,CampaignId,Motivo,FirstTs,LastTs,Mensagens,Texto,TextoExterno,TipoExterno) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![first.phone_key, first.phone, last.campaign_id, motivo, first.ts, last.ts, msgs.len() as i64, texto, texto_externo, tipo_externo])?;
             let id = conn.last_insert_rowid();
             for m in msgs {
                 conn.execute("UPDATE ESF_WaMessage SET HistoryId=?1 WHERE MsgId=?2 AND HistoryId IS NULL", params![id, m.msg_id])?;
@@ -5821,6 +5832,7 @@ impl Database {
             history_id: r.get(0)?, phone_key: r.get(1)?, phone: r.get(2)?, campaign_id: r.get(3)?, motivo: r.get(4)?,
             first_ts: r.get(5)?, last_ts: r.get(6)?, mensagens: r.get(7)?, texto: r.get(8)?, status: r.get(9)?,
             processos: r.get(10)?, erro: r.get(11)?, tentativas: r.get(12)?, created_at: r.get(13)?, gravado_em: r.get(14)?,
+            texto_externo: r.get(15)?, tipo_externo: r.get(16)?,
         })).map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>>>().map_err(|e| e.to_string())
     }
