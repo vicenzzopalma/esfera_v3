@@ -42,6 +42,15 @@ pub fn phone_of(jid: &str, alt: &str) -> Option<String> {
 
 /// O histórico do Konfiansa é texto não unicode: emoji e símbolos fora do Latin-1 não cabem.
 pub fn sem_emoji(s: &str) -> String {
+    // Pontuação tipográfica (comum em texto de IA) vira a equivalente simples, que o campo aceita.
+    let s: String = s.chars().map(|c| match c {
+        '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+        '\u{00A0}' | '\u{2007}' | '\u{202F}' | '\u{2009}' => ' ',
+        '\u{201C}' | '\u{201D}' | '\u{201E}' => '"',
+        '\u{2018}' | '\u{2019}' | '\u{201A}' => '\'',
+        '\u{2026}' => '.',
+        other => other,
+    }).collect();
     let limpo: String = s.chars()
         .filter(|c| {
             let n = *c as u32;
@@ -82,26 +91,76 @@ pub fn build_text(origem: &str, msgs: &[WaMessageRow]) -> String {
     linhas.join("\n")
 }
 
-/// Histórico externo (o credor vê): texto formal do resultado do contato e o tipo dele.
-/// Recusa (pediu SAIR) -> SEM INTERESSE; devedor respondeu -> CONTATO EFETIVO, direcionado ao
-/// negociador; sem resposta -> EM COBRANÇA.
+/// Fatos do histórico externo (o credor vê) e o tipo dele. A IA redige o registro a partir
+/// destes fatos. Recusa (pediu SAIR) -> SEM INTERESSE; devedor respondeu -> CONTATO EFETIVO,
+/// direcionado ao negociador; sem resposta -> EM COBRANÇA.
 pub fn build_external(origem: &str, motivo: &str, msgs: &[WaMessageRow]) -> (String, i32) {
     let destino = msgs.first().map(|m| m.phone.as_str()).unwrap_or("");
     let quando = msgs.first().map(|m| chrono::DateTime::from_timestamp(m.ts, 0).unwrap_or_default()
         .with_timezone(&chrono::Local).format("%d/%m/%Y").to_string()).unwrap_or_default();
-    let de = if origem.trim().is_empty() { String::new() } else { format!(", do número {}", fmt_phone(origem)) };
-    let abertura = format!(
-        "Realizado contato com o devedor via WhatsApp em {}{}, para o telefone {}, com o objetivo de dar andamento à regularização do débito.",
-        quando, de, fmt_phone(destino));
     let respondeu = msgs.iter().any(|m| !m.from_me);
-    let (fecho, tipo) = if motivo == "recusa" {
-        ("O devedor manifestou recusa em prosseguir com a tratativa por este canal e solicitou não receber novas mensagens.", TIPO_SEM_INTERESSE)
+    // SAIR escrito na conversa também é recusa (o descadastro pode chegar depois ao Esfera).
+    let pediu_sair = msgs.iter().any(|m| !m.from_me && {
+        let t = m.text.trim().to_lowercase();
+        t == "sair" || t.starts_with("sair ") || t.contains("descadastr") || t.contains("não quero receber")
+    });
+    let (resultado, tipo) = if motivo == "recusa" || pediu_sair {
+        ("o devedor recusou prosseguir com a tratativa por este canal e pediu para não receber novas mensagens", TIPO_SEM_INTERESSE)
     } else if respondeu {
-        ("O devedor retornou o contato e o atendimento foi direcionado ao negociador responsável para dar continuidade às tratativas.", TIPO_CONTATO_EFETIVO)
+        ("o devedor respondeu e o atendimento foi direcionado ao negociador responsável para continuidade das tratativas", TIPO_CONTATO_EFETIVO)
     } else {
-        ("Até o momento não houve retorno do devedor. Permanecemos no aguardo para dar continuidade ao atendimento.", TIPO_EM_COBRANCA)
+        ("o devedor não respondeu até o momento; aguardamos o retorno para dar continuidade ao atendimento", TIPO_EM_COBRANCA)
     };
-    (format!("{} {}", abertura, fecho), tipo)
+    let origem = if origem.trim().is_empty() { String::new() } else { format!("número de origem {}; ", fmt_phone(origem)) };
+    (format!("Canal WhatsApp; data do contato {}; {}telefone do devedor {}; finalidade: dar andamento à regularização do débito; resultado: {}.",
+        quando, origem, fmt_phone(destino), resultado), tipo)
+}
+
+/// Instrução para a IA escrever o histórico externo (vai como instrução da empresa).
+const EXTERNO_PROMPT: &str = "O texto recebido NÃO é mensagem para o cliente: é uma lista de fatos de um contato de \
+cobrança. Com esses fatos, redija o registro formal para o histórico do processo, lido pelo credor: português formal, \
+terceira pessoa do plural (ex.: realizamos, permanecemos), um único parágrafo de duas ou três frases, sem saudação, \
+sem emoji, sem nomes de pessoas e sem a palavra fatos. Inclua exatamente a data, os números de telefone, o canal \
+WhatsApp e o resultado. Não acrescente fatos, valores, prazos ou promessas.";
+
+/// Resposta da IA serve para o histórico externo? Mantém data, telefones e o resultado.
+pub fn external_ok(base: &str, tipo: i32, texto: &str) -> bool {
+    let t = texto.to_lowercase();
+    let numeros_da_base: Vec<&str> = base.split(|c: char| !(c.is_ascii_digit() || matches!(c, '(' | ')' | '-' | '/' | ' ')))
+        .map(str::trim).filter(|x| x.chars().filter(|c| c.is_ascii_digit()).count() >= 8).collect();
+    let so_digitos = |x: &str| x.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+    let texto_digitos = so_digitos(texto);
+    let dados_ok = numeros_da_base.iter().all(|n| texto_digitos.contains(&so_digitos(n)));
+    let resultado_ok = match tipo {
+        TIPO_SEM_INTERESSE => t.contains("recus") || t.contains("não deseja") || t.contains("sem interesse"),
+        TIPO_CONTATO_EFETIVO => t.contains("negociador"),
+        _ => t.contains("retorno") || t.contains("resposta"),
+    };
+    let sem_rotulo = !t.contains("fatos") && !t.contains("resultado:") && !t.contains("finalidade:");
+    dados_ok && resultado_ok && sem_rotulo && !t.contains("r$") && texto.chars().count() <= 900
+}
+
+/// Escreve o histórico externo com IA, um provedor depois do outro até um acertar.
+async fn external_by_ai(db: &Arc<Database>, campaign_id: i32, base: &str, tipo: i32) -> Result<String, String> {
+    let db2 = db.clone();
+    let chain = tokio::task::spawn_blocking(move || {
+        let company = db2.get_campaign_company_id(campaign_id).unwrap_or(1);
+        let mut cfg = db2.get_ai_config(company).or_else(|| db2.get_ai_config(1)).ok_or("IA não configurada")?;
+        cfg.system_prompt = EXTERNO_PROMPT.to_string();
+        Ok::<_, String>(crate::dispatcher::build_ai_fallback_chain(&db2, company, &cfg))
+    }).await.map_err(|e| e.to_string())??;
+    let mut erros = Vec::new();
+    for cfg in &chain {
+        match crate::ai_engine::AiEngine::generate_message_chain(std::slice::from_ref(cfg), base, "").await {
+            Ok(texto) => {
+                let texto = sem_emoji(texto.split_whitespace().collect::<Vec<_>>().join(" ").trim());
+                if external_ok(base, tipo, &texto) { return Ok(texto); }
+                erros.push(format!("{}: texto fora do padrão", cfg.provider));
+            }
+            Err(e) => erros.push(e),
+        }
+    }
+    Err(format!("Nenhuma IA escreveu o histórico externo: {}", erros.join(" | ")))
 }
 
 /// Hora de fechar a conversa? "recusa" logo após o SAIR; "silencio" após 1 hora parada.
@@ -397,7 +456,12 @@ async fn tick(db: &Arc<Database>) -> Result<(), String> {
             let conversa = db.open_wa_messages(&key)?;
             if conversa.is_empty() { continue; }
             let numero = conversation_origin(&conversa, &origem);
-            let (externo, tipo) = build_external(&numero, motivo, &conversa);
+            let (base, tipo) = build_external(&numero, motivo, &conversa);
+            // O externo é sempre escrito por IA; se nenhuma responder, tenta de novo no próximo minuto.
+            let externo = match external_by_ai(db, conversa[0].campaign_id, &base, tipo).await {
+                Ok(t) => t,
+                Err(e) => { eprintln!("[KONFIANSA] {}: {}", fmt_phone(&key), e); continue; }
+            };
             let id = db.create_konfiansa_history_full(&conversa, motivo, &build_text(&numero, &conversa), &externo, tipo)?;
             println!("[KONFIANSA] Conversa de {} fechada ({}): histórico {} pendente.", fmt_phone(&key), motivo, id);
         }
@@ -447,21 +511,33 @@ mod tests {
     }
 
     #[test]
-    fn externo_formal_por_resultado() {
+    fn externo_fatos_por_resultado() {
         let enviada = m(1793820390, true, "Realess", "Oi");
         let resposta = m(1793820478, false, "Mel", "Quem fala?");
         let (sem, t1) = build_external("554796834632", "silencio", &[enviada.clone()]);
         assert_eq!(t1, TIPO_EM_COBRANCA);
-        assert!(sem.starts_with("Realizado contato com o devedor via WhatsApp em "), "{}", sem);
-        assert!(sem.contains("do número (47) 99683-4632, para o telefone (11) 99170-3561"), "{}", sem);
-        assert!(sem.ends_with("não houve retorno do devedor. Permanecemos no aguardo para dar continuidade ao atendimento."));
+        assert!(sem.contains("número de origem (47) 99683-4632; telefone do devedor (11) 99170-3561"), "{}", sem);
+        assert!(sem.contains("não respondeu"));
         let (ret, t2) = build_external("554796834632", "silencio", &[enviada.clone(), resposta.clone()]);
         assert_eq!(t2, TIPO_CONTATO_EFETIVO);
-        assert!(ret.contains("direcionado ao negociador responsável") && !ret.contains("Marcela"));
+        assert!(ret.contains("negociador responsável") && !ret.contains("Marcela"));
         let (rec, t3) = build_external("554796834632", "recusa", &[enviada, resposta]);
         assert_eq!(t3, TIPO_SEM_INTERESSE);
-        assert!(rec.contains("manifestou recusa"));
-        assert!(!rec.contains("R$"));
+        assert!(rec.contains("recusou") && !rec.contains("R$"));
+        let (sair, t4) = build_external("554796834632", "silencio", &[m(1, true, "R", "Oi"), m(2, false, "D", "Sair")]);
+        assert_eq!(t4, TIPO_SEM_INTERESSE, "{}", sair);
+    }
+
+    #[test]
+    fn resposta_da_ia_mantem_dados_e_resultado() {
+        let enviada = m(1793820390, true, "Realess", "Oi");
+        let (base, tipo) = build_external("554796834632", "silencio", &[enviada.clone(), m(1793820478, false, "Mel", "ok")]);
+        let data = base.split("data do contato ").nth(1).unwrap().split(';').next().unwrap();
+        let boa = format!("Em {}, realizamos contato com o devedor via WhatsApp, do número (47) 99683-4632 para o telefone (11) 99170-3561. O devedor retornou e o atendimento foi direcionado ao negociador responsável.", data);
+        assert!(external_ok(&base, tipo, &boa), "{}", boa);
+        assert!(!external_ok(&base, tipo, &base), "os fatos crus não servem");
+        assert!(!external_ok(&base, tipo, "Contato por WhatsApp; houve retorno e foi ao negociador."));
+        assert!(!external_ok(&base, TIPO_SEM_INTERESSE, &boa));
     }
 
     #[test]
@@ -476,6 +552,11 @@ mod tests {
         assert!(t.starts_with("ENVIO IA REALESS de (47) 99627-1722 para"), "{}", t);
         assert_eq!(fmt_phone("554796834632"), "(47) 99683-4632");
         assert_eq!(fmt_phone("554733054406"), "(47) 3305-4406");
+    }
+
+    #[test]
+    fn pontuacao_da_ia_vira_simples() {
+        assert_eq!(sem_emoji("(47)\u{a0}99683\u{2011}4632 \u{201c}ok\u{201d}"), "(47) 99683-4632 \"ok\"");
     }
 
     #[test]
