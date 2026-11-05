@@ -712,6 +712,46 @@ pub struct IdentityProbe {
     pub hw_serial: String,
 }
 
+/// O que o Android responde sobre o serviço de acessibilidade do agente.
+///
+/// A lista de configuração (`enabled_accessibility_services`) não serve para saber
+/// se o agente consegue digitar: quando o sistema derruba o serviço — o MIUI mata o
+/// agente na limpeza de memória — o componente CONTINUA listado e o Android o guarda
+/// em "Crashed services", de onde ele só sai se a configuração mudar. O aparelho fica
+/// online, com a configuração correta, e mudo. Só o `dumpsys accessibility` conta a
+/// verdade, e é dele que estes estados saem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessibilityState {
+    /// Ligado de verdade: o Android está entregando eventos ao agente.
+    Bound,
+    /// O Android derrubou o serviço e não vai religar sozinho.
+    Crashed,
+    /// Listado, mas ainda não ligado (subindo, ou recusado pelo sistema).
+    Listed,
+    /// Nem está na lista de habilitados.
+    Off,
+    /// Não deu para ler o `dumpsys`; não dá para afirmar nada.
+    Unknown,
+}
+
+impl AccessibilityState {
+    /// Só `Bound` autoriza um disparo: nos outros casos o agente não digita.
+    pub fn can_type(self) -> bool {
+        matches!(self, AccessibilityState::Bound)
+    }
+
+    /// Rótulo curto para a tela de aparelhos e para o log de auditoria.
+    pub fn label(self) -> &'static str {
+        match self {
+            AccessibilityState::Bound => "ok",
+            AccessibilityState::Crashed => "caido",
+            AccessibilityState::Listed => "ligando",
+            AccessibilityState::Off => "missing",
+            AccessibilityState::Unknown => "unknown",
+        }
+    }
+}
+
 impl AdbManager {
     pub const DEFAULT_WHATSAPP_PACKAGE: &'static str = "com.whatsapp";
     pub const BUSINESS_WHATSAPP_PACKAGE: &'static str = "com.whatsapp.w4b";
@@ -1436,30 +1476,126 @@ impl AdbManager {
         }
     }
 
-    /// Liga o serviço de acessibilidade do agente pelas configurações seguras (o shell ADB pode).
-    fn ensure_agent_accessibility(serial: &str) {
-        let cur = Self::execute_shell(serial, "settings get secure enabled_accessibility_services", 6)
-            .unwrap_or_default();
-        let cur = cur.trim();
-        if !cur.contains("EsferaAccessibilityService") {
-            let new_val = if cur.is_empty() || cur == "null" {
-                Self::AGENT_ACCESSIBILITY_COMPONENT.to_string()
-            } else {
-                format!("{}:{}", cur, Self::AGENT_ACCESSIBILITY_COMPONENT)
-            };
-            let _ = Self::execute_shell(
-                serial,
-                &format!("settings put secure enabled_accessibility_services {}", new_val),
-                6,
+    /// Lê o estado real do serviço no texto do `dumpsys accessibility`.
+    ///
+    /// É a única leitura confiável: a lista de configuração continua com o componente
+    /// mesmo depois que o Android derruba o serviço, então quem pergunta só para ela
+    /// recebe "está tudo certo" de um aparelho mudo.
+    fn accessibility_state_from_dumpsys(dump: &str, component: &str) -> AccessibilityState {
+        // As seções vêm indentadas, uma por linha: "Bound services:{...}".
+        let secao = |nome: &str| {
+            dump.lines()
+                .map(str::trim)
+                .find_map(|linha| linha.strip_prefix(nome))
+        };
+        let pacote = component.split('/').next().unwrap_or(component);
+        let ligados = secao("Bound services:");
+        let derrubados = secao("Crashed services:");
+        let habilitados = secao("Enabled services:");
+
+        // Sem nenhuma das seções o texto não é um dumpsys de acessibilidade
+        // (aparelho offline, serviço inexistente): não dá para afirmar nada.
+        if ligados.is_none() && derrubados.is_none() && habilitados.is_none() {
+            return AccessibilityState::Unknown;
+        }
+        // A linha de "Bound services" traz o RÓTULO do serviço, truncado com reticências,
+        // e não o nome do componente — por isso aqui a busca é pelo pacote.
+        if ligados.is_some_and(|s| s.contains(pacote)) {
+            return AccessibilityState::Bound;
+        }
+        if derrubados.is_some_and(|s| s.contains(component)) {
+            return AccessibilityState::Crashed;
+        }
+        if habilitados.is_some_and(|s| s.contains(component)) {
+            return AccessibilityState::Listed;
+        }
+        AccessibilityState::Off
+    }
+
+    /// Religa o serviço de acessibilidade do agente sobre um shell qualquer.
+    ///
+    /// Tirar o componente da lista e devolver é o ponto da função: o Android só
+    /// reavalia os serviços quando esse valor MUDA. Enquanto ele fica parado, um
+    /// serviço em "Crashed services" continua lá para sempre — foi o que deixou o
+    /// aparelho SUPER mudo em 05/11/2026, depois que a limpeza do MIUI matou o agente.
+    fn rebind_accessibility_with(
+        shell: &mut dyn FnMut(&str) -> Result<String, String>,
+    ) -> Result<(), String> {
+        const CHAVE: &str = "enabled_accessibility_services";
+        let atual = shell(&format!("settings get secure {}", CHAVE)).unwrap_or_default();
+        // Os outros serviços de acessibilidade do aparelho (um leitor de tela, por
+        // exemplo) não podem ser desligados no caminho.
+        let outros: Vec<&str> = atual
+            .trim()
+            .split(':')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "null" && !s.contains("EsferaAccessibilityService"))
+            .collect();
+        let sem_agente = outros.join(":");
+        let com_agente = if sem_agente.is_empty() {
+            Self::AGENT_ACCESSIBILITY_COMPONENT.to_string()
+        } else {
+            format!("{}:{}", sem_agente, Self::AGENT_ACCESSIBILITY_COMPONENT)
+        };
+
+        for valor in [&sem_agente, &com_agente] {
+            shell(&format!(
+                "settings put secure {} '{}'",
+                CHAVE,
+                Self::shell_quote(valor)
+            ))
+            .map_err(|e| format!("Não foi possível reescrever a acessibilidade: {}", e))?;
+        }
+        shell("settings put secure accessibility_enabled 1")
+            .map_err(|e| format!("Não foi possível ligar a acessibilidade: {}", e))?;
+        Ok(())
+    }
+
+    /// Despejo do estado da acessibilidade, filtrado no aparelho (o despejo inteiro
+    /// tem dezenas de milhares de caracteres e nada mais nos interessa).
+    const ACCESSIBILITY_DUMP: &'static str =
+        "dumpsys accessibility | grep -E 'Bound services:|Enabled services:|Crashed services:'";
+
+    /// Estado do serviço de acessibilidade do agente, lido do aparelho.
+    /// `Unknown` quando o `dumpsys` não pôde ser lido — nunca um palpite otimista.
+    pub fn accessibility_state(serial: &str) -> AccessibilityState {
+        match Self::execute_shell(serial, Self::ACCESSIBILITY_DUMP, 8) {
+            Ok(out) => {
+                Self::accessibility_state_from_dumpsys(&out, Self::AGENT_ACCESSIBILITY_COMPONENT)
+            }
+            Err(_) => AccessibilityState::Unknown,
+        }
+    }
+
+    /// Religa o serviço de acessibilidade do agente e devolve o que o aparelho passou
+    /// a responder. Chamada no meio do disparo, quando o agente recusa uma digitação.
+    fn ensure_agent_accessibility(serial: &str) -> AccessibilityState {
+        let mut shell = |cmd: &str| Self::execute_shell(serial, cmd, 6);
+        if let Err(e) = Self::rebind_accessibility_with(&mut shell) {
+            println!(
+                "[DIGITACAO] Não foi possível religar a acessibilidade em {}: {}",
+                serial, e
             );
         }
-        let _ = Self::execute_shell(serial, "settings put secure accessibility_enabled 1", 6);
-        let _ = Self::execute_shell(
-            serial,
+        let _ = shell(
             "am start-foreground-service -n com.esfera.agent/.EsferaAgentService 2>/dev/null || am startservice -n com.esfera.agent/.EsferaAgentService 2>/dev/null",
-            6,
         );
-        std::thread::sleep(Duration::from_millis(1800));
+        // Esperar pela CONDIÇÃO, não por um tempo fixo: medido em 1,1 s num Redmi
+        // Note 12, mas um aparelho carregado demora mais, e um prazo fixo curto
+        // daria "não ligou" para um religamento que deu certo.
+        let limite = Instant::now() + Duration::from_secs(8);
+        loop {
+            let estado = Self::accessibility_state(serial);
+            if estado.can_type() || Instant::now() >= limite {
+                println!(
+                    "[DIGITACAO] Acessibilidade em {} depois de religar: {}",
+                    serial,
+                    estado.label()
+                );
+                return estado;
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
     }
 
     /// Espera o agente terminar a digitação `id` (ele registra `TYPED <id> OK|FAIL ...` no logcat).
@@ -1543,8 +1679,9 @@ impl AdbManager {
         let id = format!("t{:x}{:x}", nanos & 0xffff_ffff_ffff, seq);
 
         let mut accepted = Self::agent_type_text_request(serial, &id, text, &delays, clear)?;
+        let mut estado = AccessibilityState::Unknown;
         if !accepted {
-            Self::ensure_agent_accessibility(serial);
+            estado = Self::ensure_agent_accessibility(serial);
             accepted = Self::agent_type_text_request(serial, &id, text, &delays, clear)?;
         }
         if accepted {
@@ -1561,9 +1698,17 @@ impl AdbManager {
             return Err("Há rascunho no campo e o agente de acessibilidade está indisponível para limpá-lo".to_string());
         }
         if !text.is_ascii() {
-            return Err(
-                "Agente de acessibilidade indisponível e o texto tem acento/emoji, que o ADB não digita; ative o Esfera Agent no aparelho".to_string(),
-            );
+            // Erro nomeando a causa: é ele que chega ao operador na campanha e no
+            // cartão do aparelho. "Indisponível" sozinho não dizia o que fazer.
+            let motivo = match estado {
+                AccessibilityState::Crashed => "o sistema derrubou o serviço de acessibilidade do agente e ele não voltou (limpeza de memória do aparelho)",
+                AccessibilityState::Off => "o serviço de acessibilidade do agente não está habilitado neste aparelho",
+                _ => "o agente de acessibilidade está indisponível",
+            };
+            return Err(format!(
+                "Digitação parada: {}, e o ADB não digita acento nem emoji. Ative o Esfera Agent em Acessibilidade no aparelho.",
+                motivo
+            ));
         }
         println!(
             "[DIGITACAO] Agente indisponível em {}: digitando {} teclas em ~{:.1} s via ADB (fallback ASCII)",
@@ -3748,14 +3893,42 @@ impl AdbManager {
 
     /// Versão instalada consultada no aparelho; erro de ADB nunca significa "não instalado".
     pub fn agent_capabilities(serial: &str) -> Result<(String, String, bool), String> {
-        let out = Self::execute_shell(serial,
-            "printf 'GO='; getprop ro.config.low_ram; printf 'ACCESS='; settings get secure enabled_accessibility_services; printf 'ENABLED='; settings get secure accessibility_enabled; printf 'LISTENER='; settings get secure enabled_notification_listeners", 8)?;
+        let out = Self::execute_shell(serial, Self::CAPABILITIES_PROBE, 8)?;
+        Ok(Self::parse_agent_capabilities(&out))
+    }
+
+    /// Sonda de capacidades. O `dumpsys` entra filtrado no aparelho (o despejo inteiro
+    /// é enorme) e por último, porque é a única parte com várias linhas.
+    const CAPABILITIES_PROBE: &'static str = "printf 'GO='; getprop ro.config.low_ram; printf 'ACCESS='; settings get secure enabled_accessibility_services; printf 'ENABLED='; settings get secure accessibility_enabled; printf 'LISTENER='; settings get secure enabled_notification_listeners; echo 'DUMP='; dumpsys accessibility | grep -E 'Bound services:|Enabled services:|Crashed services:'";
+
+    fn parse_agent_capabilities(out: &str) -> (String, String, bool) {
         let field = |key: &str| out.lines().find_map(|line| line.strip_prefix(key));
         let low_ram = field("GO=").map(|v| v.trim() == "true").unwrap_or(false);
-        let accessibility = match (field("ACCESS="), field("ENABLED=")) {
-            (Some(services), Some(enabled)) if services.contains(Self::AGENT_ACCESSIBILITY_COMPONENT) && enabled.trim() == "1" => "ok",
-            (Some(_), Some(_)) => "missing",
-            _ => "unknown",
+
+        // O `dumpsys` vem por último e ocupa o resto do texto.
+        let estado = match out.find("DUMP=") {
+            Some(i) => Self::accessibility_state_from_dumpsys(
+                &out[i + "DUMP=".len()..],
+                Self::AGENT_ACCESSIBILITY_COMPONENT,
+            ),
+            None => AccessibilityState::Unknown,
+        };
+        let accessibility = match estado {
+            // Sem o `dumpsys` não dá para afirmar que está tudo certo: a lista de
+            // configuração continua correta num aparelho que não digita mais nada.
+            // O máximo honesto aqui é "não sei" — dizer "ok" foi o que escondeu do
+            // operador, por sete minutos, um SUPER mudo em 05/11/2026.
+            AccessibilityState::Unknown => match (field("ACCESS="), field("ENABLED=")) {
+                (Some(services), Some(enabled))
+                    if services.contains(Self::AGENT_ACCESSIBILITY_COMPONENT)
+                        && enabled.trim() == "1" =>
+                {
+                    "unknown"
+                }
+                (Some(_), Some(_)) => "missing",
+                _ => "unknown",
+            },
+            estado => estado.label(),
         };
         let notifications = match field("LISTENER=") {
             Some(value) if value.contains("com.esfera.agent/com.esfera.agent.EsferaOptOutNotificationListener") => "ok",
@@ -3763,7 +3936,18 @@ impl AdbManager {
             Some(_) => "denied",
             None => "unknown",
         };
-        Ok((notifications.into(), accessibility.into(), low_ram))
+        (notifications.into(), accessibility.into(), low_ram)
+    }
+
+    /// Decide se vale religar os serviços do agente.
+    ///
+    /// Estado desconhecido NÃO dispara restauração: num aparelho onde o `dumpsys`
+    /// não pode ser lido isso viraria um laço de restaurações sem fim.
+    fn agent_services_need_restore(accessibility: AccessibilityState, listeners: &str) -> bool {
+        matches!(
+            accessibility,
+            AccessibilityState::Crashed | AccessibilityState::Listed | AccessibilityState::Off
+        ) || !listeners.contains("com.esfera.agent/")
     }
 
     pub fn installed_agent_version(serial: &str) -> Result<Option<(u32,String)>, String> {
@@ -3789,10 +3973,20 @@ impl AdbManager {
     }
 
     pub fn ensure_agent_services(serial: &str) -> Result<(), String> {
-        let accessibility=Self::execute_shell(serial, "settings get secure enabled_accessibility_services", 6)?;
         let listeners=Self::execute_shell(serial, "settings get secure enabled_notification_listeners", 6)?;
-        let enabled=Self::execute_shell(serial, "settings get secure accessibility_enabled", 6)?;
-        if accessibility.contains(Self::AGENT_ACCESSIBILITY_COMPONENT) && listeners.contains("com.esfera.agent/") && enabled.trim() == "1" { return Ok(()); }
+        // O estado vem do `dumpsys`, não da lista de configuração: ela continua
+        // correta num aparelho cujo serviço o sistema derrubou.
+        let estado = Self::accessibility_state(serial);
+        let precisa = if estado == AccessibilityState::Unknown {
+            // Aparelho que não respondeu ao `dumpsys`: resta a conferência antiga.
+            let lista=Self::execute_shell(serial, "settings get secure enabled_accessibility_services", 6)?;
+            let ligado=Self::execute_shell(serial, "settings get secure accessibility_enabled", 6)?;
+            !(lista.contains(Self::AGENT_ACCESSIBILITY_COMPONENT) && ligado.trim() == "1")
+                || !listeners.contains("com.esfera.agent/")
+        } else {
+            Self::agent_services_need_restore(estado, &listeners)
+        };
+        if !precisa { return Ok(()); }
         Self::restore_agent_services_after_update(serial)
     }
 
@@ -3816,16 +4010,11 @@ impl AdbManager {
                 eprintln!("[AGENTE] Acesso a todos os arquivos não aplicado (Android {:?}): {}", sdk, e);
             }
         }
-        let current = shell("settings get secure enabled_accessibility_services")
-            .map_err(|e| format!("Agente instalado, mas não foi possível ler a acessibilidade: {}",e))?;
-        let current = current.trim();
-        if !current.contains(Self::AGENT_ACCESSIBILITY_COMPONENT) {
-            let updated = if current.is_empty() || current == "null" { Self::AGENT_ACCESSIBILITY_COMPONENT.to_string() } else { format!("{}:{}",current,Self::AGENT_ACCESSIBILITY_COMPONENT) };
-            shell(&format!("settings put secure enabled_accessibility_services '{}'",Self::shell_quote(&updated)))
-                .map_err(|e| format!("Agente instalado, mas não foi possível ativar acessibilidade: {}",e))?;
-        }
-        shell("settings put secure accessibility_enabled 1")
-            .map_err(|e| format!("Agente instalado, mas não foi possível ativar acessibilidade: {}",e))?;
+        // Apagar e regravar, sempre. Conferir se o componente está na lista não basta:
+        // depois que o sistema derruba o serviço ele continua listado, e só uma MUDANÇA
+        // nesse valor faz o Android reavaliar e religar.
+        Self::rebind_accessibility_with(shell)
+            .map_err(|e| format!("Agente instalado, mas não foi possível ativar acessibilidade: {}", e))?;
         let accessibility = shell("settings get secure enabled_accessibility_services")
             .map_err(|e| format!("Não foi possível confirmar acessibilidade: {}",e))?;
         if !accessibility.contains(Self::AGENT_ACCESSIBILITY_COMPONENT) { return Err("Agente instalado, mas a acessibilidade não foi confirmada.".into()); }
@@ -6641,6 +6830,32 @@ mod restore_agent_tests {
         assert!(!phone.log.iter().any(|c| c.contains("MANAGE_EXTERNAL_STORAGE")), "Android 8 não tem essa operação");
     }
 
+    /// A restauração dos serviços tem que religar de verdade, não só conferir a lista.
+    /// Com o serviço derrubado pelo sistema o componente CONTINUA listado, e a versão
+    /// anterior pulava a escrita justamente aí — o aparelho ficava online e mudo.
+    #[test]
+    fn restaurar_religa_apagando_e_regravando_a_lista() {
+        let mut phone = Android::new(30);
+        phone.settings.insert(
+            "enabled_accessibility_services".into(),
+            AdbManager::AGENT_ACCESSIBILITY_COMPONENT.into(),
+        );
+        assert_eq!(AdbManager::restore_agent_services_with(&mut |c| phone.run(c), Ok(())), Ok(()));
+
+        let escritas: Vec<&String> = phone
+            .log
+            .iter()
+            .filter(|c| c.starts_with("settings put secure enabled_accessibility_services"))
+            .collect();
+        assert!(escritas.len() >= 2, "precisa apagar e regravar, escreveu {:?}", escritas);
+        assert!(
+            escritas.iter().any(|c| !c.contains("EsferaAccessibilityService")),
+            "o agente tem que sair da lista em algum momento: {:?}",
+            escritas
+        );
+        assert!(phone.settings["enabled_accessibility_services"].contains(AdbManager::AGENT_ACCESSIBILITY_COMPONENT));
+    }
+
     #[test]
     fn falha_do_acesso_a_arquivos_ou_do_reverse_nao_interrompe() {
         let mut phone = Android::new(30);
@@ -6651,6 +6866,224 @@ mod restore_agent_tests {
         assert!(result.unwrap_err().contains("encaminhamento de portas"));
         assert!(phone.settings["enabled_notification_listeners"].contains("EsferaOptOutNotificationListener"));
         assert!(phone.log.iter().any(|c| c.starts_with("am start-foreground-service")));
+    }
+}
+
+/// O MIUI mata o agente na limpeza de memória (`OneKeyClean`). O Android então guarda o
+/// serviço de acessibilidade em "Crashed services" e NÃO religa sozinho, mas deixa o
+/// componente na lista de habilitados. Os textos abaixo são `dumpsys accessibility`
+/// reais, colhidos em 05/11/2026 no aparelho SUPER (quebrado) e no Moto G22 (sadio).
+#[cfg(test)]
+mod acessibilidade_tests {
+    use super::{AccessibilityState, AdbManager};
+
+    const COMPONENTE: &str = AdbManager::AGENT_ACCESSIBILITY_COMPONENT;
+
+    /// SUPER às 14:42: o componente está listado, e mesmo assim o aparelho está mudo.
+    const DERRUBADO: &str = "\
+User state[
+     attributes:{id=0, touchExplorationEnabled=false}
+     Bound services:{}
+     Enabled services:{{com.esfera.agent/com.esfera.agent.accessibility.EsferaAccessibilityService}}
+     Binding services:{}
+     Crashed services:{{com.esfera.agent/com.esfera.agent.accessibility.EsferaAccessibilityService}}
+";
+
+    /// Moto G22 no mesmo instante, digitando normalmente. Repare que a linha de
+    /// "Bound services" traz o RÓTULO truncado, não o nome do componente.
+    const LIGADO: &str = "\
+User state[
+     Bound services:{Service[label=com.esfera.agent.accessibility.EsferaAccessibilityS\u{2026}, feedbackType[FEEDBACK_GENERIC], capabilities=161, eventTypes=TYPES_ALL_MASK, notificationTimeout=100, requestA11yBtn=false]}
+     Enabled services:{{com.esfera.agent/com.esfera.agent.accessibility.EsferaAccessibilityService}}
+     Binding services:{}
+     Crashed services:{}
+";
+
+    const SEM_O_AGENTE: &str = "\
+User state[
+     Bound services:{}
+     Enabled services:{}
+     Binding services:{}
+     Crashed services:{}
+";
+
+    #[test]
+    fn servico_derrubado_pelo_sistema_nao_passa_por_ligado() {
+        let estado = AdbManager::accessibility_state_from_dumpsys(DERRUBADO, COMPONENTE);
+        assert_eq!(estado, AccessibilityState::Crashed);
+        assert!(!estado.can_type(), "aparelho derrubado não pode receber disparo");
+    }
+
+    #[test]
+    fn servico_ligado_de_verdade_e_reconhecido_pelo_rotulo_truncado() {
+        let estado = AdbManager::accessibility_state_from_dumpsys(LIGADO, COMPONENTE);
+        assert_eq!(estado, AccessibilityState::Bound);
+        assert!(estado.can_type());
+    }
+
+    #[test]
+    fn servico_fora_da_lista_e_desligado() {
+        assert_eq!(
+            AdbManager::accessibility_state_from_dumpsys(SEM_O_AGENTE, COMPONENTE),
+            AccessibilityState::Off
+        );
+    }
+
+    #[test]
+    fn dumpsys_ilegivel_nao_vira_diagnostico() {
+        for texto in ["", "error: device offline", "cmd: Can't find service: accessibility"] {
+            assert_eq!(
+                AdbManager::accessibility_state_from_dumpsys(texto, COMPONENTE),
+                AccessibilityState::Unknown,
+                "não dá para afirmar nada a partir de {:?}",
+                texto
+            );
+        }
+    }
+
+    /// Shell simulado que guarda tudo o que foi escrito, na ordem.
+    struct Shell {
+        lista: String,
+        habilitado: String,
+        log: Vec<String>,
+    }
+
+    impl Shell {
+        fn com(lista: &str) -> Self {
+            Shell { lista: lista.into(), habilitado: "0".into(), log: Vec::new() }
+        }
+        fn run(&mut self, cmd: &str) -> Result<String, String> {
+            self.log.push(cmd.to_string());
+            if cmd == "settings get secure enabled_accessibility_services" {
+                return Ok(format!("{}\n", if self.lista.is_empty() { "null".into() } else { self.lista.clone() }));
+            }
+            if let Some(v) = cmd.strip_prefix("settings put secure enabled_accessibility_services ") {
+                self.lista = v.trim().trim_matches('\'').to_string();
+                return Ok(String::new());
+            }
+            if let Some(v) = cmd.strip_prefix("settings put secure accessibility_enabled ") {
+                self.habilitado = v.trim().to_string();
+                return Ok(String::new());
+            }
+            Err(format!("comando inesperado: {}", cmd))
+        }
+        /// Valores gravados na lista, na ordem.
+        fn escritas(&self) -> Vec<String> {
+            self.log
+                .iter()
+                .filter_map(|c| c.strip_prefix("settings put secure enabled_accessibility_services "))
+                .map(|v| v.trim().trim_matches('\'').to_string())
+                .collect()
+        }
+    }
+
+    /// A REGRESSÃO que deixou o SUPER mudo: a versão anterior só escrevia a lista
+    /// quando o componente faltava nela. Com o serviço derrubado o componente está
+    /// lá, a escrita era pulada, e o Android nunca reavaliava nada.
+    #[test]
+    fn religar_apaga_e_regrava_mesmo_com_o_componente_ja_na_lista() {
+        let mut shell = Shell::com(COMPONENTE);
+        AdbManager::rebind_accessibility_with(&mut |c| shell.run(c)).unwrap();
+
+        let escritas = shell.escritas();
+        assert!(escritas.len() >= 2, "precisa apagar e regravar, escreveu {:?}", escritas);
+        assert!(
+            !escritas[0].contains("EsferaAccessibilityService"),
+            "a primeira escrita tem que TIRAR o componente, veio {:?}",
+            escritas[0]
+        );
+        assert!(
+            escritas.last().unwrap().contains(COMPONENTE),
+            "a última escrita tem que devolver o componente, veio {:?}",
+            escritas.last()
+        );
+        assert_eq!(shell.lista, COMPONENTE);
+        assert_eq!(shell.habilitado, "1");
+    }
+
+    #[test]
+    fn religar_preserva_os_outros_servicos_de_acessibilidade() {
+        let outro = "com.google.android.marvin.talkback/.TalkBackService";
+        let mut shell = Shell::com(&format!("{}:{}", outro, COMPONENTE));
+        AdbManager::rebind_accessibility_with(&mut |c| shell.run(c)).unwrap();
+
+        let escritas = shell.escritas();
+        assert!(escritas.len() >= 2, "precisa apagar e regravar, escreveu {:?}", escritas);
+        assert!(
+            escritas.iter().any(|e| !e.contains("EsferaAccessibilityService")),
+            "o agente tem que sair da lista em algum momento, senão o Android não reavalia: {:?}",
+            escritas
+        );
+        for escrita in &escritas {
+            assert!(escrita.contains(outro), "o TalkBack não pode ser desligado: {:?}", escrita);
+        }
+        assert!(shell.lista.contains(outro));
+        assert!(shell.lista.contains(COMPONENTE));
+    }
+
+    #[test]
+    fn religar_liga_do_zero_quando_a_lista_esta_vazia() {
+        let mut shell = Shell::com("");
+        AdbManager::rebind_accessibility_with(&mut |c| shell.run(c)).unwrap();
+        assert_eq!(shell.lista, COMPONENTE);
+        assert_eq!(shell.habilitado, "1");
+    }
+
+    const OUVINTE: &str = "com.esfera.agent/com.esfera.agent.EsferaOptOutNotificationListener";
+
+    /// Saída da sonda de capacidades, montada como o aparelho devolve.
+    fn sonda(dump: &str) -> String {
+        format!(
+            "GO=false\nACCESS={}\nENABLED=1\nLISTENER={}\nDUMP=\n{}",
+            COMPONENTE, OUVINTE, dump
+        )
+    }
+
+    /// O relatório que o SUPER dava enquanto estava mudo: configuração perfeita.
+    /// Dizer "ok" aqui é o que escondeu o problema do operador por sete minutos.
+    #[test]
+    fn capacidades_acusam_servico_caido_em_vez_de_dizer_ok() {
+        let (_, acessibilidade, _) = AdbManager::parse_agent_capabilities(&sonda(DERRUBADO));
+        assert_eq!(acessibilidade, "caido");
+    }
+
+    #[test]
+    fn capacidades_dizem_ok_quando_o_servico_esta_mesmo_ligado() {
+        let (ouvinte, acessibilidade, go) = AdbManager::parse_agent_capabilities(&sonda(LIGADO));
+        assert_eq!(acessibilidade, "ok");
+        assert_eq!(ouvinte, "ok");
+        assert!(!go);
+    }
+
+    /// Aparelho que não respondeu ao `dumpsys`: a lista de configuração sozinha não
+    /// autoriza dizer que está tudo certo.
+    #[test]
+    fn sem_dumpsys_as_capacidades_nao_afirmam_que_esta_ok() {
+        let antiga = format!("GO=false\nACCESS={}\nENABLED=1\nLISTENER={}\n", COMPONENTE, OUVINTE);
+        let (_, acessibilidade, _) = AdbManager::parse_agent_capabilities(&antiga);
+        assert_eq!(acessibilidade, "unknown");
+    }
+
+    #[test]
+    fn servico_caido_pede_restauracao_mesmo_com_a_lista_certa() {
+        assert!(AdbManager::agent_services_need_restore(AccessibilityState::Crashed, OUVINTE));
+    }
+
+    #[test]
+    fn servico_ligado_com_tudo_certo_nao_pede_restauracao() {
+        assert!(!AdbManager::agent_services_need_restore(AccessibilityState::Bound, OUVINTE));
+    }
+
+    /// Num aparelho onde o `dumpsys` não pode ser lido, restaurar sempre viraria
+    /// um laço de restaurações sem fim.
+    #[test]
+    fn estado_desconhecido_nao_dispara_restauracao_em_laco() {
+        assert!(!AdbManager::agent_services_need_restore(AccessibilityState::Unknown, OUVINTE));
+    }
+
+    #[test]
+    fn ouvinte_do_sair_desligado_pede_restauracao() {
+        assert!(AdbManager::agent_services_need_restore(AccessibilityState::Bound, ""));
     }
 }
 

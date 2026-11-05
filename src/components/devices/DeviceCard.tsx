@@ -33,6 +33,10 @@ export interface AgentUpdateStatus {
   expectedCode: number;
   status: string;
   detail: string;
+  /** Estado real do serviço de acessibilidade lido do aparelho: "ok", "caido",
+   *  "ligando", "missing" ou "unknown". "caido" = o sistema derrubou o serviço e
+   *  o aparelho não digita, mesmo aparecendo online e com o agente em dia. */
+  accessibility?: string;
 }
 
 export interface DeviceItemProps {
@@ -153,8 +157,21 @@ export function describeAgent(status?: AgentUpdateStatus): { text: string; tone:
   const version = hasVersion ? ` (versão ${status.versionName || status.versionCode})` : "";
   const detail = String(status.detail || "");
   const d = detail.toLowerCase();
+  // Vem antes do status: um aparelho com o agente "em dia" e o serviço derrubado
+  // pelo sistema aparece online e não digita nada. Era esse o caso que passava
+  // despercebido até o disparo abrir conversa atrás de conversa sem escrever.
+  if (status.accessibility === "caido") {
+    return {
+      text: "O sistema deste aparelho derrubou a acessibilidade do agente: ele não digita. O Esfera religa sozinho na próxima verificação; se insistir, ligue a inicialização automática do Esfera Agent nas permissões do aparelho.",
+      tone: "danger",
+      technical: detail,
+    };
+  }
   switch (status.status) {
     case "current":
+      if (d.includes("religou")) {
+        return { text: "A acessibilidade do agente tinha caído e o Esfera religou. Se repetir, ligue a inicialização automática do Esfera Agent nas permissões do aparelho.", tone: "warning", technical: detail };
+      }
       return { text: `Agente em dia${version}`, tone: "muted", technical: detail };
     case "updating":
       return { text: "Atualizando o agente…", tone: "muted" };

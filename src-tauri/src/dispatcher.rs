@@ -2043,7 +2043,34 @@ impl Dispatcher {
                                     else { status.version_name="não instalado".into(); }
                                     if status.version_code.unwrap_or(0) >= expected {
                                         match db.agent_restore_pending(device.id) {
-                                            Ok(false) => { status.status="current".into(); status.detail="Agente atualizado".into(); update_agent_status(&db,&key,status.clone(),false); }
+                                            Ok(false) => {
+                                                // Estar na versão certa não quer dizer que o agente consegue digitar:
+                                                // quando o sistema derruba o serviço de acessibilidade (a limpeza de
+                                                // memória do MIUI mata o processo), ele fica em "Crashed" e o Android
+                                                // não religa sozinho. Sem olhar aqui, o operador só descobre no meio do
+                                                // disparo, com o aparelho abrindo conversa e não escrevendo nada.
+                                                use crate::adb_manager::AccessibilityState;
+                                                let serial_check=serial.clone();
+                                                let estado = spawn_blocking(move || AdbManager::accessibility_state(&serial_check)).await;
+                                                // Estado desconhecido (aparelho não respondeu ao dumpsys) não entra aqui:
+                                                // religar no escuro a cada minuto viraria um laço sem fim.
+                                                let quebrado = matches!(estado, Ok(AccessibilityState::Crashed) | Ok(AccessibilityState::Listed) | Ok(AccessibilityState::Off));
+                                                if quebrado {
+                                                    let derrubado = matches!(estado, Ok(AccessibilityState::Crashed));
+                                                    let serial_fix=serial.clone();
+                                                    let religado = spawn_blocking(move || AdbManager::ensure_agent_services(&serial_fix)).await;
+                                                    let erro = match religado { Ok(Ok(())) => None, Ok(Err(e)) => Some(e), Err(e) => Some(e.to_string()) };
+                                                    let causa = if derrubado { "O sistema derrubou a acessibilidade do agente" } else { "A acessibilidade do agente não está ligada" };
+                                                    match erro {
+                                                        None => { status.status="current".into(); status.detail=format!("{}; o Esfera religou",causa); }
+                                                        Some(e) => { status.status="error".into(); status.detail=format!("{} e não foi possível religar: {}",causa,e); }
+                                                    }
+                                                    update_agent_status(&db,&key,status.clone(),true);
+                                                } else {
+                                                    status.status="current".into(); status.detail="Agente atualizado".into();
+                                                    update_agent_status(&db,&key,status.clone(),false);
+                                                }
+                                            }
                                             Ok(true) => {
                                                 let serial_check=serial.clone();
                                                 let restored = spawn_blocking(move || AdbManager::ensure_agent_services(&serial_check)).await;
