@@ -46,8 +46,6 @@ pub struct User {
 const REPLY_SAMPLE: usize = 30;
 const REPLY_WAIT_HOURS: i64 = 2;
 const REPLY_SLOW_PERCENT: i64 = 5;
-const REPLY_PAUSE_PERCENT: i64 = 2;
-const REPLY_PAUSE_HOURS: i64 = 24;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,7 +128,6 @@ pub struct SendBatchRow {
     pub company_id: i32,
 }
 
-const REPLY_REASON_PAUSED: &str = "Poucas respostas: chip pausado por 24 h para proteger o número";
 const REPLY_REASON_SLOW: &str = "Ritmo reduzido por poucas respostas";
 const REPLY_REASON_NONE_YET: &str = "Nenhuma resposta captada ainda neste aparelho; confira se as notificações do WhatsApp chegam ao celular";
 const REPLY_REASON_UNAVAILABLE: &str = "Taxa de resposta indisponível neste aparelho";
@@ -142,7 +139,7 @@ fn reply_state(available: bool, ever_replied: bool, sample: usize, replies: usiz
     if !available { ("indisponivel", REPLY_REASON_UNAVAILABLE) }
     else if sample < REPLY_SAMPLE { ("normal", "") }
     else if !ever_replied { ("reduzido", REPLY_REASON_NONE_YET) }
-    else if (replies as i64) * 100 < (sample as i64) * REPLY_PAUSE_PERCENT { ("pausado", REPLY_REASON_PAUSED) }
+    // Sem pausa por poucas respostas (decisão do dono, 05/11): no máximo reduz o ritmo.
     else if (replies as i64) * 100 < (sample as i64) * REPLY_SLOW_PERCENT { ("reduzido", REPLY_REASON_SLOW) }
     else { ("normal", "") }
 }
@@ -2683,23 +2680,18 @@ impl Database {
         // Disponível = leitura de notificações ativa; "já respondeu" separa chip novo de chip ignorado.
         let (available, ever_replied): (bool, bool) = conn.query_row("SELECT EXISTS(SELECT 1 FROM ESF_ReplyCapture WHERE DeviceId=?1 AND Available=1), EXISTS(SELECT 1 FROM ESF_ReplyInbound WHERE DeviceId=?1)", params![device.id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
         let (sample,replies): (i64,i64) = conn.query_row("SELECT count(*),coalesce(sum(CASE WHEN EXISTS(SELECT 1 FROM ESF_ReplyInbound r WHERE r.DeviceId=?2 AND r.PhoneDigits=a.PhoneDigits AND r.ReceivedAt>=a.CreatedAt) THEN 1 ELSE 0 END),0) FROM (SELECT PhoneDigits,CreatedAt FROM ESF_ChipAttempt WHERE ChipId=?1 AND Purpose='campaign' AND Outcome='enviado' AND CreatedAt<=datetime('now',?3) AND CreatedAt>coalesce((SELECT UntilAt FROM ESF_ReplyBrake WHERE ChipId=?1),'0000-01-01') ORDER BY AttemptId DESC LIMIT ?4) a", params![chip.id, device.id, format!("-{} hours", REPLY_WAIT_HOURS), REPLY_SAMPLE as i64], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
-        let paused: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM ESF_ReplyBrake WHERE ChipId=?1 AND UntilAt>datetime('now'))", params![chip.id], |r| r.get(0)).map_err(|e| e.to_string())?;
-        let (state, reason) = if paused { ("pausado", REPLY_REASON_PAUSED) } else { reply_state(available, ever_replied, sample as usize, replies as usize) };
+        let (state, reason) = reply_state(available, ever_replied, sample as usize, replies as usize);
         Ok(NetworkChipStatus { chip_id: chip.id, device_id: device.id, device_name: device.name.clone(), reply_rate: if available && sample > 0 { Some(replies as f64 * 100.0 / sample as f64) } else { None }, sample: sample as usize, state: state.into(), reason: reason.into(), cooldown_seconds: conn.query_row(CHIP_COOLDOWN_SQL, params![chip.id], |r| r.get(0)).map_err(|e|e.to_string())? })
     }
 
+    /// Freio por respostas: só reduz o ritmo, nunca pausa. A pausa de 24 h deixada por versões
+    /// antigas é liberada na hora (chip volta a 'livre' e a amostra recomeça a partir de agora).
     pub fn apply_reply_brake(&self, chip: &Chip, device: &Device) -> Result<NetworkChipStatus, String> {
         let conn = self.conn();
-        conn.execute("UPDATE ESF_Chip SET Status='livre',RestrictedUntil=NULL WHERE ChipId=?1 AND Status='pausado' AND RestrictedUntil=(SELECT UntilAt FROM ESF_ReplyBrake WHERE ChipId=?1 AND UntilAt<=datetime('now'))", params![chip.id]).map_err(|e|e.to_string())?;
+        conn.execute("UPDATE ESF_Chip SET Status='livre',RestrictedUntil=NULL WHERE ChipId=?1 AND Status='pausado' AND RestrictedUntil=(SELECT UntilAt FROM ESF_ReplyBrake WHERE ChipId=?1)", params![chip.id]).map_err(|e|e.to_string())?;
+        conn.execute("UPDATE ESF_ReplyBrake SET UntilAt=datetime('now') WHERE ChipId=?1 AND UntilAt>datetime('now')", params![chip.id]).map_err(|e|e.to_string())?;
         drop(conn);
-        let status = self.reply_status(chip, device)?;
-        if status.state == "pausado" && chip.status == "livre" && chip.restricted_until.is_none() {
-            let conn = self.conn();
-            let until: String = conn.query_row("SELECT datetime('now',?1)", [format!("+{} hours", REPLY_PAUSE_HOURS)], |r| r.get(0)).map_err(|e| e.to_string())?;
-            conn.execute("INSERT INTO ESF_ReplyBrake(ChipId,UntilAt) VALUES(?1,?2) ON CONFLICT(ChipId) DO UPDATE SET UntilAt=excluded.UntilAt", params![chip.id,until]).map_err(|e| e.to_string())?;
-            conn.execute("UPDATE ESF_Chip SET Status='pausado',RestrictedUntil=?2 WHERE ChipId=?1 AND Status='livre'", params![chip.id,until]).map_err(|e| e.to_string())?;
-        }
-        Ok(status)
+        self.reply_status(chip, device)
     }
 
     pub fn network_status(&self, company: Option<i32>) -> Result<NetworkStatus, String> {
@@ -5024,7 +5016,8 @@ mod antiban_tests {
         assert_eq!(reply_state(false,true,30,0).0, "indisponivel");
         assert_eq!(reply_state(false,false,30,0).0, "indisponivel");
         assert_eq!(reply_state(true,true,29,0).0, "normal");
-        assert_eq!(reply_state(true,true,30,0).0, "pausado");
+        // Sem pausa por poucas respostas: no máximo reduz o ritmo.
+        assert_eq!(reply_state(true,true,30,0).0, "reduzido");
         assert_eq!(reply_state(true,true,30,1).0, "reduzido");
         assert_eq!(reply_state(true,true,100,2).0, "reduzido");
         assert_eq!(reply_state(true,true,100,5).0, "normal");
@@ -5063,13 +5056,16 @@ mod antiban_tests {
         db.set_reply_capture(1,"usb1",false).unwrap();
         assert_eq!(db.reply_status(&chip,&device).unwrap().state,"indisponivel");
         db.set_reply_capture(1,"usb1",true).unwrap();
-        assert_eq!(db.apply_reply_brake(&chip,&device).unwrap().state,"pausado");
-        assert_eq!(db.reply_status(&chip,&device).unwrap().sample,0);
-        db.conn().execute("UPDATE ESF_ReplyBrake SET UntilAt=datetime('now','-1 hour') WHERE ChipId=?1",params![chip_id]).unwrap();
-        db.conn().execute("UPDATE ESF_Chip SET RestrictedUntil=datetime('now','-1 hour') WHERE ChipId=?1",params![chip_id]).unwrap();
+        // Poucas respostas só reduzem o ritmo: o chip continua livre.
+        assert_eq!(db.apply_reply_brake(&chip,&device).unwrap().state,"reduzido");
+        assert_eq!(db.get_chips(device.id)[0].status,"livre");
+        // Pausa de 24 h deixada pela versão antiga é liberada na hora e a amostra recomeça.
+        db.conn().execute("INSERT INTO ESF_ReplyBrake(ChipId,UntilAt) VALUES(?1,datetime('now','+20 hours')) ON CONFLICT(ChipId) DO UPDATE SET UntilAt=excluded.UntilAt",params![chip_id]).unwrap();
+        db.conn().execute("UPDATE ESF_Chip SET Status='pausado',RestrictedUntil=(SELECT UntilAt FROM ESF_ReplyBrake WHERE ChipId=?1) WHERE ChipId=?1",params![chip_id]).unwrap();
         let paused = db.get_chips(device.id).pop().unwrap();
         assert_eq!(db.apply_reply_brake(&paused,&device).unwrap().state,"normal");
-        assert_eq!(db.get_chips(device.id)[0].status,"livre");
+        let chip_agora = db.get_chips(device.id).pop().unwrap();
+        assert_eq!((chip_agora.status.as_str(), chip_agora.restricted_until.is_none()), ("livre", true));
     }
     #[test]
     fn teto_rede_soma_aparelhos_e_reabre_janela() {

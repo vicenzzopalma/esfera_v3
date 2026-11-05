@@ -2325,7 +2325,7 @@ function NetworkSettings({ canEdit }: { canEdit: boolean }) {
 
       <FormSection
         title="Freio por resposta"
-        description="O Esfera acompanha quantos clientes respondem em cada chip. Com poucas respostas, primeiro reduz o ritmo; se continuar baixo, pausa o chip por 24 h para proteger o número."
+        description="O Esfera acompanha quantos clientes respondem em cada aparelho. Com poucas respostas, ele só reduz o ritmo de envio; o aparelho não é pausado."
       >
         <div className="max-w-xl">
           {status === null ? (
