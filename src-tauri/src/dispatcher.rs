@@ -1662,6 +1662,15 @@ impl Dispatcher {
                         let campaign_last = campaign.id;
                         let contact_id_for_safety = next_contact.id;
                         let network_guard = NetworkSendGuard(network_guard, device_id);
+                        // O envio leva minutos (digitação): avisa que começou, para a tela não ficar
+                        // mostrando a última espera ("Aguardando aparelho") enquanto a mensagem sai.
+                        if let Some(ref handle) = app_handle {
+                            let _ = handle.emit("campaign-progress", CampaignProgressEvent {
+                                last_contact_phone: phone.clone(),
+                                device_name: Some(target_device.name.clone()),
+                                ..CampaignProgressEvent::of(&campaign, "dispatching", "sending")
+                            });
+                        }
                         let send_res = spawn_blocking(move || {
                             // As duas travas vivem até o fim do envio, mesmo se a tarefa de cima for cancelada.
                             let _network_guard = network_guard;
