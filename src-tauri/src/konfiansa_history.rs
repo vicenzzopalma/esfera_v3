@@ -50,6 +50,8 @@ pub fn sem_emoji(s: &str) -> String {
 pub fn fmt_phone(raw: &str) -> String {
     let d: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
     let d = if (d.len() == 12 || d.len() == 13) && d.starts_with("55") { d[2..].to_string() } else { d };
+    // O WhatsApp guarda celular antigo sem o 9 (47 9683-4632): mostra como se disca (47) 99683-4632.
+    let d = if d.len() == 10 && matches!(d.as_bytes()[2], b'6'..=b'9') { format!("{}9{}", &d[..2], &d[2..]) } else { d };
     match d.len() {
         11 => format!("({}) {}-{}", &d[..2], &d[2..7], &d[7..]),
         10 => format!("({}) {}-{}", &d[..2], &d[2..6], &d[6..]),
@@ -290,6 +292,8 @@ struct HubMessage {
     push_name: String,
     #[serde(default)]
     text: String,
+    #[serde(default)]
+    owner: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -339,7 +343,7 @@ async fn tick(db: &Arc<Database>) -> Result<(), String> {
         // Só a conversa a partir do disparo (com folga para o relógio).
         (m.ts >= c.first_sent_ts - 300).then(|| WaMessageRow {
             msg_id: m.id, ts: m.ts, phone_key: key, phone, from_me: m.from_me,
-            push_name: m.push_name, text: m.text, campaign_id: c.campaign_id,
+            push_name: m.push_name, text: m.text, campaign_id: c.campaign_id, owner: m.owner,
         })
     }).collect();
     let novas = db.store_wa_messages(&rows)?;
@@ -352,7 +356,7 @@ async fn tick(db: &Arc<Database>) -> Result<(), String> {
         if let Some(motivo) = closing_reason(now, last, opted) {
             let conversa = db.open_wa_messages(&key)?;
             if conversa.is_empty() { continue; }
-            let id = db.create_konfiansa_history(&conversa, motivo, &build_text(&origem, &conversa))?;
+            let id = db.create_konfiansa_history(&conversa, motivo, &build_text(&conversation_origin(&conversa, &origem), &conversa))?;
             println!("[KONFIANSA] Conversa de {} fechada ({}): histórico {} pendente.", fmt_phone(&key), motivo, id);
         }
     }
@@ -366,6 +370,15 @@ async fn tick(db: &Arc<Database>) -> Result<(), String> {
         println!("[KONFIANSA] Histórico {} ({}): {} {}{}", h.history_id, fmt_phone(&h.phone), status, processos, if erro.is_empty() { String::new() } else { format!(" — {}", erro) });
     }
     Ok(())
+}
+
+/// Número que fez o disparo desta conversa: o da última mensagem enviada por nós; sem ele,
+/// o de qualquer mensagem da conversa; por fim, o número informado pelo hub.
+pub fn conversation_origin(msgs: &[WaMessageRow], fallback: &str) -> String {
+    let pick = |only_mine: bool| msgs.iter().rev()
+        .find(|m| (!only_mine || m.from_me) && !m.owner.trim().is_empty())
+        .map(|m| m.owner.trim().to_string());
+    pick(true).or_else(|| pick(false)).unwrap_or_else(|| fallback.to_string())
 }
 
 pub fn start(db: Arc<Database>) {
@@ -388,7 +401,21 @@ mod tests {
 
     fn m(ts: i64, from_me: bool, push: &str, text: &str) -> WaMessageRow {
         WaMessageRow { msg_id: ts.to_string(), ts, phone_key: "1191703561".into(), phone: "5511991703561".into(), from_me,
-            push_name: push.into(), text: text.into(), campaign_id: 16 }
+            push_name: push.into(), text: text.into(), campaign_id: 16, owner: String::new() }
+    }
+
+    #[test]
+    fn titulo_usa_o_numero_que_fez_o_disparo() {
+        let mut a = m(1, true, "Realess", "oi");
+        a.owner = "5547996271722".into();
+        let mut b = m(2, false, "Mel", "ok");
+        b.owner = "5547996271722".into();
+        assert_eq!(conversation_origin(&[a.clone(), b], "5547999254497"), "5547996271722");
+        assert_eq!(conversation_origin(&[m(1, true, "R", "oi")], "5547996834632"), "5547996834632");
+        let t = build_text(&conversation_origin(&[a.clone()], ""), &[a]);
+        assert!(t.starts_with("ENVIO IA REALESS de (47) 99627-1722 para"), "{}", t);
+        assert_eq!(fmt_phone("554796834632"), "(47) 99683-4632");
+        assert_eq!(fmt_phone("554733054406"), "(47) 3305-4406");
     }
 
     #[test]

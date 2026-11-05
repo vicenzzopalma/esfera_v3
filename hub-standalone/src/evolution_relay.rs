@@ -5,7 +5,7 @@
 // alterado na Evolution (nem o webhook, que outra automação usa).
 //
 // Ambiente: ESFERA_EVOLUTION_URL (ex.: http://127.0.0.1:18081), ESFERA_EVOLUTION_INSTANCE
-// (ex.: disparo), ESFERA_EVOLUTION_APIKEY, ESFERA_EVOLUTION_NUMBER (número da instância) e,
+// (uma ou mais, separadas por vírgula: disparo,disparo-9627), ESFERA_EVOLUTION_APIKEY e,
 // opcional, ESFERA_EVOLUTION_COMPANY_ID (empresa autorizada além do master). Sem
 // URL/instância/chave a rota responde 404.
 use axum::{
@@ -43,6 +43,9 @@ pub struct WaMessage {
     pub push_name: String,
     pub kind: String,
     pub text: String,
+    /// Número do WhatsApp da instância que trocou a mensagem (quem fez o disparo).
+    #[serde(default)]
+    pub owner: String,
 }
 
 /// Converte um registro da Evolution. Reação, edição e mensagens de protocolo ficam de fora.
@@ -89,6 +92,7 @@ pub fn simplify(r: &Value) -> Option<WaMessage> {
         push_name: r.get("pushName").and_then(Value::as_str).unwrap_or("").to_string(),
         kind,
         text,
+        owner: String::new(),
     })
 }
 
@@ -117,38 +121,66 @@ pub async fn evolution_messages(
     }
     let read = |name| std::env::var(name).ok().filter(|s: &String| !s.trim().is_empty()).ok_or(StatusCode::NOT_FOUND);
     let base = read("ESFERA_EVOLUTION_URL")?;
-    let instance = read("ESFERA_EVOLUTION_INSTANCE")?;
+    let instances = read("ESFERA_EVOLUTION_INSTANCE")?;
     let apikey = read("ESFERA_EVOLUTION_APIKEY")?;
     let until = q.until.unwrap_or_else(|| chrono::Utc::now().timestamp());
     if q.since <= 0 || until < q.since || until - q.since > 7 * 86_400 {
         return Err(StatusCode::BAD_REQUEST);
     }
     let page = q.page.unwrap_or(1).max(1);
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(20))
+        .build().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let base = base.trim_end_matches('/').to_string();
+    let owners = instance_owners(&client, &base, &apikey).await;
     let body = serde_json::json!({
         "where": { "messageTimestamp": { "gte": iso(q.since), "lte": iso(until) } },
         "page": page,
         "offset": 200,
     });
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(20))
-        .build().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let resp = client.post(format!("{}/chat/findMessages/{}", base.trim_end_matches('/'), instance))
-        .header("apikey", apikey)
-        .json(&body)
-        .send().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
-    if !resp.status().is_success() {
-        return Err(StatusCode::BAD_GATEWAY);
+    let mut pages = 1u64;
+    let mut messages: Vec<WaMessage> = Vec::new();
+    let mut first_owner = String::new();
+    for instance in instances.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        // Número lido da própria instância a cada consulta: se o WhatsApp for religado em outro
+        // número, o histórico já sai com o número certo.
+        let owner = owners.get(instance).cloned().unwrap_or_default();
+        if first_owner.is_empty() { first_owner = owner.clone(); }
+        let resp = client.post(format!("{}/chat/findMessages/{}", base, instance))
+            .header("apikey", &apikey)
+            .json(&body)
+            .send().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+        if !resp.status().is_success() {
+            // Instância desconectada ou apagada não derruba as outras.
+            continue;
+        }
+        let data: Value = resp.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let m = data.get("messages").unwrap_or(&Value::Null);
+        pages = pages.max(m.get("pages").and_then(Value::as_u64).unwrap_or(1));
+        let records = m.get("records").and_then(Value::as_array).cloned().unwrap_or_default();
+        messages.extend(records.iter().filter_map(simplify).map(|mut w| { w.owner = owner.clone(); w }));
     }
-    let data: Value = resp.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let m = data.get("messages").unwrap_or(&Value::Null);
-    let pages = m.get("pages").and_then(Value::as_u64).unwrap_or(1);
-    let records = m.get("records").and_then(Value::as_array).cloned().unwrap_or_default();
-    let messages: Vec<WaMessage> = records.iter().filter_map(simplify).collect();
-    // Número do WhatsApp da instância (vai no título do histórico: "de <número>").
-    let owner = std::env::var("ESFERA_EVOLUTION_NUMBER").unwrap_or_default();
     Ok(([(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json(serde_json::json!({ "page": page, "pages": pages, "owner": owner, "messages": messages }))).into_response())
+        Json(serde_json::json!({ "page": page, "pages": pages, "owner": first_owner, "messages": messages }))).into_response())
+}
+
+/// Número de cada instância (`ownerJid` sem o sufixo), direto da Evolution.
+async fn instance_owners(client: &reqwest::Client, base: &str, apikey: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(resp) = client.get(format!("{}/instance/fetchInstances", base)).header("apikey", apikey).send().await else { return out };
+    let Ok(list) = resp.json::<Value>().await else { return out };
+    for i in list.as_array().cloned().unwrap_or_default() {
+        out.extend(owner_of(&i));
+    }
+    out
+}
+
+pub fn owner_of(i: &Value) -> Option<(String, String)> {
+    let name = i.get("name").and_then(Value::as_str)?.to_string();
+    let jid = i.get("ownerJid").and_then(Value::as_str).unwrap_or("");
+    let num: String = jid.split('@').next().unwrap_or("").chars().filter(|c| c.is_ascii_digit()).collect();
+    (!num.is_empty()).then_some((name, num))
 }
 
 #[cfg(test)]
@@ -176,6 +208,13 @@ mod tests {
         assert!(simplify(&grupo).is_none());
         assert!(simplify(&reacao).is_none());
         assert!(simplify(&serde_json::json!({"messageType": "conversation"})).is_none());
+    }
+
+    #[test]
+    fn numero_da_instancia_vem_do_owner_jid() {
+        let i = serde_json::json!({"name": "disparo", "ownerJid": "554796834632@s.whatsapp.net"});
+        assert_eq!(owner_of(&i), Some(("disparo".into(), "554796834632".into())));
+        assert_eq!(owner_of(&serde_json::json!({"name": "nova", "ownerJid": null})), None);
     }
 
     #[test]
