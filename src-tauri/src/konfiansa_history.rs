@@ -487,10 +487,57 @@ pub fn conversation_origin(msgs: &[WaMessageRow], fallback: &str) -> String {
     pick(true).or_else(|| pick(false)).unwrap_or_else(|| fallback.to_string())
 }
 
+/// Telefones disparados, só dígitos com 55, sem repetição e ordenados (a lista que o robô usa).
+pub fn dispatched_phone_list<'a>(phones: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = phones.filter_map(|p| {
+        let d: String = p.chars().filter(|c| c.is_ascii_digit()).collect();
+        let d = if (10..=11).contains(&d.len()) { format!("55{}", d) } else { d };
+        ((12..=13).contains(&d.len()) && d.starts_with("55")).then_some(d)
+    }).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// (impressão da lista, quando foi publicada): só republica quando muda ou a cada 10 min.
+static DEVEDORES_PUBLICADOS: std::sync::Mutex<(u64, i64)> = std::sync::Mutex::new((0, 0));
+
+/// Publica no hub a lista de quem o Esfera disparou. O robô da VPS só repassa à negociadora
+/// respostas desses números: contato normal do celular de disparo nunca vai para ela.
+async fn publish_dispatched(db: &Arc<Database>) {
+    let db2 = db.clone();
+    let Ok(Ok(mapa)) = tokio::task::spawn_blocking(move || db2.dispatched_contacts()).await else { return };
+    let telefones = dispatched_phone_list(mapa.values().map(|c| c.phone.as_str()));
+    let impressao = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        telefones.hash(&mut h);
+        h.finish()
+    };
+    let agora = chrono::Utc::now().timestamp();
+    if DEVEDORES_PUBLICADOS.lock().map(|s| s.0 == impressao && agora - s.1 < 600).unwrap_or(false) {
+        return;
+    }
+    let cfg = crate::config::load_config();
+    if cfg.hub_token.trim().is_empty() { return; }
+    let Ok(addr) = cfg.hub_address.trim().parse::<std::net::SocketAddr>() else { return };
+    let Ok(client) = crate::hub_client::client_vps(Duration::from_secs(30)) else { return };
+    let url = format!("https://{}:8443/api/desktop/evolution/devedores", addr.ip());
+    match client.post(&url).bearer_auth(cfg.hub_token.trim()).json(&serde_json::json!({ "telefones": telefones })).send().await {
+        Ok(r) if r.status().is_success() => {
+            if let Ok(mut s) = DEVEDORES_PUBLICADOS.lock() { *s = (impressao, agora); }
+        }
+        Ok(r) => eprintln!("[DEVEDORES] hub respondeu HTTP {} ao publicar a lista.", r.status()),
+        Err(e) => eprintln!("[DEVEDORES] hub: {}", e),
+    }
+}
+
 pub fn start(db: Arc<Database>) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(20)).await;
         loop {
+            // Vale mesmo com o histórico do Konfiansa desligado: o repasse à negociadora depende dela.
+            publish_dispatched(&db).await;
             if crate::config::load_config().konfiansa_history_enabled {
                 if let Err(e) = tick(&db).await {
                     eprintln!("[KONFIANSA] {}", e);
@@ -552,6 +599,12 @@ mod tests {
         assert!(t.starts_with("ENVIO IA REALESS de (47) 99627-1722 para"), "{}", t);
         assert_eq!(fmt_phone("554796834632"), "(47) 99683-4632");
         assert_eq!(fmt_phone("554733054406"), "(47) 3305-4406");
+    }
+
+    #[test]
+    fn lista_de_disparados_so_digitos_com_55_sem_repetir() {
+        let l = dispatched_phone_list(["(47) 99627-1722", "5547996271722", "4733054406", "123", "lid:999"].into_iter());
+        assert_eq!(l, vec!["554733054406".to_string(), "5547996271722".to_string()]);
     }
 
     #[test]

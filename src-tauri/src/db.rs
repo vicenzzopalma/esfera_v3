@@ -1336,6 +1336,43 @@ impl Database {
             [],
         )?;
 
+        // 17.7 Cópia de segurança dos contatos de cada aparelho. NUNCA é apagada pelo app:
+        // só acrescenta e atualiza. Contato que some do aparelho fica com a data em VanishedAt.
+        // DeviceKey = EsferaDeviceId (ou "serial:<serial>" quando o aparelho não tem identidade).
+        self.conn().execute_batch(
+            "CREATE TABLE IF NOT EXISTS ESF_DeviceContactBackup (
+                BackupId INTEGER PRIMARY KEY AUTOINCREMENT,
+                DeviceKey TEXT NOT NULL,
+                ContactKey TEXT NOT NULL,
+                CompanyId INTEGER NOT NULL DEFAULT 0,
+                LastSerial TEXT NOT NULL DEFAULT '',
+                DisplayName TEXT NOT NULL DEFAULT '',
+                PhonesJson TEXT NOT NULL DEFAULT '[]',
+                PhoneDigits TEXT NOT NULL DEFAULT '',
+                AccountName TEXT NOT NULL DEFAULT '',
+                AccountType TEXT NOT NULL DEFAULT '',
+                RawContactId INTEGER,
+                FirstSeenAt TEXT NOT NULL,
+                LastSeenAt TEXT NOT NULL,
+                VanishedAt TEXT,
+                RestoredAt TEXT,
+                UNIQUE(DeviceKey, ContactKey)
+            );
+            CREATE INDEX IF NOT EXISTS idx_contact_backup_device ON ESF_DeviceContactBackup (DeviceKey, VanishedAt);
+            CREATE TABLE IF NOT EXISTS ESF_DeviceContactSnapshot (
+                SnapshotId INTEGER PRIMARY KEY AUTOINCREMENT,
+                DeviceKey TEXT NOT NULL,
+                Serial TEXT NOT NULL DEFAULT '',
+                Reason TEXT NOT NULL DEFAULT '',
+                TakenAt TEXT NOT NULL,
+                Total INTEGER NOT NULL DEFAULT 0,
+                Added INTEGER NOT NULL DEFAULT 0,
+                Vanished INTEGER NOT NULL DEFAULT 0,
+                Returned INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_contact_snapshot_device ON ESF_DeviceContactSnapshot (DeviceKey, SnapshotId);",
+        )?;
+
         // 18. Performance Indexes (Microsecond Lookups)
         self.conn().execute_batch("
             CREATE INDEX IF NOT EXISTS idx_device_company ON ESF_Device (CompanyId);
@@ -4861,6 +4898,173 @@ impl Database {
                 },
             )
             .ok()
+    }
+}
+
+// ============================================================
+// CÓPIA DE SEGURANÇA DOS CONTATOS DOS APARELHOS
+// Só acrescenta e atualiza: nenhuma rotina apaga linhas destas tabelas.
+// ============================================================
+
+/// Um contato guardado na cópia de segurança de um aparelho.
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ContactBackupRow {
+    pub id: i64,
+    pub device_key: String,
+    pub display_name: String,
+    /// Telefones como estavam no aparelho.
+    pub phones: Vec<String>,
+    /// Os mesmos telefones, só dígitos.
+    pub phone_digits: Vec<String>,
+    pub account_name: String,
+    pub account_type: String,
+    pub account_label: String,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    /// "Sumiu do aparelho em": preenchido quando uma cópia nova não traz mais o contato.
+    pub vanished_at: Option<String>,
+    pub restored_at: Option<String>,
+    /// Só nos que sumiram: nome de um contato ainda no aparelho com o mesmo número.
+    pub same_phone_on_device: Option<String>,
+}
+
+/// Resultado de uma cópia dos contatos de um aparelho.
+#[derive(Debug, Serialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContactSnapshotSummary {
+    pub device_key: String,
+    pub taken_at: String,
+    pub total: usize,
+    pub added: usize,
+    pub vanished: usize,
+    pub returned: usize,
+}
+
+impl Database {
+    /// Grava uma cópia: atualiza os que vieram, acrescenta os novos e marca como "sumiu" os que
+    /// estavam no aparelho e não vieram desta vez. Nunca apaga linha.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_contact_snapshot(
+        &self,
+        device_key: &str,
+        legacy_key: &str,
+        company_id: i32,
+        serial: &str,
+        reason: &str,
+        contacts: &[crate::contact_backup::DeviceContact],
+        now: &str,
+    ) -> Result<ContactSnapshotSummary, String> {
+        let err = |e: rusqlite::Error| e.to_string();
+        if device_key.trim().is_empty() { return Err("Aparelho sem identificação para a cópia dos contatos".into()); }
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction().map_err(err)?;
+        if !legacy_key.is_empty() && legacy_key != device_key {
+            // Cópia feita antes de o aparelho ter identidade passa para a identidade dele.
+            tx.execute("UPDATE OR IGNORE ESF_DeviceContactBackup SET DeviceKey=?1 WHERE DeviceKey=?2", params![device_key, legacy_key]).map_err(err)?;
+        }
+        let mut existing: std::collections::HashMap<String, (i64, bool)> = std::collections::HashMap::new();
+        {
+            let mut stmt = tx.prepare("SELECT BackupId, ContactKey, VanishedAt IS NOT NULL FROM ESF_DeviceContactBackup WHERE DeviceKey=?1").map_err(err)?;
+            let rows = stmt.query_map(params![device_key], |r| Ok((r.get::<_, String>(1)?, (r.get::<_, i64>(0)?, r.get::<_, bool>(2)?)))).map_err(err)?;
+            for row in rows {
+                let (key, value) = row.map_err(err)?;
+                existing.insert(key, value);
+            }
+        }
+        let mut summary = ContactSnapshotSummary { device_key: device_key.into(), taken_at: now.into(), ..Default::default() };
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in contacts {
+            let key = c.key();
+            if !seen.insert(key.clone()) { continue; }
+            let phones = serde_json::to_string(&c.phones).unwrap_or_else(|_| "[]".into());
+            let digits = c.phone_digits.join(",");
+            match existing.get(&key) {
+                Some(&(id, vanished)) => {
+                    tx.execute(
+                        "UPDATE ESF_DeviceContactBackup SET CompanyId=?2, LastSerial=?3, DisplayName=?4, PhonesJson=?5, PhoneDigits=?6,
+                            AccountName=?7, AccountType=?8, RawContactId=?9, LastSeenAt=?10, VanishedAt=NULL WHERE BackupId=?1",
+                        params![id, company_id, serial, c.display_name, phones, digits, c.account_name, c.account_type, c.raw_contact_id, now],
+                    ).map_err(err)?;
+                    if vanished { summary.returned += 1; }
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO ESF_DeviceContactBackup (DeviceKey, ContactKey, CompanyId, LastSerial, DisplayName, PhonesJson, PhoneDigits,
+                            AccountName, AccountType, RawContactId, FirstSeenAt, LastSeenAt) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
+                        params![device_key, key, company_id, serial, c.display_name, phones, digits, c.account_name, c.account_type, c.raw_contact_id, now],
+                    ).map_err(err)?;
+                    summary.added += 1;
+                }
+            }
+        }
+        summary.total = seen.len();
+        // Estava no aparelho e não veio nesta cópia: sumiu agora (a linha fica guardada).
+        for (key, &(id, vanished)) in &existing {
+            if !vanished && !seen.contains(key) {
+                tx.execute("UPDATE ESF_DeviceContactBackup SET VanishedAt=?2 WHERE BackupId=?1", params![id, now]).map_err(err)?;
+                summary.vanished += 1;
+            }
+        }
+        tx.execute(
+            "INSERT INTO ESF_DeviceContactSnapshot (DeviceKey, Serial, Reason, TakenAt, Total, Added, Vanished, Returned) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![device_key, serial, reason, now, summary.total as i64, summary.added as i64, summary.vanished as i64, summary.returned as i64],
+        ).map_err(err)?;
+        tx.commit().map_err(err)?;
+        Ok(summary)
+    }
+
+    /// Todos os contatos guardados de um aparelho (por qualquer uma das chaves dele):
+    /// primeiro os que sumiram (mais recentes antes), depois os presentes por nome.
+    pub fn list_contact_backup(&self, device_keys: &[String]) -> Result<Vec<ContactBackupRow>, String> {
+        let keys: Vec<&String> = device_keys.iter().filter(|k| !k.trim().is_empty()).collect();
+        if keys.is_empty() { return Ok(vec![]); }
+        let marks = (1..=keys.len()).map(|i| format!("?{}", i)).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT BackupId, DeviceKey, DisplayName, PhonesJson, PhoneDigits, AccountName, AccountType, FirstSeenAt, LastSeenAt, VanishedAt, RestoredAt
+             FROM ESF_DeviceContactBackup WHERE DeviceKey IN ({})
+             ORDER BY (VanishedAt IS NULL), VanishedAt DESC, DisplayName COLLATE NOCASE, BackupId",
+            marks
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+            let phones_json: String = r.get(3)?;
+            let digits: String = r.get(4)?;
+            let account_name: String = r.get(5)?;
+            let account_type: String = r.get(6)?;
+            Ok(ContactBackupRow {
+                id: r.get(0)?,
+                device_key: r.get(1)?,
+                display_name: r.get(2)?,
+                phones: serde_json::from_str(&phones_json).unwrap_or_default(),
+                phone_digits: digits.split(',').filter(|d| !d.is_empty()).map(String::from).collect(),
+                account_label: crate::contact_backup::account_label(&account_name, &account_type),
+                account_name,
+                account_type,
+                first_seen_at: r.get(7)?,
+                last_seen_at: r.get(8)?,
+                vanished_at: r.get(9)?,
+                restored_at: r.get(10)?,
+                same_phone_on_device: None,
+            })
+        }).map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
+    }
+
+    /// Anota quando o contato foi recriado no aparelho pela restauração.
+    pub fn mark_contact_restored(&self, backup_id: i64, now: &str) -> Result<(), String> {
+        self.exec_retry("UPDATE ESF_DeviceContactBackup SET RestoredAt=?2 WHERE BackupId=?1", params![backup_id, now])
+            .map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Última cópia do aparelho: (quando, motivo, total).
+    pub fn last_contact_snapshot(&self, device_keys: &[String]) -> Option<(String, String, i64)> {
+        let keys: Vec<&String> = device_keys.iter().filter(|k| !k.trim().is_empty()).collect();
+        if keys.is_empty() { return None; }
+        let marks = (1..=keys.len()).map(|i| format!("?{}", i)).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT TakenAt, Reason, Total FROM ESF_DeviceContactSnapshot WHERE DeviceKey IN ({}) ORDER BY SnapshotId DESC LIMIT 1", marks);
+        self.conn().query_row(&sql, rusqlite::params_from_iter(keys.iter()), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).ok()
     }
 }
 

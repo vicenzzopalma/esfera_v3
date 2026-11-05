@@ -13,6 +13,7 @@ import DashboardTab from "./pages/DashboardTab";
 import DevicesTab from "./pages/DevicesTab";
 import CampaignsTab from "./pages/CampaignsTab";
 import AutomationsTab from "./pages/AutomationsTab";
+import DispatchNumbersTab from "./pages/DispatchNumbersTab";
 import LogsTab from "./pages/LogsTab";
 import SettingsTab from "./pages/SettingsTab";
 import ToastContainer from "./components/ui/ToastContainer";
@@ -154,6 +155,16 @@ function AppRoutes() {
             <CompanyGate>
               <RoleGate roles={["master", "gestor"]}>
                 <CampaignsTab />
+              </RoleGate>
+            </CompanyGate>
+          }
+        />
+        <Route
+          path="/dispatch-numbers"
+          element={
+            <CompanyGate>
+              <RoleGate roles={["master", "gestor"]}>
+                <DispatchNumbersTab />
               </RoleGate>
             </CompanyGate>
           }

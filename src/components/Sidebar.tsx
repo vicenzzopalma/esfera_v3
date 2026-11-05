@@ -26,6 +26,7 @@ import {
   ShieldAlert,
   PanelLeftClose,
   PanelLeftOpen,
+  MessageCircle,
 } from "lucide-react";
 
 const STORAGE_KEY_COLLAPSED = "esfera_v3_sidebar_collapsed";
@@ -93,6 +94,14 @@ const NAV_GROUPS: NavGroup[] = [
         path: "/campaigns",
         label: "Campanhas",
         icon: <Megaphone size={16} />,
+        roles: ["master", "gestor"],
+        requiresCompany: true,
+      },
+      {
+        id: "dispatch-numbers",
+        path: "/dispatch-numbers",
+        label: "Números de disparo",
+        icon: <MessageCircle size={16} />,
         roles: ["master", "gestor"],
         requiresCompany: true,
       },

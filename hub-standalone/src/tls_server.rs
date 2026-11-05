@@ -121,6 +121,16 @@ pub async fn start(db: Arc<Database>, tls_port: u16) {
     let app = Router::new()
         .route("/api/desktop/vps-ia", get(vps_ia_config))
         .route("/api/desktop/evolution/messages", get(crate::evolution_relay::evolution_messages))
+        // Aba "Números de disparo" do Esfera.
+        .route("/api/desktop/evolution/instances",
+            get(crate::evolution_relay::evolution_instances).post(crate::evolution_relay::evolution_create))
+        .route("/api/desktop/evolution/qr", post(crate::evolution_relay::evolution_qr))
+        // Lista de devedores disparados (até 50 mil telefones: corpo maior que o padrão de 2 MB).
+        .route("/api/desktop/evolution/devedores",
+            post(crate::evolution_relay::evolution_devedores).layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)))
+        .route("/api/desktop/repasse/destinos",
+            get(crate::evolution_relay::repasse_destinos).post(crate::evolution_relay::repasse_add))
+        .route("/api/desktop/repasse/destinos/remover", post(crate::evolution_relay::repasse_remove))
         .route("/api/devices/check-in", post(handle_checkin))
         .route("/api/egress", get(crate::checkin_server::handle_egress))
         .route("/api/egress/report", post(crate::checkin_server::handle_egress_report))

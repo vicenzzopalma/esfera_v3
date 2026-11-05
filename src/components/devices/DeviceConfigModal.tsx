@@ -1,10 +1,11 @@
 // ============================================================
 // Esfera v3 — Configurações do aparelho
-// Abas: Geral, Chip, Tela, Rede, Desempenho e Sistema
+// Abas: Geral, Chip, Tela, Rede, Desempenho, Contatos (só master e gestor) e Sistema
 // ============================================================
 
 import { type ReactNode, useState, useEffect, useCallback } from "react";
-import { Loader2, Copy, Check, Sliders, Radio, RefreshCw, Package, Power, Trash2, AlertTriangle, Smartphone, Ban, ShieldCheck } from "lucide-react";
+import { Loader2, Copy, Check, Sliders, Radio, RefreshCw, Package, Power, Trash2, AlertTriangle, Smartphone, Ban, ShieldCheck, DatabaseBackup, Download, RotateCcw, Search } from "lucide-react";
+import { useAuth } from "../../context/AuthContext";
 import Badge from "../ui/Badge";
 import Field, { FormSection } from "../ui/Field";
 import { type Device, type SectorType, getConnectionOrigin } from "../../types";
@@ -1161,10 +1162,372 @@ export function SystemTab({ device, serial, displayName, agentStatus, onRemove, 
 }
 
 // ============================================================
+// ContactsBackupTab — cópia de segurança dos contatos do aparelho.
+// O Esfera guarda a agenda ao conectar, a cada 6 horas e antes de
+// limpar os temporários; nada da cópia é apagado. Só master e gestor.
+// ============================================================
+
+interface ContactBackupRow {
+  id: number;
+  deviceKey: string;
+  displayName: string;
+  phones: string[];
+  phoneDigits: string[];
+  accountName: string;
+  accountType: string;
+  accountLabel: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  vanishedAt: string | null;
+  restoredAt: string | null;
+  samePhoneOnDevice: string | null;
+}
+
+interface ContactBackupView {
+  deviceKey: string;
+  total: number;
+  present: number;
+  missing: number;
+  lastSnapshotAt: string | null;
+  lastSnapshotReason: string | null;
+  contacts: ContactBackupRow[];
+}
+
+interface ContactSnapshotSummary {
+  deviceKey: string;
+  takenAt: string;
+  total: number;
+  added: number;
+  vanished: number;
+  returned: number;
+}
+
+interface RestoreItem {
+  id: number;
+  name: string;
+  ok: boolean;
+  skipped: boolean;
+  detail: string;
+}
+
+interface RestoreReport {
+  account: string;
+  restored: number;
+  skipped: number;
+  failed: number;
+  items: RestoreItem[];
+}
+
+// Lista longa: mostra as primeiras e pede para usar a busca.
+const CONTACTS_SHOW_LIMIT = 300;
+
+function whenText(value?: string | null) {
+  const d = parseDbDate(value);
+  return d ? formatWhen(d) : value || "—";
+}
+
+// Planilha para o Excel em português: BOM UTF-8 (acentos corretos).
+function downloadCsvText(fileName: string, text: string) {
+  const url = URL.createObjectURL(new Blob(["﻿" + text], { type: "text/csv;charset=utf-8;" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function BackupStat({ label, value, danger = false }: { label: string; value: number; danger?: boolean }) {
+  return (
+    <div className={`rounded-xl border p-3 ${danger ? "border-red-500/30 bg-red-500/5" : "border-border bg-secondary"}`}>
+      <p className="text-[0.75rem] text-tertiary">{label}</p>
+      <p className={`mt-0.5 text-lg font-semibold ${danger ? "text-red-600 dark:text-red-400" : "text-primary"}`}>{value.toLocaleString("pt-BR")}</p>
+    </div>
+  );
+}
+
+export function ContactsBackupTab({ device }: { device: Device }) {
+  const online = isOnlineStatus(device.status);
+  const [view, setView] = useState<ContactBackupView | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [onlyMissing, setOnlyMissing] = useState(false);
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState<Set<number>>(() => new Set());
+  const [confirming, setConfirming] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [report, setReport] = useState<RestoreReport | null>(null);
+  const busy = copying || restoring || exporting;
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      setView(await api<ContactBackupView>("get_device_contact_backup", { deviceId: device.id }));
+    } catch (e) {
+      setMsg(`Erro: ${errorText(e, "Não foi possível ler a cópia dos contatos.")}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [device.id]);
+
+  useEffect(() => {
+    setSelected(new Set());
+    setReport(null);
+    setMsg(null);
+    setConfirming(false);
+    load();
+  }, [load]);
+
+  const copyNow = async () => {
+    setCopying(true);
+    setReport(null);
+    setMsg("Lendo a agenda do aparelho...");
+    try {
+      const s = await api<ContactSnapshotSummary>("backup_device_contacts_now", { deviceId: device.id });
+      const extra = [
+        s.added ? `${s.added} novo(s)` : "",
+        s.vanished ? `${s.vanished} sumiram desde a última cópia` : "",
+        s.returned ? `${s.returned} voltaram` : "",
+      ].filter(Boolean);
+      setMsg(`Cópia feita: ${s.total} contato(s) no aparelho${extra.length ? ` (${extra.join(", ")})` : ""}.`);
+      await load();
+    } catch (e) {
+      setMsg(`Erro: ${errorText(e, "Não foi possível copiar os contatos do aparelho.")}`);
+    } finally {
+      setCopying(false);
+    }
+  };
+
+  const exportCsv = async () => {
+    setExporting(true);
+    try {
+      const csv = await api<string>("export_device_contact_backup_csv", { deviceId: device.id, onlyMissing });
+      const d = new Date();
+      const stamp = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      const who = (device.name || device.serial || "aparelho").replace(/[^\p{L}\p{N}_-]+/gu, "_");
+      downloadCsvText(`esfera_contatos_${who}${onlyMissing ? "_sumiram" : ""}_${stamp}.csv`, csv);
+    } catch (e) {
+      setMsg(`Erro: ${errorText(e, "Não foi possível gerar a planilha.")}`);
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const restore = async () => {
+    const ids = [...selected];
+    if (ids.length === 0) return;
+    setConfirming(false);
+    setRestoring(true);
+    setReport(null);
+    setMsg(`Recriando ${ids.length} contato(s) no aparelho e conferindo um a um...`);
+    try {
+      const r = await api<RestoreReport>("restore_device_contacts", { deviceId: device.id, ids });
+      setReport(r);
+      const parts = [`${r.restored} contato(s) recriado(s)${r.account ? ` em ${r.account}` : ""}`];
+      if (r.failed) parts.push(`${r.failed} com falha`);
+      if (r.skipped) parts.push(`${r.skipped} sem necessidade`);
+      setMsg(`${parts.join("; ")}.`);
+      setSelected(new Set());
+      await load();
+    } catch (e) {
+      setMsg(`Erro: ${errorText(e, "Não foi possível restaurar os contatos.")}`);
+    } finally {
+      setRestoring(false);
+    }
+  };
+
+  const rows = view?.contacts ?? [];
+  const q = query.trim().toLowerCase();
+  const qDigits = q.replace(/\D/g, "");
+  const filtered = rows.filter(
+    (r) =>
+      (!onlyMissing || !!r.vanishedAt) &&
+      (!q ||
+        r.displayName.toLowerCase().includes(q) ||
+        r.accountLabel.toLowerCase().includes(q) ||
+        (qDigits.length >= 3 && r.phoneDigits.some((d) => d.includes(qDigits))))
+  );
+  const shown = filtered.slice(0, CONTACTS_SHOW_LIMIT);
+  const missingShown = filtered.filter((r) => !!r.vanishedAt);
+
+  const toggle = (id: number) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  return (
+    <div className="space-y-6">
+      <FormSection
+        title="Contatos (cópia de segurança)"
+        description='O Esfera guarda uma cópia de todos os contatos deste aparelho quando ele fica online, a cada 6 horas e sempre antes de limpar os contatos temporários do disparo. Nada desta cópia é apagado. Os contatos "Esfera <número>" do disparo não entram.'
+      >
+        <div className="grid grid-cols-3 gap-2">
+          <BackupStat label="Guardados" value={view?.total ?? 0} />
+          <BackupStat label="No aparelho" value={view?.present ?? 0} />
+          <BackupStat label="Sumiram do aparelho" value={view?.missing ?? 0} danger={(view?.missing ?? 0) > 0} />
+        </div>
+        <p className="text-[0.75rem] text-secondary">
+          {view?.lastSnapshotAt
+            ? `Última cópia: ${whenText(view.lastSnapshotAt)}${view.lastSnapshotReason ? ` (${view.lastSnapshotReason})` : ""}.`
+            : loading
+              ? "Carregando a cópia..."
+              : "Ainda não há cópia deste aparelho. Ela é feita sozinha quando o aparelho fica online, ou agora pelo botão abaixo."}
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="primary" size="sm" icon={<DatabaseBackup size={13} />} onClick={copyNow} loading={copying} disabled={!online || (busy && !copying)} title={online ? undefined : "Disponível com o aparelho online"}>
+            Copiar agora
+          </Button>
+          <Button variant="secondary" size="sm" icon={<Download size={13} />} onClick={exportCsv} loading={exporting} disabled={!view || view.total === 0 || (busy && !exporting)}>
+            Exportar planilha
+          </Button>
+        </div>
+      </FormSection>
+
+      <FormSection title="Lista de contatos guardados">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative min-w-[12rem] flex-1">
+            <Search size={14} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-tertiary" />
+            <input
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Buscar por nome, telefone ou conta"
+              aria-label="Buscar contatos guardados"
+              className={`${inputCls} pl-8`}
+            />
+          </div>
+          <SegmentedControl<string>
+            items={[
+              { id: "all", label: "Todos" },
+              { id: "missing", label: `Só os que sumiram (${view?.missing ?? 0})` },
+            ]}
+            value={onlyMissing ? "missing" : "all"}
+            onChange={(v) => setOnlyMissing(v === "missing")}
+          />
+        </div>
+
+        {missingShown.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/5 p-3">
+            <p className="mr-auto text-[0.8125rem] text-secondary">
+              {selected.size > 0 ? `${selected.size} contato(s) escolhido(s) para restaurar.` : "Marque os contatos que sumiram para recriá-los no aparelho."}
+            </p>
+            <Button variant="ghost" size="sm" onClick={() => setSelected(new Set(missingShown.map((r) => r.id)))} disabled={busy}>
+              Marcar os que sumiram
+            </Button>
+            {selected.size > 0 && (
+              <Button variant="ghost" size="sm" onClick={() => setSelected(new Set())} disabled={busy}>
+                Limpar seleção
+              </Button>
+            )}
+            <Button
+              variant="primary"
+              size="sm"
+              icon={<RotateCcw size={13} />}
+              onClick={() => setConfirming(true)}
+              loading={restoring}
+              disabled={!online || selected.size === 0 || busy || confirming}
+              title={online ? undefined : "Disponível com o aparelho online"}
+            >
+              Restaurar no aparelho
+            </Button>
+          </div>
+        )}
+
+        {confirming && (
+          <InlineConfirm
+            question={`Recriar ${selected.size} contato(s) no aparelho?`}
+            detail="Eles são criados de novo na conta Google do aparelho (ou na agenda do próprio aparelho, se não houver conta Google) e conferidos um a um. Nada é apagado no aparelho e a conta temporária do Esfera nunca é usada."
+            confirmLabel="Sim, restaurar"
+            danger={false}
+            busy={restoring}
+            onConfirm={restore}
+            onCancel={() => setConfirming(false)}
+          />
+        )}
+
+        <StatusNote text={msg} busy={busy} />
+
+        {report && report.items.some((i) => !i.ok) && (
+          <ul className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-border p-3 text-[0.75rem] text-secondary">
+            {report.items
+              .filter((i) => !i.ok)
+              .map((i) => (
+                <li key={`${i.id}-${i.skipped}`}>
+                  <span className="font-medium text-primary">{i.name || "(sem nome)"}</span>: {i.detail}
+                </li>
+              ))}
+          </ul>
+        )}
+
+        {view && filtered.length === 0 ? (
+          <p className="rounded-xl border border-border p-4 text-[0.8125rem] text-secondary">
+            {rows.length === 0 ? "Nenhum contato guardado ainda." : onlyMissing && !q ? "Nenhum contato sumiu deste aparelho." : "Nenhum contato encontrado com essa busca."}
+          </p>
+        ) : (
+          <ul className="max-h-[26rem] divide-y divide-border overflow-y-auto rounded-xl border border-border">
+            {shown.map((r) => {
+              const name = r.displayName || "(sem nome)";
+              return (
+                <li key={r.id} className={`flex items-start gap-3 px-3 py-2.5 ${r.vanishedAt ? "bg-red-500/5" : ""}`}>
+                  {r.vanishedAt ? (
+                    <input
+                      type="checkbox"
+                      checked={selected.has(r.id)}
+                      onChange={() => toggle(r.id)}
+                      disabled={busy}
+                      aria-label={`Escolher ${name} para restaurar`}
+                      className="mt-1 h-4 w-4 shrink-0 cursor-pointer accent-[var(--color-accent)]"
+                    />
+                  ) : (
+                    <span className="h-4 w-4 shrink-0" aria-hidden />
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <p className="min-w-0 truncate text-[0.8125rem] font-medium text-primary">{name}</p>
+                      <Badge variant="neutral">{r.accountLabel}</Badge>
+                      {r.vanishedAt && (
+                        <Badge variant="danger" dot>
+                          Sumiu do aparelho em {whenText(r.vanishedAt)}
+                        </Badge>
+                      )}
+                      {r.restoredAt && <Badge variant="success">Restaurado {whenText(r.restoredAt)}</Badge>}
+                    </div>
+                    <p className="mt-0.5 break-words font-mono text-[0.75rem] text-secondary">{r.phones.join(" · ") || "sem telefone"}</p>
+                    <p className="mt-0.5 text-[0.72rem] text-tertiary">
+                      Visto por último {whenText(r.lastSeenAt)} · guardado desde {whenText(r.firstSeenAt)}
+                    </p>
+                    {r.vanishedAt && r.samePhoneOnDevice !== null && (
+                      <p className="mt-0.5 text-[0.72rem] text-amber-700 dark:text-amber-400">
+                        O mesmo número ainda está no aparelho como "{r.samePhoneOnDevice || "(sem nome)"}".
+                      </p>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {filtered.length > shown.length && (
+          <p className="text-[0.75rem] text-tertiary">
+            Mostrando {shown.length} de {filtered.length}. Use a busca para achar os outros; a planilha traz todos.
+          </p>
+        )}
+      </FormSection>
+    </div>
+  );
+}
+
+// ============================================================
 // Página
 // ============================================================
 
-export type ConfigTab = "general" | "chip" | "display" | "network" | "performance" | "system";
+export type ConfigTab = "general" | "chip" | "display" | "network" | "performance" | "contacts" | "system";
 
 interface DeviceConfigModalProps {
   isOpen: boolean;
@@ -1180,6 +1543,14 @@ interface DeviceConfigModalProps {
 
 export function DeviceConfigModal({ isOpen, onClose, device, initialTab = "general", agentStatus, onSave, onRemove, onChipsChanged }: DeviceConfigModalProps) {
   const [activeTab, setActiveTab] = useState<ConfigTab>(initialTab);
+  // Área reservada dos contatos: só master e gestor veem.
+  const { user } = useAuth();
+  const canSeeContacts = user?.role === "master" || user?.role === "gestor";
+  // A aba de contatos só carrega quando é aberta e continua montada depois (não perde o resultado).
+  const [contactsOpened, setContactsOpened] = useState(false);
+  useEffect(() => {
+    if (activeTab === "contacts") setContactsOpened(true);
+  }, [activeTab]);
 
   const [nameInput, setNameInput] = useState(device.name || device.model || "Aparelho");
   const [modelInput, setModelInput] = useState(device.model || "");
@@ -1197,6 +1568,7 @@ export function DeviceConfigModal({ isOpen, onClose, device, initialTab = "gener
       setModelInput(device.model || "");
       setSectorInput((device.sector as SectorType) || "junior");
       setActiveTab(initialTab);
+      setContactsOpened(initialTab === "contacts");
       setSaveError(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1275,6 +1647,7 @@ export function DeviceConfigModal({ isOpen, onClose, device, initialTab = "gener
             { id: "display", label: "Tela" },
             { id: "network", label: "Rede" },
             { id: "performance", label: "Desempenho" },
+            ...(canSeeContacts ? [{ id: "contacts" as ConfigTab, label: "Contatos" }] : []),
             { id: "system", label: "Sistema" },
           ]}
           value={activeTab}
@@ -1304,6 +1677,11 @@ export function DeviceConfigModal({ isOpen, onClose, device, initialTab = "gener
         <div className={activeTab === "performance" ? "" : "hidden"}>
           <PerformanceTab serial={serial} />
         </div>
+        {canSeeContacts && contactsOpened && (
+          <div className={activeTab === "contacts" ? "" : "hidden"}>
+            <ContactsBackupTab device={device} />
+          </div>
+        )}
         <div className={activeTab === "system" ? "" : "hidden"}>
           <SystemTab
             device={device}

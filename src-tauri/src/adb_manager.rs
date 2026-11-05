@@ -21,6 +21,66 @@ static UI_DUMP_AGENT_DOWN: std::sync::LazyLock<std::sync::Mutex<HashMap<String, 
 /// Sequência das digitações pedidas ao agente (compõe o id de cada pedido).
 static TYPING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+const ESFERA_IME: &str = "com.esfera.agent/.EsferaKeyboardService";
+const INPUT_METHOD_SETTING: &str = "settings get secure default_input_method";
+
+// ID do banco: continua o mesmo ao trocar entre USB e Wi-Fi.
+static CAMPAIGN_KEYBOARDS: std::sync::LazyLock<std::sync::Mutex<HashMap<i32, String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn parse_input_method_setting(output: &str) -> Option<String> {
+    let value = output.trim();
+    let (package, class) = value.split_once('/')?;
+    let valid = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._".contains(&b));
+    if valid(package) && valid(class) { Some(value.to_string()) } else { None }
+}
+
+fn is_esfera_keyboard(component: &str) -> bool {
+    component == ESFERA_IME || component == "com.esfera.agent/com.esfera.agent.EsferaKeyboardService"
+}
+
+fn ime_command(action: &str, component: &str) -> Option<String> {
+    if !matches!(action, "enable" | "set") { return None; }
+    Some(format!("ime {} {}", action, parse_input_method_setting(component)?))
+}
+
+fn keyboard_to_restore(previous: &str, current: &str) -> Option<String> {
+    let previous = parse_input_method_setting(previous)?;
+    if is_esfera_keyboard(current) && !is_esfera_keyboard(&previous) { Some(previous) } else { None }
+}
+
+fn ensure_campaign_keyboard_with(
+    previous: &mut Option<String>,
+    shell: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<bool, String> {
+    let current = parse_input_method_setting(&shell(INPUT_METHOD_SETTING)?)
+        .ok_or("Teclado atual desconhecido; usando acessibilidade")?;
+    if is_esfera_keyboard(&current) { return Ok(true); }
+    if previous.is_none() { *previous = Some(current); }
+    shell(&ime_command("enable", ESFERA_IME).unwrap())?;
+    shell(&ime_command("set", ESFERA_IME).unwrap())?;
+    Ok(parse_input_method_setting(&shell(INPUT_METHOD_SETTING)?).as_deref().map(is_esfera_keyboard).unwrap_or(false))
+}
+
+fn restore_campaign_keyboard_with(
+    previous: &str,
+    shell: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<bool, String> {
+    let current = parse_input_method_setting(&shell(INPUT_METHOD_SETTING)?)
+        .ok_or("Não foi possível ler o teclado atual")?;
+    let Some(target) = keyboard_to_restore(previous, &current) else { return Ok(false); };
+    shell(&ime_command("set", &target).unwrap())?;
+    let restored = parse_input_method_setting(&shell(INPUT_METHOD_SETTING)?)
+        .ok_or("Não foi possível confirmar o teclado restaurado")?;
+    // Android pode expandir a classe abreviada na resposta.
+    let expand = |s: &str| {
+        let (package, class) = s.split_once('/').unwrap_or((s, ""));
+        if class.starts_with('.') { format!("{}/{}{}", package, package, class) } else { s.to_string() }
+    };
+    if expand(&restored) != expand(&target) { return Err("Teclado anterior ainda não foi restaurado".into()); }
+    Ok(true)
+}
+
 /// Script shell embutido (fallback quando APK não está disponível)
 const AGENT_SCRIPT_CONTENT: &str = include_str!("../../src-agent/esfera_agent.sh");
 
@@ -1427,6 +1487,37 @@ impl AdbManager {
     const AGENT_ACCESSIBILITY_COMPONENT: &'static str =
         "com.esfera.agent/com.esfera.agent.accessibility.EsferaAccessibilityService";
 
+    /// Chamado com a trava do aparelho. Falhar aqui mantém a acessibilidade disponível.
+    pub fn ensure_campaign_keyboard(serial: &str, device_id: i32) -> bool {
+        let mut previous = CAMPAIGN_KEYBOARDS.lock().unwrap_or_else(|e| e.into_inner()).get(&device_id).cloned();
+        let result = ensure_campaign_keyboard_with(&mut previous, &mut |cmd| Self::execute_shell(serial, cmd, 3));
+        if let Some(previous) = previous {
+            CAMPAIGN_KEYBOARDS.lock().unwrap_or_else(|e| e.into_inner()).entry(device_id).or_insert(previous);
+        }
+        match result {
+            Ok(true) => true,
+            other => {
+                eprintln!("[TECLADO] IME indisponível em {} ({:?}); seguindo com acessibilidade", serial, other);
+                false
+            }
+        }
+    }
+
+    pub fn campaign_keyboard_device_ids() -> Vec<i32> {
+        CAMPAIGN_KEYBOARDS.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect()
+    }
+
+    /// Não sobrescreve uma troca manual do operador. Falhas ficam para a próxima limpeza.
+    pub fn restore_campaign_keyboard(serial: &str, device_id: i32) -> Result<(), String> {
+        let previous = CAMPAIGN_KEYBOARDS.lock().unwrap_or_else(|e| e.into_inner()).get(&device_id).cloned();
+        let Some(previous) = previous else { return Ok(()); };
+        if restore_campaign_keyboard_with(&previous, &mut |cmd| Self::execute_shell(serial, cmd, 3))? {
+            println!("[TECLADO] Teclado anterior restaurado em {}", serial);
+        }
+        CAMPAIGN_KEYBOARDS.lock().unwrap_or_else(|e| e.into_inner()).remove(&device_id);
+        Ok(())
+    }
+
     /// Pede ao agente (serviço de acessibilidade do Esfera Agent) que digite `text` no campo
     /// focado, tecla a tecla, respeitando `delays`. O agente responde na hora pelo código de
     /// resultado do broadcast: 1 aceito, 2 acessibilidade inativa, 3 sem campo de texto,
@@ -1686,7 +1777,7 @@ impl AdbManager {
         }
         if accepted {
             println!(
-                "[DIGITACAO] {} teclas em ~{:.1} s via agente de acessibilidade ({})",
+                "[DIGITACAO] {} teclas em ~{:.1} s via agente (IME ou acessibilidade) ({})",
                 delays.len(),
                 total_ms as f64 / 1000.0,
                 serial
@@ -3871,6 +3962,7 @@ impl AdbManager {
         let combined = attempts.join(" ");
 
         if installed {
+            let _ = Self::execute_shell(serial, &ime_command("enable", ESFERA_IME).unwrap(), 3);
             let _ = Self::start_agent_service(serial);
             let _ = Self::deploy_keepalive(serial);
             let _ = Self::set_device_owner(serial);
@@ -3968,6 +4060,7 @@ impl AdbManager {
         if !result.status.success() || !text.to_lowercase().contains("success") { return Err(format!("Falha ao instalar o agente: {}",text.trim())); }
         let installed = Self::installed_agent_version(serial)?.ok_or("Agente não encontrado após a instalação")?;
         if installed.0 < expected { return Err("A versão instalada não corresponde ao APK esperado.".into()); }
+        let _ = Self::execute_shell(serial, &ime_command("enable", ESFERA_IME).unwrap(), 3);
         Self::restore_agent_services_after_update(serial)?;
         Ok(installed)
     }
@@ -4388,47 +4481,58 @@ impl AdbManager {
         Ok(Some(id))
     }
 
-    /// Exclui um contato temporário específico por raw_contact_id
+    /// Exclui um contato temporário específico, só se ele for da conta do Esfera e ainda tiver o
+    /// nome exato "Esfera <número>". Nunca apaga por id solto (o id pode ser de um contato do operador).
     #[allow(dead_code)]
     pub fn delete_temporary_contact(serial: &str, contact_id: Option<i64>) -> Result<(), String> {
-        if let Some(id) = contact_id {
-            // 1. Purgamento definitivo via caller_is_syncadapter para expurgar fisicamente da tabela SQLite
-            let del_sync_cmd = format!(
-                "content delete --uri \"content://com.android.contacts/raw_contacts?caller_is_syncadapter=true\" --where _id={}",
-                id
-            );
-            // 2. Limpeza explícita dos dados do contato na tabela data
-            let del_data_cmd = format!(
-                "content delete --uri content://com.android.contacts/data --where raw_contact_id={}",
-                id
-            );
-            // 3. Fallback delete padrão sem parâmetros extras
-            let del_cmd = format!(
-                "content delete --uri content://com.android.contacts/raw_contacts --where _id={}",
-                id
-            );
-            let batch = format!("{}; {}; {}", del_sync_cmd, del_data_cmd, del_cmd);
-            let _ = Self::execute_shell(serial, &batch, 6);
+        let Some(id) = contact_id else { return Ok(()) };
+        let lista = Self::execute_shell(serial, &Self::temp_contacts_query(), 8)?;
+        if Self::deletable_temp_contact_ids(&lista).contains(&id) {
+            Self::execute_shell(serial, &Self::delete_temp_ids_command(&[id]), 8)?;
         }
         Ok(())
     }
 
-    /// Exclui TODOS os contatos temporários criados pelo Esfera (account_name='esfera_temp')
-    /// Não afeta nenhum contato pessoal ou corporativo do operador (Google/SIM/Telefone)
+    /// Apaga só os contatos temporários do Esfera: conta `esfera_temp` E nome exato "Esfera <número>".
+    /// Contato salvo ou renomeado pelo operador, mesmo que tenha ficado dentro da conta do Esfera, fica.
     pub fn cleanup_all_temporary_contacts(serial: &str) -> Result<(), String> {
-        // 1. Purgamento em lote definitivo com caller_is_syncadapter
-        let del_sync_cmd = format!(
-            "content delete --uri \"content://com.android.contacts/raw_contacts?caller_is_syncadapter=true\" --where \"account_name='{}'\"",
-            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME
-        );
-        // 2. Fallback delete padrão em lote
-        let del_cmd = format!(
-            "content delete --uri content://com.android.contacts/raw_contacts --where \"account_name='{}'\"",
-            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME
-        );
-        let batch = format!("{}; {}", del_sync_cmd, del_cmd);
-        let _ = Self::execute_shell(serial, &batch, 6);
+        let apagados = Self::cleanup_temporary_contacts_with(&mut |cmd| Self::execute_shell(serial, cmd, 10))?;
+        if apagados > 0 { println!("[CONTATOS TEMP] {} contatos \"Esfera <número>\" apagados de {}.", apagados, serial); }
         Ok(())
+    }
+
+    fn cleanup_temporary_contacts_with(shell: &mut dyn FnMut(&str) -> Result<String, String>) -> Result<usize, String> {
+        let lista = shell(&Self::temp_contacts_query())?;
+        let ids = Self::deletable_temp_contact_ids(&lista);
+        for lote in ids.chunks(40) {
+            shell(&Self::delete_temp_ids_command(lote))?;
+        }
+        Ok(ids.len())
+    }
+
+    fn temp_contacts_query() -> String {
+        format!(
+            "content query --uri content://com.android.contacts/raw_contacts --projection _id:display_name --where \"account_name='{}' AND account_type='{}'\"",
+            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME, Self::ESFERA_TEMP_CONTACT_ACCOUNT_TYPE
+        )
+    }
+
+    fn delete_temp_ids_command(ids: &[i64]) -> String {
+        let lista = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        format!(
+            "content delete --uri \"content://com.android.contacts/raw_contacts?caller_is_syncadapter=true\" --where \"account_name='{}' AND account_type='{}' AND _id IN ({})\"",
+            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME, Self::ESFERA_TEMP_CONTACT_ACCOUNT_TYPE, lista
+        )
+    }
+
+    /// Ids que podem ser apagados: nome exatamente "Esfera " + 10 a 13 dígitos.
+    pub fn deletable_temp_contact_ids(output: &str) -> Vec<i64> {
+        output.lines().filter_map(|linha| {
+            let id = Self::parse_query_ids(linha, "_id").into_iter().next()?;
+            let nome = linha.split("display_name=").nth(1)?.trim();
+            let digitos = nome.strip_prefix("Esfera ")?;
+            ((10..=13).contains(&digitos.len()) && digitos.chars().all(|c| c.is_ascii_digit())).then_some(id)
+        }).collect()
     }
 
     /// Extrai os nomes de contatos temporários ("Esfera <número>") da saída do `content query`.
@@ -6649,6 +6753,52 @@ mod send_safety_tests {
 }
 
 #[cfg(test)]
+mod limpeza_contatos_tests {
+    use super::AdbManager;
+
+    // Saída real do `content query` de raw_contacts da conta do Esfera (moto g22, 05/11/2026),
+    // com nomes trocados: contatos renomeados pelo operador ficaram dentro da conta do Esfera.
+    const CONTA_ESFERA: &str = "Row: 0 _id=101, display_name=Esfera 5569993600492\n\
+        Row: 1 _id=102, display_name=Marcela Backoffice\n\
+        Row: 2 _id=103, display_name=Esfera 5547997547956 escritório\n\
+        Row: 3 _id=104, display_name=Esfera 554733054406\n\
+        Row: 4 _id=105, display_name=Esfera 123\n\
+        Row: 5 _id=106, display_name=NULL\n";
+
+    #[test]
+    fn so_o_nome_exato_esfera_numero_pode_ser_apagado() {
+        assert_eq!(AdbManager::deletable_temp_contact_ids(CONTA_ESFERA), vec![101, 104]);
+        assert!(AdbManager::deletable_temp_contact_ids("No result found.").is_empty());
+    }
+
+    #[test]
+    fn limpeza_apaga_por_id_dentro_da_conta_e_preserva_os_renomeados() {
+        let mut comandos: Vec<String> = Vec::new();
+        let apagados = AdbManager::cleanup_temporary_contacts_with(&mut |cmd| {
+            comandos.push(cmd.to_string());
+            Ok(if cmd.starts_with("content query") { CONTA_ESFERA.to_string() } else { String::new() })
+        }).unwrap();
+        assert_eq!(apagados, 2);
+        let deletes: Vec<&String> = comandos.iter().filter(|c| c.starts_with("content delete")).collect();
+        assert_eq!(deletes.len(), 1);
+        assert!(deletes[0].contains("account_name='esfera_temp'") && deletes[0].contains("_id IN (101,104)"), "{}", deletes[0]);
+        // Nunca um delete da conta inteira (era isso que apagava os contatos do operador).
+        assert!(!comandos.iter().any(|c| c.starts_with("content delete") && !c.contains("_id IN (")));
+    }
+
+    #[test]
+    fn sem_contato_temporario_nao_apaga_nada() {
+        let mut comandos: Vec<String> = Vec::new();
+        let apagados = AdbManager::cleanup_temporary_contacts_with(&mut |cmd| {
+            comandos.push(cmd.to_string());
+            Ok("Row: 0 _id=102, display_name=Marcela Backoffice\n".to_string())
+        }).unwrap();
+        assert_eq!(apagados, 0);
+        assert!(!comandos.iter().any(|c| c.starts_with("content delete")));
+    }
+}
+
+#[cfg(test)]
 mod temp_contact_tests {
     use super::AdbManager;
 
@@ -7375,12 +7525,107 @@ mod agent_apk_version_tests {
     use super::*;
     #[test]
     fn versao_esperada_vem_do_gradle_e_apk_tem_manifesto_valido() {
-        assert_eq!(expected_agent_version().unwrap(), 2);
+        assert_eq!(expected_agent_version().unwrap(), 3);
         let file=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries/Esfera_Agent_ADB.apk");
-        assert!(apk_agent_version(&file).unwrap() > 0);
+        assert_eq!(apk_agent_version(&file).unwrap(), expected_agent_version().unwrap());
     }
     #[test]
     fn manifesto_truncado_e_rejeitado() { assert!(axml_u32(&[1,2],0).is_err()); }
+}
+
+#[cfg(test)]
+mod campaign_keyboard_tests {
+    use super::*;
+
+    #[test]
+    fn settings_aceita_so_um_componente_valido() {
+        assert_eq!(parse_input_method_setting(" com.android.inputmethod.latin/.LatinIME\r\n"), Some("com.android.inputmethod.latin/.LatinIME".into()));
+        for invalid in ["", "null", "undefined", "Error: denied", "foo/bar\nfoo/baz", "foo/bar;reboot", "foo/.Keyboard$evil", "foo/", "/bar"] {
+            assert_eq!(parse_input_method_setting(invalid), None, "{}", invalid);
+        }
+    }
+
+    #[test]
+    fn comandos_ime_nao_aceitam_injecao() {
+        assert_eq!(ime_command("enable", ESFERA_IME), Some("ime enable com.esfera.agent/.EsferaKeyboardService".into()));
+        assert_eq!(ime_command("set", ESFERA_IME), Some("ime set com.esfera.agent/.EsferaKeyboardService".into()));
+        assert_eq!(ime_command("reset", ESFERA_IME), None);
+        assert_eq!(ime_command("set", "foo/bar; reboot"), None);
+    }
+
+    #[test]
+    fn restaura_so_o_anterior_e_respeita_troca_manual() {
+        let previous = "com.android.inputmethod.latin/.LatinIME";
+        assert_eq!(keyboard_to_restore(previous, ESFERA_IME), Some(previous.into()));
+        assert_eq!(keyboard_to_restore(previous, "com.esfera.agent/com.esfera.agent.EsferaKeyboardService"), Some(previous.into()));
+        assert_eq!(keyboard_to_restore(previous, "com.other/.Keyboard"), None);
+        assert_eq!(keyboard_to_restore(ESFERA_IME, ESFERA_IME), None);
+        assert_eq!(keyboard_to_restore("null", ESFERA_IME), None);
+    }
+
+    #[test]
+    fn ativacao_guarda_anterior_uma_vez_e_confere_settings() {
+        let mut previous = None;
+        let mut commands = Vec::new();
+        let mut settings_reads = 0;
+        assert!(ensure_campaign_keyboard_with(&mut previous, &mut |cmd| {
+            commands.push(cmd.to_string());
+            if cmd == INPUT_METHOD_SETTING {
+                settings_reads += 1;
+                Ok(if settings_reads == 1 { "com.old/.Keyboard" } else { ESFERA_IME }.into())
+            } else { Ok(String::new()) }
+        }).unwrap());
+        assert_eq!(previous.as_deref(), Some("com.old/.Keyboard"));
+        assert_eq!(commands, vec![INPUT_METHOD_SETTING.to_string(), ime_command("enable", ESFERA_IME).unwrap(), ime_command("set", ESFERA_IME).unwrap(), INPUT_METHOD_SETTING.to_string()]);
+        assert!(ensure_campaign_keyboard_with(&mut previous, &mut |_| Ok(ESFERA_IME.into())).unwrap());
+        assert_eq!(previous.as_deref(), Some("com.old/.Keyboard"));
+        let mut reads = 0;
+        assert!(ensure_campaign_keyboard_with(&mut previous, &mut |cmd| {
+            if cmd == INPUT_METHOD_SETTING {
+                reads += 1;
+                Ok(if reads == 1 { "com.manual/.Keyboard" } else { ESFERA_IME }.into())
+            } else { Ok(String::new()) }
+        }).unwrap());
+        assert_eq!(previous.as_deref(), Some("com.old/.Keyboard"));
+    }
+
+    #[test]
+    fn falha_do_ime_preserva_anterior_e_permite_fallback() {
+        let mut previous = None;
+        assert!(!ensure_campaign_keyboard_with(&mut previous, &mut |_| Ok("com.old/.Keyboard".into())).unwrap());
+        assert_eq!(previous.as_deref(), Some("com.old/.Keyboard"));
+        assert!(ensure_campaign_keyboard_with(&mut previous, &mut |_| Err("offline".into())).is_err());
+        assert_eq!(previous.as_deref(), Some("com.old/.Keyboard"));
+        let mut unknown = None;
+        assert!(ensure_campaign_keyboard_with(&mut unknown, &mut |_| Ok("null".into())).is_err());
+        assert_eq!(unknown, None);
+    }
+
+    #[test]
+    fn restauracao_confirma_classe_expandida_sem_mudar_teclado_manual() {
+        let previous = "com.old/.Keyboard";
+        let mut commands = Vec::new();
+        let mut replies = vec![ESFERA_IME, "", "com.old/com.old.Keyboard"].into_iter();
+        assert!(restore_campaign_keyboard_with(previous, &mut |cmd| {
+            commands.push(cmd.to_string());
+            Ok(replies.next().unwrap().into())
+        }).unwrap());
+        assert_eq!(commands, vec![INPUT_METHOD_SETTING.to_string(), "ime set com.old/.Keyboard".into(), INPUT_METHOD_SETTING.to_string()]);
+        let mut reads = 0;
+        assert!(!restore_campaign_keyboard_with(previous, &mut |cmd| {
+            assert_eq!(cmd, INPUT_METHOD_SETTING);
+            reads += 1;
+            Ok("com.manual/.Keyboard".into())
+        }).unwrap());
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn restauracao_recusada_ou_desconhecida_fica_pendente() {
+        assert!(restore_campaign_keyboard_with("com.old/.Keyboard", &mut |_| Ok(ESFERA_IME.into())).is_err());
+        assert!(restore_campaign_keyboard_with("com.old/.Keyboard", &mut |_| Ok("null".into())).is_err());
+        assert!(restore_campaign_keyboard_with("com.old/.Keyboard", &mut |_| Err("offline".into())).is_err());
+    }
 }
 
 fn parse_installed_agent_version(output: &str) -> Result<Option<(u32,String)>, String> {

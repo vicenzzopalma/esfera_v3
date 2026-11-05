@@ -2271,6 +2271,161 @@ pub fn get_konfiansa_histories(state: State<'_, AppState>, token: String, limit:
     state.db.list_konfiansa_histories(limit.unwrap_or(200).clamp(1, 2000))
 }
 
+// ============================================================
+// NÚMEROS DE DISPARO (WhatsApp na Evolution da VPS + quem recebe as respostas), via hub
+// ============================================================
+
+fn require_dispatch_manager(state: &AppState, token: &str) -> Result<(), String> {
+    let session = validate_session(&state.sessions, token)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Somente master e gestor gerenciam os números de disparo.".into());
+    }
+    Ok(())
+}
+
+/// "47 99627-1722" -> "5547996271722" (mesma regra do hub e do painel).
+pub fn normalize_dispatch_number(raw: &str) -> Result<String, String> {
+    let d: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    let d = if d.len() == 10 || d.len() == 11 { format!("55{}", d) } else { d };
+    if (d.len() == 12 || d.len() == 13) && d.starts_with("55") && d.as_bytes()[2] != b'0' {
+        Ok(d)
+    } else {
+        Err("Número inválido: informe DDD + número (ex.: 47 99999-8888).".into())
+    }
+}
+
+pub fn valid_dispatch_instance(name: &str) -> bool {
+    (1..=60).contains(&name.len()) && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Erro do hub em português. Usa o "erro" que o hub (ou o painel) mandou quando houver.
+pub fn dispatch_hub_error(status: u16, body: &str) -> String {
+    let erro = serde_json::from_str::<serde_json::Value>(body).ok()
+        .and_then(|v| v.get("erro").and_then(|e| e.as_str()).map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty());
+    match (status, erro) {
+        (401, _) => "O hub recusou o token desta máquina. Confira o token do hub em Configurações.".into(),
+        (403, _) => "Sem permissão: o token do hub desta máquina não pode gerenciar os números de disparo.".into(),
+        (_, Some(e)) => e,
+        (404, None) => "O hub da VPS ainda não tem esta função (precisa ser atualizado).".into(),
+        (502..=504, None) => "O hub não conseguiu falar com a Evolution ou o painel na VPS. Tente de novo em instantes.".into(),
+        (s, None) => format!("O hub respondeu HTTP {}.", s),
+    }
+}
+
+/// Chama o hub da VPS (HTTPS com o certificado fixado, como o histórico do Konfiansa).
+async fn dispatch_hub(method: reqwest::Method, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let cfg = config::load_config();
+    if cfg.hub_token.trim().is_empty() {
+        return Err("Token do hub não configurado nesta máquina.".into());
+    }
+    let addr: std::net::SocketAddr = cfg.hub_address.trim().parse()
+        .map_err(|_| "Endereço do hub inválido: use IP:porta em Configurações.".to_string())?;
+    let client = crate::hub_client::client_vps(std::time::Duration::from_secs(60))?;
+    let mut req = client.request(method, format!("https://{}:8443{}", addr.ip(), path)).bearer_auth(cfg.hub_token.trim());
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let resp = req.send().await.map_err(|e| {
+        if e.is_timeout() { "O hub demorou demais para responder. Tente de novo.".to_string() }
+        else { "Hub fora do ar: não foi possível conectar à VPS.".to_string() }
+    })?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
+        return Err(dispatch_hub_error(status, &text));
+    }
+    serde_json::from_str(&text).map_err(|_| "Resposta inválida do hub.".to_string())
+}
+
+/// Instâncias do WhatsApp do disparo: nome, número, perfil, estado e motivo da queda.
+#[tauri::command]
+pub async fn get_dispatch_numbers(state: State<'_, AppState>, token: String) -> Result<serde_json::Value, String> {
+    require_dispatch_manager(&state, &token)?;
+    let v = dispatch_hub(reqwest::Method::GET, "/api/desktop/evolution/instances", None).await?;
+    Ok(v.get("instances").cloned().unwrap_or_else(|| serde_json::json!([])))
+}
+
+/// QR para conectar a instância: {"conectado":true} ou {"conectado":false,"qr","pairingCode"}.
+#[tauri::command]
+pub async fn get_dispatch_number_qr(state: State<'_, AppState>, token: String, instancia: String) -> Result<serde_json::Value, String> {
+    require_dispatch_manager(&state, &token)?;
+    let instancia = instancia.trim().to_string();
+    if !valid_dispatch_instance(&instancia) {
+        return Err("Nome de instância inválido.".into());
+    }
+    dispatch_hub(reqwest::Method::POST, "/api/desktop/evolution/qr", Some(serde_json::json!({ "instancia": instancia }))).await
+}
+
+/// Cria a instância de um número novo ("disparo-<4 dígitos>" ou "disparo-<apelido>").
+#[tauri::command]
+pub async fn create_dispatch_number(state: State<'_, AppState>, token: String, numero: String, nome: Option<String>) -> Result<serde_json::Value, String> {
+    require_dispatch_manager(&state, &token)?;
+    let numero = normalize_dispatch_number(&numero)?;
+    let nome = nome.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    dispatch_hub(reqwest::Method::POST, "/api/desktop/evolution/instances", Some(serde_json::json!({ "numero": numero, "nome": nome }))).await
+}
+
+/// Quem recebe as respostas dos devedores: {"destinos":[...], "padrao": {...}|null}.
+#[tauri::command]
+pub async fn get_repasse_destinos(state: State<'_, AppState>, token: String) -> Result<serde_json::Value, String> {
+    require_dispatch_manager(&state, &token)?;
+    dispatch_hub(reqwest::Method::GET, "/api/desktop/repasse/destinos", None).await
+}
+
+#[tauri::command]
+pub async fn add_repasse_destino(state: State<'_, AppState>, token: String, numero: String, nome: Option<String>) -> Result<serde_json::Value, String> {
+    require_dispatch_manager(&state, &token)?;
+    let numero = normalize_dispatch_number(&numero)?;
+    let nome = nome.unwrap_or_default().trim().to_string();
+    dispatch_hub(reqwest::Method::POST, "/api/desktop/repasse/destinos", Some(serde_json::json!({ "numero": numero, "nome": nome }))).await
+}
+
+/// Tira um destino; o painel recusa tirar o último (o repasse pararia).
+#[tauri::command]
+pub async fn remove_repasse_destino(state: State<'_, AppState>, token: String, numero: String) -> Result<serde_json::Value, String> {
+    require_dispatch_manager(&state, &token)?;
+    let numero: String = numero.chars().filter(|c| c.is_ascii_digit()).collect();
+    if numero.is_empty() {
+        return Err("Número inválido.".into());
+    }
+    dispatch_hub(reqwest::Method::POST, "/api/desktop/repasse/destinos/remover", Some(serde_json::json!({ "numero": numero }))).await
+}
+
+#[cfg(test)]
+mod dispatch_numbers_tests {
+    use super::*;
+
+    #[test]
+    fn numero_ganha_ddi_e_recusa_invalido() {
+        assert_eq!(normalize_dispatch_number("47 99627-1722").unwrap(), "5547996271722");
+        assert_eq!(normalize_dispatch_number("(47) 3305-4406").unwrap(), "554733054406");
+        assert_eq!(normalize_dispatch_number("+55 47 99627-1722").unwrap(), "5547996271722");
+        assert!(normalize_dispatch_number("99627-1722").unwrap_err().contains("DDD"));
+        assert!(normalize_dispatch_number("").is_err());
+        assert!(normalize_dispatch_number("07 99627-1722").is_err());
+    }
+
+    #[test]
+    fn nome_de_instancia_seguro() {
+        assert!(valid_dispatch_instance("disparo-9627"));
+        assert!(!valid_dispatch_instance("../instance"));
+        assert!(!valid_dispatch_instance(""));
+        assert!(!valid_dispatch_instance("a b"));
+    }
+
+    #[test]
+    fn erro_do_hub_em_portugues() {
+        assert!(dispatch_hub_error(401, "").contains("token"));
+        assert!(dispatch_hub_error(403, r#"{"erro":"x"}"#).contains("Sem permissão"));
+        assert_eq!(dispatch_hub_error(400, r#"{"erro":"Mantenha ao menos um destino."}"#), "Mantenha ao menos um destino.");
+        assert_eq!(dispatch_hub_error(404, r#"{"erro":"Painel do repasse não configurado no hub."}"#), "Painel do repasse não configurado no hub.");
+        assert!(dispatch_hub_error(404, "").contains("atualizado"));
+        assert!(dispatch_hub_error(502, "<html>").contains("Evolution"));
+        assert_eq!(dispatch_hub_error(500, ""), "O hub respondeu HTTP 500.");
+    }
+}
+
 /// Relatório da campanha: número, nome, CNPJ e a mensagem que saiu, só dos enviados.
 #[tauri::command]
 pub fn get_campaign_sent_report(state: State<'_, AppState>, token: String, campaign_id: i32) -> Result<Vec<crate::db::SentReportRow>, String> {
@@ -4844,7 +4999,77 @@ pub fn clear_device_temporary_contacts(
     serial: String,
 ) -> Result<(), String> {
     let _session = validate_session(&state.sessions, &token)?;
+    // Copia a agenda antes de limpar; sem cópia, não limpa.
+    crate::contact_backup::snapshot_device_contacts(&state.db, &serial)
+        .map_err(|e| format!("A limpeza não foi feita: não deu para copiar os contatos do aparelho antes ({}).", e))?;
     AdbManager::clear_all_temporary_contacts(&serial)
+}
+
+// ============================================================
+// CÓPIA DE SEGURANÇA DOS CONTATOS DO APARELHO (só master e gestor)
+// ============================================================
+
+fn contact_backup_device(state: &AppState, token: &str, device_id: i32) -> Result<Device, String> {
+    let session = validate_session(&state.sessions, token)?;
+    if session.role != "master" && session.role != "gestor" {
+        return Err("Somente master e gestor acessam a cópia dos contatos.".into());
+    }
+    let device = state.db.get_all_devices().into_iter().find(|d| d.id == device_id).ok_or("Aparelho nao encontrado.")?;
+    check_company_access(&session, device.company_id)?;
+    Ok(device)
+}
+
+/// Cópia guardada dos contatos do aparelho (com filtro "só os que sumiram").
+#[tauri::command]
+pub fn get_device_contact_backup(
+    state: State<'_, AppState>,
+    token: String,
+    device_id: i32,
+    only_missing: Option<bool>,
+) -> Result<crate::contact_backup::ContactBackupView, String> {
+    let device = contact_backup_device(&state, &token, device_id)?;
+    crate::contact_backup::backup_view(&state.db, &device, only_missing.unwrap_or(false))
+}
+
+/// Copia agora a agenda do aparelho para o banco (só lê o aparelho).
+#[tauri::command]
+pub async fn backup_device_contacts_now(
+    state: State<'_, AppState>,
+    token: String,
+    device_id: i32,
+) -> Result<crate::db::ContactSnapshotSummary, String> {
+    let device = contact_backup_device(&state, &token, device_id)?;
+    let db = state.db.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::contact_backup::take_snapshot(&db, &crate::contact_backup::device_serial(&device), "manual")
+    }).await.map_err(|e| e.to_string())?
+}
+
+/// Recria no aparelho os contatos que sumiram (ids vazios = todos os que sumiram).
+#[tauri::command]
+pub async fn restore_device_contacts(
+    state: State<'_, AppState>,
+    token: String,
+    device_id: i32,
+    ids: Vec<i64>,
+) -> Result<crate::contact_backup::RestoreReport, String> {
+    let device = contact_backup_device(&state, &token, device_id)?;
+    let db = state.db.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::contact_backup::restore_device_contacts(&db, &device, &ids))
+        .await.map_err(|e| e.to_string())?
+}
+
+/// Planilha da cópia: nome, telefones, conta, visto por último, sumiu em.
+#[tauri::command]
+pub fn export_device_contact_backup_csv(
+    state: State<'_, AppState>,
+    token: String,
+    device_id: i32,
+    only_missing: Option<bool>,
+) -> Result<String, String> {
+    let device = contact_backup_device(&state, &token, device_id)?;
+    let view = crate::contact_backup::backup_view(&state.db, &device, only_missing.unwrap_or(false))?;
+    Ok(crate::contact_backup::backup_csv(&view.contacts))
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
