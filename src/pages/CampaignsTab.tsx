@@ -2425,6 +2425,7 @@ export interface ProgressPayload {
   last_contact_phone?: string;
   delay_used_ms?: number;
   status: string;
+  device_name?: string | null;
 }
 
 export type LiveKind =
@@ -2511,6 +2512,17 @@ export function describeProgress(p: ProgressPayload): { level: LogLevel; text: s
   const phone = p.last_contact_phone ? ` ${formatPhoneBr(p.last_contact_phone)}` : "";
   const status = (p.status || "").trim();
   switch (status) {
+    case "dispatching":
+      return {
+        level: "info",
+        text: `Enviando para${phone || " o contato"}`,
+        live: {
+          kind: "sending",
+          short: "Enviando",
+          text: `Digitando a mensagem para${phone || " o contato"}${p.device_name ? ` no aparelho ${p.device_name}` : ""}.`,
+          tone: "success",
+        },
+      };
     case "running": {
       const pause = p.delay_used_ms ? ` · intervalo de ~${Math.round(p.delay_used_ms / 1000)}s` : "";
       return {
@@ -2697,7 +2709,8 @@ export function handleProgress(p: ProgressPayload) {
   const withDelay = p.status === "running" || p.status === "send_error";
   // O motor pode avisar o mesmo envio duas vezes (ao gravar e depois da pausa): o console mostra uma linha só.
   const repeatedSend = p.status === "running" && (activityStore.get(p.campaign_id)?.logs.slice(-6) ?? []).some((l) => l.level === "success" && l.text === d.text);
-  if (!repeatedSend) appendCampaignLog(p.campaign_id, d.level, d.text, withDelay ? p.delay_used_ms || undefined : undefined);
+  // "Envio começou" só atualiza o estado ao vivo; o console registra quando a mensagem sai.
+  if (!repeatedSend && p.status !== "dispatching") appendCampaignLog(p.campaign_id, d.level, d.text, withDelay ? p.delay_used_ms || undefined : undefined);
   if (d.live) setLiveState(p.campaign_id, { ...d.live, at: Date.now() });
   // Aviso no app inteiro: o operador pode estar em outra tela quando a campanha para.
   const who = p.campaign_name ? `${p.campaign_name}: ` : "";
