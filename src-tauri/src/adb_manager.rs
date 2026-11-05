@@ -695,6 +695,14 @@ static SHELL_TARGET_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (String, I
 static CONTACT_PREPARED: std::sync::LazyLock<RwLock<HashMap<String, Instant>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Bloqueio de instalação que só se resolve no próprio celular (Xiaomi/Redmi/POCO).
+pub fn install_block_hint(output: &str) -> Option<String> {
+    if output.contains("INSTALL_FAILED_USER_RESTRICTED") {
+        return Some("O celular bloqueou a instalação do Agente. Em Xiaomi/Redmi/POCO: Configurações > Configurações adicionais >             Opções do desenvolvedor > ligue \"Instalar via USB\" e \"Depuração USB (configurações de segurança)\"             (pode pedir chip e conta Mi). Depois clique em Reinstalar e aceite o aviso que aparecer na tela do celular.".into());
+    }
+    None
+}
+
 pub struct AdbManager;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3696,44 +3704,40 @@ impl AdbManager {
         push_cmd.args(["-s", serial, "push", apk_str, remote_apk]);
         let _ = run_cmd_timeout(push_cmd, Duration::from_secs(15));
 
-        // 2. Instalação ultra-rápida via pm install
-        let mut pm_cmd = create_cmd("adb");
-        pm_cmd.args(["-s", serial, "shell", "pm", "install", "-r", "-g", remote_apk]);
+        // 2. pm install com permissões concedidas; Xiaomi sem "Depuração USB (configurações de
+        //    segurança)" recusa o -g, então tenta sem ele; por fim, adb install.
+        let mut attempts: Vec<String> = Vec::new();
+        let mut installed = false;
+        for args in [
+            vec!["-s", serial, "shell", "pm", "install", "-r", "-g", remote_apk],
+            vec!["-s", serial, "shell", "pm", "install", "-r", remote_apk],
+            vec!["-s", serial, "install", "-r", apk_str],
+        ] {
+            let mut cmd = create_cmd("adb");
+            cmd.args(&args);
+            let Ok(out) = run_cmd_timeout(cmd, Duration::from_secs(45)) else { continue };
+            let text = format!("{} {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            if text.contains("Success") && !text.contains("Failure") {
+                installed = true;
+                break;
+            }
+            attempts.push(text);
+        }
+        let combined = attempts.join(" ");
 
-        let output = run_cmd_timeout(pm_cmd, Duration::from_secs(20))
-            .map_err(|e| format!("Falha ao executar 'pm install': {}", e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{} {}", stdout, stderr);
-
-        if output.status.success() || combined.to_lowercase().contains("success") {
+        if installed {
             let _ = Self::start_agent_service(serial);
             let _ = Self::deploy_keepalive(serial);
             let _ = Self::set_device_owner(serial);
             let _ = Self::inject_device_immunity(serial, None);
-
             Ok(format!(
                 "📱 App Agente Esfera v3 instalado e ativado no celular {} com sucesso!",
                 serial
             ))
         } else {
-            // Fallback para adb install padrão caso pm install falhe
-            let mut fallback_cmd = create_cmd("adb");
-            fallback_cmd.args(["-s", serial, "install", "-r", "-g", apk_str]);
-            if let Ok(retry_out) = run_cmd_timeout(fallback_cmd, Duration::from_secs(45)) {
-                if retry_out.status.success() {
-                    let _ = Self::start_agent_service(serial);
-                    let _ = Self::deploy_keepalive(serial);
-                    let _ = Self::set_device_owner(serial);
-                    let _ = Self::inject_device_immunity(serial, None);
-                    return Ok(format!(
-                        "📱 App Agente Esfera v3 instalado e ativado no celular {} com sucesso!",
-                        serial
-                    ));
-                }
+            if let Some(hint) = install_block_hint(&combined) {
+                return Err(hint);
             }
-
             Err(format!(
                 "Falha na instalação do APK no celular {}: {}",
                 serial,
@@ -6431,6 +6435,13 @@ mod send_safety_tests {
     fn pacote_fora_do_whatsapp_e_recusado_antes_de_acessar_aparelho() {
         let result = AdbManager::send_whatsapp_parts("nao_acessar", "5511999998888", &["Olá".into()], Some("com.outro.app"), &|| true);
         assert!(result.unwrap_err().contains("WhatsApp"));
+    }
+
+    #[test]
+    fn bloqueio_da_xiaomi_explica_o_que_ligar() {
+        let msg = crate::adb_manager::install_block_hint("Failure [INSTALL_FAILED_USER_RESTRICTED: Install canceled by user]").unwrap();
+        assert!(msg.contains("Instalar via USB") && msg.contains("configurações de segurança"));
+        assert_eq!(crate::adb_manager::install_block_hint("Failure [INSTALL_FAILED_VERSION_DOWNGRADE]"), None);
     }
 
     #[test]
