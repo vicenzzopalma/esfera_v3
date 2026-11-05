@@ -349,11 +349,11 @@ pub fn evolution_error_text(v: &Value) -> String {
 }
 
 /// Destinos do repasse dentro do /api/operacao do painel (grupo "disparo").
-pub fn repasse_of(v: &Value) -> Value {
+/// Ausência ou formato inválido não significa que a lista de destinos esteja vazia.
+pub fn repasse_of(v: &Value) -> Option<Value> {
     v.get("grupos").and_then(Value::as_array)
         .and_then(|g| g.iter().find(|x| x.get("id").and_then(Value::as_str) == Some("disparo")))
-        .and_then(|g| g.get("repasse")).filter(|r| r.is_object()).cloned()
-        .unwrap_or_else(|| serde_json::json!({ "destinos": [], "padrao": null }))
+        .and_then(|g| g.get("repasse")).filter(|r| r.get("destinos").and_then(Value::as_array).is_some()).cloned()
 }
 
 /// Gestão dos números: master, gestor ou a empresa configurada.
@@ -532,7 +532,9 @@ pub async fn repasse_destinos(
 ) -> Result<Response, Response> {
     authorize_manage(&db, &headers)?;
     let data = painel_call(reqwest::Method::GET, "/api/operacao", None).await?;
-    Ok(reply(StatusCode::OK, repasse_of(&data)))
+    let repasse = repasse_of(&data)
+        .ok_or_else(|| fail(StatusCode::BAD_GATEWAY, "O painel não informou os destinos do repasse"))?;
+    Ok(reply(StatusCode::OK, repasse))
 }
 
 #[derive(Debug, Deserialize)]
@@ -810,7 +812,30 @@ mod tests {
         assert_eq!(evolution_error_text(&e), "This name \"disparo\" is already in use.");
         assert_eq!(evolution_error_text(&serde_json::json!({})), "");
         let op = serde_json::json!({"grupos": [{"id": "pafixa"}, {"id": "disparo", "repasse": {"destinos": [{"numero": "554733054406"}], "padrao": null}}]});
-        assert_eq!(repasse_of(&op)["destinos"][0]["numero"], "554733054406");
-        assert_eq!(repasse_of(&serde_json::json!({})), serde_json::json!({"destinos": [], "padrao": null}));
+        assert_eq!(repasse_of(&op).unwrap()["destinos"][0]["numero"], "554733054406");
+    }
+
+    #[test]
+    fn repasse_ausente_ou_invalido_nao_e_lista_vazia() {
+        for op in [
+            serde_json::json!({}),
+            serde_json::json!({"erro": "Não autorizado"}),
+            serde_json::json!({"grupos": [{"id": "pafixa"}]}),
+            serde_json::json!({"grupos": [{"id": "disparo"}]}),
+            serde_json::json!({"grupos": [{"id": "disparo", "repasse": {}}]}),
+            serde_json::json!({"grupos": [{"id": "disparo", "repasse": {"destinos": null, "padrao": null}}]}),
+        ] {
+            assert!(repasse_of(&op).is_none());
+        }
+    }
+
+    #[test]
+    fn repasse_vazio_explicito_preserva_o_padrao() {
+        let repasse = serde_json::json!({"destinos": [], "padrao": {"numero": "554733054406"}});
+        let op = serde_json::json!({"grupos": [{"id": "disparo", "repasse": repasse.clone()}]});
+        assert_eq!(repasse_of(&op), Some(repasse));
+        let vazio = serde_json::json!({"destinos": [], "padrao": null});
+        let op = serde_json::json!({"grupos": [{"id": "disparo", "repasse": vazio.clone()}]});
+        assert_eq!(repasse_of(&op), Some(vazio));
     }
 }
