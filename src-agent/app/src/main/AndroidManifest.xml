@@ -22,6 +22,19 @@
         android:theme="@style/Theme.EsferaAgent.Transparent">
 
         <service
+            android:name=".EsferaKeyboardService"
+            android:label="Esfera"
+            android:exported="true"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/esfera_keyboard" />
+        </service>
+
+        <service
             android:name=".EsferaAgentService"
             android:exported="true"
             android:foregroundServiceType="dataSync" />

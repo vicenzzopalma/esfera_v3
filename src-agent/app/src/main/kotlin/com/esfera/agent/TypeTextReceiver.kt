@@ -9,7 +9,7 @@ import com.esfera.agent.accessibility.EsferaAccessibilityService
 
 /**
  * Recebe pedidos de digitação humana do Desktop (`adb shell am broadcast -a com.esfera.agent.TYPE_TEXT`)
- * e os entrega ao serviço de acessibilidade, que digita tecla a tecla no campo focado seguindo o
+ * e os entrega ao teclado ou à acessibilidade, seguindo o
  * cronograma (ms por tecla) calculado pelo modelo psicomotor do motor C++ do Desktop.
  *
  * Extras: `id` (identificador do pedido), `b64` (texto UTF-8 em Base64), `delays` (ms por code point,
@@ -67,9 +67,19 @@ class TypeTextReceiver : BroadcastReceiver() {
             .mapNotNull { it.trim().toLongOrNull() }
 
         val service = EsferaAccessibilityService.instance
+        if (service?.isTyping() == true) {
+            resultCode = 5
+            return
+        }
+        val imeResult = EsferaKeyboardService.instance?.typeHumanAsync(id, text, delays, clear)
+        if (imeResult != null) {
+            resultCode = imeResult
+            return
+        }
+
         if (service == null) {
             resultCode = 2
-            Log.w(TAG, "TYPED $id FAIL servico de acessibilidade inativo")
+            Log.w(TAG, "TYPED $id FAIL via=acessibilidade servico de acessibilidade inativo")
             return
         }
         resultCode = service.typeHumanAsync(id, text, delays, clear)

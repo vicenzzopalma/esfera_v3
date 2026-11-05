@@ -182,6 +182,8 @@ class EsferaAccessibilityService : AccessibilityService() {
     @Volatile
     private var typingActive = false
 
+    fun isTyping(): Boolean = typingActive
+
     /**
      * Digita [text] no campo focado (ou no primeiro editável da tela), um code point por vez,
      * esperando `delays[i]` ms antes da tecla i (cronograma do modelo psicomotor do Desktop).
@@ -198,7 +200,7 @@ class EsferaAccessibilityService : AccessibilityService() {
             try {
                 typeHumanBlocking(id, text, delays, clear)
             } catch (e: Throwable) {
-                Log.w(TYPING_TAG, "TYPED $id FAIL ${e.javaClass.simpleName}: ${e.message}")
+                Log.w(TYPING_TAG, "TYPED $id FAIL via=acessibilidade ${e.javaClass.simpleName}: ${e.message}")
             } finally {
                 typingActive = false
             }
@@ -223,7 +225,7 @@ class EsferaAccessibilityService : AccessibilityService() {
     private fun typeHumanBlocking(id: String, text: String, delays: List<Long>, clear: Boolean) {
         val first = findTypingTarget()
         if (first == null) {
-            Log.w(TYPING_TAG, "TYPED $id FAIL sem campo editavel na tela")
+            Log.w(TYPING_TAG, "TYPED $id FAIL via=acessibilidade sem campo editavel na tela")
             return
         }
         var node: AccessibilityNodeInfo = first
@@ -260,7 +262,7 @@ class EsferaAccessibilityService : AccessibilityService() {
                 }
                 val tid = target.viewIdResourceName
                 if (targetId != null && tid != null && tid != targetId) {
-                    Log.w(TYPING_TAG, "TYPED $id FAIL campo de texto mudou na tecla ${i + 1}/${cps.size} ($tid)")
+                    Log.w(TYPING_TAG, "TYPED $id FAIL via=acessibilidade campo de texto mudou na tecla ${i + 1}/${cps.size} ($tid)")
                     return
                 }
                 node = target
@@ -271,11 +273,11 @@ class EsferaAccessibilityService : AccessibilityService() {
                 Thread.sleep(120)
             }
             if (!committed) {
-                Log.w(TYPING_TAG, "TYPED $id FAIL SET_TEXT recusado na tecla ${i + 1}/${cps.size}")
+                Log.w(TYPING_TAG, "TYPED $id FAIL via=acessibilidade SET_TEXT recusado na tecla ${i + 1}/${cps.size}")
                 return
             }
         }
-        Log.i(TYPING_TAG, "TYPED $id OK teclas=${cps.size}")
+        Log.i(TYPING_TAG, "TYPED $id OK via=acessibilidade teclas=${cps.size}")
     }
 
     private fun findFirstEditable(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {

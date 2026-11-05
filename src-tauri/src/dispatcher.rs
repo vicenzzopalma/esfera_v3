@@ -629,7 +629,13 @@ pub fn cleanup_campaign_contacts(db: Arc<Database>, company_id: i32, device_ids:
             let Some(device) = device else { continue; };
             let device_lock = device_operation_lock_for_id(device.id);
             let Ok(_guard) = device_lock.try_lock() else { continue; };
+            if let Ok(campaigns) = db.get_running_campaigns() {
+                if !campaigns.iter().any(|c| campaign_uses_keyboard(c, device)) {
+                    let _ = AdbManager::restore_campaign_keyboard(&serial, device.id);
+                }
+            }
             if db.device_has_open_campaign(company_id, &device.serial, device.esfera_device_id.as_deref()).unwrap_or(true) { continue; }
+            if let Err(e) = crate::contact_backup::snapshot_device_contacts(&db, &serial) { eprintln!("[CONTATOS] Limpeza adiada em {}: a cópia dos contatos falhou: {}", serial, e); continue; }
             let _ = AdbManager::cleanup_all_temporary_contacts(&serial);
             if let Ok(mut s) = TEMP_CONTACTS.lock() {
                 s.retain(|k| !k.starts_with(&format!("{}|", serial)));
@@ -640,6 +646,28 @@ pub fn cleanup_campaign_contacts(db: Arc<Database>, company_id: i32, device_ids:
             println!("[CONTATOS TEMP] Contatos temporários apagados de {}.", serial);
         }
     });
+}
+
+fn campaign_uses_keyboard(campaign: &crate::db::Campaign, device: &crate::db::Device) -> bool {
+    campaign.company_id == device.company_id && campaign.device_ids.iter().any(|id| {
+        id == &device.serial || device.esfera_device_id.as_deref() == Some(id.as_str())
+    })
+}
+
+// Também cobre pausa, remoção do aparelho e limpeza que encontrou o envio ainda ocupado.
+fn restore_unused_campaign_keyboards(db: &Database) {
+    let pending = AdbManager::campaign_keyboard_device_ids();
+    if pending.is_empty() { return; }
+    for device in db.get_all_devices().into_iter().filter(|d| pending.contains(&d.id) && d.status == "online") {
+        let lock = device_operation_lock_for_id(device.id);
+        let Ok(_guard) = lock.try_lock() else { continue; };
+        let Ok(campaigns) = db.get_running_campaigns() else { continue; };
+        if campaigns.iter().any(|c| campaign_uses_keyboard(c, &device)) { continue; }
+        let serial = device.current_adb_address.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(&device.serial);
+        if let Err(e) = AdbManager::restore_campaign_keyboard(serial, device.id) {
+            eprintln!("[TECLADO] Restauração pendente em {}: {}", serial, e);
+        }
+    }
 }
 
 /// Mensagens geradas antecipadamente (campanha, contato) enquanto o disparo anterior pausa.
@@ -1333,9 +1361,15 @@ impl Dispatcher {
             let mut poll_delay = Duration::ZERO;
             // Uma tarefa por campanha: uma campanha em pausa não segura o início de outra.
             let mut running: HashMap<i32, tokio::task::JoinHandle<()>> = HashMap::new();
+            let mut keyboard_cleanup: Option<tokio::task::JoinHandle<()>> = None;
             loop {
                 // Ocioso: acorda no clique em iniciar (wake) ou no próximo ciclo de 2 s.
                 let _ = timeout(poll_delay, WORKER_WAKE.notified()).await;
+
+                if keyboard_cleanup.as_ref().map_or(true, |task| task.is_finished()) {
+                    let keyboard_db = db_arc.clone();
+                    keyboard_cleanup = Some(spawn_blocking(move || restore_unused_campaign_keyboards(&keyboard_db)));
+                }
 
                 let db = db_arc.clone();
                 let active_campaigns = match spawn_blocking(move || db.get_running_campaigns()).await {
@@ -1725,6 +1759,7 @@ impl Dispatcher {
                                     && within_send_window()
                                     && !db_last.is_opted_out(company_last, &phone2),
                             );
+                            AdbManager::ensure_campaign_keyboard(&serial, device_id);
                             let result = AdbManager::send_whatsapp_parts(&serial, &phone2, &parts, None, &check);
                             if let Err(ref e) = result {
                                 if e.starts_with("CONTA_RESTRITA:") {

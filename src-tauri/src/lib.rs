@@ -9,6 +9,7 @@ mod adb_tcp;
 mod ai_engine;
 pub mod checkin_server;
 mod commands;
+pub mod contact_backup;
 pub mod config;
 pub mod db;
 mod dispatcher;
@@ -152,6 +153,8 @@ pub fn run() {
             dispatcher::Dispatcher::start_opt_out_import_loop(db_arc_clone.clone());
             dispatcher::Dispatcher::start_agent_update_loop(db_arc_clone.clone());
             konfiansa_history::start(db_arc_clone.clone());
+            // Cópia de segurança dos contatos: ao aparecer online e a cada 6 horas, um aparelho por vez.
+            contact_backup::start(db_arc_clone.clone());
             adb_manager::AdbManager::start_status_monitor(db_arc_clone);
             diag("ETAPA [5] backend/servers iniciados no setup; setup retorna Ok");
             Ok(())
@@ -223,6 +226,13 @@ pub fn run() {
             import_campaign_contacts,
             get_campaign_sent_report,
             get_konfiansa_histories,
+            // Números de disparo (Evolution + repasse, via hub)
+            get_dispatch_numbers,
+            get_dispatch_number_qr,
+            create_dispatch_number,
+            get_repasse_destinos,
+            add_repasse_destino,
+            remove_repasse_destino,
             get_pending_contacts,
             update_contact_status,
             set_contact_custom_message,
@@ -341,6 +351,11 @@ pub fn run() {
             get_device_network_status,
             trigger_manual_intent_bezier_dispatch,
             clear_device_temporary_contacts,
+            // Cópia de segurança dos contatos do aparelho
+            get_device_contact_backup,
+            backup_device_contacts_now,
+            restore_device_contacts,
+            export_device_contact_backup_csv,
             check_git_auto_update,
             apply_git_auto_update,
             // Config
