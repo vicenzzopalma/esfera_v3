@@ -2466,7 +2466,8 @@ pub async fn link_usb_to_wireless(
         let final_name = device_name
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| if device_number > 0 { device_number.to_string() } else { ip.clone() });
-        let persistent_id = AdbManager::require_persistent_device_id(&wireless_serial)?;
+        let persistent_id = AdbManager::identity_for_first_adoption(&wireless_serial)?;
+        AdbManager::inject_persistent_device_id(&wireless_serial, &persistent_id)?;
         let device = Device {
             id: 0,
             serial: wireless_serial.clone(),
@@ -2787,8 +2788,10 @@ pub async fn force_enable_wireless_adb(
             log_connect(&format!("[CONNECT] adb_connect_end ip={}", ip));
 
             log_connect("[CONNECT] persistent_id_start");
-            let persistent_id = AdbManager::require_persistent_device_id(&serial)?;
-            let _ = AdbManager::inject_persistent_device_id(&serial, &persistent_id);
+            // Primeira conexão já provisiona: sem identidade no aparelho (ausência confirmada e
+            // nenhum cadastro dele), cria uma e grava; aparelho já conhecido mantém a sua.
+            let persistent_id = AdbManager::identity_for_first_adoption(&serial)?;
+            AdbManager::inject_persistent_device_id(&serial, &persistent_id)?;
             log_connect(&format!("[CONNECT] persistent_id_end pid={}", persistent_id));
 
             if is_usb_attached {

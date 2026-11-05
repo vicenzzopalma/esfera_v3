@@ -1475,6 +1475,8 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_konfiansa_history_status ON ESF_KonfiansaHistory(Status, ProximaTentativa);
              CREATE TABLE IF NOT EXISTS ESF_EvoCursor (Id INTEGER PRIMARY KEY CHECK (Id = 1), LastTs INTEGER NOT NULL);");
         let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN KonfiansaCredor INTEGER NOT NULL DEFAULT 0;", []);
+        // Número do WhatsApp que fez o disparo daquela conversa (vai no título do histórico).
+        let _ = self.conn().execute("ALTER TABLE ESF_WaMessage ADD COLUMN Owner TEXT NOT NULL DEFAULT '';", []);
         // Limpeza APENAS de dispositivos mockados de testes 'adb-dev-%' (NUNCA deletar conexões reais Wi-Fi/IP)
         let _ = self.conn().execute("DELETE FROM ESF_Device WHERE AdbDeviceId LIKE 'adb-dev-%';", []);
         let _ = self.conn().execute("DELETE FROM ESF_AuditLog WHERE Message LIKE '%adb-dev-%';", []);
@@ -5680,6 +5682,8 @@ pub struct WaMessageRow {
     pub push_name: String,
     pub text: String,
     pub campaign_id: i32,
+    /// Número do WhatsApp de disparo que trocou a mensagem ('' = desconhecido).
+    pub owner: String,
 }
 
 /// Uma conversa enviada (ou a enviar) ao Konfiansa e o que aconteceu com ela.
@@ -5753,8 +5757,8 @@ impl Database {
         let mut n = 0;
         for m in msgs {
             n += conn.execute(
-                "INSERT OR IGNORE INTO ESF_WaMessage(MsgId,Ts,PhoneKey,Phone,FromMe,PushName,Text,CampaignId) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![m.msg_id, m.ts, m.phone_key, m.phone, m.from_me, m.push_name, m.text, m.campaign_id]).map_err(|e| e.to_string())?;
+                "INSERT OR IGNORE INTO ESF_WaMessage(MsgId,Ts,PhoneKey,Phone,FromMe,PushName,Text,CampaignId,Owner) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![m.msg_id, m.ts, m.phone_key, m.phone, m.from_me, m.push_name, m.text, m.campaign_id, m.owner]).map_err(|e| e.to_string())?;
         }
         Ok(n)
     }
@@ -5779,11 +5783,11 @@ impl Database {
     pub fn open_wa_messages(&self, phone_key: &str) -> Result<Vec<WaMessageRow>, String> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT MsgId,Ts,PhoneKey,Phone,FromMe,PushName,Text,CampaignId FROM ESF_WaMessage
+            "SELECT MsgId,Ts,PhoneKey,Phone,FromMe,PushName,Text,CampaignId,Owner FROM ESF_WaMessage
              WHERE PhoneKey=?1 AND HistoryId IS NULL ORDER BY Ts, MsgId").map_err(|e| e.to_string())?;
         let rows = stmt.query_map(params![phone_key], |r| Ok(WaMessageRow {
             msg_id: r.get(0)?, ts: r.get(1)?, phone_key: r.get(2)?, phone: r.get(3)?, from_me: r.get(4)?,
-            push_name: r.get(5)?, text: r.get(6)?, campaign_id: r.get(7)?,
+            push_name: r.get(5)?, text: r.get(6)?, campaign_id: r.get(7)?, owner: r.get(8)?,
         })).map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>>>().map_err(|e| e.to_string())
     }
@@ -5868,7 +5872,7 @@ mod historico_konfiansa_db_tests {
 
     fn msg(id: &str, ts: i64, from_me: bool, text: &str) -> WaMessageRow {
         WaMessageRow { msg_id: id.into(), ts, phone_key: "1191703561".into(), phone: "5511991703561".into(), from_me,
-            push_name: if from_me { "Realess".into() } else { "Mel".into() }, text: text.into(), campaign_id: 16 }
+            push_name: if from_me { "Realess".into() } else { "Mel".into() }, text: text.into(), campaign_id: 16, owner: String::new() }
     }
 
     #[test]
