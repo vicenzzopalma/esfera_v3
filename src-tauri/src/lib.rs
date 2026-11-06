@@ -27,8 +27,10 @@ mod spintax;
 mod tunnel_server;
 pub mod veritas_crm;
 pub mod konfiansa_history;
+pub mod atendimento_celular;
 mod write_queue;
 
+use atendimento_celular::*;
 use commands::*;
 use db::Database;
 use hub_client::HubClient;
@@ -365,6 +367,12 @@ pub fn run() {
             get_vexor_token_status,
             save_vexor_token,
             test_vexor_token,
+            // Atendimento pelo Celular (Ponte ADB PA FIXA)
+            get_atendimento_celular_status,
+            get_atendimento_celular_log,
+            save_atendimento_celular_config,
+            start_atendimento_celular,
+            stop_atendimento_celular,
         ])
         .build(tauri::generate_context!())
         .expect("Erro ao construir aplicação Tauri")
