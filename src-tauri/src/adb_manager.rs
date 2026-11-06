@@ -4805,15 +4805,19 @@ impl AdbManager {
         Ok(())
     }
 
-    /// Abre somente o número no pacote autorizado; o texto sempre é digitado.
-    fn wa_open_link(serial: &str, pkg: &str, digits: &str) -> Result<(), String> {
-        if !Self::WHATSAPP_PACKAGES.contains(&pkg) { return Err("Use somente o WhatsApp (normal ou Business) para o envio".into()); }
-        let url = format!("https://api.whatsapp.com/send?phone={}", digits);
-        let cmd = format!(
+    fn wa_open_link_command(pkg: &str, digits: &str) -> String {
+        let url = format!("whatsapp://send?phone={}", digits);
+        format!(
             "am start -a android.intent.action.VIEW -p {} -d '{}'",
             pkg,
             Self::shell_quote(&url)
-        );
+        )
+    }
+
+    /// Abre somente o número no pacote autorizado; o texto sempre é digitado.
+    fn wa_open_link(serial: &str, pkg: &str, digits: &str) -> Result<(), String> {
+        if !Self::WHATSAPP_PACKAGES.contains(&pkg) { return Err("Use somente o WhatsApp (normal ou Business) para o envio".into()); }
+        let cmd = Self::wa_open_link_command(pkg, digits);
         Self::execute_shell(serial, &cmd, 8).map_err(|e| format!("Falha ao abrir conversa por link: {}", e))?;
         let d = Self::calculate_gaussian_delay(2200, 3200);
         std::thread::sleep(Duration::from_millis(d as u64));
@@ -6722,6 +6726,16 @@ mod send_safety_tests {
         assert!(AdbManager::entry_empty("\u{200B}"));
         assert!(AdbManager::entry_empty("Mensagem"));
         assert!(!AdbManager::entry_empty("Olá"));
+    }
+
+    #[test]
+    fn wa_open_link_command_abre_numero_no_pacote_sem_texto() {
+        for (pkg, expected) in [
+            ("com.whatsapp", "am start -a android.intent.action.VIEW -p com.whatsapp -d 'whatsapp://send?phone=5511999998888'"),
+            ("com.whatsapp.w4b", "am start -a android.intent.action.VIEW -p com.whatsapp.w4b -d 'whatsapp://send?phone=5511999998888'"),
+        ] {
+            assert_eq!(AdbManager::wa_open_link_command(pkg, "5511999998888"), expected);
+        }
     }
 
     #[test]
