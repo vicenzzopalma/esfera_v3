@@ -3647,7 +3647,7 @@ mod regras_do_inicio_tests {
         crate::db::Campaign {
             id: 1, name: "Teste".into(), greeting: greeting.into(), message: message.into(), closing: closing.into(),
             delay_min: 30, delay_max: 90, use_spintax, use_ai: false, ai_model: String::new(), ai_provider: String::new(),
-            ai_prompt: String::new(), device_ids: vec!["usb1".into()], status: "draft".into(), contacts_count: 0,
+            ai_prompt: String::new(), device_ids: vec!["usb1".into()], return_number: String::new(), status: "draft".into(), contacts_count: 0,
             sent_count: 0, failed_count: 0, company_id: 1, updated_at: String::new(), pause_reason: None,
         }
     }
@@ -5367,7 +5367,7 @@ mod tests {
             sent_count: 0,
             failed_count: 0,
             company_id: 1,
-            device_ids: vec![],
+            device_ids: vec![], return_number: String::new(),
             ai_provider: String::new(),
             updated_at: String::new(),
             pause_reason: None,

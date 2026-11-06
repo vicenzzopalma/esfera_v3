@@ -224,7 +224,7 @@ mod tests {
             ai_model: String::new(),
             ai_provider: String::new(),
             ai_prompt: String::new(),
-            device_ids: vec![],
+            device_ids: vec![], return_number: String::new(),
             status: "draft".into(),
             contacts_count: 0,
             sent_count: 0,

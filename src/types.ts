@@ -100,6 +100,7 @@ export interface Device {
 export type CampaignStatus = "running" | "paused" | "completed" | "draft" | "error";
 
 export interface Campaign {
+  returnNumber?: string;
   id: number;
   name: string;
   greeting: string;
