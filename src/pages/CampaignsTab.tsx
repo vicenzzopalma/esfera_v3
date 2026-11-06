@@ -4174,25 +4174,32 @@ function ReturnNumberSelector({ companyId, devices, selected, value, onChange }:
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
   }, [companyId]);
+  const selectedDevices = devices.filter((d) => d.companyId === companyId && (selected.includes(d.serial) || selected.includes(deviceKey(d))));
   const options = chips.flatMap((chip) => {
-    const device = devices.find((d) => d.companyId === companyId && d.id === chip.deviceId && selected.includes(deviceKey(d)));
+    const device = selectedDevices.find((d) => d.id === chip.deviceId);
     const raw = chip.phoneNumber.replace(/\D/g, "");
     const phone = raw.length === 10 || raw.length === 11 ? `55${raw}` : raw;
-    return device && /^55[1-9]\d{9,10}$/.test(phone) ? [{ phone, label: `${formatPhoneBr(phone)} · ${deviceLabel(device)}` }] : [];
-  }).filter((option, index, rows) => rows.findIndex((r) => r.phone === option.phone) === index);
-  const available = options.some((o) => o.phone === value);
+    return device && /^55[1-9]\d{9,10}$/.test(phone) ? [{ phone, deviceId: device.id, label: `${formatPhoneBr(phone)} · ${deviceLabel(device)}` }] : [];
+  });
+  const withoutNine = (phone: string) => phone.length === 13 && phone[4] === "9" ? phone.slice(0, 4) + phone.slice(5) : phone;
+  const matchingOption = options.find((o) => withoutNine(o.phone) === withoutNine(value));
+  const available = value === "*" ? selected.length > 0 : !!matchingOption;
+  const missingNumbers = selectedDevices.filter((d) => !options.some((o) => o.deviceId === d.id));
+  const uniqueOptions = options.filter((option, index, rows) => rows.findIndex((r) => r.phone === option.phone) === index);
   return (
-    <FormSection title="Retorno VERITAS" description="Escolha o número desta campanha que receberá o retorno. Somente contatos efetivamente enviados por ele ficam autorizados.">
+    <FormSection title="Retorno VERITAS" description="O retorno (SAIR e repasse à Marcela) só vale para contatos enviados pelos números escolhidos.">
       <label className="block space-y-2 text-sm">
         <span>Número do retorno</span>
-        <select className="w-full rounded-lg border border-border bg-surface px-3 py-2" value={value} onChange={(e) => onChange(e.target.value)}>
+        <select className="w-full rounded-lg border border-border bg-surface px-3 py-2" value={matchingOption?.phone || value} onChange={(e) => onChange(e.target.value)}>
           <option value="">Desativado</option>
-          {value && !available && <option value={value}>{formatPhoneBr(value)} — indisponível na seleção atual</option>}
-          {options.map((option) => <option key={option.phone} value={option.phone}>{option.label}</option>)}
+          <option value="*" disabled={selected.length === 0}>Todos os aparelhos desta campanha</option>
+          {value && value !== "*" && !available && <option value={value}>{formatPhoneBr(value)} — indisponível na seleção atual</option>}
+          {uniqueOptions.map((option) => <option key={option.phone} value={option.phone}>{option.label}</option>)}
         </select>
       </label>
       <p className="mt-2 text-xs text-secondary">{loading ? "Carregando números…" : loadError ? "Não foi possível carregar os números. Reabra esta configuração para tentar novamente." : "Os números disponíveis pertencem aos aparelhos selecionados desta empresa."}</p>
-      {value && !available && !loading && <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">Selecione um número disponível ou desative o retorno antes de salvar.</p>}
+      {!loading && !loadError && missingNumbers.length > 0 && <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">Sem número do chip: cadastre o número no aparelho para ele ter retorno. Aparelhos: {missingNumbers.map(deviceLabel).join(", ")}.</p>}
+      {value && !available && !loading && <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">{value === "*" ? "Selecione ao menos um aparelho para ativar o retorno." : "Selecione um número disponível ou desative o retorno antes de salvar."}</p>}
     </FormSection>
   );
 }
@@ -4611,7 +4618,7 @@ function CampaignWizard({
                   )}
                 </ReviewRow>
                 <ReviewRow label="Retorno VERITAS" onEdit={() => goTo("sending")}>
-                  {form.returnNumber ? formatPhoneBr(form.returnNumber) : "Desativado"}
+                  {form.returnNumber === "*" ? "Todos os aparelhos da campanha" : form.returnNumber ? formatPhoneBr(form.returnNumber) : "Desativado"}
                 </ReviewRow>
                 <ReviewRow label="IA" onEdit={() => goTo("ai")}>
                   {form.useAI ? `${providerName}${form.aiModel ? ` · ${form.aiModel}` : ""}` : "Desativada"}

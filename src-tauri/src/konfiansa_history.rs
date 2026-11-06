@@ -499,7 +499,7 @@ pub fn dispatched_phone_list<'a>(phones: impl Iterator<Item = &'a str>) -> Vec<S
     out
 }
 
-/// Fingerprint includes campaign selection and links; renew every minute.
+/// A impressão inclui a lista antiga, a seleção das campanhas e os vínculos; renova a cada minuto.
 static DEVEDORES_PUBLICADOS: std::sync::Mutex<(u64, i64)> = std::sync::Mutex::new((0, 0));
 
 /// Publica no hub a lista de quem o Esfera disparou. O robô da VPS só repassa à negociadora
@@ -507,7 +507,9 @@ static DEVEDORES_PUBLICADOS: std::sync::Mutex<(u64, i64)> = std::sync::Mutex::ne
 async fn publish_dispatched(db: &Arc<Database>) {
     let db2 = db.clone();
     let Ok(Ok((snapshot, selection))) = tokio::task::spawn_blocking(move || {
-        let snapshot = db2.veritas_dispatch_snapshot()?;
+        let mut snapshot = db2.veritas_dispatch_snapshot()?;
+        let contacts = db2.dispatched_contacts()?;
+        snapshot.telefones = dispatched_phone_list(contacts.values().map(|c| c.phone.as_str()));
         let selection: Vec<_> = snapshot.empresas.iter().flat_map(|id| db2.get_campaigns(*id))
             .map(|c| (c.company_id,c.id,c.return_number,c.device_ids,c.status)).collect();
         Ok::<_,String>((snapshot,selection))
@@ -515,7 +517,7 @@ async fn publish_dispatched(db: &Arc<Database>) {
     let impressao = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        let Ok(bytes) = serde_json::to_vec(&(&snapshot.empresas,&snapshot.vinculos,&selection)) else { return };
+        let Ok(bytes) = serde_json::to_vec(&(&snapshot.empresas,&snapshot.telefones,&snapshot.vinculos,&selection)) else { return };
         bytes.hash(&mut h);
         h.finish()
     };
@@ -532,7 +534,13 @@ async fn publish_dispatched(db: &Arc<Database>) {
         Ok(r) if r.status().is_success() => {
             if let Ok(mut s) = DEVEDORES_PUBLICADOS.lock() { *s = (impressao, agora); }
         }
-        Ok(r) => eprintln!("[DEVEDORES] hub respondeu HTTP {} ao publicar a lista.", r.status()),
+        Ok(r) => {
+            let status = r.status();
+            let erro = r.json::<serde_json::Value>().await.ok()
+                .and_then(|body| body.get("erro").and_then(|v| v.as_str()).map(|v| v.chars().take(200).collect::<String>()))
+                .unwrap_or_default();
+            eprintln!("[DEVEDORES] hub respondeu HTTP {} ao publicar a lista. Erro: {}", status, erro);
+        }
         Err(_) => eprintln!("[DEVEDORES] Falha de comunicação ao publicar autorizações de retorno."),
     }
 }

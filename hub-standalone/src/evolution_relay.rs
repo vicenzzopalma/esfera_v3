@@ -562,7 +562,6 @@ pub async fn repasse_add(
 // ------------------------------------------------------------------
 
 pub const MAX_DEVEDORES: usize = 50_000;
-const DEVEDORES_WINDOW: i64 = 48 * 60 * 60;
 // O lock cobre leitura, merge e rename; só bloquear o rename perderia snapshots concorrentes.
 static DEVEDORES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -580,7 +579,12 @@ pub struct DevedoresBody {
     pub schema: u8,
     pub empresas: Vec<i32>,
     pub vinculos: Vec<DevedorVinculo>,
-    // atualizado_em e telefones recebidos são ignorados. O servidor deriva ambos.
+    // Lida e normalizada separadamente; ausência preserva a lista já gravada.
+    #[serde(skip)]
+    pub telefones: Option<Vec<String>>,
+    #[serde(skip)]
+    ignorados: usize,
+    // atualizado_em é definido pelo servidor.
 }
 
 #[derive(Debug)]
@@ -597,6 +601,48 @@ fn invalid_devedores() -> DevedoresError {
 fn valid_devedor_phone(number: &str) -> bool {
     (number.len() == 12 || number.len() == 13) && number.starts_with("55")
         && number.bytes().all(|b| b.is_ascii_digit()) && number.as_bytes()[2] != b'0'
+}
+
+/// Só dígitos, 10 a 13; ordenados e sem repetição, como no formato legado.
+/// Devolve (telefones, ignorados); repetições válidas não contam como ignorados.
+pub fn normalize_devedores(list: &[Value]) -> (Vec<String>, usize) {
+    let mut out = Vec::with_capacity(list.len());
+    let mut ignorados = 0;
+    for v in list {
+        let s = match v {
+            Value::String(s) => s.trim().to_string(),
+            Value::Number(n) if n.is_u64() => n.to_string(),
+            _ => String::new(),
+        };
+        if (10..=13).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()) { out.push(s) }
+        else { ignorados += 1; }
+    }
+    out.sort_unstable();
+    out.dedup();
+    (out, ignorados)
+}
+
+fn decode_devedores(value: Value) -> Result<DevedoresBody, DevedoresError> {
+    let (telefones, ignorados) = match value.get("telefones") {
+        Some(Value::Array(list)) => {
+            let (phones, ignored) = normalize_devedores(list);
+            (Some(phones), ignored)
+        }
+        None => (None, 0),
+        _ => return Err(invalid_devedores()),
+    };
+    if value.get("schema").is_none() {
+        if telefones.is_none() { return Err(invalid_devedores()); }
+        // O cliente legado só substitui a lista global, sem declarar escopo de vínculos.
+        return Ok(DevedoresBody { schema: 2, empresas: vec![], vinculos: vec![], telefones, ignorados });
+    }
+    if value.get("schema").and_then(Value::as_u64) != Some(2) {
+        return Err(invalid_devedores());
+    }
+    let mut body: DevedoresBody = serde_json::from_value(value).map_err(|_| invalid_devedores())?;
+    body.telefones = telefones;
+    body.ignorados = ignorados;
+    Ok(body)
 }
 
 fn normalize_vinculos(vinculos: Vec<DevedorVinculo>) -> Vec<DevedorVinculo> {
@@ -616,26 +662,21 @@ fn validate_devedores(mut body: DevedoresBody, now: i64) -> Result<DevedoresBody
     }
     body.empresas.sort_unstable();
     body.empresas.dedup();
-    // Valida inclusive os vínculos expirados antes de descartá-los: um item inválido
-    // nunca transforma uma atualização rejeitada em um snapshot vazio aceito.
-    for v in &body.vinculos {
+    for v in &mut body.vinculos {
         if v.empresa_id <= 0 || v.campanha_id <= 0 || body.empresas.binary_search(&v.empresa_id).is_err()
             || !valid_devedor_phone(&v.numero_disparo) || !valid_devedor_phone(&v.telefone)
-            || v.enviado_em <= 0 || v.enviado_em > now.saturating_add(120)
+            || v.enviado_em <= 0
         {
             return Err(invalid_devedores());
         }
+        if v.enviado_em > now.saturating_add(120) { v.enviado_em = now; }
     }
-    body.vinculos.retain(|v| v.enviado_em >= now.saturating_sub(DEVEDORES_WINDOW));
     body.vinculos = normalize_vinculos(body.vinculos);
     Ok(body)
 }
 
 fn parse_devedores(value: Value, now: i64, company_id: i32, role: &str) -> Result<DevedoresBody, DevedoresError> {
-    if value.get("schema").and_then(Value::as_u64) != Some(2) {
-        return Err(DevedoresError(StatusCode::BAD_REQUEST, "Envie schema 2 com empresas e vínculos; a lista global legada não é aceita."));
-    }
-    let body: DevedoresBody = serde_json::from_value(value).map_err(|_| invalid_devedores())?;
+    let body = decode_devedores(value)?;
     if body.vinculos.len() > MAX_DEVEDORES {
         return Err(DevedoresError(StatusCode::BAD_REQUEST, "No máximo 50000 vínculos por envio."));
     }
@@ -653,19 +694,13 @@ fn authorize_devedores_scope(body: &DevedoresBody, company_id: i32, role: &str) 
 }
 
 fn stored_devedores(value: Value, now: i64) -> Result<DevedoresBody, DevedoresError> {
-    // A lista global antiga não comprova empresa/campanha/origem/envio. Migração
-    // descarta todo acesso amplo, em vez de atribuí-lo ao primeiro tenant que subir.
-    if value.get("schema").is_none() && value.get("telefones").and_then(Value::as_array).is_some() {
-        return Ok(DevedoresBody { schema: 2, empresas: vec![], vinculos: vec![] });
-    }
-    let stored = serde_json::from_value(value).map_err(|_| invalid_devedores())?;
-    validate_devedores(stored, now)
+    validate_devedores(decode_devedores(value)?, now)
 }
 
 fn merge_devedores(current: DevedoresBody, incoming: DevedoresBody, now: i64) -> Result<Value, DevedoresError> {
     let current = validate_devedores(current, now)?;
     let mut incoming = validate_devedores(incoming, now)?;
-    // Se o contato permanece no snapshot, mantém o primeiro envio ainda válido.
+    // Se o contato permanece no snapshot, mantém o primeiro envio.
     let oldest: std::collections::BTreeMap<_, _> = current.vinculos.iter().map(|v|
         ((v.empresa_id, v.campanha_id, v.numero_disparo.as_str(), v.telefone.as_str()), v.enviado_em)).collect();
     for v in &mut incoming.vinculos {
@@ -687,7 +722,7 @@ fn merge_devedores(current: DevedoresBody, incoming: DevedoresBody, now: i64) ->
             return Err(DevedoresError(StatusCode::CONFLICT, "Número de disparo vinculado a mais de uma empresa."));
         }
     }
-    let telefones: std::collections::BTreeSet<_> = vinculos.iter().map(|v| &v.telefone).collect();
+    let telefones = incoming.telefones.or(current.telefones).unwrap_or_default();
     Ok(serde_json::json!({ "schema": 2, "atualizado_em": now, "empresas": empresas,
         "telefones": telefones, "vinculos": vinculos }))
 }
@@ -698,7 +733,9 @@ fn persist_devedores(path: &std::path::Path, incoming: DevedoresBody, now: i64) 
     let current = match std::fs::read(path) {
         Ok(data) => stored_devedores(serde_json::from_slice(&data).map_err(|_| disk_error())?, now)
             .map_err(|_| disk_error())?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DevedoresBody { schema: 2, empresas: vec![], vinculos: vec![] },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DevedoresBody {
+            schema: 2, empresas: vec![], vinculos: vec![], telefones: None, ignorados: 0,
+        },
         Err(_) => return Err(disk_error()),
     };
     let merged = merge_devedores(current, incoming, now)?;
@@ -725,7 +762,7 @@ pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
     result
 }
 
-/// POST /api/desktop/evolution/devedores — snapshot v2 autenticado por empresa.
+/// POST /api/desktop/evolution/devedores — lista legada ou snapshot v2 autenticado por empresa.
 pub async fn evolution_devedores(
     State((db, _)): State<(Arc<Database>, u16)>,
     headers: HeaderMap,
@@ -735,6 +772,7 @@ pub async fn evolution_devedores(
     let Json(value) = payload.map_err(|_| invalid_devedores().response())?;
     let now = chrono::Utc::now().timestamp();
     let b = parse_devedores(value, now, company_id, &role).map_err(DevedoresError::response)?;
+    let ignorados = b.ignorados;
     let path = env_value("ESFERA_DEVEDORES_ARQUIVO")
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "Arquivo de devedores não configurado no hub."))?;
     let merged = tokio::task::spawn_blocking(move || persist_devedores(std::path::Path::new(&path), b, now)).await
@@ -742,7 +780,7 @@ pub async fn evolution_devedores(
         .map_err(DevedoresError::response)?;
     Ok(reply(StatusCode::OK, serde_json::json!({ "ok": true, "schema": 2,
         "total": merged["telefones"].as_array().map_or(0, Vec::len),
-        "vinculos": merged["vinculos"].as_array().map_or(0, Vec::len), "ignorados": 0 })))
+        "vinculos": merged["vinculos"].as_array().map_or(0, Vec::len), "ignorados": ignorados })))
 }
 
 /// POST /api/desktop/repasse/destinos/remover {"numero"} — tira um destino (o painel mantém ao menos 1).
@@ -913,33 +951,40 @@ mod tests {
     }
 
     #[test]
-    fn devedores_v2_deriva_telefones_e_timestamp_dos_vinculos() {
+    fn devedores_v2_guarda_lista_do_corpo_e_normaliza_vinculos() {
         let mut value = snapshot(&[2, 1, 2], vec![
             vinculo(2, 3, "5547996271722", "5511991703561", NOW - 10),
             vinculo(2, 3, "5547996271722", "5511991703561", NOW - 30),
             vinculo(1, 4, "554796834632", "554733054406", NOW),
         ]);
-        value["telefones"] = serde_json::json!(["5511999999999"]);
+        value["telefones"] = serde_json::json!(["5511999999999", " 4733054406 ", 4733054406u64,
+            "11991703561", "5511999999999", "47 99999-8888", "123", "55479999988881", null, "abcdefghij"]);
         value["atualizado_em"] = serde_json::json!(i64::MAX);
         let merged = merge_devedores(parsed(snapshot(&[], vec![])), parsed(value), NOW).unwrap();
         assert_eq!(merged["schema"], 2);
         assert_eq!(merged["atualizado_em"], NOW);
         assert_eq!(merged["empresas"], serde_json::json!([1, 2]));
-        assert_eq!(merged["telefones"], serde_json::json!(["5511991703561", "554733054406"]));
+        assert_eq!(merged["telefones"], serde_json::json!(["11991703561", "4733054406", "5511999999999"]));
         assert_eq!(merged["vinculos"].as_array().unwrap().len(), 2);
         assert_eq!(merged["vinculos"][0]["empresa_id"], 1);
         assert_eq!(merged["vinculos"][1]["enviado_em"], NOW - 30);
     }
 
     #[test]
-    fn devedores_rejeita_legado_campos_ausentes_e_malformados() {
+    fn devedores_rejeita_campos_ausentes_e_malformados() {
         let valid = snapshot(&[1], vec![vinculo(1, 1, "5547996271722", "5511991703561", NOW)]);
-        for value in [serde_json::json!({"telefones": ["5511991703561"]}),
+        for value in [serde_json::json!({}),
+            serde_json::json!({"telefones": null}),
+            serde_json::json!({"telefones": "5511991703561"}),
+            serde_json::json!({"schema": null, "telefones": []}),
+            serde_json::json!({"schema": 1, "telefones": []}),
             serde_json::json!({"schema": 2, "empresas": [1]}),
             serde_json::json!({"schema": 2, "vinculos": []}),
             serde_json::json!({"schema": "2", "empresas": [1], "vinculos": []}),
             serde_json::json!({"schema": 2, "empresas": [-1], "vinculos": []}),
             serde_json::json!({"schema": 2, "empresas": [1], "vinculos": null}),
+            serde_json::json!({"schema": 2, "empresas": [1], "vinculos": [], "telefones": null}),
+            serde_json::json!({"schema": 2, "empresas": [1], "vinculos": [], "telefones": {}}),
         ] {
             assert_eq!(parse_devedores(value, NOW, 0, "master").unwrap_err().0, StatusCode::BAD_REQUEST);
         }
@@ -949,8 +994,8 @@ mod tests {
             ("telefone", serde_json::json!(5511991703561u64)), ("telefone", serde_json::json!("11991703561")),
             ("telefone", serde_json::json!("+5511991703561")), ("telefone", serde_json::json!("5511991703561 ")),
             ("numero_disparo", serde_json::json!("47 99627-1722")), ("numero_disparo", serde_json::json!("4407996271722")),
-            ("enviado_em", serde_json::json!(0)), ("enviado_em", serde_json::json!(NOW + 121)),
-            ("enviado_em", serde_json::json!(i64::MAX)), ("enviado_em", serde_json::json!(NOW.to_string())),
+            ("enviado_em", serde_json::json!(0)), ("enviado_em", serde_json::json!(-1)),
+            ("enviado_em", serde_json::json!(NOW.to_string())),
         ] {
             let mut value = valid.clone();
             value["vinculos"][0][field] = bad;
@@ -972,20 +1017,29 @@ mod tests {
     }
 
     #[test]
-    fn devedores_janela_descarta_expirados_antes_do_primeiro_envio() {
+    fn devedores_preserva_envios_de_60_dias_e_primeiro_envio() {
         let body = parsed(snapshot(&[1], vec![
-            vinculo(1, 1, "5547996271722", "5511991703561", NOW - 172_801),
+            vinculo(1, 1, "5547996271722", "5511991703561", NOW - 60 * 86_400),
             vinculo(1, 1, "5547996271722", "5511991703561", NOW - 172_800),
             vinculo(1, 1, "5547996271722", "5511991703561", NOW - 1),
             vinculo(1, 2, "5547996271722", "554733054406", NOW + 120),
         ]));
         assert_eq!(body.vinculos.len(), 2);
-        assert_eq!(body.vinculos[0].enviado_em, NOW - 172_800);
+        assert_eq!(body.vinculos[0].enviado_em, NOW - 60 * 86_400);
         assert_eq!(body.vinculos[1].enviado_em, NOW + 120);
         let mut expired_bad = snapshot(&[1], vec![vinculo(1, 1, "5547996271722", "bad", NOW - 172_801)]);
         assert!(parse_devedores(expired_bad.clone(), NOW, 0, "master").is_err());
         expired_bad["vinculos"][0]["telefone"] = serde_json::json!("5511991703561");
-        assert!(parsed(expired_bad).vinculos.is_empty());
+        assert_eq!(parsed(expired_bad).vinculos.len(), 1);
+    }
+
+    #[test]
+    fn devedores_horario_futuro_acima_da_tolerancia_vira_agora() {
+        for (timestamp, expected) in [(NOW + 120, NOW + 120), (NOW + 121, NOW), (i64::MAX, NOW)] {
+            let value = snapshot(&[1], vec![vinculo(1, 1, "5547996271722", "5511991703561", timestamp)]);
+            let merged = merge_devedores(parsed(snapshot(&[], vec![])), parsed(value), NOW).unwrap();
+            assert_eq!(merged["vinculos"][0]["enviado_em"], expected);
+        }
     }
 
     #[test]
@@ -1022,7 +1076,7 @@ mod tests {
         let cleared = merge_devedores(stored_devedores(merged, NOW).unwrap(), parsed(snapshot(&[1], vec![])), NOW).unwrap();
         assert_eq!(cleared["vinculos"].as_array().unwrap().len(), 1);
         assert_eq!(cleared["vinculos"][0]["empresa_id"], 2);
-        assert_eq!(cleared["telefones"], serde_json::json!(["5547999998888"]));
+        assert_eq!(cleared["telefones"], serde_json::json!([]));
     }
 
     #[test]
@@ -1038,27 +1092,62 @@ mod tests {
     }
 
     #[test]
-    fn devedores_legado_migra_sem_conceder_acesso_amplo() {
+    fn devedores_arquivo_legado_preserva_telefones_sem_criar_vinculos() {
         let old = stored_devedores(serde_json::json!({"atualizado_em": NOW, "telefones": ["5511999999999"]}), NOW).unwrap();
         let merged = merge_devedores(old, parsed(snapshot(&[1], vec![])), NOW).unwrap();
         assert_eq!(merged["schema"], 2);
-        assert_eq!(merged["telefones"], serde_json::json!([]));
+        assert_eq!(merged["telefones"], serde_json::json!(["5511999999999"]));
+        assert_eq!(merged["vinculos"], serde_json::json!([]));
         assert!(stored_devedores(serde_json::json!({"schema": 2, "telefones": ["5511999999999"]}), NOW).is_err());
     }
 
     #[test]
-    fn devedores_merge_preserva_empresa_sem_vinculos_e_descarta_vencidos() {
-        let current = DevedoresBody { schema: 2, empresas: vec![1, 2], vinculos: vec![
-            serde_json::from_value(vinculo(2, 1, "5547996271722", "5511991703561", NOW - 172_801)).unwrap(),
-        ] };
+    fn devedores_merge_preserva_empresa_sem_vinculos_e_envio_antigo() {
+        let current = parsed(snapshot(&[1, 2], vec![
+            vinculo(2, 1, "5547996271722", "5511991703561", NOW - 60 * 86_400),
+        ]));
         let merged = merge_devedores(current, parsed(snapshot(&[3], vec![])), NOW).unwrap();
         assert_eq!(merged["empresas"], serde_json::json!([1, 2, 3]));
         assert_eq!(merged["telefones"], serde_json::json!([]));
+        assert_eq!(merged["vinculos"], serde_json::json!([
+            vinculo(2, 1, "5547996271722", "5511991703561", NOW - 60 * 86_400),
+        ]));
+    }
+
+    #[test]
+    fn devedores_v2_sem_telefones_preserva_lista_e_lista_vazia_limpa() {
+        let mut value = snapshot(&[1], vec![vinculo(1, 1, "5547996271722", "5511991703561", NOW)]);
+        value["telefones"] = serde_json::json!(["4733054406", "5511999999999"]);
+        let merged = merge_devedores(parsed(value), parsed(snapshot(&[1], vec![])), NOW).unwrap();
+        assert_eq!(merged["telefones"], serde_json::json!(["4733054406", "5511999999999"]));
         assert_eq!(merged["vinculos"], serde_json::json!([]));
+        let mut clear = snapshot(&[1], vec![]);
+        clear["telefones"] = serde_json::json!([]);
+        let cleared = merge_devedores(stored_devedores(merged, NOW).unwrap(), parsed(clear), NOW).unwrap();
+        assert_eq!(cleared["telefones"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn devedores_legado_aceito_preserva_empresas_e_vinculos_no_disco() {
+        let dir = std::env::temp_dir().join(format!("esfera-devedores-legado-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("devedores.json");
+        let current = persist_devedores(&target, parsed(snapshot(&[1, 2], vec![
+            vinculo(1, 1, "5547996271722", "5511991703561", NOW - 60 * 86_400),
+            vinculo(2, 2, "554796834632", "5547999998888", NOW),
+        ])), NOW).unwrap();
+        let incoming = parse_devedores(serde_json::json!({"telefones": [" 4733054406 ", "5511999999999",
+            4733054406u64, "123", null]}), NOW, 1, "gestor").unwrap();
+        let merged = persist_devedores(&target, incoming, NOW).unwrap();
+        assert_eq!(merged["telefones"], serde_json::json!(["4733054406", "5511999999999"]));
+        assert_eq!(merged["empresas"], current["empresas"]);
+        assert_eq!(merged["vinculos"], current["vinculos"]);
+        assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(&target).unwrap()).unwrap(), merged);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
-    async fn devedores_handler_exige_token_e_rejeita_escopo_e_legado_antes_de_gravar() {
+    async fn devedores_handler_exige_token_e_rejeita_escopo_antes_de_gravar() {
         let dir = std::env::temp_dir().join(format!("esfera-devedores-auth-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.db");
@@ -1074,7 +1163,7 @@ mod tests {
         for (value, code) in [
             (snapshot(&[78], vec![]), StatusCode::FORBIDDEN),
             (snapshot(&[77], vec![vinculo(78, 1, "5547996271722", "5511991703561", NOW)]), StatusCode::FORBIDDEN),
-            (serde_json::json!({"telefones": ["5511991703561"]}), StatusCode::BAD_REQUEST),
+            (serde_json::json!({"telefones": null}), StatusCode::BAD_REQUEST),
             (serde_json::json!({"schema": 2, "empresas": [77]}), StatusCode::BAD_REQUEST),
             (snapshot(&[0], vec![]), StatusCode::BAD_REQUEST),
         ] {
@@ -1113,6 +1202,56 @@ mod tests {
         write_atomic(&target, b"{\"schema\":2,\"vinculos\":null}").unwrap();
         assert_eq!(persist_devedores(&target, parsed(snapshot(&[1], vec![])), NOW).unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"schema\":2,\"vinculos\":null}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn devedores_handler_aceita_legado_e_v2_com_contagem_de_ignorados() {
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                if let Some(value) = &self.0 { std::env::set_var("ESFERA_DEVEDORES_ARQUIVO", value); }
+                else { std::env::remove_var("ESFERA_DEVEDORES_ARQUIVO"); }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("esfera-devedores-handler-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Database::init(dir.join("test.db").to_str().unwrap()).unwrap());
+        db.ensure_company(77, "Teste local").unwrap();
+        db.upsert_company_token(77, "token-apenas-para-teste-local", "gestor").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::AUTHORIZATION, "Bearer token-apenas-para-teste-local".parse().unwrap());
+        let target = dir.join("devedores.json");
+        let links = vec![vinculo(77, 1, "5547996271722", "5511991703561", NOW - 60 * 86_400)];
+        let mut initial = snapshot(&[77], links.clone());
+        initial["telefones"] = serde_json::json!(["5511991703561"]);
+        write_atomic(&target, &serde_json::to_vec(&initial).unwrap()).unwrap();
+        let _restore = RestoreEnv(std::env::var_os("ESFERA_DEVEDORES_ARQUIVO"));
+        std::env::set_var("ESFERA_DEVEDORES_ARQUIVO", &target);
+        let mut v2 = snapshot(&[77], links.clone());
+        v2["telefones"] = serde_json::json!(["5511999999999", "5511999999999", -4733054406i64]);
+        for (value, expected_phones, ignored) in [
+            (serde_json::json!({"telefones": ["5547999998888", " 5511991703561 ", "5547999998888",
+                "47 99999-8888", "123", "55479999988881", 4733054406u64, null, "abcdefghij"]}),
+                serde_json::json!(["4733054406", "5511991703561", "5547999998888"]), 5),
+            (v2, serde_json::json!(["5511999999999"]), 1),
+            (snapshot(&[77], links.clone()), serde_json::json!(["5511999999999"]), 0),
+            (serde_json::json!({"telefones": []}), serde_json::json!([]), 0),
+        ] {
+            let response = evolution_devedores(State((db.clone(), 0)), headers.clone(), Ok(Json(value))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), serde_json::json!({
+                "ok": true, "schema": 2, "total": expected_phones.as_array().unwrap().len(), "vinculos": 1, "ignorados": ignored,
+            }));
+            let stored: Value = serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+            assert_eq!(stored["schema"], 2);
+            assert!(stored["atualizado_em"].as_i64().unwrap() > NOW);
+            assert_eq!(stored["empresas"], serde_json::json!([77]));
+            assert_eq!(stored["vinculos"], serde_json::json!(links));
+            assert_eq!(stored["telefones"], expected_phones);
+        }
+        drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
