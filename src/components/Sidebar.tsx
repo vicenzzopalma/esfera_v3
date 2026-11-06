@@ -27,6 +27,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   MessageCircle,
+  PhoneCall,
 } from "lucide-react";
 
 const STORAGE_KEY_COLLAPSED = "esfera_v3_sidebar_collapsed";
@@ -102,6 +103,14 @@ const NAV_GROUPS: NavGroup[] = [
         path: "/dispatch-numbers",
         label: "Números de disparo",
         icon: <MessageCircle size={16} />,
+        roles: ["master", "gestor"],
+        requiresCompany: true,
+      },
+      {
+        id: "atendimento-celular",
+        path: "/atendimento-celular",
+        label: "Atendimento pelo Celular",
+        icon: <PhoneCall size={16} />,
         roles: ["master", "gestor"],
         requiresCompany: true,
       },
