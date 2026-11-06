@@ -245,6 +245,8 @@ pub struct Campaign {
     pub ai_prompt: String,
     #[serde(default)]
     pub device_ids: Vec<String>,
+    #[serde(default)]
+    pub return_number: String,
     pub status: String,
     pub contacts_count: i32,
     pub sent_count: i32,
@@ -255,6 +257,31 @@ pub struct Campaign {
     /// quando houver. Some ao iniciar de novo; ausente quando a pausa não foi do sistema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_reason: Option<String>,
+}
+
+/// Publicação explícita de autorizações de retorno; nunca usa a lista geral de conectados.
+#[derive(Debug, Serialize)]
+pub struct VeritasDispatchSnapshot {
+    pub schema: i32,
+    pub empresas: Vec<i32>,
+    pub atualizado_em: i64,
+    pub telefones: Vec<String>,
+    pub vinculos: Vec<VeritasDispatchLink>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VeritasDispatchLink {
+    pub empresa_id: i32,
+    pub campanha_id: i32,
+    pub numero_disparo: String,
+    pub telefone: String,
+    pub enviado_em: i64,
+}
+
+fn normalize_brazil_phone(raw: &str) -> Option<String> {
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    let digits = if matches!(digits.len(), 10 | 11) { format!("55{}", digits) } else { digits };
+    (matches!(digits.len(), 12 | 13) && digits.starts_with("55") && digits.as_bytes()[2] != b'0').then_some(digits)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -978,7 +1005,13 @@ impl Database {
         CREATE TABLE IF NOT EXISTS ESF_ChipCooldown (ChipId INTEGER PRIMARY KEY, NextAt TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS ESF_ChipBrakeReset (ChipId INTEGER PRIMARY KEY, AfterAttemptId INTEGER NOT NULL);")?;
 
+        let _ = self.conn().execute("ALTER TABLE ESF_Campaign ADD COLUMN ReturnNumber TEXT NOT NULL DEFAULT ''", []);
         let _ = self.conn().execute("ALTER TABLE ESF_ChipAttempt ADD COLUMN Purpose TEXT NOT NULL DEFAULT 'campaign'", []);
+        // Sem backfill: o chip atual não prova qual número/aparelho fez um envio antigo.
+        let _ = self.conn().execute("ALTER TABLE ESF_ChipAttempt ADD COLUMN SourceNumber TEXT NOT NULL DEFAULT ''", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_ChipAttempt ADD COLUMN SourceDeviceId INTEGER", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_ChipAttempt ADD COLUMN TargetNumber TEXT NOT NULL DEFAULT ''", []);
+        let _ = self.conn().execute("ALTER TABLE ESF_ChipAttempt ADD COLUMN CompletedAt TEXT DEFAULT NULL", []);
         self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_NetworkLimits (
             Id INTEGER PRIMARY KEY CHECK(Id=1), Hourly INTEGER NOT NULL, Daily INTEGER NOT NULL
         ); INSERT OR IGNORE INTO ESF_NetworkLimits(Id,Hourly,Daily) VALUES(1,40,200);")?;
@@ -2226,7 +2259,7 @@ impl Database {
     pub fn get_campaigns(&self, company_id: i32) -> Vec<Campaign> {
         let conn = self.conn();
         let mut stmt = match conn.prepare_cached(
-            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt, SelectedDevices, AiProvider, PauseReason
+            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt, SelectedDevices, AiProvider, PauseReason, ReturnNumber
              FROM ESF_Campaign WHERE CompanyId = ?1 AND ExcluidoEm IS NULL"
         ) {
             Ok(s) => s,
@@ -2255,6 +2288,7 @@ impl Database {
                 company_id: row.get(15)?,
                 updated_at: row.get(16)?,
                 pause_reason: row.get::<_, Option<String>>(19)?.filter(|r| !r.trim().is_empty()),
+                return_number: row.get(20)?,
             })
         });
 
@@ -2283,12 +2317,77 @@ impl Database {
         ).ok()
     }
 
+    fn validate_campaign_return_number(&self, c: &Campaign) -> Result<(), String> {
+        if c.return_number.is_empty() { return Ok(()); }
+        if !c.return_number.chars().all(|v| v.is_ascii_digit())
+            || !matches!(c.return_number.len(), 12 | 13) || !c.return_number.starts_with("55")
+            || c.return_number.as_bytes()[2] == b'0' {
+            return Err("Selecione um número brasileiro de retorno com DDI 55 e somente dígitos.".into());
+        }
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT chip.PhoneNumber,d.AdbDeviceId,d.EsferaDeviceId
+            FROM ESF_Chip chip JOIN ESF_Device d ON d.rowid=chip.DeviceId
+            JOIN ESF_Company empresa ON empresa.CompanyId=d.CompanyId AND empresa.IsActive=1
+            WHERE d.CompanyId=?1 AND chip.ExcluidoEm IS NULL").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![c.company_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?))).map_err(|e| e.to_string())?;
+        for row in rows {
+            let (phone, serial, identity) = row.map_err(|e| e.to_string())?;
+            if normalize_brazil_phone(&phone).as_deref() == Some(c.return_number.as_str())
+                && c.device_ids.iter().any(|id| id == &serial || identity.as_ref() == Some(id)) {
+                return Ok(());
+            }
+        }
+        Err("O número de retorno deve pertencer a um aparelho selecionado nesta empresa.".into())
+    }
+
+    pub fn veritas_dispatch_snapshot(&self) -> Result<VeritasDispatchSnapshot, String> {
+        let conn = self.conn();
+        let empresas = {
+            // Inclui empresas sem vínculo e desativadas para revogar a publicação anterior.
+            let mut stmt = conn.prepare("SELECT CompanyId FROM ESF_Company WHERE CompanyId>0 ORDER BY CompanyId").map_err(|e| e.to_string())?;
+            let rows = stmt.query_map([], |r| r.get::<_,i32>(0)).map_err(|e| e.to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
+        };
+        let mut stmt = conn.prepare("SELECT a.CompanyId,a.CampaignId,a.SourceNumber,a.TargetNumber,
+                CAST(strftime('%s',a.CompletedAt) AS INTEGER),c.SelectedDevices,d.AdbDeviceId,d.EsferaDeviceId
+            FROM ESF_ChipAttempt a
+            JOIN ESF_Campaign c ON c.CampaignId=a.CampaignId AND c.CompanyId=a.CompanyId
+            JOIN ESF_Device d ON d.rowid=a.SourceDeviceId AND d.CompanyId=a.CompanyId
+            JOIN ESF_Chip chip ON chip.ChipId=a.ChipId AND chip.ExcluidoEm IS NULL
+            JOIN ESF_Company empresa ON empresa.CompanyId=a.CompanyId AND empresa.IsActive=1
+            WHERE a.Outcome='enviado' AND a.Purpose='campaign' AND a.CompanyId>0
+              AND c.ExcluidoEm IS NULL AND c.Status IN ('running','paused','completed','stopped')
+              AND a.SourceNumber<>'' AND a.TargetNumber<>'' AND c.ReturnNumber=a.SourceNumber
+              AND a.CompletedAt IS NOT NULL
+              AND a.CompletedAt>=datetime('now','-48 hours') AND a.CompletedAt<=datetime('now')").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |r| Ok((VeritasDispatchLink {
+            empresa_id:r.get(0)?, campanha_id:r.get(1)?, numero_disparo:r.get(2)?, telefone:r.get(3)?, enviado_em:r.get(4)?
+        },r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,Option<String>>(7)?))).map_err(|e| e.to_string())?;
+        let mut vinculos = Vec::new();
+        for row in rows {
+            let (link, selected, serial, identity) = row.map_err(|e| e.to_string())?;
+            let ids: Vec<String> = serde_json::from_str(&selected).unwrap_or_default();
+            if ids.iter().any(|id| id == &serial || identity.as_ref() == Some(id))
+                && normalize_brazil_phone(&link.numero_disparo).as_deref() == Some(link.numero_disparo.as_str())
+                && normalize_brazil_phone(&link.telefone).as_deref() == Some(link.telefone.as_str()) {
+                vinculos.push(link);
+            }
+        }
+        vinculos.sort();
+        vinculos.dedup();
+        let mut telefones: Vec<String> = vinculos.iter().map(|v| v.telefone.clone()).collect();
+        telefones.sort();
+        telefones.dedup();
+        Ok(VeritasDispatchSnapshot { schema:2, empresas, atualizado_em:chrono::Utc::now().timestamp(), telefones, vinculos })
+    }
+
     pub fn create_campaign(&self, c: &Campaign) -> Result<i32, String> {
+        self.validate_campaign_return_number(c)?;
         // O id é lido na mesma conexão do INSERT (outra gravação no meio trocaria o last_insert_rowid).
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO ESF_Campaign (CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, SelectedDevices, AiProvider)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17);",
+            "INSERT INTO ESF_Campaign (CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, SelectedDevices, AiProvider, ReturnNumber)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18);",
             params![
                 c.name,
                 c.greeting,
@@ -2307,6 +2406,7 @@ impl Database {
                 c.company_id,
                 serde_json::to_string(&c.device_ids).map_err(|e| e.to_string())?,
                 c.ai_provider,
+                c.return_number,
             ]
         ).map_err(|e| e.to_string())?;
         Ok(conn.last_insert_rowid() as i32)
@@ -2315,7 +2415,7 @@ impl Database {
     pub fn get_running_campaigns(&self) -> Result<Vec<Campaign>> {
         let conn = self.pooled_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt, SelectedDevices, AiProvider, PauseReason FROM ESF_Campaign WHERE Status = 'running' AND ExcluidoEm IS NULL"
+            "SELECT CampaignId, CampaignName, MessageGreeting, MessageBody, MessageClosing, DelayMin, DelayMax, UseSpintax, UseAI, AiModel, AiPrompt, Status, TotalContacts, SentContacts, FailedContacts, CompanyId, UpdatedAt, SelectedDevices, AiProvider, PauseReason, ReturnNumber FROM ESF_Campaign WHERE Status = 'running' AND ExcluidoEm IS NULL"
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -2340,6 +2440,7 @@ impl Database {
                 company_id: row.get(15)?,
                 updated_at: row.get(16)?,
                 pause_reason: row.get::<_, Option<String>>(19)?.filter(|r| !r.trim().is_empty()),
+                return_number: row.get(20)?,
             })
         })?;
 
@@ -2355,10 +2456,11 @@ impl Database {
     }
 
     pub fn update_campaign(&self, c: &Campaign) -> Result<(), String> {
+        self.validate_campaign_return_number(c)?;
         let updated = self.conn().execute(
             "UPDATE ESF_Campaign SET CampaignName=?1, MessageGreeting=?2, MessageBody=?3, MessageClosing=?4,
              DelayMin=?5, DelayMax=?6, UseSpintax=?7, UseAI=?8, AiModel=?9, AiPrompt=?10,
-             SelectedDevices=?11, AiProvider=?12, UpdatedAt=datetime('now')
+             SelectedDevices=?11, AiProvider=?12, ReturnNumber=?15, UpdatedAt=datetime('now')
              WHERE CampaignId=?13 AND CompanyId=?14 AND ExcluidoEm IS NULL;",
             params![
                 c.name, c.greeting, c.message, c.closing,
@@ -2370,6 +2472,7 @@ impl Database {
                 c.ai_provider,
                 c.id,
                 c.company_id,
+                c.return_number,
             ]
         ).map_err(|e| e.to_string())?;
         if updated == 0 { return Err("Campanha não encontrada nesta empresa.".to_string()); }
@@ -2784,7 +2887,7 @@ impl Database {
         if !confirmation && count >= 20 && (failed * 100 > count * 15 || optouts * 100 > count * 10) {
             return Err(format!("Freio automático: nas últimas {} tentativas, {} falhas e {} pedidos de SAIR.", count, failed, optouts));
         }
-        conn.execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Purpose) VALUES (?1,?2,?3,?4,?5)", params![chip.id,company_id,campaign_id,Self::opt_out_key(phone),purpose]).map_err(|e| e.to_string())?;
+        conn.execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Purpose,SourceNumber,SourceDeviceId,TargetNumber) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![chip.id,company_id,campaign_id,Self::opt_out_key(phone),purpose,normalize_brazil_phone(&chip.phone_number).unwrap_or_default(),chip.device_id,normalize_brazil_phone(phone).unwrap_or_default()]).map_err(|e| e.to_string())?;
         let id = conn.last_insert_rowid();
         let n = chip_config(chip.id, "BREAK_EVERY", 10);
         let total: i64 = conn.query_row("SELECT count(*) FROM ESF_ChipAttempt WHERE ChipId=?1", params![chip.id], |r| r.get(0)).map_err(|e| e.to_string())?;
@@ -2818,7 +2921,7 @@ impl Database {
     }
 
     pub fn finish_chip_attempt(&self, attempt_id: i64, sent: bool) -> Result<(), String> {
-        self.conn().execute("UPDATE ESF_ChipAttempt SET Outcome=?1 WHERE AttemptId=?2", params![if sent { "enviado" } else { "falhou" }, attempt_id]).map_err(|e| e.to_string())?;
+        self.conn().execute("UPDATE ESF_ChipAttempt SET Outcome=?1,CompletedAt=CASE WHEN ?1='enviado' THEN coalesce(CompletedAt,datetime('now')) ELSE CompletedAt END WHERE AttemptId=?2", params![if sent { "enviado" } else { "falhou" }, attempt_id]).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -5609,7 +5712,7 @@ mod pausa_automatica_tests {
         let path = std::env::temp_dir().join(format!("esfera_pausa_motivo_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
-        let id = db.create_campaign(&Campaign { id: 0, name: "Teste".into(), greeting: "Olá".into(), message: "Corpo".into(), closing: "SAIR".into(), delay_min: 30, delay_max: 60, use_spintax: false, use_ai: false, ai_model: String::new(), ai_provider: String::new(), ai_prompt: String::new(), device_ids: vec![], status: "draft".into(), contacts_count: 0, sent_count: 0, failed_count: 0, company_id: 1, updated_at: String::new(), pause_reason: None }).unwrap();
+        let id = db.create_campaign(&Campaign { id: 0, name: "Teste".into(), greeting: "Olá".into(), message: "Corpo".into(), closing: "SAIR".into(), delay_min: 30, delay_max: 60, use_spintax: false, use_ai: false, ai_model: String::new(), ai_provider: String::new(), ai_prompt: String::new(), device_ids: vec![], return_number: String::new(), status: "draft".into(), contacts_count: 0, sent_count: 0, failed_count: 0, company_id: 1, updated_at: String::new(), pause_reason: None }).unwrap();
         let campaign = |db: &Database| db.get_campaigns(1).into_iter().find(|c| c.id == id).unwrap();
         // Só pausa campanha rodando: nunca passa por cima de uma pausa ou parada do operador.
         assert!(!db.pause_campaign_auto(id, "TRAVA: teste").unwrap());
@@ -6136,4 +6239,199 @@ mod historico_konfiansa_db_tests {
         db.set_campaign_konfiansa_credor(c, 598).unwrap();
         assert_eq!(db.campaign_konfiansa_credor(c), 598);
     }
+}
+
+#[cfg(test)]
+mod veritas_campaign_tests {
+    use super::*;
+
+    fn fixture(name: &str) -> Database {
+        let path = std::env::temp_dir().join(format!("esfera_veritas_{}_{}.db", name, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Database::init(path.to_string_lossy().as_ref()).unwrap()
+    }
+
+    #[test]
+    fn campaign_return_number_and_attempt_snapshot_have_disabled_defaults() {
+        let db = fixture("migration");
+        let campaign_columns: Vec<String> = db.conn().prepare("PRAGMA table_info(ESF_Campaign)").unwrap()
+            .query_map([], |r| r.get(1)).unwrap().map(Result::unwrap).collect();
+        assert!(campaign_columns.contains(&"ReturnNumber".to_string()));
+        let attempt_columns: Vec<String> = db.conn().prepare("PRAGMA table_info(ESF_ChipAttempt)").unwrap()
+            .query_map([], |r| r.get(1)).unwrap().map(Result::unwrap).collect();
+        assert!(attempt_columns.contains(&"SourceNumber".to_string()));
+        assert!(attempt_columns.contains(&"SourceDeviceId".to_string()));
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId) VALUES('Legacy','Oi',1)", []).unwrap();
+        assert_eq!(db.get_campaigns(1)[0].return_number, "");
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty());
+    }
+    fn sending_fixture(name: &str) -> (Database, Chip, i32) {
+        let db = fixture(name);
+        db.conn().execute("INSERT INTO ESF_Company(CompanyId,CompanyName) VALUES(2,'Outra')", []).unwrap();
+        db.conn().execute("INSERT INTO ESF_Device(AdbDeviceId,DeviceName,CompanyId,EsferaDeviceId) VALUES('veritas-usb','Teste',1,'veritas-device')", []).unwrap();
+        let device = db.get_all_devices().into_iter().find(|d| d.serial == "veritas-usb").unwrap();
+        let chip_id = db.add_chip(device.id, "11999990001", "Teste").unwrap();
+        let chip = db.get_chips(device.id).into_iter().find(|c| c.id == chip_id).unwrap();
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId,Status,SelectedDevices,ReturnNumber) VALUES('Teste','Oi',1,'running','[\"veritas-device\"]','5511999990001')", []).unwrap();
+        let id = db.conn().last_insert_rowid() as i32;
+        (db, chip, id)
+    }
+
+    #[test]
+    fn return_selection_validates_company_device_and_brazilian_digits() {
+        let (db, _chip, id) = sending_fixture("validation");
+        let mut c = db.get_campaigns(1).into_iter().find(|c| c.id == id).unwrap();
+        assert_eq!(c.return_number, "5511999990001");
+        assert!(db.update_campaign(&c).is_ok());
+        c.return_number = "+5511999990001".into();
+        assert!(db.update_campaign(&c).is_err());
+        c.return_number = "11999990001".into();
+        assert!(db.update_campaign(&c).is_err());
+        c.return_number = "5511999990001".into();
+        c.device_ids = vec!["outro".into()];
+        assert!(db.update_campaign(&c).is_err());
+        c.device_ids = vec!["veritas-device".into()];
+        c.company_id = 2;
+        assert!(db.create_campaign(&c).is_err());
+        c.return_number.clear();
+        c.company_id = 1;
+        assert!(db.update_campaign(&c).is_ok());
+    }
+
+    #[test]
+    fn sent_snapshot_retains_original_number_and_revokes_current_selection() {
+        let (db, chip, id) = sending_fixture("snapshot");
+        db.import_contacts(id, vec![("Contato".into(), "11988880001".into())]).unwrap();
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty());
+        let pending = db.reserve_chip_attempt(&chip, 1, id, "11988880001", false).unwrap();
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty());
+        db.finish_chip_attempt(pending, false).unwrap();
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty());
+        let sent = db.reserve_chip_attempt(&chip, 1, id, "11988880001", false).unwrap();
+        db.finish_chip_attempt(sent, true).unwrap();
+        let snapshot = db.veritas_dispatch_snapshot().unwrap();
+        assert_eq!(snapshot.schema, 2);
+        assert_eq!(snapshot.empresas, vec![1, 2]);
+        assert_eq!(snapshot.telefones, vec!["5511988880001"]);
+        assert_eq!(snapshot.vinculos[0].numero_disparo, "5511999990001");
+        assert_eq!(snapshot.vinculos[0].campanha_id, id);
+        db.conn().execute("UPDATE ESF_Chip SET PhoneNumber='11999990002' WHERE ChipId=?1", params![chip.id]).unwrap();
+        assert_eq!(db.veritas_dispatch_snapshot().unwrap().vinculos.len(), 1);
+        for status in ["paused", "completed", "stopped"] {
+            db.set_campaign_status(id, status).unwrap();
+            assert_eq!(db.veritas_dispatch_snapshot().unwrap().vinculos.len(), 1);
+        }
+        db.conn().execute("UPDATE ESF_Campaign SET ReturnNumber='' WHERE CampaignId=?1", params![id]).unwrap();
+        let revoked = db.veritas_dispatch_snapshot().unwrap();
+        assert_eq!(revoked.empresas, vec![1, 2]);
+        assert!(revoked.vinculos.is_empty());
+        db.conn().execute("UPDATE ESF_Campaign SET ReturnNumber='5511999990001' WHERE CampaignId=?1", params![id]).unwrap();
+        db.soft_delete_campaign(id).unwrap();
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty());
+    }
+
+    #[test]
+    fn wrong_origin_tenant_purpose_stale_and_legacy_attempts_are_never_exported() {
+        let (db, chip, id) = sending_fixture("scope");
+        for (company, source, purpose, outcome, age) in [
+            (1, "5511999990002", "campaign", "enviado", "-1 hour"),
+            (2, "5511999990001", "campaign", "enviado", "-1 hour"),
+            (1, "5511999990001", "manual", "enviado", "-1 hour"),
+            (1, "5511999990001", "confirmation", "enviado", "-1 hour"),
+            (1, "", "campaign", "enviado", "-1 hour"),
+            (1, "5511999990001", "campaign", "enviado", "-49 hours"),
+            (1, "5511999990001", "campaign", "iniciado", "-1 hour"),
+        ] {
+            db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,SourceNumber,SourceDeviceId,TargetNumber,Purpose,Outcome,CreatedAt,CompletedAt) VALUES(?1,?2,?3,'11988880002',?4,?5,'5511988880002',?6,?7,datetime('now',?8),datetime('now',?8))", params![chip.id,company,id,source,chip.device_id,purpose,outcome,age]).unwrap();
+        }
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty());
+        let sent = db.reserve_chip_attempt(&chip, 1, id, "11988880001", false).unwrap();
+        db.finish_chip_attempt(sent, true).unwrap();
+        assert_eq!(db.veritas_dispatch_snapshot().unwrap().vinculos.len(), 1);
+        db.set_campaign_status(id, "draft").unwrap();
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty());
+        db.set_campaign_status(id, "running").unwrap();
+        db.conn().execute("UPDATE ESF_Campaign SET SelectedDevices='[]' WHERE CampaignId=?1", params![id]).unwrap();
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty());
+        db.conn().execute("UPDATE ESF_Campaign SET SelectedDevices='[\"veritas-device\"]' WHERE CampaignId=?1", params![id]).unwrap();
+        db.conn().execute("UPDATE ESF_Device SET CompanyId=2 WHERE rowid=?1", params![chip.device_id]).unwrap();
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty());
+    }
+
+    #[test]
+    fn published_send_time_is_completion_not_reservation_and_excludes_prior_messages() {
+        let (db, chip, id) = sending_fixture("completed_time");
+        let attempt = db.reserve_chip_attempt(&chip, 1, id, "11988880001", false).unwrap();
+        db.conn().execute("UPDATE ESF_ChipAttempt SET CreatedAt=datetime('now','-72 hours') WHERE AttemptId=?1", params![attempt]).unwrap();
+        let reserved: String = db.conn().query_row("SELECT CreatedAt FROM ESF_ChipAttempt WHERE AttemptId=?1", params![attempt], |r| r.get(0)).unwrap();
+        let before = chrono::Utc::now().timestamp();
+        let message_before_send = before - 3600;
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty());
+        db.finish_chip_attempt(attempt, true).unwrap();
+        let after = chrono::Utc::now().timestamp();
+        let snapshot = db.veritas_dispatch_snapshot().unwrap();
+        assert_eq!(snapshot.vinculos.len(), 1, "a recent completion is eligible even when reservation is older than 48h");
+        let sent_at = snapshot.vinculos[0].enviado_em;
+        assert!((before..=after).contains(&sent_at));
+        assert!(message_before_send < sent_at, "responses before the real send must precede the authorization timestamp");
+        let (created, completed): (String, i64) = db.conn().query_row("SELECT CreatedAt,CAST(strftime('%s',CompletedAt) AS INTEGER) FROM ESF_ChipAttempt WHERE AttemptId=?1", params![attempt], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(created, reserved, "antiban accounting keeps reservation time");
+        assert_eq!(completed, sent_at);
+        db.finish_chip_attempt(attempt, true).unwrap();
+        assert_eq!(db.veritas_dispatch_snapshot().unwrap().vinculos[0].enviado_em, completed);
+        db.conn().execute("UPDATE ESF_ChipAttempt SET CreatedAt=datetime('now'),CompletedAt=datetime('now','-49 hours') WHERE AttemptId=?1", params![attempt]).unwrap();
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty(), "expiry follows completion even if reservation appears recent");
+    }
+
+    #[test]
+    fn legacy_success_without_completion_and_failed_completion_remain_unauthorized() {
+        let (db, chip, id) = sending_fixture("missing_completion");
+        let legacy = db.reserve_chip_attempt(&chip, 1, id, "11988880001", false).unwrap();
+        db.conn().execute("UPDATE ESF_ChipAttempt SET Outcome='enviado' WHERE AttemptId=?1", params![legacy]).unwrap();
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty());
+        let failed = db.reserve_chip_attempt(&chip, 1, id, "11988880002", false).unwrap();
+        db.finish_chip_attempt(failed, false).unwrap();
+        let completed: Option<String> = db.conn().query_row("SELECT CompletedAt FROM ESF_ChipAttempt WHERE AttemptId=?1", params![failed], |r| r.get(0)).unwrap();
+        assert_eq!(completed, None);
+        assert!(db.veritas_dispatch_snapshot().unwrap().vinculos.is_empty());
+    }
+
+    #[test]
+    fn zero_ddd_is_rejected_by_normalization_and_return_selection() {
+        for raw in ["5501999990001", "01999990001", "+55 (01) 99999-0001", "550199990001"] {
+            assert_eq!(normalize_brazil_phone(raw), None, "invalid DDD must not reach the hub: {}", raw);
+        }
+        assert_eq!(normalize_brazil_phone("(11) 99999-0001"), Some("5511999990001".into()));
+        assert_eq!(normalize_brazil_phone("5591999990001"), Some("5591999990001".into()));
+        let (db, chip, id) = sending_fixture("zero_ddd_selection");
+        db.conn().execute("UPDATE ESF_Chip SET PhoneNumber='01999990001' WHERE ChipId=?1", params![chip.id]).unwrap();
+        let mut campaign = db.get_campaigns(1).into_iter().find(|c| c.id == id).unwrap();
+        campaign.return_number = "5501999990001".into();
+        assert!(db.update_campaign(&campaign).is_err());
+        assert!(db.create_campaign(&campaign).is_err());
+    }
+
+    #[test]
+    fn zero_ddd_links_do_not_block_valid_snapshot_or_empty_revocation() {
+        let (db, chip, id) = sending_fixture("zero_ddd_snapshot");
+        let valid = db.reserve_chip_attempt(&chip, 1, id, "11988880001", false).unwrap();
+        db.finish_chip_attempt(valid, true).unwrap();
+        let invalid = db.reserve_chip_attempt(&chip, 1, id, "01988880002", false).unwrap();
+        db.finish_chip_attempt(invalid, true).unwrap();
+        // Also exercise already-persisted malformed metadata rather than relying only on reservation normalization.
+        db.conn().execute("UPDATE ESF_ChipAttempt SET TargetNumber='5501988880002' WHERE AttemptId=?1", params![invalid]).unwrap();
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId,Status,SelectedDevices,ReturnNumber) VALUES('Invalid','Oi',1,'running','[\"veritas-device\"]','5501999990001')", []).unwrap();
+        let bad_campaign = db.conn().last_insert_rowid();
+        db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,SourceNumber,SourceDeviceId,TargetNumber,Purpose,Outcome,CompletedAt) VALUES(?1,1,?2,'11988880003','5501999990001',?3,'5511988880003','campaign','enviado',datetime('now'))", params![chip.id,bad_campaign,chip.device_id]).unwrap();
+        let snapshot = db.veritas_dispatch_snapshot().unwrap();
+        assert_eq!(snapshot.empresas, vec![1,2]);
+        assert_eq!(snapshot.vinculos.len(), 1);
+        assert_eq!(snapshot.telefones, vec!["5511988880001"]);
+        db.conn().execute("UPDATE ESF_Campaign SET ReturnNumber='' WHERE CampaignId=?1", params![id]).unwrap();
+        let revoked = db.veritas_dispatch_snapshot().unwrap();
+        assert_eq!(revoked.empresas, vec![1,2]);
+        assert!(revoked.vinculos.is_empty());
+        assert!(revoked.telefones.is_empty());
+    }
+
 }

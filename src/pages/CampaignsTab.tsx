@@ -7,7 +7,7 @@
 
 import { type ReactNode, useEffect, useRef, useState, useMemo, useDeferredValue, useCallback, useId, useSyncExternalStore } from "react";
 import { Search, X, MoreHorizontal, Check, CheckCheck, ChevronLeft, ChevronRight, Shuffle, AlertCircle, Sparkles, ChevronDown, UserRound, Clock, AlertTriangle, Battery, RefreshCw, Smartphone, ArrowDown, Terminal, Upload, Users, FileUp, CheckCircle2, Eye, EyeOff, PlugZap, ArrowLeft, ArrowRight, Circle, LayoutDashboard, Pause, Pencil, Play, RotateCcw, Send, Settings2, Square, XCircle, Brain, Building2, Megaphone, Plus, Ban, Trash2, Download, Info } from "lucide-react";
-import type { Campaign, CampaignStatus, Contact, Device, AiConfig } from "../types";
+import type { Campaign, CampaignStatus, Contact, Device, Chip, AiConfig } from "../types";
 import { AI_PROVIDERS, DEFAULT_WHATSAPP_SYSTEM_PROMPT, getAiProviderInfo } from "../constants/aiProviders";
 import Modal from "../components/ui/Modal";
 import Button from "../components/ui/Button";
@@ -4157,6 +4157,46 @@ function GlobalAiConfigModal({ isOpen, onClose }: { isOpen: boolean; onClose: ()
 
 // Assistente em etapas para criar ou editar uma campanha.
 
+function ReturnNumberSelector({ companyId, devices, selected, value, onChange }: {
+  companyId: number; devices: Device[]; selected: string[]; value: string; onChange: (value: string) => void;
+}) {
+  const [chips, setChips] = useState<Chip[]>([]);
+  const [loadError, setLoadError] = useState(false);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    let alive = true;
+    setChips([]);
+    setLoading(true);
+    setLoadError(false);
+    api<Chip[]>("get_company_chips", { companyId })
+      .then((rows) => { if (alive) setChips(rows || []); })
+      .catch(() => { if (alive) setLoadError(true); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [companyId]);
+  const options = chips.flatMap((chip) => {
+    const device = devices.find((d) => d.companyId === companyId && d.id === chip.deviceId && selected.includes(deviceKey(d)));
+    const raw = chip.phoneNumber.replace(/\D/g, "");
+    const phone = raw.length === 10 || raw.length === 11 ? `55${raw}` : raw;
+    return device && /^55[1-9]\d{9,10}$/.test(phone) ? [{ phone, label: `${formatPhoneBr(phone)} · ${deviceLabel(device)}` }] : [];
+  }).filter((option, index, rows) => rows.findIndex((r) => r.phone === option.phone) === index);
+  const available = options.some((o) => o.phone === value);
+  return (
+    <FormSection title="Retorno VERITAS" description="Escolha o número desta campanha que receberá o retorno. Somente contatos efetivamente enviados por ele ficam autorizados.">
+      <label className="block space-y-2 text-sm">
+        <span>Número do retorno</span>
+        <select className="w-full rounded-lg border border-border bg-surface px-3 py-2" value={value} onChange={(e) => onChange(e.target.value)}>
+          <option value="">Desativado</option>
+          {value && !available && <option value={value}>{formatPhoneBr(value)} — indisponível na seleção atual</option>}
+          {options.map((option) => <option key={option.phone} value={option.phone}>{option.label}</option>)}
+        </select>
+      </label>
+      <p className="mt-2 text-xs text-secondary">{loading ? "Carregando números…" : loadError ? "Não foi possível carregar os números. Reabra esta configuração para tentar novamente." : "Os números disponíveis pertencem aos aparelhos selecionados desta empresa."}</p>
+      {value && !available && !loading && <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">Selecione um número disponível ou desative o retorno antes de salvar.</p>}
+    </FormSection>
+  );
+}
+
 type StepId = "basics" | "message" | "ai" | "sending" | "review";
 
 const STEPS: StepDef<StepId>[] = [
@@ -4172,6 +4212,7 @@ interface FormState extends MessageValue, AiValue {
   delayMin: number;
   delayMax: number;
   deviceIds: string[];
+  returnNumber: string;
 }
 
 function initialForm(c: Campaign | null): FormState {
@@ -4189,6 +4230,7 @@ function initialForm(c: Campaign | null): FormState {
       delayMin: c.delayMin || 30,
       delayMax: c.delayMax || 90,
       deviceIds: c.deviceIds || [],
+      returnNumber: c.returnNumber || "",
     };
   }
   return {
@@ -4204,6 +4246,7 @@ function initialForm(c: Campaign | null): FormState {
     delayMin: 30,
     delayMax: 90,
     deviceIds: [],
+    returnNumber: "",
   };
 }
 
@@ -4355,6 +4398,7 @@ function CampaignWizard({
       aiProvider: form.aiProvider,
       aiPrompt: form.aiPrompt,
       deviceIds: form.deviceIds,
+      returnNumber: form.returnNumber,
       status: campaign?.status || "draft",
       contactsCount: campaign?.contactsCount || 0,
       sentCount: campaign?.sentCount || 0,
@@ -4546,6 +4590,7 @@ function CampaignWizard({
                 />
               )}
             </FormSection>
+            <ReturnNumberSelector companyId={selectedCompanyId || 0} devices={devices} selected={form.deviceIds} value={form.returnNumber} onChange={(returnNumber) => patch({ returnNumber })} />
           </div>
         )}
 
@@ -4564,6 +4609,9 @@ function CampaignWizard({
                       {partCount} mensagens seguidas · {formatNumber(fullMessage.length)} caracteres · {form.useSpintax ? "com variações" : "sem variações"}
                     </>
                   )}
+                </ReviewRow>
+                <ReviewRow label="Retorno VERITAS" onEdit={() => goTo("sending")}>
+                  {form.returnNumber ? formatPhoneBr(form.returnNumber) : "Desativado"}
                 </ReviewRow>
                 <ReviewRow label="IA" onEdit={() => goTo("ai")}>
                   {form.useAI ? `${providerName}${form.aiModel ? ` · ${form.aiModel}` : ""}` : "Desativada"}
@@ -4656,6 +4704,7 @@ interface Draft {
   aiModel: string;
   aiPrompt: string;
   deviceIds: string[];
+  returnNumber: string;
 }
 
 function draftFrom(c: Campaign): Draft {
@@ -4671,6 +4720,7 @@ function draftFrom(c: Campaign): Draft {
     aiModel: c.aiModel || "",
     aiPrompt: c.aiPrompt || "",
     deviceIds: c.deviceIds || [],
+    returnNumber: c.returnNumber || "",
   };
 }
 
@@ -4916,6 +4966,7 @@ function CampaignDetail({
   const base = draftFrom(campaign);
   const devicesDirty = !sameIds(draft.deviceIds, base.deviceIds);
   const settingsDirty =
+    draft.returnNumber !== base.returnNumber ||
     draft.greeting !== base.greeting ||
     draft.body !== base.body ||
     draft.closing !== base.closing ||
@@ -4990,6 +5041,7 @@ function CampaignDetail({
       aiModel: draft.aiModel,
       aiPrompt: draft.aiPrompt,
       deviceIds: draft.deviceIds,
+      returnNumber: draft.returnNumber,
       ...extra,
     };
   };
@@ -5533,6 +5585,7 @@ function CampaignDetail({
         <div className="space-y-6">
           <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,22rem)]">
             <div className="space-y-10">
+              <ReturnNumberSelector companyId={campaign.companyId} devices={devices} selected={draft.deviceIds} value={draft.returnNumber} onChange={(returnNumber) => patch({ returnNumber })} />
               <FormSection title="Mensagem" description="Saudação, corpo e encerramento saem como mensagens seguidas, nesta ordem.">
                 <MessageFields value={draft} onChange={(p) => patch(p)} partLimit={partLimit} />
               </FormSection>

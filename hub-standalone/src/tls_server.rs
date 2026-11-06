@@ -125,9 +125,9 @@ pub async fn start(db: Arc<Database>, tls_port: u16) {
         .route("/api/desktop/evolution/instances",
             get(crate::evolution_relay::evolution_instances).post(crate::evolution_relay::evolution_create))
         .route("/api/desktop/evolution/qr", post(crate::evolution_relay::evolution_qr))
-        // Lista de devedores disparados (até 50 mil telefones: corpo maior que o padrão de 2 MB).
+        // Snapshot hierárquico de disparos (até 50 mil vínculos: corpo maior que o padrão de 2 MB).
         .route("/api/desktop/evolution/devedores",
-            post(crate::evolution_relay::evolution_devedores).layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)))
+            post(crate::evolution_relay::evolution_devedores).layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)))
         .route("/api/desktop/repasse/destinos",
             get(crate::evolution_relay::repasse_destinos).post(crate::evolution_relay::repasse_add))
         .route("/api/desktop/repasse/destinos/remover", post(crate::evolution_relay::repasse_remove))

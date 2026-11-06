@@ -2573,7 +2573,7 @@ mod ai_wait_tests {
             ai_model: String::new(),
             ai_provider: "groq".into(),
             ai_prompt: String::new(),
-            device_ids: vec![],
+            device_ids: vec![], return_number: String::new(),
             status: "running".into(),
             contacts_count: 1,
             sent_count: 0,
@@ -2808,7 +2808,7 @@ mod local_fallback_tests {
         let path=std::env::temp_dir().join(format!("esfera_local_sair_{}.db",std::process::id()));
         let _=std::fs::remove_file(&path);
         let db=Database::init(path.to_string_lossy().as_ref()).unwrap();
-        let campaign=Campaign { id:0, name:"Teste".into(), greeting:"Olá".into(), message:"Teste".into(), closing:"SAIR".into(), delay_min:30, delay_max:60, use_spintax:false, use_ai:false, ai_model:String::new(), ai_provider:String::new(), ai_prompt:String::new(), device_ids:vec![], status:"draft".into(), contacts_count:0, sent_count:0, failed_count:0, company_id:1, updated_at:String::new(), pause_reason:None };
+        let campaign=Campaign { id:0, name:"Teste".into(), greeting:"Olá".into(), message:"Teste".into(), closing:"SAIR".into(), delay_min:30, delay_max:60, use_spintax:false, use_ai:false, ai_model:String::new(), ai_provider:String::new(), ai_prompt:String::new(), device_ids:vec![], return_number:String::new(), status:"draft".into(), contacts_count:0, sent_count:0, failed_count:0, company_id:1, updated_at:String::new(), pause_reason:None };
         let id=db.create_campaign(&campaign).unwrap();
         db.import_contacts(id,vec![("Pessoa".into(),"5575988052539".into()),("Outra".into(),"5575911112222".into())]).unwrap();
         let old=r#"{"title":"Esfera 5575988052539","text":"SAIIR"}"#;

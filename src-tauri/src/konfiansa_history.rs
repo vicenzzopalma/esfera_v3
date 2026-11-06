@@ -499,23 +499,28 @@ pub fn dispatched_phone_list<'a>(phones: impl Iterator<Item = &'a str>) -> Vec<S
     out
 }
 
-/// (impressão da lista, quando foi publicada): só republica quando muda ou a cada 10 min.
+/// Fingerprint includes campaign selection and links; renew every minute.
 static DEVEDORES_PUBLICADOS: std::sync::Mutex<(u64, i64)> = std::sync::Mutex::new((0, 0));
 
 /// Publica no hub a lista de quem o Esfera disparou. O robô da VPS só repassa à negociadora
 /// respostas desses números: contato normal do celular de disparo nunca vai para ela.
 async fn publish_dispatched(db: &Arc<Database>) {
     let db2 = db.clone();
-    let Ok(Ok(mapa)) = tokio::task::spawn_blocking(move || db2.dispatched_contacts()).await else { return };
-    let telefones = dispatched_phone_list(mapa.values().map(|c| c.phone.as_str()));
+    let Ok(Ok((snapshot, selection))) = tokio::task::spawn_blocking(move || {
+        let snapshot = db2.veritas_dispatch_snapshot()?;
+        let selection: Vec<_> = snapshot.empresas.iter().flat_map(|id| db2.get_campaigns(*id))
+            .map(|c| (c.company_id,c.id,c.return_number,c.device_ids,c.status)).collect();
+        Ok::<_,String>((snapshot,selection))
+    }).await else { return };
     let impressao = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        telefones.hash(&mut h);
+        let Ok(bytes) = serde_json::to_vec(&(&snapshot.empresas,&snapshot.vinculos,&selection)) else { return };
+        bytes.hash(&mut h);
         h.finish()
     };
     let agora = chrono::Utc::now().timestamp();
-    if DEVEDORES_PUBLICADOS.lock().map(|s| s.0 == impressao && agora - s.1 < 600).unwrap_or(false) {
+    if DEVEDORES_PUBLICADOS.lock().map(|s| s.0 == impressao && agora - s.1 < 60).unwrap_or(false) {
         return;
     }
     let cfg = crate::config::load_config();
@@ -523,12 +528,12 @@ async fn publish_dispatched(db: &Arc<Database>) {
     let Ok(addr) = cfg.hub_address.trim().parse::<std::net::SocketAddr>() else { return };
     let Ok(client) = crate::hub_client::client_vps(Duration::from_secs(30)) else { return };
     let url = format!("https://{}:8443/api/desktop/evolution/devedores", addr.ip());
-    match client.post(&url).bearer_auth(cfg.hub_token.trim()).json(&serde_json::json!({ "telefones": telefones })).send().await {
+    match client.post(&url).bearer_auth(cfg.hub_token.trim()).json(&snapshot).send().await {
         Ok(r) if r.status().is_success() => {
             if let Ok(mut s) = DEVEDORES_PUBLICADOS.lock() { *s = (impressao, agora); }
         }
         Ok(r) => eprintln!("[DEVEDORES] hub respondeu HTTP {} ao publicar a lista.", r.status()),
-        Err(e) => eprintln!("[DEVEDORES] hub: {}", e),
+        Err(_) => eprintln!("[DEVEDORES] Falha de comunicação ao publicar autorizações de retorno."),
     }
 }
 
