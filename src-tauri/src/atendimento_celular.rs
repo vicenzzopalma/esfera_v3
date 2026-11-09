@@ -195,6 +195,21 @@ pub fn local_app_data_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
+/// Arquivo que o vigia do Windows ("PAFIXA vigia da ponte", a cada 5 min) olha: se existe, ele religa a
+/// ponte quando ela cai. Ligar cria; Desligar apaga (senão o vigia religaria o que o usuário desligou).
+pub fn manter_ligada_path() -> PathBuf {
+    local_app_data_dir().join("pafixa_ponte_manter_ligada")
+}
+
+fn marcar_manter_ligada(ligada: bool) {
+    let p = manter_ligada_path();
+    if ligada {
+        let _ = fs::write(&p, b"1");
+    } else {
+        let _ = fs::remove_file(&p);
+    }
+}
+
 pub fn ponte_log_path() -> PathBuf {
     local_app_data_dir().join("pafixa_ponte_adb.log")
 }
@@ -1017,6 +1032,7 @@ pub async fn start_atendimento_celular(
             )
         })?;
         if !existing.is_empty() {
+            marcar_manter_ligada(true);
             return Ok(AtendimentoStartResult {
                 already_running: true,
                 status: build_current_status(&db, DETECT_CACHE_MAX_AGE),
@@ -1065,6 +1081,7 @@ pub async fn start_atendimento_celular(
         }
         // `child` é solto aqui sem matar: no Windows isso só fecha o handle e a ponte segue viva.
         drop(child);
+        marcar_manter_ligada(true);
 
         Ok(AtendimentoStartResult {
             already_running: false,
@@ -1085,6 +1102,8 @@ pub async fn stop_atendimento_celular(
 
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = lock_lifecycle()?;
+        // Primeiro avisa o vigia do Windows para não religar enquanto (e depois que) desligamos.
+        marcar_manter_ligada(false);
 
         let initial = detect_running_ponte(Duration::ZERO)
             .map_err(|e| format!("{} Nada foi encerrado.", e))?;
