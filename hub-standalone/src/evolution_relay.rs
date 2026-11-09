@@ -1064,8 +1064,10 @@ pub async fn central(
     let agora = chrono::Utc::now();
     let ponte = ponte_automacao(&servico, &ultima, agora);
     let painel = painel.map_err(|e| painel_falha(&e));
+    // A ponte só roda no modo ADB; o arquivo MODO_ADB fica numa pasta que o usuário do hub não lê.
+    let ponte_ligada = matches!(servico.as_deref(), Ok(s) if s.trim() == "active");
     let mut c = mesclar_central(painel, ponte, iso_brasilia(agora));
-    if modo_adb_ligado() {
+    if ponte_ligada || modo_adb_ligado() {
         ajustar_modo_adb(&mut c);
     }
     Ok(reply(StatusCode::OK, c))
