@@ -12,7 +12,7 @@ import PermissionsTab from "./pages/PermissionsTab";
 import DashboardTab from "./pages/DashboardTab";
 import DevicesTab from "./pages/DevicesTab";
 import CampaignsTab from "./pages/CampaignsTab";
-import AutomationsTab from "./pages/AutomationsTab";
+import CentralTab from "./pages/CentralTab";
 import DispatchNumbersTab from "./pages/DispatchNumbersTab";
 import AtendimentoCelularTab from "./pages/AtendimentoCelularTab";
 import LogsTab from "./pages/LogsTab";
@@ -141,6 +141,18 @@ function AppRoutes() {
           }
         />
 
+        {/* Central: estado das automações, pendências e busca de devedor (master/gestor) */}
+        <Route
+          path="/central"
+          element={
+            <CompanyGate>
+              <RoleGate roles={["master", "gestor"]}>
+                <CentralTab />
+              </RoleGate>
+            </CompanyGate>
+          }
+        />
+
         {/* Tabs que requerem empresa */}
         <Route
           path="/devices"
@@ -180,16 +192,8 @@ function AppRoutes() {
             </CompanyGate>
           }
         />
-        <Route
-          path="/automations"
-          element={
-            <CompanyGate>
-              <RoleGate roles={["master", "gestor"]}>
-                <AutomationsTab />
-              </RoleGate>
-            </CompanyGate>
-          }
-        />
+        {/* A antiga "Automações" virou a Central */}
+        <Route path="/automations" element={<Navigate to="/central" replace />} />
         <Route
           path="/logs"
           element={
@@ -229,3 +233,4 @@ export default function App() {
     </BrowserRouter>
   );
 }
+// ref: vpm-517e566c8c

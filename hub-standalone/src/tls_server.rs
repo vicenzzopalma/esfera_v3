@@ -131,6 +131,10 @@ pub async fn start(db: Arc<Database>, tls_port: u16) {
         .route("/api/desktop/repasse/destinos",
             get(crate::evolution_relay::repasse_destinos).post(crate::evolution_relay::repasse_add))
         .route("/api/desktop/repasse/destinos/remover", post(crate::evolution_relay::repasse_remove))
+        // Aba "Central" do Esfera: estado das automações da PA FIXA + ponte ADB do host.
+        .route("/api/desktop/central", get(crate::evolution_relay::central))
+        .route("/api/desktop/central/acao", post(crate::evolution_relay::central_acao))
+        .route("/api/desktop/central/devedor", get(crate::evolution_relay::central_devedor))
         .route("/api/devices/check-in", post(handle_checkin))
         .route("/api/egress", get(crate::checkin_server::handle_egress))
         .route("/api/egress/report", post(crate::checkin_server::handle_egress_report))

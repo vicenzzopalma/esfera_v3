@@ -7,7 +7,6 @@ import type {
   Company,
   Device,
   Campaign,
-  Automation,
   Contact,
   LogEntry,
 } from "./types";
@@ -17,6 +16,5 @@ export const MOCK_USERS: User[] = [];
 export const MOCK_COMPANIES: Company[] = [];
 export const MOCK_DEVICES: Device[] = [];
 export const MOCK_CAMPAIGNS: Campaign[] = [];
-export const MOCK_AUTOMATIONS: Automation[] = [];
 export const MOCK_CONTACTS: Contact[] = [];
 export const MOCK_LOGS: LogEntry[] = [];

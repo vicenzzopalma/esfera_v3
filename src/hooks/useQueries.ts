@@ -1,7 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../tauri";
 import type {
-  Company, Device, Campaign, Automation, LogEntry,
+  Company, Device, Campaign, LogEntry,
   DashboardKpis, AiConfig, AppConfig,
   Permission, SectorPermission, Contact, AdbDeviceInfo,
 } from "../types";
@@ -68,7 +68,6 @@ export const keys = {
   companies: ["companies"] as const,
   devices: (cid: number) => ["devices", cid] as const,
   campaigns: (cid: number) => ["campaigns", cid] as const,
-  automations: (cid: number) => ["automations", cid] as const,
   logs: (cid: number) => ["logs", cid] as const,
   dashboard: (cid: number) => ["dashboard", cid] as const,
   aiConfig: (cid: number) => ["aiConfig", cid] as const,
@@ -161,15 +160,6 @@ export function useCampaigns(companyId: number | null, opts?: { refetchInterval?
     enabled: companyId != null,
     staleTime: 15_000,
     refetchInterval: opts?.refetchInterval,
-  });
-}
-
-export function useAutomations(companyId: number | null) {
-  return useQuery({
-    queryKey: keys.automations(companyId ?? 0),
-    queryFn: () => api<Automation[]>("get_automations", { companyId: companyId ?? 0 }),
-    enabled: companyId != null,
-    staleTime: 15_000,
   });
 }
 
@@ -342,39 +332,6 @@ export function useUpdateDevice() {
       api("update_device", { device: args.device }),
     onSuccess: (_, vars) => {
       qc.invalidateQueries({ queryKey: keys.devices(vars.device.companyId) });
-    },
-  });
-}
-
-export function useCreateAutomation() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (automation: Omit<Automation, "createdAt"> & { createdAt?: string }) =>
-      api<number>("create_automation", { automation }),
-    onSuccess: (_, automation) => {
-      qc.invalidateQueries({ queryKey: keys.automations(automation.companyId) });
-    },
-  });
-}
-
-export function useUpdateAutomation() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (automation: Omit<Automation, "createdAt"> & { createdAt?: string }) =>
-      api("update_automation", { automation }),
-    onSuccess: (_, automation) => {
-      qc.invalidateQueries({ queryKey: keys.automations(automation.companyId) });
-    },
-  });
-}
-
-export function useDeleteAutomation() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (args: { id: number; companyId: number }) =>
-      api("soft_delete_automation", { automationId: args.id }),
-    onSuccess: (_, vars) => {
-      qc.invalidateQueries({ queryKey: keys.automations(vars.companyId) });
     },
   });
 }
