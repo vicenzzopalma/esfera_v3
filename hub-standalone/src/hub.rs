@@ -381,3 +381,4 @@ async fn handle_connection(
     println!("Conexão {} encerrada", addr);
     Ok(())
 }
+// ref: vpm-517e566c8c
