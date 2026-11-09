@@ -24,6 +24,8 @@ import type { Central, CentralAcao, CentralAutomacao, CentralEvento, CentralPend
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   ExternalLink,
   History,
   Info,
@@ -79,6 +81,15 @@ const ROTA_POR_ORIGEM: Record<string, string> = {
   repasse: "/dispatch-numbers",
 };
 
+/** A partir de quantas pendências do mesmo tipo elas viram um item só na lista. */
+const GRUPO_MIN = 3;
+
+/** Título do grupo para os tipos conhecidos; os outros usam o texto genérico. */
+const GRUPO_TITULO: Record<string, (n: number) => string> = {
+  "maiara:sem_responsavel": (n) => `Maiara: ${n} devedores responderam e estão sem responsável`,
+  "marcela:pedido": (n) => `Marcela: ${n} pedidos esperando você`,
+};
+
 // ---- Regras puras ----
 
 /** Foco num campo de texto: a atualização automática espera. */
@@ -129,6 +140,59 @@ function formatDocumento(raw: string): string {
 /** CPF (11), CNPJ (14) ou telefone com DDD (10/11, ou 12/13 com o 55). */
 function validDevedorQuery(digits: string): boolean {
   return digits.length >= 10 && digits.length <= 14;
+}
+
+function gravidadeOrder(g: string): number {
+  return GRAVIDADE_INFO[g]?.order ?? 3;
+}
+
+/** Tipo da pendência = os dois primeiros pedaços do id ("maiara:sem_responsavel:12" → "maiara:sem_responsavel"). */
+function tipoPendencia(id: string): string {
+  return String(id ?? "").split(":").slice(0, 2).join(":");
+}
+
+type PendenciaEntrada =
+  | { tipo: "item"; item: CentralPendencia; ordem: number; tempo: number }
+  | { tipo: "grupo"; chave: string; origem: string; itens: CentralPendencia[]; gravidade: string; quando: string | null; ordem: number; tempo: number };
+
+/**
+ * Junta num item só as pendências do mesmo tipo quando são GRUPO_MIN ou mais.
+ * Recebe a lista já ordenada (gravidade, depois data); o grupo fica com a maior
+ * gravidade e a data mais recente, e a lista final segue a mesma ordenação.
+ */
+function agruparPendencias(sorted: CentralPendencia[]): PendenciaEntrada[] {
+  const porTipo = new Map<string, CentralPendencia[]>();
+  for (const p of sorted) {
+    const t = tipoPendencia(p.id);
+    const lista = porTipo.get(t);
+    if (lista) lista.push(p);
+    else porTipo.set(t, [p]);
+  }
+  const entradas: PendenciaEntrada[] = [];
+  for (const [chave, itens] of porTipo) {
+    if (itens.length < GRUPO_MIN) {
+      for (const item of itens) entradas.push({ tipo: "item", item, ordem: gravidadeOrder(item.gravidade), tempo: timeOf(item.quando) });
+      continue;
+    }
+    // Itens já vêm ordenados: o primeiro tem a maior gravidade.
+    const gravidade = itens[0].gravidade;
+    let quando: string | null = null;
+    let tempo = 0;
+    for (const it of itens) {
+      const t = timeOf(it.quando);
+      if (quando === null || t > tempo) {
+        tempo = t;
+        quando = it.quando ?? null;
+      }
+    }
+    entradas.push({ tipo: "grupo", chave, origem: itens[0].origem, itens, gravidade, quando, ordem: gravidadeOrder(gravidade), tempo });
+  }
+  return entradas.sort((a, b) => a.ordem - b.ordem || b.tempo - a.tempo);
+}
+
+function tituloGrupo(chave: string, origem: string, n: number): string {
+  const f = GRUPO_TITULO[chave];
+  return f ? f(n) : `${origemLabel(origem || chave.split(":")[0])}: ${n} pendências parecidas`;
 }
 
 function formatValor(v: number | string): string {
@@ -610,13 +674,21 @@ function PendenciasSection({
 }) {
   // Mais grave primeiro; na mesma gravidade, a mais recente primeiro.
   const sorted = useMemo(
-    () =>
-      [...(pendencias ?? [])].sort(
-        (a, b) =>
-          (GRAVIDADE_INFO[a.gravidade]?.order ?? 3) - (GRAVIDADE_INFO[b.gravidade]?.order ?? 3) || timeOf(b.quando) - timeOf(a.quando),
-      ),
+    () => [...(pendencias ?? [])].sort((a, b) => gravidadeOrder(a.gravidade) - gravidadeOrder(b.gravidade) || timeOf(b.quando) - timeOf(a.quando)),
     [pendencias],
   );
+  // Muitas do mesmo tipo viram um item só, com "Ver todos".
+  const entradas = useMemo(() => agruparPendencias(sorted), [sorted]);
+  // Grupos abertos, pela chave do tipo: a atualização de 20 s não fecha o que está aberto.
+  const [abertos, setAbertos] = useState<Set<string>>(() => new Set());
+  const toggleGrupo = useCallback((chave: string) => {
+    setAbertos((prev) => {
+      const next = new Set(prev);
+      if (next.has(chave)) next.delete(chave);
+      else next.add(chave);
+      return next;
+    });
+  }, []);
   const urgentes = sorted.filter((p) => p.gravidade === "alta").length;
   const now = Date.now();
 
@@ -650,9 +722,22 @@ function PendenciasSection({
         <EmptyState icon={<CheckCircle2 size={18} />} title="Nada esperando por você" description="Quando alguma automação precisar de uma decisão, ela aparece aqui." />
       ) : (
         <Card padding="none" className="divide-y divide-border">
-          {sorted.map((p) => (
-            <PendenciaRow key={p.id} item={p} now={now} busy={busy} onAction={onAction} onDevedor={onDevedor} />
-          ))}
+          {entradas.map((e) =>
+            e.tipo === "item" ? (
+              <PendenciaRow key={e.item.id} item={e.item} now={now} busy={busy} onAction={onAction} onDevedor={onDevedor} />
+            ) : (
+              <PendenciaGrupo
+                key={`grupo:${e.chave}`}
+                grupo={e}
+                aberto={abertos.has(e.chave)}
+                onToggle={() => toggleGrupo(e.chave)}
+                now={now}
+                busy={busy}
+                onAction={onAction}
+                onDevedor={onDevedor}
+              />
+            ),
+          )}
         </Card>
       )}
     </section>
@@ -722,6 +807,77 @@ function PendenciaRow({
               <AcaoButton key={key} acao={acao} actionKey={key} busy={busy} primary={i === 0} onRun={() => onAction(acao, item.origem, key)} />
             );
           })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Várias pendências do mesmo tipo num item só; "Ver todos" abre cada uma com seus botões. */
+function PendenciaGrupo({
+  grupo,
+  aberto,
+  onToggle,
+  now,
+  busy,
+  onAction,
+  onDevedor,
+}: {
+  grupo: Extract<PendenciaEntrada, { tipo: "grupo" }>;
+  aberto: boolean;
+  onToggle: () => void;
+  now: number;
+  busy: string | null;
+  onAction: RunAction;
+  onDevedor: (valor: string) => void;
+}) {
+  const grav = GRAVIDADE_INFO[grupo.gravidade] ?? GRAVIDADE_INFO.baixa;
+  const iconColor = grav.variant === "danger" ? "text-red-500" : grav.variant === "warning" ? "text-amber-500" : "text-tertiary";
+  const n = grupo.itens.length;
+  const listaId = `central-grupo-${grupo.chave.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+
+  return (
+    <div>
+      <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 items-start gap-2.5">
+          {grav.variant === "neutral" ? (
+            <Info size={15} className={`mt-0.5 shrink-0 ${iconColor}`} />
+          ) : (
+            <AlertTriangle size={15} className={`mt-0.5 shrink-0 ${iconColor}`} />
+          )}
+          <div className="min-w-0">
+            <p className="break-words text-[0.8125rem] font-medium text-primary">{tituloGrupo(grupo.chave, grupo.origem, n)}</p>
+            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-tertiary">
+              <Badge variant={grav.variant}>{grav.label}</Badge>
+              <Badge variant="neutral">{origemLabel(grupo.origem)}</Badge>
+              {grupo.quando && (
+                <span className="tabular-nums" title={formatDbDate(grupo.quando)}>
+                  mais recente {relativeTime(grupo.quando, now)}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex shrink-0 flex-wrap items-center gap-2 sm:justify-end">
+          <Button
+            size="sm"
+            variant="secondary"
+            icon={aberto ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+            onClick={onToggle}
+            aria-expanded={aberto}
+            aria-controls={listaId}
+          >
+            {aberto ? "Recolher" : `Ver todos (${n})`}
+          </Button>
+        </div>
+      </div>
+
+      {aberto && (
+        <div id={listaId} className="ml-4 mb-2 mr-2 divide-y divide-border rounded-lg border border-border bg-secondary">
+          {grupo.itens.map((p) => (
+            <PendenciaRow key={p.id} item={p} now={now} busy={busy} onAction={onAction} onDevedor={onDevedor} />
+          ))}
         </div>
       )}
     </div>
