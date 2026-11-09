@@ -2315,13 +2315,18 @@ pub fn dispatch_hub_error(status: u16, body: &str) -> String {
 
 /// Chama o hub da VPS (HTTPS com o certificado fixado, como o histórico do Konfiansa).
 async fn dispatch_hub(method: reqwest::Method, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    dispatch_hub_timeout(method, path, body, 60).await
+}
+
+/// Como `dispatch_hub`, com prazo próprio (a Central atualiza sozinha e não pode ficar presa).
+async fn dispatch_hub_timeout(method: reqwest::Method, path: &str, body: Option<serde_json::Value>, secs: u64) -> Result<serde_json::Value, String> {
     let cfg = config::load_config();
     if cfg.hub_token.trim().is_empty() {
         return Err("Token do hub não configurado nesta máquina.".into());
     }
     let addr: std::net::SocketAddr = cfg.hub_address.trim().parse()
         .map_err(|_| "Endereço do hub inválido: use IP:porta em Configurações.".to_string())?;
-    let client = crate::hub_client::client_vps(std::time::Duration::from_secs(60))?;
+    let client = crate::hub_client::client_vps(std::time::Duration::from_secs(secs))?;
     let mut req = client.request(method, format!("https://{}:8443{}", addr.ip(), path)).bearer_auth(cfg.hub_token.trim());
     if let Some(b) = body {
         req = req.json(&b);
@@ -2392,6 +2397,469 @@ pub async fn remove_repasse_destino(state: State<'_, AppState>, token: String, n
     dispatch_hub(reqwest::Method::POST, "/api/desktop/repasse/destinos/remover", Some(serde_json::json!({ "numero": numero }))).await
 }
 
+// ============================================================
+// CENTRAL DAS AUTOMAÇÕES (aba "Central"): hub da VPS + o que este Esfera já sabe
+// ============================================================
+
+/// Aparelho sem sinal há mais que isto vira pendência.
+const CENTRAL_OFFLINE_SECS: i64 = 600;
+/// Aparelho fora de campanha sumido há mais que isto só conta no cartão (aposentado/guardado).
+const CENTRAL_OFFLINE_ESQUECIDO_SECS: i64 = 3 * 86_400;
+/// Ações que o hub repassa ao painel da PA FIXA (a mesma lista do hub e do painel).
+pub const CENTRAL_ACOES: [&str; 6] = ["pausar_marcela", "retomar_marcela", "liberar_pedido", "pausar_fila_maiara", "retomar_fila_maiara", "dispensar_pendencia"];
+/// A parte da VPS usa o token do hub DESTA máquina (PA FIXA): só o master a vê e opera.
+const CENTRAL_SO_MASTER: &str = "Só o administrador geral pode operar as automações da VPS.";
+
+/// Dados locais já lidos do banco (a montagem é pura e testada).
+pub struct CentralLocalDados {
+    pub campanhas: Vec<Campaign>,
+    pub aparelhos: Vec<Device>,
+    pub chips: Vec<(Chip, crate::db::NetworkChipStatus)>,
+    pub janela: SendWindowStatus,
+    pub enviadas_hoje: Option<i64>,
+    pub konfiansa_ligado: bool,
+    pub historicos: Vec<crate::db::KonfiansaHistoryRow>,
+}
+
+/// Data do banco ("2026-11-09 19:00:00", RFC 3339 ou com fração) em UTC.
+pub fn central_parse_utc(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = s.trim();
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) { return Some(t.with_timezone(&chrono::Utc)); }
+    ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"].iter()
+        .find_map(|f| chrono::NaiveDateTime::parse_from_str(s, f).ok())
+        .map(|n| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(n, chrono::Utc))
+}
+
+/// ISO-8601 no horário do PC (o mesmo da janela de envio).
+pub fn central_iso(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.with_timezone(&chrono::Local).format("%Y-%m-%dT%H:%M:%S%:z").to_string()
+}
+
+fn central_tempo(secs: i64) -> String {
+    let m = secs.max(0) / 60;
+    if m < 60 { format!("{} min", m.max(1)) } else if m < 48 * 60 { format!("{} h", m / 60) } else { format!("{} dias", m / 1440) }
+}
+
+fn central_acao_local(acao: &str, rotulo: &str, params: serde_json::Value, perigosa: bool, confirmar: Option<String>) -> serde_json::Value {
+    serde_json::json!({ "acao": acao, "rotulo": rotulo, "params": params, "perigosa": perigosa, "confirmar": confirmar })
+}
+
+fn central_abrir(rotulo: &str, rota: &str) -> serde_json::Value {
+    central_acao_local("local:abrir", rotulo, serde_json::json!({ "rota": rota }), false, None)
+}
+
+fn central_pendencia(id: String, origem: &str, gravidade: &str, titulo: String, detalhe: String, quando: String,
+    telefone: Option<String>, acoes: Vec<serde_json::Value>) -> serde_json::Value {
+    let devedor = telefone.filter(|t| !t.is_empty()).map(|t| serde_json::json!({ "documento": null, "telefone": t }));
+    serde_json::json!({ "id": id, "origem": origem, "gravidade": gravidade, "titulo": titulo, "detalhe": detalhe,
+        "quando": quando, "devedor": devedor, "acoes": acoes })
+}
+
+fn central_aparelho_na_campanha(d: &Device, c: &Campaign) -> bool {
+    c.device_ids.iter().any(|id| {
+        let id = id.trim();
+        !id.is_empty() && (id == d.serial || d.esfera_device_id.as_deref() == Some(id) || d.current_adb_address.as_deref() == Some(id))
+    })
+}
+
+/// Envios mínimos para o freio por respostas julgar o chip (o mesmo REPLY_SAMPLE do db.rs).
+const CENTRAL_FREIO_AMOSTRA: usize = 30;
+/// Histórico do Konfiansa com erro só vira pendência nestes dias (mesma janela do painel).
+const CENTRAL_HIST_ERRO_SECS: i64 = 3 * 86_400;
+
+/// Freio de verdade: chip pausado (ainda valendo) ou ritmo reduzido com envios suficientes para julgar.
+/// Chip novo, com poucos envios, nunca entra.
+fn central_freio_real(chip: &Chip, st: &crate::db::NetworkChipStatus, agora: chrono::DateTime<chrono::Utc>) -> bool {
+    if chip.status == "pausado" {
+        return chip.restricted_until.as_deref().and_then(central_parse_utc).map_or(true, |t| t > agora);
+    }
+    st.state == "reduzido" && st.sample >= CENTRAL_FREIO_AMOSTRA
+}
+
+/// Cartões "disparo" e "konfiansa_hist" e as pendências locais.
+pub fn central_local(d: &CentralLocalDados, agora: chrono::DateTime<chrono::Utc>) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut pend = Vec::new();
+    let rodando: Vec<&Campaign> = d.campanhas.iter().filter(|c| c.status == "running").collect();
+    let em_campanha = |dev: &Device| rodando.iter().any(|c| central_aparelho_na_campanha(dev, c));
+    let online = |dev: &Device| dev.status.eq_ignore_ascii_case("online");
+
+    // Aparelhos sem sinal.
+    let mut offline = 0;
+    let mut esquecidos = 0;
+    for dev in d.aparelhos.iter().filter(|dev| !online(dev)) {
+        offline += 1;
+        let visto = dev.last_seen_utc.as_deref().and_then(central_parse_utc);
+        let idade = visto.map(|t| (agora - t).num_seconds());
+        let usado = em_campanha(dev);
+        let gravidade = match idade {
+            Some(s) if s <= CENTRAL_OFFLINE_SECS => continue,
+            _ if usado => "alta",
+            Some(s) if s <= CENTRAL_OFFLINE_ESQUECIDO_SECS => "media",
+            _ => { esquecidos += 1; continue; }
+        };
+        let detalhe = match idade {
+            Some(s) => format!("Sem comunicação há {}.{}", central_tempo(s), if usado { " Está numa campanha rodando." } else { "" }),
+            None => "Sem registro de comunicação. Está numa campanha rodando.".into(),
+        };
+        pend.push(central_pendencia(format!("aparelho:offline:{}", dev.id), "aparelho", gravidade,
+            format!("Aparelho {} sem comunicação", dev.name), detalhe, central_iso(visto.unwrap_or(agora)), None,
+            vec![
+                central_acao_local("local:reconectar_aparelho", "Reconectar", serde_json::json!({ "serial": dev.serial, "companyId": dev.company_id }), false, None),
+                central_abrir("Abrir aparelhos", "/devices"),
+            ]));
+    }
+
+    // Campanhas que o sistema pausou sozinho (TRAVA, conta restrita...).
+    for c in d.campanhas.iter().filter(|c| c.status == "paused") {
+        let Some(motivo) = c.pause_reason.as_deref().map(str::trim).filter(|m| !m.is_empty()) else { continue };
+        let quando = central_parse_utc(&c.updated_at).unwrap_or(agora);
+        pend.push(central_pendencia(format!("disparo:campanha:{}:pausa", c.id), "disparo", "media",
+            format!("Campanha \"{}\" pausada pelo sistema", c.name), crate::db::central_resumo(motivo, 200), central_iso(quando), None,
+            vec![
+                central_acao_local("local:retomar_campanha", "Retomar", serde_json::json!({ "campaignId": c.id }), true,
+                    Some(format!("Retomar a campanha \"{}\"? O disparo volta a enviar.", c.name))),
+                central_abrir("Abrir campanhas", "/campaigns"),
+            ]));
+    }
+
+    // Chips: banidos, restritos e em freio (freio só importa em aparelho de campanha rodando).
+    let mut em_freio = 0;
+    for (chip, st) in &d.chips {
+        let dev = d.aparelhos.iter().find(|x| x.id == chip.device_id);
+        let nome = dev.map(|x| x.name.clone()).unwrap_or_else(|| st.device_name.clone());
+        let abrir = vec![central_abrir("Abrir aparelhos", "/devices")];
+        if chip.status == "banido" {
+            pend.push(central_pendencia(format!("disparo:chip:{}:banido", chip.id), "disparo", "alta",
+                format!("Chip banido no aparelho {}", nome), "O WhatsApp deste chip foi banido: troque o chip ou tire o aparelho das campanhas.".into(),
+                central_iso(agora), None, abrir));
+        } else if chip.status.starts_with("restrito") {
+            let ate = chip.restricted_until.as_deref().and_then(central_parse_utc);
+            if ate.map_or(true, |t| t > agora) {
+                let detalhe = match ate { Some(t) => format!("Restrito até {}.", t.with_timezone(&chrono::Local).format("%d/%m %H:%M")), None => "Restrito.".into() };
+                pend.push(central_pendencia(format!("disparo:chip:{}:restrito", chip.id), "disparo", "media",
+                    format!("Chip restrito no aparelho {}", nome), detalhe, central_iso(agora), None, abrir));
+            }
+        } else if central_freio_real(chip, st, agora) {
+            em_freio += 1;
+            if dev.map_or(false, |x| em_campanha(x)) {
+                let motivo = if chip.status == "pausado" { "Chip pausado pelo freio de respostas.".to_string() } else { st.reason.clone() };
+                pend.push(central_pendencia(format!("disparo:chip:{}:freio", chip.id), "disparo", "media",
+                    format!("Chip em freio no aparelho {}", nome), motivo, central_iso(agora), None, abrir));
+            }
+        }
+    }
+
+    // Cartão do disparo.
+    let quando_abre = d.janela.next_open_local.as_deref()
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").ok())
+        .map(|t| t.format("%d/%m às %H:%M").to_string()).unwrap_or_else(|| "no próximo horário".into());
+    let rodando_n = rodando.len();
+    let ligados_em_campanha = d.aparelhos.iter().any(|x| online(x) && em_campanha(x));
+    let (estado, mut detalhe) = if rodando_n == 0 {
+        ("pausado", "Nenhuma campanha rodando.".to_string())
+    } else if !d.janela.open {
+        ("pausado", format!("{} campanha(s) esperando a janela de envio, que abre {}.", rodando_n, quando_abre))
+    } else if !ligados_em_campanha {
+        ("caido", format!("{} campanha(s) rodando, mas nenhum aparelho delas está com sinal.", rodando_n))
+    } else {
+        ("ok", format!("{} campanha(s) rodando; janela aberta até {}.", rodando_n, d.janela.closes_at_local.as_deref().unwrap_or("o fim do horário")))
+    };
+    if esquecidos > 0 { detalhe.push_str(&format!(" {} aparelho(s) sem sinal há mais de 3 dias.", esquecidos)); }
+    let mut numeros = vec![
+        serde_json::json!({ "rotulo": "Campanhas rodando", "valor": rodando_n }),
+        serde_json::json!({ "rotulo": "Aparelhos com sinal", "valor": d.aparelhos.len() - offline }),
+        serde_json::json!({ "rotulo": "Aparelhos sem sinal", "valor": offline }),
+        serde_json::json!({ "rotulo": "Chips em freio", "valor": em_freio }),
+    ];
+    if let Some(n) = d.enviadas_hoje { numeros.insert(1, serde_json::json!({ "rotulo": "Enviadas hoje", "valor": n })); }
+    let mut acoes = vec![central_abrir("Abrir campanhas", "/campaigns"), central_abrir("Abrir aparelhos", "/devices")];
+    if offline > 0 {
+        acoes.push(central_acao_local("local:reconectar_todos", "Reconectar aparelhos", serde_json::json!({}), false,
+            Some("Reconectar todos os aparelhos agora?".into())));
+    }
+    for c in rodando.iter().take(3) {
+        acoes.push(central_acao_local("local:pausar_campanha", &format!("Pausar \"{}\"", c.name), serde_json::json!({ "campaignId": c.id }), false,
+            Some(format!("Pausar a campanha \"{}\"?", c.name))));
+    }
+    let disparo = serde_json::json!({ "id": "disparo", "nome": "Disparo", "estado": estado, "detalhe": detalhe, "numeros": numeros, "acoes": acoes });
+
+    // Históricos do Konfiansa.
+    let conta = |s: &str| d.historicos.iter().filter(|h| h.status == s).count();
+    let (erros, pendentes, sem_processo) = (conta("erro"), conta("pendente"), conta("sem_processo"));
+    let gravados_24h = d.historicos.iter().filter(|h| h.status == "gravado"
+        && h.gravado_em.as_deref().and_then(central_parse_utc).map_or(false, |t| (agora - t).num_seconds() <= 86_400)).count();
+    // Lista vem do mais novo: o último resultado decide se a gravação está caída.
+    let ultimo_resultado = d.historicos.iter().find(|h| h.status != "pendente").map(|h| h.status.as_str());
+    let (k_estado, k_detalhe) = if !d.konfiansa_ligado {
+        ("pausado", "Desligado nas Configurações: as conversas do disparo não vão para o Konfiansa.".to_string())
+    } else if ultimo_resultado == Some("erro") {
+        ("caido", format!("A última gravação falhou. {} conversa(s) com erro esperando nova tentativa.", erros))
+    } else {
+        ("ok", format!("{} conversa(s) gravada(s) nas últimas 24 h; {} aguardando.", gravados_24h, pendentes))
+    };
+    let konfiansa = serde_json::json!({
+        "id": "konfiansa_hist", "nome": "Históricos no Konfiansa", "estado": k_estado, "detalhe": k_detalhe,
+        "numeros": [
+            { "rotulo": "Gravados em 24 h", "valor": gravados_24h },
+            { "rotulo": "Aguardando", "valor": pendentes },
+            { "rotulo": "Com erro", "valor": erros },
+            { "rotulo": "Sem processo", "valor": sem_processo },
+        ],
+        "acoes": [central_abrir("Ver históricos", "/dispatch-numbers")],
+    });
+    for h in d.historicos.iter().filter(|h| h.status == "erro").take(20) {
+        // Data ilegível conta como antiga: não prende pendência para sempre.
+        let Some(quando) = central_parse_utc(&h.created_at) else { continue };
+        if (agora - quando).num_seconds() > CENTRAL_HIST_ERRO_SECS { continue; }
+        let desistiu = h.tentativas >= 20;
+        pend.push(central_pendencia(format!("konfiansa_hist:{}", h.history_id), "konfiansa_hist", if desistiu { "alta" } else { "media" },
+            format!("Histórico de {} não gravado no Konfiansa", crate::konfiansa_history::fmt_phone(&h.phone)),
+            format!("{}{}", if desistiu { "Tentativas esgotadas. " } else { "Vai tentar de novo sozinho. " }, crate::db::central_resumo(&h.erro, 160)),
+            central_iso(quando), Some(h.phone.clone()), vec![central_abrir("Ver históricos", "/dispatch-numbers")]));
+    }
+    (vec![disparo, konfiansa], pend)
+}
+
+fn central_gravidade(p: &serde_json::Value) -> u8 {
+    match p.get("gravidade").and_then(|g| g.as_str()) { Some("alta") => 0, Some("media") => 1, _ => 2 }
+}
+
+fn central_quando(v: &serde_json::Value) -> i64 {
+    v.get("quando").and_then(|q| q.as_str()).and_then(central_parse_utc).map_or(i64::MIN, |t| t.timestamp())
+}
+
+/// Junta a Central do hub (ou a falha dele) com a parte local. Hub fora não derruba nada.
+pub fn central_mesclar(hub: Result<serde_json::Value, String>, locais: Vec<serde_json::Value>, pend_locais: Vec<serde_json::Value>, gerado_em: String) -> serde_json::Value {
+    let lista = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let (base, mut falhas) = match hub {
+        Ok(v) if v.is_object() => (v, Vec::new()),
+        Ok(_) => (serde_json::Value::Null, vec![serde_json::json!("Resposta inválida do hub da VPS.")]),
+        Err(e) => (serde_json::Value::Null, vec![serde_json::json!(e)]),
+    };
+    falhas.extend(lista(&base, "falhas"));
+    let ids_locais: Vec<String> = locais.iter().filter_map(|a| a.get("id").and_then(|i| i.as_str()).map(str::to_string)).collect();
+    let (primeiros, ultimos): (Vec<_>, Vec<_>) = locais.into_iter().partition(|a| a.get("id").and_then(|i| i.as_str()) == Some("disparo"));
+    let mut automacoes = primeiros;
+    automacoes.extend(lista(&base, "automacoes").into_iter()
+        .filter(|a| !a.get("id").and_then(|i| i.as_str()).map_or(false, |id| ids_locais.iter().any(|l| l == id))));
+    automacoes.extend(ultimos);
+    let mut pendencias = lista(&base, "pendencias");
+    pendencias.extend(pend_locais);
+    pendencias.sort_by(|a, b| central_gravidade(a).cmp(&central_gravidade(b)).then(central_quando(b).cmp(&central_quando(a))));
+    serde_json::json!({ "geradoEm": gerado_em, "automacoes": automacoes, "pendencias": pendencias, "falhas": falhas })
+}
+
+/// Junta os eventos do hub e os locais: mais novo primeiro, no máximo 200.
+pub fn central_mesclar_eventos(hub: Vec<serde_json::Value>, locais: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut todos: Vec<serde_json::Value> = hub.into_iter().chain(locais).collect();
+    todos.sort_by(|a, b| central_quando(b).cmp(&central_quando(a)));
+    todos.truncate(200);
+    todos
+}
+
+/// Ação da Central que vai ao hub: só as da lista, com só os parâmetros que ela usa.
+pub fn central_acao_valida(acao: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if acao.starts_with("local:") {
+        return Err("Esta ação é feita pela própria tela do Esfera.".into());
+    }
+    if !CENTRAL_ACOES.contains(&acao) {
+        return Err("Ação desconhecida na Central.".into());
+    }
+    match acao {
+        "liberar_pedido" => {
+            let id = params.get("pedido_id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok())))
+                .filter(|n| *n > 0)
+                .ok_or_else(|| "Pedido inválido: falta o número do pedido.".to_string())?;
+            Ok(serde_json::json!({ "pedido_id": id }))
+        }
+        "dispensar_pendencia" => {
+            let id = params.get("id").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+            let ok = (1..=200).contains(&id.len()) && id.chars().all(|c| c.is_ascii_alphanumeric() || ":_-./@".contains(c));
+            if !ok { return Err("Pendência inválida: falta o identificador.".into()); }
+            Ok(serde_json::json!({ "id": id }))
+        }
+        _ => Ok(serde_json::json!({})),
+    }
+}
+
+/// Só o master fala com a parte da VPS (o hub usa o token da máquina, não o do usuário).
+pub fn central_pode_vps(role: &str) -> bool {
+    role == "master"
+}
+
+/// Ação da VPS: só o master.
+pub fn central_acao_permitida(role: &str) -> Result<(), String> {
+    if central_pode_vps(role) { Ok(()) } else { Err(CENTRAL_SO_MASTER.into()) }
+}
+
+/// Login da sessão para o log do painel: só caracteres seguros num header (não serve para permissão).
+pub fn central_usuario_log(login: &str) -> String {
+    let s: String = login.trim().chars().take(64)
+        .map(|c| if c.is_ascii_alphanumeric() || "._-@".contains(c) { c } else { '_' }).collect();
+    if s.is_empty() { "desconhecido".into() } else { s }
+}
+
+/// Busca do devedor: (q só dígitos, chave de telefone, documento). 11 dígitos pode ser CPF ou celular: busca os dois.
+pub fn central_busca(q: &str) -> Result<(String, Option<String>, Option<String>), String> {
+    let d: String = q.chars().filter(|c| c.is_ascii_digit()).collect();
+    if (d.len() == 12 || d.len() == 13) && !d.starts_with("55") {
+        return Err("Telefone com 12 ou 13 números precisa começar com 55 (Brasil). Ou digite só DDD + número.".into());
+    }
+    let (tel, doc) = match d.len() {
+        10 | 12 | 13 => (Some(Database::opt_out_key(&d)), None),
+        11 => (Some(Database::opt_out_key(&d)), Some(d.clone())),
+        14 => (None, Some(d.clone())),
+        _ => return Err("Informe CPF (11 números), CNPJ (14) ou telefone com DDD.".into()),
+    };
+    Ok((d, tel.filter(|k| k.len() >= 10), doc))
+}
+
+/// Quem pede e o que vê: empresa do filtro local e se pode a parte da VPS.
+struct CentralEscopo {
+    empresa: Option<i32>,
+    vps: bool,
+}
+
+/// Empresa do filtro local: a da sessão quando houver; senão a escolhida na tela (`companyId`); senão todas.
+pub fn central_empresa(session_company: Option<i32>, escolhida: Option<i32>) -> Option<i32> {
+    session_company.or(escolhida.filter(|c| *c > 0))
+}
+
+fn central_escopo(state: &AppState, token: &str, company_id: Option<i32>) -> Result<CentralEscopo, String> {
+    require_dispatch_manager(state, token)?;
+    let session = validate_session(&state.sessions, token)?;
+    Ok(CentralEscopo { empresa: central_empresa(session.company_id, company_id), vps: central_pode_vps(&session.role) })
+}
+
+/// Chips e envios do dia: a leitura por chip pesa na conexão que o disparo usa, então vale 60 s.
+const CENTRAL_CHIPS_CACHE_SECS: u64 = 60;
+type CentralChips = (Vec<(Chip, crate::db::NetworkChipStatus)>, Option<i64>);
+static CENTRAL_CHIPS_CACHE: Mutex<Option<(Option<i32>, Instant, CentralChips)>> = Mutex::new(None);
+
+fn central_chips(db: &Database, empresa: Option<i32>, aparelhos: &[Device]) -> CentralChips {
+    if let Ok(g) = CENTRAL_CHIPS_CACHE.lock() {
+        if let Some((e, t, v)) = g.as_ref() {
+            if *e == empresa && t.elapsed() < Duration::from_secs(CENTRAL_CHIPS_CACHE_SECS) { return v.clone(); }
+        }
+    }
+    // Uma só passada por chip (a do network_status); o status do chip vem do get_chips, que é leve.
+    let (mut estados, enviadas) = match db.network_status(empresa) {
+        Ok(n) => (n.chips.into_iter().map(|c| (c.chip_id, c)).collect::<std::collections::HashMap<_, _>>(), Some(n.sent_today)),
+        Err(_) => (std::collections::HashMap::new(), None),
+    };
+    let mut chips = Vec::new();
+    for dev in aparelhos {
+        for chip in db.get_chips(dev.id) {
+            if let Some(st) = estados.remove(&chip.id) { chips.push((chip, st)); }
+        }
+    }
+    let v = (chips, enviadas);
+    if let Ok(mut g) = CENTRAL_CHIPS_CACHE.lock() { *g = Some((empresa, Instant::now(), v.clone())); }
+    v
+}
+
+fn central_ler_local(db: &Database, empresa: Option<i32>) -> CentralLocalDados {
+    let campanhas: Vec<Campaign> = match empresa {
+        Some(id) => db.get_campaigns(id),
+        None => db.get_companies().iter().flat_map(|c| db.get_campaigns(c.id)).collect(),
+    };
+    let aparelhos = match empresa { Some(id) => db.get_devices(id), None => db.get_all_devices() };
+    let (chips, enviadas_hoje) = central_chips(db, empresa, &aparelhos);
+    let ids: std::collections::HashSet<i32> = campanhas.iter().map(|c| c.id).collect();
+    let historicos = db.list_konfiansa_histories(500).unwrap_or_default().into_iter()
+        .filter(|h| empresa.is_none() || ids.contains(&h.campaign_id)).collect();
+    CentralLocalDados {
+        campanhas, aparelhos, chips,
+        janela: send_window_status_at(chrono::Local::now().naive_local()),
+        enviadas_hoje,
+        konfiansa_ligado: config::load_config().konfiansa_history_enabled,
+        historicos,
+    }
+}
+
+/// Central: cartões das automações, o que precisa de alguém e as falhas de leitura.
+/// O hub fora do ar entra em "falhas"; a parte local aparece sempre. Só o master recebe a parte da VPS.
+/// `companyId` (opcional): empresa escolhida na tela para filtrar o que é local.
+#[tauri::command]
+pub async fn get_central(state: State<'_, AppState>, token: String, company_id: Option<i32>) -> Result<serde_json::Value, String> {
+    let esc = central_escopo(&state, &token, company_id)?;
+    let db = state.db.clone();
+    let empresa = esc.empresa;
+    let hub_fut = async {
+        if esc.vps { dispatch_hub_timeout(reqwest::Method::GET, "/api/desktop/central", None, 30).await }
+        else { Ok(serde_json::json!({})) }
+    };
+    let (hub, local) = tokio::join!(
+        hub_fut,
+        tauri::async_runtime::spawn_blocking(move || central_ler_local(&db, empresa)),
+    );
+    let agora = chrono::Utc::now();
+    let (autos, pends, falha_local) = match local {
+        Ok(d) => { let (a, p) = central_local(&d, agora); (a, p, None) }
+        Err(_) => (Vec::new(), Vec::new(), Some("Não deu para ler os dados do disparo neste computador.".to_string())),
+    };
+    let mut c = central_mesclar(hub, autos, pends, central_iso(agora));
+    if let (Some(f), Some(lista)) = (falha_local, c.get_mut("falhas").and_then(|x| x.as_array_mut())) { lista.push(serde_json::json!(f)); }
+    Ok(c)
+}
+
+/// Ação de uma automação da VPS (pausar/retomar Marcela e fila da Maiara, liberar pedido,
+/// dispensar pendência). Só o master. As "local:*" a tela faz sozinha.
+#[tauri::command]
+pub async fn central_action(state: State<'_, AppState>, token: String, acao: String, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    require_dispatch_manager(&state, &token)?;
+    let session = validate_session(&state.sessions, &token)?;
+    let acao = acao.trim().to_string();
+    let params = central_acao_valida(&acao, &params.unwrap_or(serde_json::Value::Null))?;
+    central_acao_permitida(&session.role)?;
+    let corpo = serde_json::json!({ "acao": acao, "params": params, "usuario": central_usuario_log(&session.username) });
+    let r = dispatch_hub(reqwest::Method::POST, "/api/desktop/central/acao", Some(corpo)).await?;
+    let ok = r.get("ok").and_then(|o| o.as_bool()).unwrap_or(true);
+    let mensagem = r.get("mensagem").and_then(|m| m.as_str()).map(str::to_string)
+        .unwrap_or_else(|| if ok { "Feito.".into() } else { "O painel não confirmou a ação.".into() });
+    Ok(serde_json::json!({ "ok": ok, "mensagem": mensagem }))
+}
+
+/// Junta eventos e falhas da busca: hub (None = não consultado; o que veio ou o erro) + locais.
+pub fn central_devedor_resposta(hub: Option<Result<serde_json::Value, String>>, locais: Result<Vec<serde_json::Value>, ()>) -> serde_json::Value {
+    let mut falhas: Vec<serde_json::Value> = Vec::new();
+    let hub_eventos = match hub {
+        None => Vec::new(),
+        Some(Ok(v)) => {
+            falhas.extend(v.get("falhas").and_then(|f| f.as_array()).cloned().unwrap_or_default());
+            v.get("eventos").and_then(|e| e.as_array()).cloned().unwrap_or_default()
+        }
+        Some(Err(e)) => { falhas.push(serde_json::json!(e)); Vec::new() }
+    };
+    let locais = locais.unwrap_or_else(|_| { falhas.push(serde_json::json!("Não deu para ler o histórico deste computador.")); Vec::new() });
+    serde_json::json!({ "eventos": central_mesclar_eventos(hub_eventos, locais), "falhas": falhas })
+}
+
+/// Tudo que aconteceu com um devedor (CPF, CNPJ ou telefone): VPS (só master) + disparo, descadastro e Konfiansa daqui.
+#[tauri::command]
+pub async fn central_devedor(state: State<'_, AppState>, token: String, q: String, company_id: Option<i32>) -> Result<serde_json::Value, String> {
+    let esc = central_escopo(&state, &token, company_id)?;
+    let (q, tel, doc) = central_busca(&q)?;
+    let db = state.db.clone();
+    let empresa = esc.empresa;
+    let caminho = format!("/api/desktop/central/devedor?q={}", q);
+    let hub_fut = async {
+        if esc.vps { Some(dispatch_hub_timeout(reqwest::Method::GET, &caminho, None, 30).await) } else { None }
+    };
+    let (hub, local) = tokio::join!(
+        hub_fut,
+        tauri::async_runtime::spawn_blocking(move || db.central_devedor_eventos(tel.as_deref(), doc.as_deref(), empresa, 200)),
+    );
+    let locais = match local {
+        Ok(Ok(v)) => Ok(v.into_iter().map(|e| serde_json::json!({
+            "quando": central_iso(chrono::DateTime::<chrono::Utc>::from_timestamp(e.ts, 0).unwrap_or_default()),
+            "origem": e.origem, "titulo": e.titulo, "detalhe": e.detalhe,
+        })).collect()),
+        _ => Err(()),
+    };
+    Ok(central_devedor_resposta(hub, locais))
+}
+
 #[cfg(test)]
 mod dispatch_numbers_tests {
     use super::*;
@@ -2423,6 +2891,254 @@ mod dispatch_numbers_tests {
         assert!(dispatch_hub_error(404, "").contains("atualizado"));
         assert!(dispatch_hub_error(502, "<html>").contains("Evolution"));
         assert_eq!(dispatch_hub_error(500, ""), "O hub respondeu HTTP 500.");
+    }
+}
+
+#[cfg(test)]
+mod central_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn agora() -> chrono::DateTime<chrono::Utc> { central_parse_utc("2026-11-09 19:00:00").unwrap() }
+
+    fn aparelho(id: i32, serial: &str, status: &str, visto: Option<&str>) -> Device {
+        Device { id, serial: serial.into(), name: format!("Aparelho {}", id), brand: String::new(), model: String::new(), ip: String::new(), port: 0,
+            status: status.into(), battery: 0, company_id: 1, device_number: id, sector: String::new(), esfera_device_id: None,
+            current_adb_address: None, last_seen_utc: visto.map(str::to_string), via_tunnel: false }
+    }
+
+    fn campanha(id: i32, status: &str, devices: &[&str], pausa: Option<&str>) -> Campaign {
+        Campaign { id, name: format!("C{}", id), greeting: String::new(), message: String::new(), closing: String::new(), delay_min: 1, delay_max: 2,
+            use_spintax: false, use_ai: false, ai_model: String::new(), ai_provider: String::new(), ai_prompt: String::new(),
+            device_ids: devices.iter().map(|s| s.to_string()).collect(), return_number: String::new(), status: status.into(),
+            contacts_count: 0, sent_count: 0, failed_count: 0, company_id: 1, updated_at: "2026-11-09 18:00:00".into(), pause_reason: pausa.map(str::to_string) }
+    }
+
+    fn chip(id: i32, device: i32, status: &str, estado: &str) -> (Chip, crate::db::NetworkChipStatus) {
+        (Chip { id, device_id: device, phone_number: String::new(), chip_name: String::new(), status: status.into(), restricted_until: None, created_at: String::new() },
+         crate::db::NetworkChipStatus { chip_id: id, device_id: device, device_name: String::new(), reply_rate: None, sample: 30, state: estado.into(), reason: "Ritmo reduzido por poucas respostas".into(), cooldown_seconds: 0 })
+    }
+
+    fn historico(id: i64, status: &str, tentativas: i64) -> crate::db::KonfiansaHistoryRow {
+        crate::db::KonfiansaHistoryRow { history_id: id, phone_key: "7588052539".into(), phone: "5575988052539".into(), campaign_id: 1, motivo: "silencio".into(),
+            first_ts: 0, last_ts: 0, mensagens: 2, texto: String::new(), status: status.into(), processos: String::new(), erro: "Konfiansa fora do ar".into(),
+            tentativas, created_at: "2026-11-09 18:30:00".into(), gravado_em: if status == "gravado" { Some("2026-11-09 18:40:00".into()) } else { None },
+            texto_externo: String::new(), tipo_externo: 0 }
+    }
+
+    fn janela(open: bool) -> SendWindowStatus {
+        SendWindowStatus { open, closes_at_local: open.then(|| "20:00".into()), next_open_local: (!open).then(|| "2026-11-10T08:00".into()) }
+    }
+
+    fn dados() -> CentralLocalDados {
+        CentralLocalDados {
+            campanhas: vec![campanha(1, "running", &["A1", "A2"], None), campanha(2, "paused", &[], Some("TRAVA no aparelho A3")), campanha(3, "paused", &[], None)],
+            aparelhos: vec![
+                aparelho(1, "A1", "online", Some("2026-11-09 18:59:00")),
+                aparelho(2, "A2", "offline", Some("2026-11-09 18:30:00")),   // em campanha, 30 min: alta
+                aparelho(3, "A3", "offline", Some("2026-11-09 18:55:00")),   // 5 min: ainda não
+                aparelho(4, "A4", "offline", Some("2026-11-08 19:00:00")),   // fora de campanha, 1 dia: média
+                aparelho(5, "A5", "offline", Some("2026-10-01 10:00:00")),   // sumido há semanas: só conta
+            ],
+            chips: vec![chip(10, 1, "livre", "reduzido"), chip(11, 4, "livre", "reduzido"), chip(12, 3, "banido", "normal")],
+            janela: janela(true),
+            enviadas_hoje: Some(42),
+            konfiansa_ligado: true,
+            historicos: vec![historico(3, "pendente", 0), historico(2, "gravado", 1), historico(1, "erro", 3)],
+        }
+    }
+
+    fn ids(v: &[serde_json::Value]) -> Vec<String> { v.iter().map(|p| p["id"].as_str().unwrap().to_string()).collect() }
+
+    #[test]
+    fn monta_disparo_e_pendencias_locais() {
+        let (autos, pend) = central_local(&dados(), agora());
+        assert_eq!(ids(&autos), vec!["disparo", "konfiansa_hist"]);
+        assert_eq!(autos[0]["estado"], "ok");
+        assert!(autos[0]["detalhe"].as_str().unwrap().contains("20:00"));
+        assert!(autos[0]["numeros"].as_array().unwrap().iter().any(|n| n["rotulo"] == "Enviadas hoje" && n["valor"] == 42));
+        let ids = ids(&pend);
+        assert!(ids.contains(&"aparelho:offline:2".to_string()));
+        assert!(ids.contains(&"aparelho:offline:4".to_string()));
+        assert!(!ids.contains(&"aparelho:offline:3".to_string()));
+        assert!(!ids.contains(&"aparelho:offline:5".to_string()));
+        assert!(ids.contains(&"disparo:campanha:2:pausa".to_string()));
+        assert!(!ids.contains(&"disparo:campanha:3:pausa".to_string()));
+        assert!(ids.contains(&"disparo:chip:10:freio".to_string()));
+        assert!(!ids.contains(&"disparo:chip:11:freio".to_string()), "freio fora de campanha só conta no cartão");
+        assert!(ids.contains(&"disparo:chip:12:banido".to_string()));
+        assert!(ids.contains(&"konfiansa_hist:1".to_string()));
+        assert!(!ids.contains(&"konfiansa_hist:2".to_string()));
+        let a2 = pend.iter().find(|p| p["id"] == "aparelho:offline:2").unwrap();
+        assert_eq!((a2["gravidade"].as_str(), a2["origem"].as_str()), (Some("alta"), Some("aparelho")));
+        assert_eq!(a2["acoes"][0], json!({"acao": "local:reconectar_aparelho", "rotulo": "Reconectar", "params": {"serial": "A2", "companyId": 1}, "perigosa": false, "confirmar": null}));
+        let a4 = pend.iter().find(|p| p["id"] == "aparelho:offline:4").unwrap();
+        assert_eq!(a4["gravidade"], "media");
+        let c2 = pend.iter().find(|p| p["id"] == "disparo:campanha:2:pausa").unwrap();
+        assert_eq!((c2["acoes"][0]["acao"].as_str(), c2["acoes"][0]["perigosa"].as_bool()), (Some("local:retomar_campanha"), Some(true)));
+        assert_eq!(c2["acoes"][0]["params"]["campaignId"], 2);
+        let k = pend.iter().find(|p| p["id"] == "konfiansa_hist:1").unwrap();
+        assert_eq!(k["devedor"]["telefone"], "5575988052539");
+        assert_eq!(autos[1]["estado"], "ok");
+        assert!(autos[1]["detalhe"].as_str().unwrap().contains("1 conversa(s) gravada(s)"));
+        assert!(autos[0]["acoes"].as_array().unwrap().iter().any(|a| a["acao"] == "local:pausar_campanha" && a["params"]["campaignId"] == 1));
+    }
+
+    #[test]
+    fn estados_do_disparo_e_do_konfiansa() {
+        let mut d = dados();
+        d.janela = janela(false);
+        assert_eq!(central_local(&d, agora()).0[0]["estado"], "pausado");
+        let mut d = dados();
+        d.aparelhos[0].status = "offline".into();
+        assert_eq!(central_local(&d, agora()).0[0]["estado"], "caido");
+        let mut d = dados();
+        d.campanhas.retain(|c| c.status != "running");
+        assert_eq!(central_local(&d, agora()).0[0]["estado"], "pausado");
+        let mut d = dados();
+        d.historicos = vec![historico(5, "erro", 20), historico(4, "gravado", 1)];
+        let (autos, pend) = central_local(&d, agora());
+        assert_eq!(autos[1]["estado"], "caido");
+        assert_eq!(pend.iter().find(|p| p["id"] == "konfiansa_hist:5").unwrap()["gravidade"], "alta");
+        let mut d = dados();
+        d.konfiansa_ligado = false;
+        assert_eq!(central_local(&d, agora()).0[1]["estado"], "pausado");
+    }
+
+    #[test]
+    fn hub_fora_nao_derruba_a_central() {
+        let (autos, pend) = central_local(&dados(), agora());
+        let n = pend.len();
+        let c = central_mesclar(Err("Hub fora do ar: não foi possível conectar à VPS.".into()), autos, pend, "g".into());
+        assert_eq!(ids(c["automacoes"].as_array().unwrap()), vec!["disparo", "konfiansa_hist"]);
+        assert_eq!(c["pendencias"].as_array().unwrap().len(), n);
+        assert_eq!(c["falhas"], json!(["Hub fora do ar: não foi possível conectar à VPS."]));
+        assert_eq!(c["geradoEm"], "g");
+    }
+
+    #[test]
+    fn mescla_hub_com_local_na_ordem() {
+        let hub = json!({
+            "geradoEm": "x",
+            "automacoes": [{"id": "maiara"}, {"id": "ponte"}, {"id": "disparo", "estado": "falso"}],
+            "pendencias": [
+                {"id": "marcela:1", "gravidade": "baixa", "quando": "2026-11-09T16:00:00-03:00"},
+                {"id": "ponte:parada", "gravidade": "alta", "quando": "2026-11-09T15:00:00-03:00"},
+            ],
+            "falhas": ["Robô da Marcela não respondeu"],
+        });
+        let locais = vec![json!({"id": "disparo", "estado": "ok"}), json!({"id": "konfiansa_hist"})];
+        let pend = vec![
+            json!({"id": "aparelho:offline:2", "gravidade": "alta", "quando": "2026-11-09T15:30:00-03:00"}),
+            json!({"id": "disparo:chip:1:freio", "gravidade": "media", "quando": "2026-11-09T16:00:00-03:00"}),
+        ];
+        let c = central_mesclar(Ok(hub), locais, pend, "agora".into());
+        assert_eq!(ids(c["automacoes"].as_array().unwrap()), vec!["disparo", "maiara", "ponte", "konfiansa_hist"]);
+        assert_eq!(c["automacoes"][0]["estado"], "ok");
+        assert_eq!(ids(c["pendencias"].as_array().unwrap()), vec!["aparelho:offline:2", "ponte:parada", "disparo:chip:1:freio", "marcela:1"]);
+        assert_eq!(c["falhas"], json!(["Robô da Marcela não respondeu"]));
+        assert_eq!(c["geradoEm"], "agora");
+    }
+
+    #[test]
+    fn eventos_do_devedor_mais_novo_primeiro() {
+        let hub = vec![json!({"quando": "2026-11-09T10:00:00-03:00", "origem": "maiara"}), json!({"quando": "2026-11-09T12:00:00-03:00", "origem": "marcela"})];
+        let locais = vec![json!({"quando": "2026-11-09T14:00:00Z", "origem": "disparo"}), json!({"quando": "lixo", "origem": "x"})];
+        let ev = central_mesclar_eventos(hub, locais);
+        let origens: Vec<&str> = ev.iter().map(|e| e["origem"].as_str().unwrap()).collect();
+        assert_eq!(origens, vec!["marcela", "disparo", "maiara", "x"]);
+        let muitos: Vec<serde_json::Value> = (0..300).map(|i| json!({"quando": format!("2026-11-09T10:{:02}:00Z", i % 60)})).collect();
+        assert_eq!(central_mesclar_eventos(muitos, vec![]).len(), 200);
+    }
+
+    #[test]
+    fn whitelist_e_busca_do_devedor() {
+        assert!(central_acao_valida("local:abrir", &json!({"rota": "/devices"})).unwrap_err().contains("tela"));
+        assert!(central_acao_valida("apagar", &json!({})).is_err());
+        assert_eq!(central_acao_valida("pausar_marcela", &json!({"x": 1})).unwrap(), json!({}));
+        assert_eq!(central_acao_valida("liberar_pedido", &json!({"pedido_id": 9})).unwrap(), json!({"pedido_id": 9}));
+        assert!(central_acao_valida("liberar_pedido", &json!({"pedido_id": 0})).is_err());
+        assert_eq!(central_acao_valida("dispensar_pendencia", &json!({"id": " marcela:pedido:123 ", "x": 1})).unwrap(), json!({"id": "marcela:pedido:123"}));
+        assert!(central_acao_valida("dispensar_pendencia", &json!({})).is_err());
+        assert!(central_acao_valida("dispensar_pendencia", &json!({"id": "a b"})).is_err());
+        assert!(central_acao_valida("dispensar_pendencia", &json!({"id": "x".repeat(201)})).is_err());
+        // 12/13 dígitos sem o 55 é engano de digitação: recusa antes do hub.
+        assert!(central_busca("475988052539").unwrap_err().contains("55"));
+        assert!(central_busca("4475988052539").is_err());
+        // Telefone: chave igual à do descadastro (sem 55 e sem 9º dígito).
+        assert_eq!(central_busca("+55 (75) 98805-2539").unwrap(), ("5575988052539".into(), Some("7588052539".into()), None));
+        assert_eq!(central_busca("7588052539").unwrap().1.as_deref(), Some("7588052539"));
+        // 11 dígitos: celular com DDD ou CPF.
+        assert_eq!(central_busca("75988052539").unwrap(), ("75988052539".into(), Some("7588052539".into()), Some("75988052539".into())));
+        assert_eq!(central_busca("12.345.678/0001-99").unwrap(), ("12345678000199".into(), None, Some("12345678000199".into())));
+        assert!(central_busca("88052539").is_err());
+        assert!(central_busca("").is_err());
+    }
+
+    #[test]
+    fn parte_da_vps_so_para_o_master() {
+        assert!(central_pode_vps("master"));
+        assert!(!central_pode_vps("gestor"));
+        assert!(!central_pode_vps("empresa"));
+        assert!(central_acao_permitida("master").is_ok());
+        assert_eq!(central_acao_permitida("gestor").unwrap_err(), "Só o administrador geral pode operar as automações da VPS.");
+        assert!(central_acao_permitida("colaborador").is_err());
+        // Gestor (sem hub) recebe só o local: sem cartões da VPS e sem falha extra.
+        let (autos, pend) = central_local(&dados(), agora());
+        let c = central_mesclar(Ok(json!({})), autos, pend, "g".into());
+        assert_eq!(ids(c["automacoes"].as_array().unwrap()), vec!["disparo", "konfiansa_hist"]);
+        assert_eq!(c["falhas"], json!([]));
+        let r = central_devedor_resposta(None, Ok(vec![json!({"quando": "2026-11-09T10:00:00Z", "origem": "disparo"})]));
+        assert_eq!((r["eventos"].as_array().unwrap().len(), r["falhas"].clone()), (1, json!([])));
+    }
+
+    #[test]
+    fn empresa_do_filtro_local_e_login_do_log() {
+        assert_eq!(central_empresa(Some(3), Some(7)), Some(3));
+        assert_eq!(central_empresa(None, Some(7)), Some(7));
+        assert_eq!(central_empresa(None, Some(0)), None);
+        assert_eq!(central_empresa(None, None), None);
+        assert_eq!(central_usuario_log(" vicenzzo.palma "), "vicenzzo.palma");
+        assert_eq!(central_usuario_log("João\r\nX: y"), "Jo_o__X__y");
+        assert_eq!(central_usuario_log(""), "desconhecido");
+    }
+
+    #[test]
+    fn devedor_junta_falhas_do_hub_e_locais() {
+        let hub = json!({"eventos": [{"quando": "2026-11-09T12:00:00-03:00", "origem": "marcela"}], "falhas": ["Robô da Marcela não respondeu"]});
+        let r = central_devedor_resposta(Some(Ok(hub)), Err(()));
+        assert_eq!(r["eventos"].as_array().unwrap().len(), 1);
+        assert_eq!(r["falhas"], json!(["Robô da Marcela não respondeu", "Não deu para ler o histórico deste computador."]));
+        let r = central_devedor_resposta(Some(Err("Hub fora do ar: não foi possível conectar à VPS.".into())), Ok(vec![]));
+        assert_eq!(r["falhas"], json!(["Hub fora do ar: não foi possível conectar à VPS."]));
+    }
+
+    #[test]
+    fn freio_so_quando_e_de_verdade_e_historico_antigo_some() {
+        let mut d = dados();
+        let mut novo = chip(20, 1, "livre", "reduzido");
+        novo.1.sample = 5;
+        let mut pausado = chip(21, 2, "pausado", "normal");
+        pausado.0.restricted_until = Some("2026-11-10 10:00:00".into());
+        let mut pausa_vencida = chip(22, 2, "pausado", "normal");
+        pausa_vencida.0.restricted_until = Some("2026-11-08 10:00:00".into());
+        d.chips = vec![novo, pausado, pausa_vencida];
+        d.historicos = vec![historico(9, "erro", 3)];
+        d.historicos[0].created_at = "2026-11-05 10:00:00".into();
+        let (autos, pend) = central_local(&d, agora());
+        let ids = ids(&pend);
+        assert!(!ids.contains(&"disparo:chip:20:freio".to_string()), "chip novo com poucos envios não é freio");
+        assert!(ids.contains(&"disparo:chip:21:freio".to_string()));
+        assert!(!ids.contains(&"disparo:chip:22:freio".to_string()));
+        assert!(!ids.contains(&"konfiansa_hist:9".to_string()), "erro de mais de 3 dias não vira pendência");
+        assert!(autos[0]["numeros"].as_array().unwrap().iter().any(|n| n["rotulo"] == "Chips em freio" && n["valor"] == 1));
+    }
+
+    #[test]
+    fn datas_do_banco() {
+        assert_eq!(central_parse_utc("2026-11-09 19:00:00").unwrap().timestamp(), central_parse_utc("2026-11-09T16:00:00-03:00").unwrap().timestamp());
+        assert!(central_parse_utc("2026-11-09T19:00:00.123").is_some());
+        assert!(central_parse_utc("ontem").is_none());
     }
 }
 
@@ -5451,3 +6167,4 @@ pub fn get_network_status(state: State<'_, AppState>, token: String) -> Result<c
     if session.role != "master" && company.is_none() { return Err("Usuário sem empresa vinculada.".into()); }
     state.db.network_status(company)
 }
+// ref: vpm-517e566c8c

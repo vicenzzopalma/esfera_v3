@@ -47,7 +47,7 @@ const REPLY_SAMPLE: usize = 30;
 const REPLY_WAIT_HOURS: i64 = 2;
 const REPLY_SLOW_PERCENT: i64 = 5;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkChipStatus { pub chip_id: i32, pub device_id: i32, pub device_name: String, pub reply_rate: Option<f64>, pub sample: usize, pub state: String, pub reason: String, pub cooldown_seconds: u64 }
 /// `attempts_*` são as tentativas que o teto conta (cada parte extra soma uma); `sent_*`, só as enviadas.
@@ -6240,6 +6240,122 @@ impl Database {
         let Ok(mut stmt) = conn.prepare("SELECT Phone FROM ESF_Contact WHERE CampaignId=?1 AND ExcluidoEm IS NULL AND Status IN ('sent','replied','partial') ORDER BY SentAt DESC LIMIT ?2") else { return vec![]; };
         stmt.query_map(params![campaign_id, limit], |r| r.get::<_, String>(0)).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     }
+
+    /// Linha do tempo local de um devedor (aba Central): envios do disparo, SAIR/descadastro,
+    /// respostas no WhatsApp do disparo e históricos do Konfiansa. Busca por telefone (chave do
+    /// descadastro: sem DDI e sem 9º dígito) e/ou documento (CPF/CNPJ, só dígitos). `company`
+    /// None = todas as empresas (master). Mais novo primeiro, no máximo `limit`.
+    pub fn central_devedor_eventos(&self, phone_key: Option<&str>, document: Option<&str>, company: Option<i32>, limit: usize) -> Result<Vec<CentralEventoLocal>, String> {
+        let digits = |s: &str| -> String { s.chars().filter(|c| c.is_ascii_digit()).collect() };
+        let doc = document.map(digits).filter(|d| d.len() == 11 || d.len() == 14).unwrap_or_default();
+        let key = phone_key.map(Self::opt_out_key).filter(|k| k.len() >= 10).unwrap_or_default();
+        if doc.is_empty() && key.is_empty() { return Ok(Vec::new()); }
+        let tail = if key.len() >= 8 { key[key.len() - 8..].to_string() } else { String::new() };
+        let conn = self.conn();
+        let mut out = Vec::new();
+        let mut keys: Vec<String> = if key.is_empty() { Vec::new() } else { vec![key.clone()] };
+
+        // 1) Contatos das campanhas (o LIKE só pré-filtra; a chave confere no Rust).
+        let mut stmt = conn.prepare(
+            "SELECT c.Phone, coalesce(c.Document,''), c.Status, CAST(strftime('%s', coalesce(c.SentAt, c.CreatedAt)) AS INTEGER),
+                    coalesce(c.SentMessage,''), coalesce(k.CampaignName,''), c.SentAt IS NOT NULL
+             FROM ESF_Contact c LEFT JOIN ESF_Campaign k ON k.CampaignId=c.CampaignId
+             WHERE c.ExcluidoEm IS NULL AND (?3 IS NULL OR k.CompanyId=?3)
+               AND ((?1<>'' AND replace(replace(replace(replace(replace(replace(c.Phone,' ',''),'-',''),'(',''),')',''),'+',''),'.','') LIKE '%' || ?1)
+                 OR (?2<>'' AND replace(replace(replace(replace(coalesce(c.Document,''),'.',''),'-',''),'/',''),' ','')=?2))
+             ORDER BY c.ContactId DESC LIMIT 1000").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![tail, doc, company], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?,
+            r.get::<_, String>(4)?, r.get::<_, String>(5)?, r.get::<_, bool>(6)?,
+        ))).map_err(|e| e.to_string())?;
+        for row in rows {
+            let (phone, document, status, ts, message, campaign, sent) = row.map_err(|e| e.to_string())?;
+            let pkey = Self::opt_out_key(&phone);
+            let by_phone = !key.is_empty() && pkey == key;
+            let by_doc = !doc.is_empty() && digits(&document) == doc;
+            if !by_phone && !by_doc { continue; }
+            if by_doc && pkey.len() >= 10 && !keys.contains(&pkey) { keys.push(pkey); }
+            let campanha = if campaign.is_empty() { "campanha".to_string() } else { format!("campanha \"{}\"", campaign) };
+            let (titulo, detalhe) = match status.as_str() {
+                "sent" | "replied" | "partial" if sent => ("Mensagem do disparo enviada".to_string(),
+                    format!("Para {} ({}). {}", phone, campanha, central_resumo(&message, 200)).trim().to_string()),
+                "failed" => ("Envio do disparo falhou".to_string(), format!("Para {} ({}).", phone, campanha)),
+                "opt_out" => ("Disparo não enviado: já tinha pedido SAIR".to_string(), format!("Para {} ({}).", phone, campanha)),
+                _ => continue,
+            };
+            out.push(CentralEventoLocal { ts: ts.unwrap_or(0), origem: "disparo", titulo, detalhe });
+        }
+        drop(stmt);
+
+        for k in &keys {
+            // 2) Descadastro (SAIR) da empresa e a origem de cada pedido.
+            let mut stmt = conn.prepare("SELECT Reason, CAST(strftime('%s', CreatedAt) AS INTEGER) FROM ESF_OptOut WHERE PhoneDigits=?1 AND (?2 IS NULL OR CompanyId=?2)").map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(params![k, company], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))).map_err(|e| e.to_string())?;
+            for row in rows {
+                let (reason, ts) = row.map_err(|e| e.to_string())?;
+                out.push(CentralEventoLocal { ts: ts.unwrap_or(0), origem: "disparo", titulo: "Descadastrado (não recebe mais disparo)".into(),
+                    detalhe: if reason.trim().is_empty() { "Pediu SAIR.".into() } else { central_resumo(&reason, 200) } });
+            }
+            drop(stmt);
+            let mut stmt = conn.prepare("SELECT Source, Reason, CAST(strftime('%s', RecordedAt) AS INTEGER) FROM ESF_OptOutEvent WHERE PhoneDigits=?1 AND (?2 IS NULL OR CompanyId=?2) ORDER BY RecordedAt DESC LIMIT 50").map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(params![k, company], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?))).map_err(|e| e.to_string())?;
+            for row in rows {
+                let (source, reason, ts) = row.map_err(|e| e.to_string())?;
+                let titulo = if source.trim().is_empty() { "Pedido de SAIR recebido".to_string() } else { format!("Pedido de SAIR recebido ({})", source.trim()) };
+                out.push(CentralEventoLocal { ts: ts.unwrap_or(0), origem: "disparo", titulo, detalhe: central_resumo(&reason, 200) });
+            }
+            drop(stmt);
+
+            // 3) Respostas no WhatsApp do disparo (Evolution), já guardadas para o Konfiansa.
+            let mut stmt = conn.prepare(
+                "SELECT m.Ts, m.Text FROM ESF_WaMessage m LEFT JOIN ESF_Campaign k ON k.CampaignId=m.CampaignId
+                 WHERE m.PhoneKey=?1 AND m.FromMe=0 AND (?2 IS NULL OR k.CompanyId=?2) ORDER BY m.Ts DESC LIMIT 100").map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(params![k, company], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).map_err(|e| e.to_string())?;
+            for row in rows {
+                let (ts, text) = row.map_err(|e| e.to_string())?;
+                out.push(CentralEventoLocal { ts, origem: "disparo", titulo: "Respondeu no WhatsApp do disparo".into(), detalhe: central_resumo(&text, 200) });
+            }
+            drop(stmt);
+
+            // 4) Históricos do Konfiansa (registro de prova).
+            let mut stmt = conn.prepare(
+                "SELECT h.Motivo, h.Mensagens, h.Status, h.Processos, h.Erro, CAST(strftime('%s', coalesce(h.GravadoEm, h.CreatedAt)) AS INTEGER)
+                 FROM ESF_KonfiansaHistory h LEFT JOIN ESF_Campaign k ON k.CampaignId=h.CampaignId
+                 WHERE h.PhoneKey=?1 AND (?2 IS NULL OR k.CompanyId=?2) ORDER BY h.HistoryId DESC LIMIT 50").map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(params![k, company], |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, Option<i64>>(5)?,
+            ))).map_err(|e| e.to_string())?;
+            for row in rows {
+                let (motivo, mensagens, status, processos, erro, ts) = row.map_err(|e| e.to_string())?;
+                let conversa = format!("Conversa com {} mensagem(ns){}.", mensagens, if motivo == "recusa" { ", após pedir SAIR" } else { "" });
+                let (titulo, detalhe) = match status.as_str() {
+                    "gravado" => ("Histórico gravado no Konfiansa", format!("{} Processo(s): {}.", conversa, processos.replace(';', ", "))),
+                    "sem_processo" => ("Histórico não gravado: sem processo no Konfiansa", conversa),
+                    "erro" => ("Histórico com erro no Konfiansa", format!("{} {}", conversa, central_resumo(&erro, 160))),
+                    _ => ("Histórico aguardando gravação no Konfiansa", conversa),
+                };
+                out.push(CentralEventoLocal { ts: ts.unwrap_or(0), origem: "konfiansa_hist", titulo: titulo.into(), detalhe });
+            }
+        }
+        out.sort_by(|a, b| b.ts.cmp(&a.ts));
+        out.truncate(limit);
+        Ok(out)
+    }
+}
+
+/// Evento local da linha do tempo do devedor (a tela recebe `quando` em ISO).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CentralEventoLocal {
+    pub ts: i64,
+    pub origem: &'static str,
+    pub titulo: String,
+    pub detalhe: String,
+}
+
+/// Uma linha, no máximo `max` caracteres (com "…").
+pub fn central_resumo(s: &str, max: usize) -> String {
+    let linha = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if linha.chars().count() <= max { linha } else { format!("{}…", linha.chars().take(max).collect::<String>()) }
 }
 
 #[cfg(test)]
@@ -6295,6 +6411,47 @@ mod historico_konfiansa_db_tests {
         assert!(!db.opted_out_since("1191703561", i64::MAX));
         db.set_campaign_konfiansa_credor(c, 598).unwrap();
         assert_eq!(db.campaign_konfiansa_credor(c), 598);
+    }
+
+    #[test]
+    fn linha_do_tempo_do_devedor_por_telefone_e_documento() {
+        let path = std::env::temp_dir().join(format!("esfera_central_dev_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId,Status) VALUES('Cobra','Oi',1,'running')", []).unwrap();
+        let c: i32 = db.conn().query_row("SELECT max(CampaignId) FROM ESF_Campaign", [], |r| r.get(0)).unwrap();
+        db.import_contacts_with_documents(c, vec![
+            ("Ana".into(), "(11) 99170-3561".into(), "12.345.678/0001-99".into()),
+            ("Bia".into(), "+5511999990002".into(), "".into()),
+        ]).unwrap();
+        let ana = db.get_contacts(c).into_iter().find(|x| x.contact_name == "Ana").unwrap();
+        db.complete_send_now(&ana.phone, c, ana.id).unwrap();
+        db.set_sent_message(ana.id, "Olá Ana,\n tudo bem?").unwrap();
+        db.add_opt_out(1, "11991703561", "SAIR").unwrap();
+        db.store_wa_messages(&[msg("r1", 2_000_000_000, false, "SAIR")]).unwrap();
+        let msgs = db.open_wa_messages("1191703561").unwrap();
+        let h = db.create_konfiansa_history(&msgs, "recusa", "texto").unwrap();
+        db.finish_konfiansa_history(h, "gravado", "1#2", "").unwrap();
+
+        // Telefone com 55 e 9º dígito acha o mesmo devedor.
+        let ev = db.central_devedor_eventos(Some("5511991703561"), None, None, 200).unwrap();
+        let titulos: Vec<&str> = ev.iter().map(|e| e.titulo.as_str()).collect();
+        assert!(titulos.contains(&"Mensagem do disparo enviada"));
+        assert!(titulos.contains(&"Descadastrado (não recebe mais disparo)"));
+        assert!(titulos.contains(&"Respondeu no WhatsApp do disparo"));
+        assert!(titulos.contains(&"Histórico gravado no Konfiansa"));
+        assert!(ev.windows(2).all(|w| w[0].ts >= w[1].ts));
+        assert!(ev.iter().any(|e| e.detalhe.contains("Olá Ana, tudo bem?")));
+        assert!(ev.iter().all(|e| !e.detalhe.contains("Bia")));
+        // Sem 9º dígito e sem 55 também.
+        assert_eq!(db.central_devedor_eventos(Some("1191703561"), None, None, 200).unwrap().len(), ev.len());
+        // CNPJ acha o contato e, pelo telefone dele, o resto.
+        assert_eq!(db.central_devedor_eventos(None, Some("12345678000199"), None, 200).unwrap().len(), ev.len());
+        // Outra empresa não vê.
+        assert!(db.central_devedor_eventos(Some("11991703561"), None, Some(2), 200).unwrap().is_empty());
+        assert!(db.central_devedor_eventos(Some("123"), None, None, 200).unwrap().is_empty());
+        assert_eq!(central_resumo("a\n  b", 10), "a b");
+        assert_eq!(central_resumo("abcdef", 3), "abc…");
     }
 }
 

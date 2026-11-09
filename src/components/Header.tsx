@@ -15,12 +15,12 @@ import { Building2, ChevronDown, ChevronRight, Check, Sun, Moon, LogOut, Setting
 const PAGE_TITLES: Record<string, { title: string; subtitle: string }> = {
   "/companies": { title: "Empresas", subtitle: "Empresas, cotas e limites" },
   "/permissions": { title: "Usuários e permissões", subtitle: "Acessos, solicitações e vínculos de aparelhos" },
+  "/central": { title: "Central", subtitle: "Automações, o que precisa de você e busca de devedor" },
   "/dashboard": { title: "Dashboard", subtitle: "Indicadores de desempenho" },
   "/devices": { title: "Aparelhos", subtitle: "Conexões, espelhamento e status" },
   "/campaigns": { title: "Campanhas", subtitle: "Disparos e fluxo de contatos" },
   "/dispatch-numbers": { title: "Números de disparo", subtitle: "WhatsApp do disparo, repasse das respostas e Konfiansa" },
   "/atendimento-celular": { title: "Atendimento pelo Celular", subtitle: "Conexão ADB do WhatsApp Business com o robô de atendimento" },
-  "/automations": { title: "Automações", subtitle: "Respostas automáticas por palavra-chave" },
   "/logs": { title: "Logs", subtitle: "Histórico de eventos e execuções" },
   "/settings": { title: "Configurações", subtitle: "Preferências e infraestrutura" },
 };
@@ -108,7 +108,7 @@ export default function Header() {
   const canSwitch = user.role === "master";
 
   // Continua na mesma tela ao trocar de empresa (a página é recriada no Layout, sem dados da anterior).
-  const COMPANY_PAGES = ["/dashboard", "/devices", "/campaigns", "/dispatch-numbers", "/atendimento-celular", "/automations", "/logs", "/settings"];
+  const COMPANY_PAGES = ["/central", "/dashboard", "/devices", "/campaigns", "/dispatch-numbers", "/atendimento-celular", "/logs", "/settings"];
   const handleCompanySelect = (companyId: number) => {
     enterCompany(companyId);
     setCompanyDropdownOpen(false);

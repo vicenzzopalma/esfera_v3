@@ -15,7 +15,7 @@ import type { Company } from "../types";
 import {
   Smartphone,
   Megaphone,
-  Bot,
+  Radar,
   ScrollText,
   Settings,
   Building2,
@@ -58,6 +58,14 @@ const NAV_GROUPS: NavGroup[] = [
   {
     groupName: "Operações",
     items: [
+      {
+        id: "central",
+        path: "/central",
+        label: "Central",
+        icon: <Radar size={16} />,
+        roles: ["master", "gestor"],
+        requiresCompany: true,
+      },
       {
         id: "dashboard",
         path: "/dashboard",
@@ -111,14 +119,6 @@ const NAV_GROUPS: NavGroup[] = [
         path: "/atendimento-celular",
         label: "Atendimento pelo Celular",
         icon: <PhoneCall size={16} />,
-        roles: ["master", "gestor"],
-        requiresCompany: true,
-      },
-      {
-        id: "automations",
-        path: "/automations",
-        label: "Automações",
-        icon: <Bot size={16} />,
         roles: ["master", "gestor"],
         requiresCompany: true,
       },

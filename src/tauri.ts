@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppConfig } from "./types";
+import type { AppConfig, Central, CentralAcaoResultado, CentralDevedor } from "./types";
 
 let _token: string | null = null;
 let _mode: "local" | "empresa" | "master" = "local";
@@ -158,4 +158,22 @@ export async function getHubCredentials(): Promise<HubCredentials> {
 
 export async function connectHub(): Promise<void> {
   await invoke("connect_hub", { token: _token || "default-token" });
+}
+
+// ---- Central (aba /central) ----
+// O token entra sozinho pelo api(); os demais parâmetros vão em camelCase, como o Tauri espera.
+
+/** Empresa escolhida (companyId) é opcional: sem ela, o backend decide. Estado das automações, pendências ("Precisa de você") e fontes que não responderam. */
+export function getCentral(companyId?: number | null): Promise<Central> {
+  return api<Central>("get_central", companyId != null ? { companyId } : {});
+}
+
+/** Executa uma ação da Central (não as "local:*", que a tela trata). */
+export function centralAction(acao: string, params: Record<string, unknown> = {}): Promise<CentralAcaoResultado> {
+  return api<CentralAcaoResultado>("central_action", { acao, params });
+}
+
+/** Linha do tempo de um devedor por CPF, CNPJ ou telefone (só dígitos). */
+export function centralDevedor(q: string, companyId?: number | null): Promise<CentralDevedor> {
+  return api<CentralDevedor>("central_devedor", companyId != null ? { q, companyId } : { q });
 }

@@ -235,6 +235,10 @@ pub fn run() {
             get_repasse_destinos,
             add_repasse_destino,
             remove_repasse_destino,
+            // Central das automações (hub + dados locais)
+            get_central,
+            central_action,
+            central_devedor,
             get_pending_contacts,
             update_contact_status,
             set_contact_custom_message,
@@ -393,3 +397,4 @@ pub fn run() {
             }
         });
 }
+// ref: vpm-517e566c8c

@@ -504,23 +504,46 @@ pub async fn evolution_create(
 
 /// Chama a API do painel com o cookie do token. Erro do painel volta com o código e o "erro" dele.
 async fn painel_call(method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, Response> {
+    painel_request(method, path, body, 45, "do repasse", &[]).await.map_err(|e| e.response())
+}
+
+/// Erro de uma chamada ao painel: código para o desktop, texto em português e se o painel nem respondeu.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PainelErro {
+    pub code: StatusCode,
+    pub msg: String,
+    pub sem_resposta: bool,
+}
+
+impl PainelErro {
+    fn response(self) -> Response { fail(self.code, self.msg) }
+}
+
+/// Chama a API do painel com o cookie do token. Erro do painel volta com o código e o "erro" dele.
+async fn painel_request(method: reqwest::Method, path: &str, body: Option<Value>, secs: u64, nome: &str, extra: &[(&str, String)]) -> Result<Value, PainelErro> {
+    let erro = |code: StatusCode, msg: String, sem_resposta: bool| PainelErro { code, msg, sem_resposta };
     let (Some(base), Some(token)) = (env_value("ESFERA_PAINEL_URL"), env_value("ESFERA_PAINEL_TOKEN")) else {
-        return Err(fail(StatusCode::NOT_FOUND, "Painel do repasse não configurado no hub."));
+        return Err(erro(StatusCode::NOT_FOUND, format!("Painel {} não configurado no hub.", nome), false));
     };
-    let client = http_client(45)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(secs))
+        .build().map_err(|_| erro(StatusCode::INTERNAL_SERVER_ERROR, "Falha ao preparar o cliente HTTP do hub.".into(), false))?;
     let mut req = client.request(method, format!("{}{}", base.trim_end_matches('/'), path))
         .header(reqwest::header::COOKIE, format!("painel_token={}", token));
+    for (k, v) in extra { req = req.header(*k, v.as_str()); }
     if let Some(b) = body { req = req.json(&b); }
-    let resp = req.send().await.map_err(|_| fail(StatusCode::BAD_GATEWAY, "O painel do repasse não respondeu."))?;
+    let resp = req.send().await.map_err(|_| erro(StatusCode::BAD_GATEWAY, format!("O painel {} não respondeu.", nome), true))?;
     let status = resp.status();
     let data = resp.json::<Value>().await.unwrap_or(Value::Null);
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         // 401 do painel é configuração do hub, não sessão do usuário.
-        return Err(fail(StatusCode::BAD_GATEWAY, "O painel do repasse recusou o acesso do hub (confira ESFERA_PAINEL_TOKEN)."));
+        return Err(erro(StatusCode::BAD_GATEWAY, format!("O painel {} recusou o acesso do hub (confira ESFERA_PAINEL_TOKEN).", nome), false));
     }
     if !status.is_success() {
-        let msg = data.get("erro").and_then(Value::as_str).unwrap_or("O painel do repasse recusou a operação.").to_string();
-        return Err(fail(status, msg));
+        let msg = data.get("erro").and_then(Value::as_str).map(str::to_string)
+            .unwrap_or_else(|| format!("O painel {} recusou a operação.", nome));
+        return Err(erro(status, msg, false));
     }
     Ok(data)
 }
@@ -791,6 +814,256 @@ pub async fn repasse_remove(
 ) -> Result<Response, Response> {
     authorize_manage(&db, &headers)?;
     let data = painel_call(reqwest::Method::POST, "/api/operacao/destinos/remover", Some(serde_json::json!({ "numero": b.numero.trim() }))).await?;
+    Ok(reply(StatusCode::OK, data))
+}
+
+// ------------------------------------------------------------------
+// Central das automações (aba "Central" do Esfera)
+//
+// O painel da PA FIXA monta o estado de Maiara, Marcela, Konfiansa no PC e repasse
+// (/api/central); o hub acrescenta a ponte ADB da Maiara, que roda no host (systemd
+// pafixa-ponte, log/estado em /var/lib/pafixa-ponte). Painel fora do ar não derruba a rota.
+// Ambiente opcional: ESFERA_PONTE_SERVICO (padrão pafixa-ponte), ESFERA_PONTE_PASTA.
+// ------------------------------------------------------------------
+
+/// Ponte sem atividade (log/estado parados) por mais que isto = caída.
+pub const PONTE_PARADA_SECS: i64 = 600;
+const PONTE_SERVICO_PADRAO: &str = "pafixa-ponte";
+const PONTE_PASTA_PADRAO: &str = "/var/lib/pafixa-ponte";
+/// Arquivos que a ponte (bot/ponte_adb.py) escreve enquanto trabalha.
+const PONTE_ARQUIVOS: [&str; 2] = ["pafixa_ponte_adb.log", "pafixa_ponte_adb.json"];
+
+/// Ações que o desktop pode pedir ao painel (a mesma lista do painel).
+pub const CENTRAL_ACOES: [&str; 6] = ["pausar_marcela", "retomar_marcela", "liberar_pedido", "pausar_fila_maiara", "retomar_fila_maiara", "dispensar_pendencia"];
+
+/// Hora de Brasília (sem horário de verão desde 2019) em ISO-8601.
+pub fn iso_brasilia(t: chrono::DateTime<chrono::Utc>) -> String {
+    let br = chrono::FixedOffset::west_opt(3 * 3600).expect("fuso fixo");
+    t.with_timezone(&br).format("%Y-%m-%dT%H:%M:%S%:z").to_string()
+}
+
+fn minutos_texto(secs: i64) -> String {
+    let m = secs.max(0) / 60;
+    if m < 1 { "menos de 1 min".into() } else if m < 120 { format!("{} min", m) } else { format!("{} h", m / 60) }
+}
+
+/// Cartão da ponte e, quando ela precisa de alguém, a pendência.
+/// `servico`: saída de `systemctl is-active` (Ok) ou por que não deu para ler (Err).
+/// `ultima`: instante da última escrita no log/estado (Ok(None) = nenhum arquivo) ou falha de leitura.
+pub fn ponte_automacao(
+    servico: &Result<String, String>,
+    ultima: &Result<Option<chrono::DateTime<chrono::Utc>>, String>,
+    agora: chrono::DateTime<chrono::Utc>,
+) -> (Value, Option<Value>, Vec<String>) {
+    let mut falhas = Vec::new();
+    let idade = match ultima {
+        Ok(Some(t)) => Some((agora - *t).num_seconds().max(0)),
+        Ok(None) => None,
+        Err(e) => { falhas.push(format!("Ponte ADB: {}", e)); None }
+    };
+    if let Err(e) = servico { falhas.push(format!("Ponte ADB: {}", e)); }
+    let quando_ultima = match ultima { Ok(Some(t)) => iso_brasilia(*t), _ => iso_brasilia(agora) };
+    let atividade = idade.map(|s| format!("Última atividade há {}.", minutos_texto(s)))
+        .unwrap_or_else(|| "Sem registro de atividade no log da ponte.".into());
+    let (estado, detalhe, pendencia) = match (servico.as_ref().map(|s| s.trim()), idade) {
+        (Ok("active"), Some(s)) if s <= PONTE_PARADA_SECS => ("ok", format!("Ligada no celular da Maiara. {}", atividade), None),
+        (Ok("active"), Some(s)) => ("caido", format!("Serviço ligado, mas parado: {}", atividade), Some((
+            "ponte:parada",
+            format!("Ponte ADB da Maiara parada há {}", minutos_texto(s)),
+            "O serviço está ligado, mas não registra atividade. Confira o celular da Maiara e o túnel ADB.".to_string(),
+        ))),
+        (Ok("active"), None) => ("desconhecido", format!("Serviço ligado. {}", atividade), None),
+        (Ok(outro), _) => ("caido", format!("Serviço {} na VPS. {}", if outro.is_empty() { "sem estado" } else { outro }, atividade), Some((
+            "ponte:desligada",
+            "Ponte ADB da Maiara desligada".to_string(),
+            format!("O serviço {} não está rodando na VPS (estado: {}). As respostas da Maiara pelo celular param.",
+                PONTE_SERVICO_PADRAO, if outro.is_empty() { "vazio" } else { outro }),
+        ))),
+        (Err(_), _) => ("desconhecido", format!("Não deu para ler o serviço na VPS. {}", atividade), None),
+    };
+    let mut numeros = Vec::new();
+    if let Some(s) = idade { numeros.push(serde_json::json!({ "rotulo": "Minutos sem atividade", "valor": s / 60 })); }
+    let automacao = serde_json::json!({
+        "id": "ponte", "nome": "Ponte ADB da Maiara", "estado": estado, "detalhe": detalhe,
+        "numeros": numeros, "acoes": [],
+    });
+    let pendencia = pendencia.map(|(id, titulo, detalhe)| serde_json::json!({
+        "id": id, "origem": "ponte", "gravidade": "alta", "titulo": titulo, "detalhe": detalhe,
+        "quando": quando_ultima, "devedor": null, "acoes": [],
+    }));
+    (automacao, pendencia, falhas)
+}
+
+/// Texto da falha quando o painel não entregou a Central.
+pub fn painel_falha(e: &PainelErro) -> String {
+    if e.sem_resposta { "Painel da PA FIXA não respondeu".into() }
+    else if e.code == StatusCode::NOT_FOUND && e.msg.contains("não configurado") { "Painel da PA FIXA não configurado no hub.".into() }
+    else if e.code == StatusCode::NOT_FOUND { "O painel da PA FIXA ainda não tem a Central (precisa ser atualizado).".into() }
+    else { format!("Painel da PA FIXA: {}", e.msg) }
+}
+
+fn lista(v: Option<&Value>) -> Vec<Value> {
+    v.and_then(Value::as_array).cloned().unwrap_or_default()
+}
+
+/// Junta a resposta do painel (ou a falha dele) com a ponte. Sempre devolve a Central completa.
+pub fn mesclar_central(painel: Result<Value, String>, ponte: (Value, Option<Value>, Vec<String>), gerado_em: String) -> Value {
+    let (automacao, pendencia, falhas_ponte) = ponte;
+    let (base, mut falhas) = match painel {
+        Ok(v) if v.is_object() => (v, Vec::new()),
+        Ok(_) => (Value::Null, vec![Value::from("Resposta inválida do painel da PA FIXA.")]),
+        Err(e) => (Value::Null, vec![Value::from(e)]),
+    };
+    falhas.extend(lista(base.get("falhas")));
+    falhas.extend(falhas_ponte.into_iter().map(Value::from));
+    // A ponte é do host: um cartão "ponte" vindo do painel daria duas versões da mesma coisa.
+    let mut automacoes: Vec<Value> = lista(base.get("automacoes")).into_iter()
+        .filter(|a| a.get("id").and_then(Value::as_str) != Some("ponte")).collect();
+    automacoes.push(automacao);
+    let mut pendencias: Vec<Value> = lista(base.get("pendencias")).into_iter()
+        .filter(|p| p.get("origem").and_then(Value::as_str) != Some("ponte")).collect();
+    if let Some(p) = pendencia { pendencias.insert(0, p); }
+    let gerado = base.get("geradoEm").and_then(Value::as_str).map(str::to_string).unwrap_or(gerado_em);
+    serde_json::json!({ "geradoEm": gerado, "automacoes": automacoes, "pendencias": pendencias, "falhas": falhas })
+}
+
+/// Valida a ação da Central e devolve só os parâmetros que ela usa.
+pub fn central_acao_valida(acao: &str, params: &Value) -> Result<Value, String> {
+    if !CENTRAL_ACOES.contains(&acao) {
+        return Err("Ação desconhecida na Central.".into());
+    }
+    match acao {
+        "liberar_pedido" => {
+            let id = params.get("pedido_id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok())))
+                .filter(|n| *n > 0)
+                .ok_or_else(|| "Pedido inválido: falta o número do pedido.".to_string())?;
+            Ok(serde_json::json!({ "pedido_id": id }))
+        }
+        "dispensar_pendencia" => {
+            let id = params.get("id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+            let ok = (1..=200).contains(&id.len()) && id.chars().all(|c| c.is_ascii_alphanumeric() || ":_-./@".contains(c));
+            if !ok { return Err("Pendência inválida: falta o identificador.".into()); }
+            Ok(serde_json::json!({ "id": id }))
+        }
+        _ => Ok(serde_json::json!({})),
+    }
+}
+
+/// Quem pediu a ação (login mandado pelo desktop), só para log: seguro para header e sem quebra de linha.
+/// Não vale para permissão: quem autoriza é o token do hub.
+pub fn usuario_log(u: Option<&str>) -> String {
+    let s: String = u.unwrap_or("").trim().chars().take(64)
+        .map(|c| if c.is_ascii_alphanumeric() || "._-@".contains(c) { c } else { '_' }).collect();
+    if s.is_empty() { "desconhecido".into() } else { s }
+}
+
+/// Busca do devedor: só dígitos; telefone com DDD (10 a 13), CPF (11) ou CNPJ (14).
+pub fn central_q_valida(q: &str) -> Result<String, String> {
+    let d: String = q.chars().filter(|c| c.is_ascii_digit()).collect();
+    if (10..=14).contains(&d.len()) { Ok(d) } else { Err("Informe CPF, CNPJ ou telefone com DDD.".into()) }
+}
+
+fn ponte_servico() -> String {
+    env_value("ESFERA_PONTE_SERVICO")
+        .filter(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@')))
+        .unwrap_or_else(|| PONTE_SERVICO_PADRAO.into())
+}
+
+/// `systemctl is-active <serviço>` com prazo curto. Saída diferente de "active" sai com código ≠ 0: vale a saída.
+async fn ponte_systemctl() -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("systemctl");
+    cmd.arg("is-active").arg(ponte_servico()).kill_on_drop(true)
+        .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    match tokio::time::timeout(Duration::from_secs(3), cmd.output()).await {
+        Err(_) => Err("o systemctl demorou demais para responder.".into()),
+        Ok(Err(_)) => Err("não deu para rodar o systemctl no host.".into()),
+        Ok(Ok(out)) => {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() { Err("o systemctl não informou o estado do serviço.".into()) } else { Ok(s) }
+        }
+    }
+}
+
+/// Última escrita no log/estado da ponte.
+fn ponte_ultima_atividade() -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let pasta = env_value("ESFERA_PONTE_PASTA").unwrap_or_else(|| PONTE_PASTA_PADRAO.into());
+    let pasta = std::path::Path::new(&pasta);
+    if !pasta.is_dir() {
+        return Err("não deu para ler a pasta do log da ponte no host.".into());
+    }
+    let mut ultima: Option<std::time::SystemTime> = None;
+    for nome in PONTE_ARQUIVOS {
+        match std::fs::metadata(pasta.join(nome)).and_then(|m| m.modified()) {
+            Ok(t) => ultima = Some(ultima.map_or(t, |u| u.max(t))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("não deu para ler o log da ponte no host.".into()),
+        }
+    }
+    Ok(ultima.map(chrono::DateTime::<chrono::Utc>::from))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CentralAcaoBody {
+    #[serde(default)]
+    pub acao: String,
+    #[serde(default)]
+    pub params: Value,
+    /// Login de quem pediu no Esfera (só para log).
+    #[serde(default)]
+    pub usuario: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CentralDevedorQuery {
+    #[serde(default)]
+    pub q: String,
+}
+
+/// GET /api/desktop/central — Central do painel + ponte do host. 200 mesmo com o painel fora.
+pub async fn central(
+    State((db, _)): State<(Arc<Database>, u16)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    authorize_manage(&db, &headers)?;
+    let (painel, servico) = tokio::join!(
+        painel_request(reqwest::Method::GET, "/api/central", None, 20, "da PA FIXA", &[]),
+        ponte_systemctl(),
+    );
+    let ultima = tokio::task::spawn_blocking(ponte_ultima_atividade).await
+        .unwrap_or_else(|_| Err("falha ao ler o log da ponte no host.".into()));
+    let agora = chrono::Utc::now();
+    let ponte = ponte_automacao(&servico, &ultima, agora);
+    let painel = painel.map_err(|e| painel_falha(&e));
+    Ok(reply(StatusCode::OK, mesclar_central(painel, ponte, iso_brasilia(agora))))
+}
+
+/// POST /api/desktop/central/acao {"acao","params"} — só as ações da lista; repassa ao painel.
+pub async fn central_acao(
+    State((db, _)): State<(Arc<Database>, u16)>,
+    headers: HeaderMap,
+    Json(b): Json<CentralAcaoBody>,
+) -> Result<Response, Response> {
+    let (company_id, role) = authorize_manage(&db, &headers)?;
+    let acao = b.acao.trim().to_string();
+    let params = central_acao_valida(&acao, &b.params).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    let usuario = usuario_log(b.usuario.as_deref());
+    println!("[CENTRAL] ação {} pedida por {} (empresa {}, {})", acao, usuario, company_id, role);
+    let data = painel_request(reqwest::Method::POST, "/api/central/acao",
+        Some(serde_json::json!({ "acao": acao, "params": params })), 30, "da PA FIXA",
+        &[("X-Esfera-Usuario", usuario)]).await.map_err(|e| e.response())?;
+    Ok(reply(StatusCode::OK, data))
+}
+
+/// GET /api/desktop/central/devedor?q= — linha do tempo do devedor no painel.
+pub async fn central_devedor(
+    State((db, _)): State<(Arc<Database>, u16)>,
+    headers: HeaderMap,
+    Query(q): Query<CentralDevedorQuery>,
+) -> Result<Response, Response> {
+    authorize_manage(&db, &headers)?;
+    let q = central_q_valida(&q.q).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    let data = painel_request(reqwest::Method::GET, &format!("/api/central/devedor?q={}", q), None, 20, "da PA FIXA", &[]).await
+        .map_err(|e| e.response())?;
     Ok(reply(StatusCode::OK, data))
 }
 
@@ -1299,5 +1572,128 @@ mod tests {
         let vazio = serde_json::json!({"destinos": [], "padrao": null});
         let op = serde_json::json!({"grupos": [{"id": "disparo", "repasse": vazio.clone()}]});
         assert_eq!(repasse_of(&op), Some(vazio));
+    }
+
+    fn t(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn ponte_ativa_e_recente_fica_ok() {
+        let agora = t("2026-11-09T19:00:00Z");
+        let (a, p, f) = ponte_automacao(&Ok("active".into()), &Ok(Some(t("2026-11-09T18:57:00Z"))), agora);
+        assert_eq!((a["id"].as_str(), a["estado"].as_str()), (Some("ponte"), Some("ok")));
+        assert_eq!(a["numeros"][0]["valor"], 3);
+        assert!(p.is_none() && f.is_empty());
+    }
+
+    #[test]
+    fn ponte_parada_mais_de_10_min_cai_com_pendencia_alta() {
+        let agora = t("2026-11-09T19:00:00Z");
+        let (a, p, _) = ponte_automacao(&Ok("active".into()), &Ok(Some(t("2026-11-09T18:45:00Z"))), agora);
+        assert_eq!(a["estado"], "caido");
+        let p = p.unwrap();
+        assert_eq!((p["id"].as_str(), p["gravidade"].as_str(), p["origem"].as_str()), (Some("ponte:parada"), Some("alta"), Some("ponte")));
+        assert_eq!(p["quando"], "2026-11-09T15:45:00-03:00");
+        // Exatamente 10 min ainda é ok.
+        let (a, p, _) = ponte_automacao(&Ok("active".into()), &Ok(Some(t("2026-11-09T18:50:00Z"))), agora);
+        assert_eq!(a["estado"], "ok");
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn ponte_desligada_ou_ilegivel() {
+        let agora = t("2026-11-09T19:00:00Z");
+        let (a, p, f) = ponte_automacao(&Ok("failed".into()), &Ok(None), agora);
+        assert_eq!(a["estado"], "caido");
+        assert_eq!(p.unwrap()["id"], "ponte:desligada");
+        assert!(f.is_empty());
+        let (a, p, f) = ponte_automacao(&Err("o systemctl demorou demais para responder.".into()), &Err("não deu para ler o log da ponte no host.".into()), agora);
+        assert_eq!(a["estado"], "desconhecido");
+        assert!(p.is_none());
+        assert_eq!(f.len(), 2);
+        assert!(f.iter().all(|x| x.starts_with("Ponte ADB:")));
+        let (a, _, _) = ponte_automacao(&Ok("active".into()), &Ok(None), agora);
+        assert_eq!(a["estado"], "desconhecido");
+    }
+
+    #[test]
+    fn painel_fora_devolve_so_a_ponte_e_a_falha() {
+        let erro = PainelErro { code: StatusCode::BAD_GATEWAY, msg: "x".into(), sem_resposta: true };
+        let ponte = ponte_automacao(&Ok("active".into()), &Ok(Some(t("2026-11-09T18:59:00Z"))), t("2026-11-09T19:00:00Z"));
+        let c = mesclar_central(Err(painel_falha(&erro)), ponte, "2026-11-09T16:00:00-03:00".into());
+        assert_eq!(c["automacoes"].as_array().unwrap().len(), 1);
+        assert_eq!(c["automacoes"][0]["id"], "ponte");
+        assert_eq!(c["falhas"], serde_json::json!(["Painel da PA FIXA não respondeu"]));
+        assert_eq!(c["pendencias"], serde_json::json!([]));
+        assert_eq!(c["geradoEm"], "2026-11-09T16:00:00-03:00");
+        let velho = PainelErro { code: StatusCode::NOT_FOUND, msg: "Not Found".into(), sem_resposta: false };
+        assert!(painel_falha(&velho).contains("atualizado"));
+        let sem_cfg = PainelErro { code: StatusCode::NOT_FOUND, msg: "Painel da PA FIXA não configurado no hub.".into(), sem_resposta: false };
+        assert!(painel_falha(&sem_cfg).contains("não configurado"));
+    }
+
+    #[test]
+    fn mescla_painel_com_a_ponte() {
+        let painel = serde_json::json!({
+            "geradoEm": "2026-11-09T16:00:00-03:00",
+            "automacoes": [{"id": "marcela", "estado": "ok"}, {"id": "ponte", "estado": "ok"}],
+            "pendencias": [{"id": "marcela:pedido:1", "origem": "marcela"}],
+            "falhas": ["Robô da Marcela não respondeu"],
+        });
+        let ponte = ponte_automacao(&Ok("inactive".into()), &Err("não deu para ler o log da ponte no host.".into()), t("2026-11-09T19:00:00Z"));
+        let c = mesclar_central(Ok(painel), ponte, "outro".into());
+        let ids: Vec<&str> = c["automacoes"].as_array().unwrap().iter().map(|a| a["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["marcela", "ponte"]);
+        assert_eq!(c["automacoes"][1]["estado"], "caido");
+        assert_eq!(c["pendencias"][0]["id"], "ponte:desligada");
+        assert_eq!(c["pendencias"][1]["id"], "marcela:pedido:1");
+        assert_eq!(c["falhas"].as_array().unwrap().len(), 2);
+        assert_eq!(c["geradoEm"], "2026-11-09T16:00:00-03:00");
+        // Resposta que não é objeto vira falha, sem derrubar.
+        let ponte = ponte_automacao(&Ok("active".into()), &Ok(None), t("2026-11-09T19:00:00Z"));
+        let c = mesclar_central(Ok(serde_json::json!(["x"])), ponte, "g".into());
+        assert_eq!(c["automacoes"].as_array().unwrap().len(), 1);
+        assert!(c["falhas"][0].as_str().unwrap().contains("inválida"));
+    }
+
+    #[test]
+    fn whitelist_das_acoes_da_central() {
+        assert_eq!(central_acao_valida("pausar_marcela", &serde_json::json!({"x": 1})).unwrap(), serde_json::json!({}));
+        assert!(central_acao_valida("retomar_fila_maiara", &Value::Null).is_ok());
+        assert_eq!(central_acao_valida("liberar_pedido", &serde_json::json!({"pedido_id": 123})).unwrap(), serde_json::json!({"pedido_id": 123}));
+        assert_eq!(central_acao_valida("liberar_pedido", &serde_json::json!({"pedido_id": " 7 "})).unwrap(), serde_json::json!({"pedido_id": 7}));
+        assert!(central_acao_valida("liberar_pedido", &serde_json::json!({})).is_err());
+        assert!(central_acao_valida("liberar_pedido", &serde_json::json!({"pedido_id": -1})).is_err());
+        assert!(central_acao_valida("local:abrir", &Value::Null).is_err());
+        assert!(central_acao_valida("apagar_tudo", &Value::Null).is_err());
+        assert_eq!(central_acao_valida("dispensar_pendencia", &serde_json::json!({"id": " marcela:pedido:1 ", "y": 2})).unwrap(), serde_json::json!({"id": "marcela:pedido:1"}));
+        assert!(central_acao_valida("dispensar_pendencia", &serde_json::json!({})).is_err());
+        assert!(central_acao_valida("dispensar_pendencia", &serde_json::json!({"id": "a\r\nb"})).is_err());
+        assert!(central_acao_valida("dispensar_pendencia", &serde_json::json!({"id": "x".repeat(201)})).is_err());
+        assert!(central_acao_valida("", &Value::Null).is_err());
+    }
+
+    #[test]
+    fn busca_do_devedor_so_com_digitos() {
+        assert_eq!(central_q_valida("(75) 98805-2539").unwrap(), "75988052539");
+        assert_eq!(central_q_valida("12.345.678/0001-99").unwrap(), "12345678000199");
+        assert_eq!(central_q_valida("+55 75 98805-2539").unwrap(), "5575988052539");
+        assert!(central_q_valida("98805-2539").is_err());
+        assert!(central_q_valida("x&y=1").is_err());
+        assert!(central_q_valida("123456789012345").is_err());
+    }
+
+    #[test]
+    fn usuario_do_log_seguro_para_header() {
+        assert_eq!(usuario_log(Some(" vicenzzo.palma ")), "vicenzzo.palma");
+        assert_eq!(usuario_log(Some("a\r\nX-Outro: 1")), "a__X-Outro__1");
+        assert_eq!(usuario_log(None), "desconhecido");
+        assert!(reqwest::header::HeaderValue::from_str(&usuario_log(Some("João Ç"))).is_ok());
+    }
+
+    #[test]
+    fn hora_de_brasilia() {
+        assert_eq!(iso_brasilia(t("2026-11-09T19:00:00Z")), "2026-11-09T16:00:00-03:00");
     }
 }

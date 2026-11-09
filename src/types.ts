@@ -125,54 +125,71 @@ export interface Campaign {
   updatedAt: string;
 }
 
-export interface Automation {
-  id: number;
-  name: string;
-  keyword: string;
-  response: string;
-  active: boolean;
-  companyId: number;
-  triggeredCount: number;
-  createdAt: string;
-  // Extended trigger/action fields
-  triggerType: AutomationTriggerType;
-  actionType: AutomationActionType;
-  triggerConfig: string; // JSON config for trigger
-  actionConfig: string;  // JSON config for action
-  sector?: string;
+// --- Central (aba /central): estado das automações, pendências e busca de devedor ---
+
+export type CentralEstado = "ok" | "pausado" | "teste" | "caido" | "desconhecido";
+export type CentralGravidade = "alta" | "media" | "baixa";
+
+/** Botão de resolver. "acao" começando com "local:" é tratada pela própria tela. */
+export interface CentralAcao {
+  acao: string;
+  rotulo: string;
+  params?: Record<string, unknown> | null;
+  perigosa?: boolean;
+  /** Pergunta de confirmação; sem ela (e sem "perigosa") a ação roda direto. */
+  confirmar?: string | null;
 }
 
-export type AutomationTriggerType =
-  | "keyword"
-  | "ban_detected"
-  | "device_offline"
-  | "schedule"
-  | "message_received";
+export interface CentralNumero {
+  rotulo: string;
+  valor: number | string;
+}
 
-export type AutomationActionType =
-  | "send_response"
-  | "move_chip"
-  | "notify"
-  | "toggle_campaign"
-  | "set_chip_status"
-  | "send_to_sector";
+export interface CentralAutomacao {
+  id: string;
+  nome: string;
+  estado: CentralEstado | string;
+  detalhe?: string | null;
+  numeros?: CentralNumero[] | null;
+  acoes?: CentralAcao[] | null;
+}
 
-export const TRIGGER_LABELS: Record<AutomationTriggerType, string> = {
-  keyword: "Palavra-chave",
-  ban_detected: "Banimento detectado",
-  device_offline: "Aparelho offline",
-  schedule: "Agendamento",
-  message_received: "Mensagem recebida",
-};
+export interface CentralPendencia {
+  id: string;
+  origem: string;
+  gravidade: CentralGravidade | string;
+  titulo: string;
+  detalhe?: string | null;
+  quando?: string | null;
+  devedor?: { documento?: string | null; telefone?: string | null } | null;
+  acoes?: CentralAcao[] | null;
+}
 
-export const ACTION_LABELS: Record<AutomationActionType, string> = {
-  send_response: "Enviar resposta",
-  move_chip: "Mover chip",
-  notify: "Notificar gestor",
-  toggle_campaign: "Pausar ou iniciar campanha",
-  set_chip_status: "Alterar status do chip",
-  send_to_sector: "Encaminhar para setor",
-};
+export interface Central {
+  geradoEm?: string | null;
+  automacoes: CentralAutomacao[];
+  pendencias: CentralPendencia[];
+  /** Fontes que não responderam (o resto da Central continua valendo). */
+  falhas: string[];
+}
+
+export interface CentralAcaoResultado {
+  ok: boolean;
+  mensagem?: string | null;
+}
+
+export interface CentralEvento {
+  quando?: string | null;
+  origem: string;
+  titulo: string;
+  detalhe?: string | null;
+}
+
+export interface CentralDevedor {
+  eventos: CentralEvento[];
+  /** Partes da busca que não responderam (os eventos que chegaram continuam valendo). */
+  falhas?: string[] | null;
+}
 
 // --- Novos tipos Fase 1 ---
 
