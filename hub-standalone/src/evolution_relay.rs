@@ -927,6 +927,36 @@ pub fn mesclar_central(painel: Result<Value, String>, ponte: (Value, Option<Valu
     serde_json::json!({ "geradoEm": gerado, "automacoes": automacoes, "pendencias": pendencias, "falhas": falhas })
 }
 
+/// Com o arquivo MODO_ADB na VPS o WhatsApp da Maiara está restrito e ela atende pela ponte ADB:
+/// o "desconectado" que o painel vê (ele não enxerga esse arquivo) não é falha. O estado passa a ser o da ponte.
+pub fn ajustar_modo_adb(central: &mut Value) {
+    let ponte_ok = lista(central.get("automacoes")).iter()
+        .any(|a| a.get("id").and_then(Value::as_str) == Some("ponte") && a.get("estado").and_then(Value::as_str) == Some("ok"));
+    if let Some(autos) = central.get_mut("automacoes").and_then(Value::as_array_mut) {
+        for a in autos.iter_mut() {
+            let maiara_sem_wa = a.get("id").and_then(Value::as_str) == Some("maiara")
+                && a.get("estado").and_then(Value::as_str) == Some("caido")
+                && a.get("detalhe").and_then(Value::as_str).map_or(false, |d| d.contains("WhatsApp"));
+            if maiara_sem_wa {
+                a["estado"] = Value::from(if ponte_ok { "ok" } else { "caido" });
+                a["detalhe"] = Value::from(if ponte_ok {
+                    "WhatsApp restrito: atendendo pela ponte ADB."
+                } else {
+                    "WhatsApp restrito e a ponte ADB não está bem: veja o cartão da ponte."
+                });
+            }
+        }
+    }
+    if let Some(pend) = central.get_mut("pendencias").and_then(Value::as_array_mut) {
+        pend.retain(|p| p.get("id").and_then(Value::as_str) != Some("maiara:whatsapp"));
+    }
+}
+
+fn modo_adb_ligado() -> bool {
+    let caminho = env_value("ESFERA_PAFIXA_MODO_ADB").unwrap_or_else(|| "/opt/pafixa/MODO_ADB".to_string());
+    std::path::Path::new(&caminho).exists()
+}
+
 /// Valida a ação da Central e devolve só os parâmetros que ela usa.
 pub fn central_acao_valida(acao: &str, params: &Value) -> Result<Value, String> {
     if !CENTRAL_ACOES.contains(&acao) {
@@ -1034,7 +1064,11 @@ pub async fn central(
     let agora = chrono::Utc::now();
     let ponte = ponte_automacao(&servico, &ultima, agora);
     let painel = painel.map_err(|e| painel_falha(&e));
-    Ok(reply(StatusCode::OK, mesclar_central(painel, ponte, iso_brasilia(agora))))
+    let mut c = mesclar_central(painel, ponte, iso_brasilia(agora));
+    if modo_adb_ligado() {
+        ajustar_modo_adb(&mut c);
+    }
+    Ok(reply(StatusCode::OK, c))
 }
 
 /// POST /api/desktop/central/acao {"acao","params"} — só as ações da lista; repassa ao painel.
@@ -1631,6 +1665,30 @@ mod tests {
         assert!(painel_falha(&velho).contains("atualizado"));
         let sem_cfg = PainelErro { code: StatusCode::NOT_FOUND, msg: "Painel da PA FIXA não configurado no hub.".into(), sem_resposta: false };
         assert!(painel_falha(&sem_cfg).contains("não configurado"));
+    }
+
+    #[test]
+    fn modo_adb_troca_o_desconectado_da_maiara_pelo_estado_da_ponte() {
+        let base = |ponte: &str| serde_json::json!({
+            "automacoes": [
+                {"id": "maiara", "estado": "caido", "detalhe": "WhatsApp da Maiara desconectado."},
+                {"id": "ponte", "estado": ponte},
+            ],
+            "pendencias": [{"id": "maiara:whatsapp"}, {"id": "maiara:sem_responsavel:1"}],
+        });
+        let mut c = base("ok");
+        ajustar_modo_adb(&mut c);
+        assert_eq!(c["automacoes"][0]["estado"], "ok");
+        assert_eq!(c["pendencias"].as_array().unwrap().len(), 1);
+        assert_eq!(c["pendencias"][0]["id"], "maiara:sem_responsavel:1");
+        let mut c = base("caido");
+        ajustar_modo_adb(&mut c);
+        assert_eq!(c["automacoes"][0]["estado"], "caido");
+        assert!(c["automacoes"][0]["detalhe"].as_str().unwrap().contains("ponte"));
+        // Robô fora do ar continua caído.
+        let mut c = serde_json::json!({"automacoes": [{"id": "maiara", "estado": "caido", "detalhe": "O robô da Maiara não responde."}], "pendencias": []});
+        ajustar_modo_adb(&mut c);
+        assert_eq!(c["automacoes"][0]["estado"], "caido");
     }
 
     #[test]
