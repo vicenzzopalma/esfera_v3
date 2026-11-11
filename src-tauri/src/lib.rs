@@ -27,6 +27,7 @@ mod spintax;
 mod tunnel_server;
 pub mod veritas_crm;
 pub mod konfiansa_history;
+pub mod retorno_negociador;
 pub mod atendimento_celular;
 mod write_queue;
 
@@ -155,6 +156,7 @@ pub fn run() {
             dispatcher::Dispatcher::start_opt_out_import_loop(db_arc_clone.clone());
             dispatcher::Dispatcher::start_agent_update_loop(db_arc_clone.clone());
             konfiansa_history::start(db_arc_clone.clone());
+            retorno_negociador::start(db_arc_clone.clone());
             // Cópia de segurança dos contatos: ao aparecer online e a cada 6 horas, um aparelho por vez.
             contact_backup::start(db_arc_clone.clone());
             adb_manager::AdbManager::start_status_monitor(db_arc_clone);

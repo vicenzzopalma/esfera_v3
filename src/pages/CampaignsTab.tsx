@@ -4187,7 +4187,7 @@ function ReturnNumberSelector({ companyId, devices, selected, value, onChange }:
   const missingNumbers = selectedDevices.filter((d) => !options.some((o) => o.deviceId === d.id));
   const uniqueOptions = options.filter((option, index, rows) => rows.findIndex((r) => r.phone === option.phone) === index);
   return (
-    <FormSection title="Retorno VERITAS" description="O retorno (SAIR e repasse à Marcela) só vale para contatos enviados pelos números escolhidos.">
+    <FormSection title="WhatsApp retorno" description="Resposta de quem esta campanha enviou, pelo número que enviou: SAIR vai ao descadastro; o resto vai ao negociador do processo (ou ao grupo da equipe, em rodízio) e vira histórico no Konfiansa. Nada é enviado ao devedor.">
       <label className="block space-y-2 text-sm">
         <span>Número do retorno</span>
         <select className="w-full rounded-lg border border-border bg-surface px-3 py-2" value={matchingOption?.phone || value} onChange={(e) => onChange(e.target.value)}>
@@ -4617,7 +4617,7 @@ function CampaignWizard({
                     </>
                   )}
                 </ReviewRow>
-                <ReviewRow label="Retorno VERITAS" onEdit={() => goTo("sending")}>
+                <ReviewRow label="WhatsApp retorno" onEdit={() => goTo("sending")}>
                   {form.returnNumber === "*" ? "Todos os aparelhos da campanha" : form.returnNumber ? formatPhoneBr(form.returnNumber) : "Desativado"}
                 </ReviewRow>
                 <ReviewRow label="IA" onEdit={() => goTo("ai")}>

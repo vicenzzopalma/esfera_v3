@@ -125,6 +125,8 @@ pub async fn start(db: Arc<Database>, tls_port: u16) {
         .route("/api/desktop/evolution/instances",
             get(crate::evolution_relay::evolution_instances).post(crate::evolution_relay::evolution_create))
         .route("/api/desktop/evolution/qr", post(crate::evolution_relay::evolution_qr))
+        // "WhatsApp retorno": aviso ao negociador / grupo da equipe.
+        .route("/api/desktop/retorno/enviar", post(crate::evolution_relay::retorno_enviar))
         // Snapshot hierárquico de disparos (até 50 mil vínculos: corpo maior que o padrão de 2 MB).
         .route("/api/desktop/evolution/devedores",
             post(crate::evolution_relay::evolution_devedores).layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)))

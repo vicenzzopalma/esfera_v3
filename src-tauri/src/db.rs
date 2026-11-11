@@ -284,7 +284,7 @@ fn normalize_brazil_phone(raw: &str) -> Option<String> {
     (matches!(digits.len(), 12 | 13) && digits.starts_with("55") && digits.as_bytes()[2] != b'0').then_some(digits)
 }
 
-fn same_dispatch_number(a: &str, b: &str) -> bool {
+pub(crate) fn same_dispatch_number(a: &str, b: &str) -> bool {
     let (Some(a), Some(b)) = (normalize_brazil_phone(a), normalize_brazil_phone(b)) else { return false };
     if a == b { return true; }
     let (long, short) = if a.len() > b.len() { (&a, &b) } else { (&b, &a) };
@@ -1029,6 +1029,22 @@ impl Database {
         CREATE TABLE IF NOT EXISTS ESF_ReplyBrake (ChipId INTEGER PRIMARY KEY, UntilAt TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS ESF_ReplyCapture (DeviceId INTEGER PRIMARY KEY, Available INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS ESF_NetworkExtra (AttemptId INTEGER PRIMARY KEY, Extra INTEGER NOT NULL, CreatedAt TEXT NOT NULL DEFAULT (datetime('now')));")?;
+        // Texto da resposta (notificação do WhatsApp): base do "WhatsApp retorno" ao negociador.
+        let _ = self.conn().execute("ALTER TABLE ESF_ReplyInbound ADD COLUMN Text TEXT NOT NULL DEFAULT ''", []);
+        // Um caso por devedor e campanha: nunca encaminhado duas vezes (UNIQUE + estado antes do envio).
+        self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_ReturnCase (
+            CaseId INTEGER PRIMARY KEY AUTOINCREMENT, CompanyId INTEGER NOT NULL, CampaignId INTEGER NOT NULL,
+            PhoneKey TEXT NOT NULL, Phone TEXT NOT NULL, Channel TEXT NOT NULL, SourceNumber TEXT NOT NULL DEFAULT '',
+            DeviceId INTEGER NOT NULL DEFAULT 0, FirstReplyAt TEXT NOT NULL, LastReplyAt TEXT NOT NULL,
+            Conversa TEXT NOT NULL DEFAULT '[]', Status TEXT NOT NULL DEFAULT 'aguardando',
+            Destino TEXT NOT NULL DEFAULT '', Pessoa TEXT NOT NULL DEFAULT '', Numeros TEXT NOT NULL DEFAULT '',
+            Processos TEXT NOT NULL DEFAULT '', Mensagem TEXT NOT NULL DEFAULT '', MensagemIds TEXT NOT NULL DEFAULT '',
+            Interno TEXT NOT NULL DEFAULT '', Externo TEXT NOT NULL DEFAULT '', Gravados TEXT NOT NULL DEFAULT '',
+            Erro TEXT NOT NULL DEFAULT '', Tentativas INTEGER NOT NULL DEFAULT 0, ProximaTentativa TEXT NOT NULL DEFAULT '1970-01-01',
+            CreatedAt TEXT NOT NULL DEFAULT (datetime('now')), UpdatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(CompanyId, CampaignId, PhoneKey)
+        );
+        CREATE TABLE IF NOT EXISTS ESF_ReturnRotation (Chave TEXT PRIMARY KEY, Proximo INTEGER NOT NULL);")?;
 
         // Banco de variações da IA por versão do texto da campanha: sobrevive ao reinício do app.
         self.conn().execute_batch("CREATE TABLE IF NOT EXISTS ESF_AiVariant (
@@ -2872,9 +2888,9 @@ impl Database {
 
     /// Número fora do padrão brasileiro é ignorado com Ok: uma linha ruim nunca trava a importação
     /// (e com ela o envio do aparelho); só erro real do banco falha.
-    pub fn remember_reply(&self, event_id: &str, company: i32, serial: &str, phone: &str, received_at: &str) -> Result<(), String> {
+    pub fn remember_reply(&self, event_id: &str, company: i32, serial: &str, phone: &str, received_at: &str, text: &str) -> Result<(), String> {
         let Some(key) = Self::reply_phone_key(phone) else { return Ok(()); };
-        self.conn().execute("INSERT OR IGNORE INTO ESF_ReplyInbound(EventId,DeviceId,PhoneDigits,ReceivedAt) SELECT ?1,rowid,?2,?3 FROM ESF_Device WHERE CompanyId=?5 AND (AdbDeviceId=?4 OR EsferaDeviceId=?4 OR CurrentAdbAddress=?4) LIMIT 1", params![event_id,key,received_at,serial,company]).map(|_| ()).map_err(|e| e.to_string())
+        self.conn().execute("INSERT OR IGNORE INTO ESF_ReplyInbound(EventId,DeviceId,PhoneDigits,ReceivedAt,Text) SELECT ?1,rowid,?2,?3,?6 FROM ESF_Device WHERE CompanyId=?5 AND (AdbDeviceId=?4 OR EsferaDeviceId=?4 OR CurrentAdbAddress=?4) LIMIT 1", params![event_id,key,received_at,serial,company,text]).map(|_| ()).map_err(|e| e.to_string())
     }
 
     pub fn reply_status(&self, chip: &Chip, device: &Device) -> Result<NetworkChipStatus, String> {
@@ -5414,12 +5430,12 @@ mod antiban_tests {
         assert_eq!(db.get_chips(device.id)[0].status, "livre");
         // Número estrangeiro ou título com dígitos demais é ignorado sem erro (não trava a importação).
         for (id, title) in [("ext1", "+1 415 555 1234"), ("ext2", "+44 7911 123456"), ("grupo", "Grupo 2024 11 98888-7777 bloco 12")] {
-            db.remember_reply(id,1,"usb1",title,"2020-01-01 00:00:00").unwrap();
+            db.remember_reply(id,1,"usb1",title,"2020-01-01 00:00:00","oi").unwrap();
         }
         let n: i64 = db.conn().query_row("SELECT count(*) FROM ESF_ReplyInbound", [], |r|r.get(0)).unwrap();
         assert_eq!(n,0);
-        db.remember_reply("evento",1,"usb1","11988888888","2020-01-01 00:00:00").unwrap();
-        db.remember_reply("evento",1,"usb1","11988888888","2020-01-01 00:00:00").unwrap();
+        db.remember_reply("evento",1,"usb1","11988888888","2020-01-01 00:00:00","oi").unwrap();
+        db.remember_reply("evento",1,"usb1","11988888888","2020-01-01 00:00:00","oi").unwrap();
         let n: i64 = db.conn().query_row("SELECT count(*) FROM ESF_ReplyInbound", [], |r|r.get(0)).unwrap();
         assert_eq!(n,1);
         db.set_reply_capture(1,"usb1",false).unwrap();
@@ -6696,5 +6712,337 @@ mod veritas_campaign_tests {
         assert!(!links.iter().any(|v| v.telefone == "5511980000000" || v.telefone == "5511980000001"));
         assert!(links.iter().any(|v| v.telefone == "5511980050001"));
         assert!(links.windows(2).all(|w| w[0] < w[1]));
+    }
+}
+
+// ------------------------------------------------------------------
+// "WhatsApp retorno": respostas ao disparo -> negociador / grupo da equipe -> Konfiansa
+// ------------------------------------------------------------------
+
+/// Uma resposta do devedor a um disparo de campanha com retorno ligado.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnReply {
+    pub company_id: i32,
+    pub campaign_id: i32,
+    pub phone_key: String,
+    pub phone: String,
+    /// "celular" (notificação do aparelho ADB) ou "evolution".
+    pub channel: String,
+    pub device_id: i64,
+    /// Número que fez o disparo (o número do retorno).
+    pub source: String,
+    /// Horário UTC "AAAA-MM-DD HH:MM:SS".
+    pub received_at: String,
+    pub text: String,
+}
+
+/// Um caso de retorno e o que já foi feito com ele.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnCase {
+    pub case_id: i64,
+    pub company_id: i32,
+    pub campaign_id: i32,
+    pub phone_key: String,
+    pub phone: String,
+    pub channel: String,
+    pub source: String,
+    pub first_reply_at: String,
+    pub last_reply_at: String,
+    /// JSON: [["AAAA-MM-DD HH:MM:SS","texto"], ...] (UTC).
+    pub conversa: String,
+    /// aguardando | enviando | encaminhado | gravado | sair | sem_processo | revisar | sem_destino | incerto
+    pub status: String,
+    pub destino: String,
+    pub pessoa: String,
+    pub processos: String,
+    pub mensagem: String,
+    pub interno: String,
+    pub externo: String,
+    pub gravados: String,
+    pub erro: String,
+}
+
+const RETURN_CASE_COLS: &str = "CaseId,CompanyId,CampaignId,PhoneKey,Phone,Channel,SourceNumber,FirstReplyAt,LastReplyAt,Conversa,Status,Destino,Pessoa,Processos,Mensagem,Interno,Externo,Gravados,Erro";
+
+fn return_case_row(r: &rusqlite::Row) -> rusqlite::Result<ReturnCase> {
+    Ok(ReturnCase {
+        case_id: r.get(0)?, company_id: r.get(1)?, campaign_id: r.get(2)?, phone_key: r.get(3)?, phone: r.get(4)?,
+        channel: r.get(5)?, source: r.get(6)?, first_reply_at: r.get(7)?, last_reply_at: r.get(8)?, conversa: r.get(9)?,
+        status: r.get(10)?, destino: r.get(11)?, pessoa: r.get(12)?, processos: r.get(13)?, mensagem: r.get(14)?,
+        interno: r.get(15)?, externo: r.get(16)?, gravados: r.get(17)?, erro: r.get(18)?,
+    })
+}
+
+impl Database {
+    /// Respostas recebidas desde `since` (UTC) a disparos de campanhas com retorno ligado.
+    /// O retorno é da CAMPANHA, não do aparelho (um aparelho roda várias campanhas): a resposta só
+    /// conta para a campanha X se o número consta como ENVIADO na X (chave sem o 9, então com e sem o
+    /// 9), a resposta chegou no mesmo aparelho que enviou, depois do envio (folga de 15 min) e até 30
+    /// dias depois. Número enviado por mais de uma campanha da empresa não entra em nenhuma (não dá
+    /// para saber a qual ela responde). O número do disparo precisa ser o escolhido ("*" = todos).
+    pub fn return_replies(&self, since: &str) -> Result<Vec<ReturnReply>, String> {
+        let conn = self.conn();
+        let mut out = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT a.CompanyId, a.CampaignId, r.PhoneDigits, a.TargetNumber, r.DeviceId,
+                    COALESCE(NULLIF(a.SourceNumber,''), ch.PhoneNumber, ''), c.ReturnNumber, r.ReceivedAt,
+                    COALESCE(NULLIF(r.Text,''), CASE WHEN json_valid(o.Line) THEN json_extract(o.Line,'$.text') END, ''),
+                    (SELECT count(DISTINCT y.CampaignId) FROM ESF_ChipAttempt y WHERE y.CompanyId=a.CompanyId
+                        AND y.PhoneDigits=r.PhoneDigits AND y.Purpose='campaign' AND y.Outcome='enviado')
+             FROM ESF_ReplyInbound r
+             JOIN ESF_ChipAttempt a ON a.AttemptId = (SELECT max(x.AttemptId) FROM ESF_ChipAttempt x
+                    WHERE x.PhoneDigits=r.PhoneDigits AND x.SourceDeviceId=r.DeviceId AND x.Purpose='campaign'
+                      AND x.Outcome='enviado' AND x.CreatedAt <= datetime(r.ReceivedAt,'+15 minutes'))
+             JOIN ESF_Campaign c ON c.CampaignId=a.CampaignId AND c.ExcluidoEm IS NULL AND c.ReturnNumber<>''
+             LEFT JOIN ESF_Chip ch ON ch.ChipId=a.ChipId
+             LEFT JOIN ESF_DeviceOutbox o ON o.EventId=r.EventId
+             WHERE r.ReceivedAt >= ?1 AND r.ReceivedAt <= datetime(a.CreatedAt,'+30 days')
+             ORDER BY r.ReceivedAt, r.EventId").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![since], |r| Ok((
+            r.get::<_, i32>(0)?, r.get::<_, i32>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?,
+            r.get::<_, String>(5)?, r.get::<_, String>(6)?, r.get::<_, String>(7)?, r.get::<_, String>(8)?, r.get::<_, i64>(9)?,
+        ))).map_err(|e| e.to_string())?;
+        for row in rows {
+            let (company, campaign, key, target, device, source, ret, at, text, campanhas) = row.map_err(|e| e.to_string())?;
+            if campanhas != 1 { continue; }
+            if ret != "*" && !same_dispatch_number(&source, &ret) { continue; }
+            let phone = normalize_brazil_phone(&target).unwrap_or_else(|| format!("55{}", key));
+            out.push(ReturnReply { company_id: company, campaign_id: campaign, phone_key: key, phone, channel: "celular".into(),
+                device_id: device, source, received_at: at, text });
+        }
+        // Evolution: as mensagens do devedor já guardadas para o histórico (já ligadas à campanha).
+        let mut stmt = conn.prepare(
+            "SELECT c.CompanyId, m.CampaignId, m.PhoneKey, m.Phone, m.Owner, c.ReturnNumber, datetime(m.Ts,'unixepoch'), m.Text
+             FROM ESF_WaMessage m JOIN ESF_Campaign c ON c.CampaignId=m.CampaignId AND c.ExcluidoEm IS NULL AND c.ReturnNumber<>''
+             WHERE m.FromMe=0 AND datetime(m.Ts,'unixepoch') >= ?1 ORDER BY m.Ts, m.MsgId").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![since], |r| Ok((
+            r.get::<_, i32>(0)?, r.get::<_, i32>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?, r.get::<_, String>(5)?, r.get::<_, String>(6)?, r.get::<_, String>(7)?,
+        ))).map_err(|e| e.to_string())?;
+        for row in rows {
+            let (company, campaign, key, phone, owner, ret, at, text) = row.map_err(|e| e.to_string())?;
+            if ret != "*" && !same_dispatch_number(&owner, &ret) { continue; }
+            out.push(ReturnReply { company_id: company, campaign_id: campaign, phone_key: key, phone, channel: "evolution".into(),
+                device_id: 0, source: owner, received_at: at, text });
+        }
+        Ok(out)
+    }
+
+    /// Cria o caso (uma vez) e, enquanto ele ainda aguarda, atualiza a conversa com as respostas.
+    pub fn return_case_upsert(&self, first: &ReturnReply, last_at: &str, conversa_json: &str) -> Result<(), String> {
+        let conn = self.conn();
+        conn.execute("INSERT OR IGNORE INTO ESF_ReturnCase(CompanyId,CampaignId,PhoneKey,Phone,Channel,SourceNumber,DeviceId,FirstReplyAt,LastReplyAt,Conversa)
+                      VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![first.company_id, first.campaign_id, first.phone_key, first.phone, first.channel, first.source, first.device_id,
+                    first.received_at, last_at, conversa_json]).map_err(|e| e.to_string())?;
+        conn.execute("UPDATE ESF_ReturnCase SET LastReplyAt=?4, Conversa=?5, UpdatedAt=datetime('now')
+                      WHERE CompanyId=?1 AND CampaignId=?2 AND PhoneKey=?3 AND Status='aguardando' AND Conversa<>?5",
+            params![first.company_id, first.campaign_id, first.phone_key, last_at, conversa_json]).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Casos com algo a fazer: aguardando há `quiet_secs` sem resposta nova, ou já encaminhados
+    /// com histórico pendente. Respeita a próxima tentativa depois de um erro.
+    pub fn return_cases_due(&self, quiet_secs: i64) -> Result<Vec<ReturnCase>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM ESF_ReturnCase WHERE ProximaTentativa <= datetime('now')
+               AND ((Status='aguardando' AND LastReplyAt <= datetime('now', ?1)) OR Status='encaminhado')
+             ORDER BY CaseId LIMIT 20", RETURN_CASE_COLS)).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![format!("-{} seconds", quiet_secs)], return_case_row).map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
+    }
+
+    pub fn return_case(&self, case_id: i64) -> Result<ReturnCase, String> {
+        self.conn().query_row(&format!("SELECT {} FROM ESF_ReturnCase WHERE CaseId=?1", RETURN_CASE_COLS), params![case_id], return_case_row)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Fim de linha sem envio (SAIR, sem processo, sem destino, revisar) ou resultado final.
+    pub fn return_case_finish(&self, case_id: i64, status: &str, erro: &str) -> Result<(), String> {
+        self.conn().execute("UPDATE ESF_ReturnCase SET Status=?2, Erro=?3, UpdatedAt=datetime('now') WHERE CaseId=?1",
+            params![case_id, status, erro]).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Erro passageiro (Konfiansa, CRM, IA fora): tenta de novo em alguns minutos, sem mudar o estado.
+    pub fn return_case_retry(&self, case_id: i64, erro: &str) -> Result<(), String> {
+        self.conn().execute("UPDATE ESF_ReturnCase SET Erro=?2, Tentativas=Tentativas+1,
+                ProximaTentativa=datetime('now', '+' || min(60, 5 * (Tentativas+1)) || ' minutes'), UpdatedAt=datetime('now') WHERE CaseId=?1",
+            params![case_id, erro]).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Marca "enviando" ANTES do envio: se o Esfera cair no meio, o caso fica "incerto" e nunca é
+    /// reenviado sozinho. Só passa de "aguardando"; devolve false se outro já pegou.
+    pub fn return_case_claim(&self, case_id: i64, destino: &str, pessoa: &str, numeros: &str, processos: &str, mensagem: &str) -> Result<bool, String> {
+        self.conn().execute("UPDATE ESF_ReturnCase SET Status='enviando', Destino=?2, Pessoa=?3, Numeros=?4, Processos=?5, Mensagem=?6,
+                Erro='', UpdatedAt=datetime('now') WHERE CaseId=?1 AND Status='aguardando'",
+            params![case_id, destino, pessoa, numeros, processos, mensagem]).map(|n| n == 1).map_err(|e| e.to_string())
+    }
+
+    pub fn return_case_sent(&self, case_id: i64, ids: &str, interno: &str) -> Result<(), String> {
+        self.conn().execute("UPDATE ESF_ReturnCase SET Status='encaminhado', MensagemIds=?2, Interno=?3, Erro='', UpdatedAt=datetime('now')
+                WHERE CaseId=?1 AND Status='enviando'", params![case_id, ids, interno]).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Guarda o que já foi gravado no Konfiansa (e o externo escrito pela IA), para não repetir.
+    pub fn return_case_history(&self, case_id: i64, externo: &str, gravados: &str, status: &str) -> Result<(), String> {
+        self.conn().execute("UPDATE ESF_ReturnCase SET Externo=?2, Gravados=?3, Status=?4, Erro='', UpdatedAt=datetime('now') WHERE CaseId=?1",
+            params![case_id, externo, gravados, status]).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// "enviando" que sobrou de um envio interrompido vira "incerto" (para o operador conferir).
+    pub fn return_cases_mark_uncertain(&self) -> Result<usize, String> {
+        self.conn().execute("UPDATE ESF_ReturnCase SET Status='incerto', Erro='Envio interrompido: confira se o aviso chegou antes de repetir.',
+                UpdatedAt=datetime('now') WHERE Status='enviando' AND UpdatedAt <= datetime('now','-10 minutes')", [])
+            .map_err(|e| e.to_string())
+    }
+
+    /// Há caso de retorno encaminhado para este telefone? (o histórico da Evolution não grava externo em dobro)
+    pub fn return_case_exists(&self, phone_key: &str) -> bool {
+        self.conn().query_row("SELECT 1 FROM ESF_ReturnCase WHERE PhoneKey=?1 AND Status IN ('enviando','encaminhado','gravado','incerto') LIMIT 1",
+            params![phone_key], |_| Ok(())).is_ok()
+    }
+
+    /// Próxima pessoa do rodízio (posição de 0 a n-1) e avança a fila, numa transação.
+    pub fn return_rotation_next(&self, chave: &str, n: usize) -> Result<usize, String> {
+        if n == 0 { return Err("Rodízio vazio.".into()); }
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+        let r = (|| -> rusqlite::Result<usize> {
+            let atual: i64 = conn.query_row("SELECT Proximo FROM ESF_ReturnRotation WHERE Chave=?1", params![chave], |r| r.get(0)).unwrap_or(0);
+            let pos = (atual.max(0) as usize) % n;
+            conn.execute("INSERT INTO ESF_ReturnRotation(Chave,Proximo) VALUES(?1,?2) ON CONFLICT(Chave) DO UPDATE SET Proximo=excluded.Proximo",
+                params![chave, ((pos + 1) % n) as i64])?;
+            Ok(pos)
+        })();
+        match r {
+            Ok(pos) => { conn.execute_batch("COMMIT").map_err(|e| e.to_string())?; Ok(pos) }
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK"); Err(e.to_string()) }
+        }
+    }
+
+    /// Nome do contato importado na campanha (ajuda a escolher o devedor quando o telefone é de dois).
+    pub fn campaign_contact_name(&self, campaign_id: i32, phone_key: &str) -> String {
+        let conn = self.conn();
+        let Ok(mut stmt) = conn.prepare("SELECT ContactName, Phone FROM ESF_Contact WHERE CampaignId=?1 AND ExcluidoEm IS NULL") else { return String::new() };
+        let Ok(rows) = stmt.query_map(params![campaign_id], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))) else { return String::new() };
+        let nome = rows.flatten().find(|(_, p)| Self::opt_out_key(p) == phone_key).and_then(|(n, _)| n).unwrap_or_default();
+        nome
+    }
+}
+
+#[cfg(test)]
+mod retorno_db_tests {
+    use super::*;
+
+    /// Aparelho 22 (chip RESERVA 0366) e aparelho 11 (chip 7654); campanha 19 (Tecnoponto) nos dois e
+    /// campanha 20 (outro credor) no aparelho 11, as duas com retorno ligado.
+    struct Fx { db: Database, c19: i32, c20: i32, chip22: i64, chip11: i64, dev22: i32, dev11: i32 }
+
+    fn fixture(nome: &str) -> Fx {
+        let path = std::env::temp_dir().join(format!("esfera_retorno_{}_{}.db", nome, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::init(path.to_string_lossy().as_ref()).unwrap();
+        db.conn().execute("INSERT INTO ESF_Device(AdbDeviceId,DeviceName,CompanyId,EsferaDeviceId) VALUES('usb22','10',1,'ESF-22')", []).unwrap();
+        db.conn().execute("INSERT INTO ESF_Device(AdbDeviceId,DeviceName,CompanyId,EsferaDeviceId) VALUES('usb11','11',1,'ESF-11')", []).unwrap();
+        let devs = db.get_all_devices();
+        let dev22 = devs.iter().find(|d| d.serial == "usb22").unwrap().id;
+        let dev11 = devs.iter().find(|d| d.serial == "usb11").unwrap().id;
+        let chip22 = db.add_chip(dev22, "4799990366", "RESERVA 0366").unwrap() as i64;
+        let chip11 = db.add_chip(dev11, "4796977654", "RESERVA 7654").unwrap() as i64;
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId,Status,SelectedDevices,ReturnNumber) VALUES('TECNOPONTO','Oi',1,'running','[\"ESF-22\",\"ESF-11\"]','*')", []).unwrap();
+        let c19 = db.conn().last_insert_rowid() as i32;
+        db.conn().execute("INSERT INTO ESF_Campaign(CampaignName,MessageBody,CompanyId,Status,SelectedDevices,ReturnNumber) VALUES('OUTRO CREDOR','Oi',1,'running','[\"ESF-11\"]','*')", []).unwrap();
+        let c20 = db.conn().last_insert_rowid() as i32;
+        let fx = Fx { db, c19, c20, chip22, chip11, dev22, dev11 };
+        // Caso real: campanha 19, enviado em 11/11 09:24 (12:24 UTC) pelo chip 554799990366.
+        sent(&fx, fx.c19, fx.chip22, fx.dev22, "+5527999990001", "ALFA CAES DE SEGURANCA", "2026-11-11 12:24:06", "554799990366");
+        fx
+    }
+
+    fn sent(fx: &Fx, campaign: i32, chip: i64, device: i32, phone: &str, nome: &str, at: &str, source: &str) {
+        fx.db.conn().execute("INSERT INTO ESF_Contact(CampaignId,ContactName,Phone,Status,SentAt) VALUES(?1,?2,?3,'sent',?4)", params![campaign, nome, phone, at]).unwrap();
+        fx.db.conn().execute("INSERT INTO ESF_ChipAttempt(ChipId,CompanyId,CampaignId,PhoneDigits,Outcome,CreatedAt,SourceNumber,SourceDeviceId,TargetNumber,CompletedAt)
+            VALUES(?1,1,?2,?3,'enviado',?4,?5,?6,?7,?4)",
+            params![chip, campaign, Database::opt_out_key(phone), at, source, device, normalize_brazil_phone(phone).unwrap()]).unwrap();
+    }
+
+    #[test]
+    fn caso_real_resposta_no_aparelho_que_enviou_vira_retorno_com_texto() {
+        let fx = fixture("real");
+        fx.db.remember_reply("e1", 1, "usb22", "Esfera 5527999990001", "2026-11-11 12:27:23", "De onde").unwrap();
+        fx.db.remember_reply("e2", 1, "usb22", "Esfera 5527999990001", "2026-11-11 12:27:36", "Qual empresa vcs representam").unwrap();
+        let r = fx.db.return_replies("2026-11-11 00:00:00").unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[0].campaign_id, r[0].phone_key.as_str(), r[0].phone.as_str(), r[0].source.as_str(), r[0].channel.as_str()),
+                   (fx.c19, "2799990001", "5527999990001", "554799990366", "celular"));
+        assert_eq!(r[1].text, "Qual empresa vcs representam");
+        // Antes do "desde" não entra (respostas já tratadas à mão).
+        assert!(fx.db.return_replies("2026-11-11 12:28:00").unwrap().is_empty());
+        assert_eq!(fx.db.campaign_contact_name(fx.c19, "2799990001"), "ALFA CAES DE SEGURANCA");
+    }
+
+    #[test]
+    fn retorno_e_da_campanha_nao_do_aparelho() {
+        let fx = fixture("campanhas");
+        // Aparelho 11 roda as campanhas 19 e 20. O número da 20 responde no aparelho 11.
+        sent(&fx, fx.c20, fx.chip11, fx.dev11, "+5514999990002", "HELIO", "2026-11-11 14:00:00", "554796977654");
+        sent(&fx, fx.c19, fx.chip11, fx.dev11, "+5511999990003", "OUTRO TECNOPONTO", "2026-11-11 13:00:00", "554796977654");
+        fx.db.remember_reply("h1", 1, "usb11", "+55 14 99999-0002", "2026-11-11 14:22:25", "Bom dia, tudo certo?").unwrap();
+        fx.db.remember_reply("b1", 1, "usb22", "Esfera 5527999990001", "2026-11-11 12:27:23", "De onde").unwrap();
+        let r = fx.db.return_replies("2026-11-11").unwrap();
+        let da19: Vec<&str> = r.iter().filter(|x| x.campaign_id == fx.c19).map(|x| x.phone_key.as_str()).collect();
+        let da20: Vec<&str> = r.iter().filter(|x| x.campaign_id == fx.c20).map(|x| x.phone_key.as_str()).collect();
+        assert_eq!(da19, vec!["2799990001"], "número da campanha 20 não entra no retorno da 19");
+        assert_eq!(da20, vec!["1499990002"]);
+        // Número enviado pelas duas campanhas: não entra em nenhuma.
+        sent(&fx, fx.c20, fx.chip11, fx.dev11, "+5511999990003", "OUTRO TECNOPONTO", "2026-11-11 13:30:00", "554796977654");
+        fx.db.remember_reply("o1", 1, "usb11", "+55 11 99999-0003", "2026-11-11 14:32:33", "oi").unwrap();
+        assert!(fx.db.return_replies("2026-11-11").unwrap().iter().all(|x| x.phone_key != "1199990003"));
+        // Resposta antes do envio (mais de 15 min) não é retorno.
+        sent(&fx, fx.c19, fx.chip11, fx.dev11, "+5571999990004", "GAMA", "2026-11-11 15:00:00", "554796977654");
+        fx.db.remember_reply("l1", 1, "usb11", "+55 71 99999-0004", "2026-11-11 14:34:56", "Olá").unwrap();
+        assert!(fx.db.return_replies("2026-11-11").unwrap().iter().all(|x| x.phone_key != "7199990004"));
+    }
+
+    #[test]
+    fn texto_antigo_vem_da_fila_do_aparelho_e_retorno_desligado_nao_entra() {
+        let fx = fixture("fila");
+        // Resposta gravada antes da coluna Text: o texto vem da linha guardada na fila do aparelho.
+        fx.db.conn().execute("INSERT INTO ESF_ReplyInbound(EventId,DeviceId,PhoneDigits,ReceivedAt) VALUES('ev',?1,'2799990001','2026-11-11 12:27:23')", params![fx.dev22]).unwrap();
+        fx.db.conn().execute("INSERT INTO ESF_DeviceOutbox(EventId,CompanyId,Serial,Line) VALUES('ev',1,'ESF-22','{\"title\":\"Esfera 5527999990001\",\"text\":\"De onde\",\"ts\":1}')", []).unwrap();
+        assert_eq!(fx.db.return_replies("2026-11-01").unwrap()[0].text, "De onde");
+        // Resposta do mesmo número em OUTRO aparelho não é retorno deste disparo.
+        fx.db.remember_reply("outro", 1, "usb11", "5527999990001", "2026-11-11 12:30:00", "oi").unwrap();
+        assert_eq!(fx.db.return_replies("2026-11-01").unwrap().len(), 1);
+        // Número do retorno diferente do que disparou, ou retorno desligado: nada.
+        fx.db.conn().execute("UPDATE ESF_Campaign SET ReturnNumber='5547996271722' WHERE CampaignId=?1", params![fx.c19]).unwrap();
+        assert!(fx.db.return_replies("2026-11-01").unwrap().is_empty());
+        fx.db.conn().execute("UPDATE ESF_Campaign SET ReturnNumber='5547999990366' WHERE CampaignId=?1", params![fx.c19]).unwrap();
+        assert_eq!(fx.db.return_replies("2026-11-01").unwrap().len(), 1, "com e sem o 9");
+        fx.db.conn().execute("UPDATE ESF_Campaign SET ReturnNumber='' WHERE CampaignId=?1", params![fx.c19]).unwrap();
+        assert!(fx.db.return_replies("2026-11-01").unwrap().is_empty());
+    }
+
+    #[test]
+    fn caso_unico_nunca_enviado_duas_vezes_e_rodizio_avanca() {
+        let fx = fixture("caso");
+        let db = &fx.db;
+        db.remember_reply("e1", 1, "usb22", "Esfera 5527999990001", "2026-11-11 12:27:23", "De onde").unwrap();
+        let r = db.return_replies("2026-11-01").unwrap();
+        db.return_case_upsert(&r[0], "2026-11-11 12:27:36", "[[\"a\"]]").unwrap();
+        db.return_case_upsert(&r[0], "2026-11-11 12:27:36", "[[\"a\"]]").unwrap();
+        let due = db.return_cases_due(180).unwrap();
+        assert_eq!(due.len(), 1);
+        let id = due[0].case_id;
+        assert!(db.return_case_claim(id, "equipe", "Pessoa A", "grupo", "2400000001", "msg").unwrap());
+        assert!(!db.return_case_claim(id, "equipe", "Pessoa B", "grupo", "2400000001", "msg").unwrap(), "segundo pedido não pega");
+        assert!(db.return_cases_due(180).unwrap().is_empty(), "enviando não volta à fila");
+        db.return_case_upsert(&r[0], "2026-11-11 13:00:00", "[[\"b\"]]").unwrap();
+        assert_eq!(db.return_case(id).unwrap().conversa, "[[\"a\"]]", "caso já encaminhado não muda");
+        db.return_case_sent(id, "MSG1", "interno").unwrap();
+        assert_eq!(db.return_case(id).unwrap().status, "encaminhado");
+        assert!(db.return_case_exists("2799990001"));
+        let pos: Vec<usize> = (0..4).map(|_| db.return_rotation_next("598", 3).unwrap()).collect();
+        assert_eq!(pos, vec![0, 1, 2, 0]);
     }
 }
