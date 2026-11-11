@@ -22,7 +22,7 @@ pub const SILENCE_SECS: i64 = 3600;
 pub const OPT_OUT_GRACE_SECS: i64 = 120;
 const POLL_SECS: u64 = 60;
 /// Tipo de histórico "AUTOMÁTICO" no Konfiansa.
-const HISTORICO_TIPO: i32 = 41;
+pub(crate) const HISTORICO_TIPO: i32 = 41;
 /// Tipos do histórico externo, por resultado (os mesmos que a equipe usa).
 pub const TIPO_SEM_INTERESSE: i32 = 85;
 pub const TIPO_EM_COBRANCA: i32 = 99;
@@ -299,7 +299,7 @@ fn processes_for(phones: &[String], credor: Option<i32>) -> Result<Vec<(String, 
 }
 
 /// Credor da campanha no Konfiansa: o mais comum entre os processos dos contatos já enviados.
-fn campaign_credor(db: &Database, campaign_id: i32) -> Result<i32, String> {
+pub(crate) fn campaign_credor(db: &Database, campaign_id: i32) -> Result<i32, String> {
     let salvo = db.campaign_konfiansa_credor(campaign_id);
     if salvo > 0 { return Ok(salvo); }
     let phones = db.campaign_sent_phones(campaign_id, 30);
@@ -322,7 +322,7 @@ fn campaign_credor(db: &Database, campaign_id: i32) -> Result<i32, String> {
 
 /// Grava um histórico no processo, uma vez só: o mesmo texto e tipo já gravados (tentativa anterior
 /// que caiu no meio) só devolvem o número existente. Interno fica bloqueado; externo aparece ao credor.
-fn insert_once(processo: i64, tipo: i32, externo: bool, texto: &str, usuario: &str) -> Result<i64, String> {
+pub(crate) fn insert_once(processo: i64, tipo: i32, externo: bool, texto: &str, usuario: &str) -> Result<i64, String> {
     let ext = if externo { 1 } else { 0 };
     let existente = konfiansa_query(&format!(
         "SELECT TOP 1 CodProcessoHistorico AS n FROM ProcessoHistorico WHERE CodProcesso={} AND CodProcessoHistoricoTipo={} AND HisExterno={} \
@@ -457,10 +457,15 @@ async fn tick(db: &Arc<Database>) -> Result<(), String> {
             if conversa.is_empty() { continue; }
             let numero = conversation_origin(&conversa, &origem);
             let (base, tipo) = build_external(&numero, motivo, &conversa);
+            // Resposta já encaminhada pelo "WhatsApp retorno": ele grava o externo; aqui só a conversa.
+            let ja_no_retorno = tipo == TIPO_CONTATO_EFETIVO && crate::config::load_config().retorno_negociador_enabled
+                && db.return_case_exists(&key);
             // O externo é sempre escrito por IA; se nenhuma responder, tenta de novo no próximo minuto.
-            let externo = match external_by_ai(db, conversa[0].campaign_id, &base, tipo).await {
-                Ok(t) => t,
-                Err(e) => { eprintln!("[KONFIANSA] {}: {}", fmt_phone(&key), e); continue; }
+            let (externo, tipo) = if ja_no_retorno { (String::new(), 0) } else {
+                match external_by_ai(db, conversa[0].campaign_id, &base, tipo).await {
+                    Ok(t) => (t, tipo),
+                    Err(e) => { eprintln!("[KONFIANSA] {}: {}", fmt_phone(&key), e); continue; }
+                }
             };
             let id = db.create_konfiansa_history_full(&conversa, motivo, &build_text(&numero, &conversa), &externo, tipo)?;
             println!("[KONFIANSA] Conversa de {} fechada ({}): histórico {} pendente.", fmt_phone(&key), motivo, id);

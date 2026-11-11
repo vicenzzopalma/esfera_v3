@@ -293,7 +293,7 @@ fn forward_device_messages_at(db: &Database, serial: &str, company: i32, lines: 
 }
 
 /// Classificação local conservadora para proteger o descadastro sem depender da rede.
-fn local_opt_out(text: &str) -> bool {
+pub(crate) fn local_opt_out(text: &str) -> bool {
     let mut normalized = String::new();
     for c in text.to_lowercase().chars() {
         let c = match c {
@@ -365,7 +365,7 @@ pub fn process_opt_out_jsonl(
             use chrono::TimeZone;
             if let Some(when) = v.get("ts").and_then(|t| t.as_i64()).and_then(|ms| chrono::Utc.timestamp_millis_opt(ms).single()) {
                 let id = hex::encode(Sha256::digest(format!("{}|{}|{}", company_id, stable, line.trim()).as_bytes()));
-                if db.remember_reply(&id, company_id, serial, &phone, &when.format("%Y-%m-%d %H:%M:%S").to_string()).is_err() { all_saved = false; }
+                if db.remember_reply(&id, company_id, serial, &phone, &when.format("%Y-%m-%d %H:%M:%S").to_string(), text).is_err() { all_saved = false; }
             }
         }
         if !local_opt_out(text) { continue; }

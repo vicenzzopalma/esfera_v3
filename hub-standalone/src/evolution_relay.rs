@@ -1757,3 +1757,67 @@ mod tests {
         assert_eq!(iso_brasilia(t("2026-11-09T19:00:00Z")), "2026-11-09T16:00:00-03:00");
     }
 }
+
+// ------------------------------------------------------------------
+// "WhatsApp retorno" do Esfera: aviso interno ao negociador ou ao grupo da equipe
+// ------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct RetornoEnvio {
+    #[serde(default)]
+    pub instancia: String,
+    #[serde(default)]
+    pub numero: String,
+    #[serde(default)]
+    pub texto: String,
+}
+
+/// Destino aceito: grupo ("...@g.us") ou celular brasileiro com 55 (12 ou 13 dígitos).
+pub fn retorno_destino_ok(numero: &str) -> bool {
+    let n = numero.trim();
+    if let Some(id) = n.strip_suffix("@g.us") {
+        return !id.is_empty() && id.len() <= 40 && id.chars().all(|c| c.is_ascii_digit() || c == '-');
+    }
+    n.chars().all(|c| c.is_ascii_digit()) && matches!(n.len(), 12 | 13) && n.starts_with("55") && n.as_bytes()[2] != b'0'
+}
+
+/// POST /api/desktop/retorno/enviar {"instancia","numero","texto"} — texto pela instância da Evolution
+/// do disparo. Só para quem gere os números de disparo; o texto vai como está (o Esfera monta).
+pub async fn retorno_enviar(
+    State((db, _)): State<(Arc<Database>, u16)>,
+    headers: HeaderMap,
+    Json(b): Json<RetornoEnvio>,
+) -> Result<Response, Response> {
+    authorize_manage(&db, &headers)?;
+    let instancia = b.instancia.trim();
+    if !valid_instance_name(instancia) { return Err(fail(StatusCode::BAD_REQUEST, "Nome de instância inválido.")); }
+    if !retorno_destino_ok(&b.numero) { return Err(fail(StatusCode::BAD_REQUEST, "Destino inválido: grupo (@g.us) ou celular com 55.")); }
+    let texto = b.texto.trim();
+    if texto.is_empty() || texto.chars().count() > 4000 { return Err(fail(StatusCode::BAD_REQUEST, "Texto vazio ou longo demais.")); }
+    let (base, apikey) = evolution_env()?;
+    let client = http_client(60)?;
+    let (status, data) = evolution_call(&client, reqwest::Method::POST, format!("{}/message/sendText/{}", base, instancia), &apikey,
+        Some(serde_json::json!({ "number": b.numero.trim(), "text": texto }))).await?;
+    if !status.is_success() {
+        let msg = evolution_error_text(&data);
+        return Err(fail(StatusCode::BAD_GATEWAY, format!("A Evolution não enviou (HTTP {}){}", status.as_u16(),
+            if msg.is_empty() { ".".to_string() } else { format!(": {}", msg) })));
+    }
+    let id = data.pointer("/key/id").and_then(Value::as_str).unwrap_or("").to_string();
+    Ok(reply(StatusCode::OK, serde_json::json!({ "ok": true, "id": id })))
+}
+
+#[cfg(test)]
+mod retorno_tests {
+    use super::retorno_destino_ok;
+
+    #[test]
+    fn destino_do_retorno_so_grupo_ou_celular_brasileiro() {
+        assert!(retorno_destino_ok("120363000000000001@g.us"));
+        assert!(retorno_destino_ok("5547999990101"));
+        assert!(retorno_destino_ok("554799990101"));
+        for ruim in ["", "@g.us", "abc@g.us", "47999990101", "5501999991049", "1415555123456", "5547999990101@s.whatsapp.net"] {
+            assert!(!retorno_destino_ok(ruim), "{}", ruim);
+        }
+    }
+}

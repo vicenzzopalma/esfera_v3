@@ -27,6 +27,25 @@ pub struct AppConfig {
     pub konfiansa_win_user: String,
     pub konfiansa_win_pass: String,
     pub konfiansa_logon: String,
+    /// "WhatsApp retorno": resposta ao disparo vai ao negociador (ou ao grupo da equipe, em rodízio)
+    /// e vira histórico interno + externo no Konfiansa. Desligado por padrão.
+    pub retorno_negociador_enabled: bool,
+    /// Só respostas recebidas a partir deste instante (UTC "AAAA-MM-DD HH:MM:SS"). Vazio: o Esfera
+    /// grava "agora" na primeira rodada, para não reencaminhar respostas já tratadas à mão.
+    pub retorno_desde: String,
+    /// Instância da Evolution (no hub) que envia o aviso; precisa participar do grupo da equipe.
+    pub retorno_instancia: String,
+    /// Grupo da equipe (JID "...@g.us") e o nome dele no histórico interno.
+    pub retorno_grupo: String,
+    pub retorno_grupo_nome: String,
+    /// Pessoas do rodízio do grupo, na ordem (equipe que atende o credor do grupo).
+    pub retorno_rodizio: Vec<String>,
+    /// Carteiras (login do cobrador no Konfiansa) que não têm negociador próprio: vão ao grupo.
+    pub retorno_carteiras_equipe: Vec<String>,
+    /// Único credor cujo retorno vai ao grupo da equipe. Outro credor sem negociador não vai a ninguém.
+    pub retorno_credor_equipe: i32,
+    /// Modelo do Groq que escreve o histórico externo (chave: a do Groq em Configurações > IA).
+    pub retorno_ia_modelo: String,
 }
 
 impl Default for AppConfig {
@@ -49,6 +68,15 @@ impl Default for AppConfig {
             konfiansa_win_user: String::new(),
             konfiansa_win_pass: String::new(),
             konfiansa_logon: String::new(),
+            retorno_negociador_enabled: false,
+            retorno_desde: String::new(),
+            retorno_instancia: String::new(),
+            retorno_grupo: String::new(),
+            retorno_grupo_nome: "grupo da equipe".to_string(),
+            retorno_rodizio: Vec::new(),
+            retorno_carteiras_equipe: vec!["MARCELA".to_string(), "REGINA".to_string()],
+            retorno_credor_equipe: 598,
+            retorno_ia_modelo: "qwen/qwen3.8-27b".to_string(),
         }
     }
 }
