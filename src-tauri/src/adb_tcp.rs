@@ -327,10 +327,16 @@ fn connect_transport(serial: &str, budget: Duration) -> Result<TcpStream, String
         let handle = RUNTIME_HANDLE
             .lock()
             .map_err(|_| "Não foi possível abrir a conexão com o aparelho".to_string())?
-            .clone()
-            .ok_or_else(|| "runtime tokio não inicializado (adb_tcp::init)".to_string())?;
-        return handle
-            .block_on(async { tokio::time::timeout(budget, crate::tunnel_server::open_proxy(serial, 5555)).await })
+            .clone();
+        let proxy = async { tokio::time::timeout(budget, crate::tunnel_server::open_proxy(serial, 5555)).await };
+        // Sem handle guardado (o init() nunca era chamado — caso 11/11), usa o runtime do Tauri, o mesmo
+        // em que o tunnel_server roda; antes isso dava "runtime tokio não inicializado" e nenhum aparelho
+        // conectava pelo túnel do ID.
+        let resultado = match handle {
+            Some(h) => h.block_on(proxy),
+            None => tauri::async_runtime::block_on(proxy),
+        };
+        return resultado
             .map_err(|_| format!("Tempo esgotado ao abrir túnel para {}", serial))?
             .map_err(|e| format!("falha ao abrir proxy de túnel para {}: {}", serial, e));
     }
@@ -399,6 +405,23 @@ mod wifi_timeout_tests {
         assert!(result.is_err());
         assert!(start.elapsed() < Duration::from_secs(2));
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tunnel_runtime_tests {
+    use super::*;
+
+    // Caso real 11/11 (aparelho 10, ESF-00829256): "runtime tokio não inicializado (adb_tcp::init)".
+    // O init() nunca era chamado, então nenhum aparelho conectava pelo túnel do ID.
+    #[test]
+    fn tunel_sem_init_usa_o_runtime_do_tauri() {
+        let serial = "ESF-TESTE-RUNTIME";
+        register_tunnel_serial(serial);
+        let erro = exec_shell_with_timeout(serial, "true", Duration::from_millis(300)).unwrap_err();
+        unregister_tunnel_serial(serial);
+        assert!(!erro.contains("runtime tokio"), "{}", erro);
+        assert!(erro.contains("sem sessão de túnel ativa") || erro.contains("Tempo esgotado"), "{}", erro);
     }
 }
 
