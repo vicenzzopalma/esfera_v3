@@ -1,0 +1,27 @@
+title = "Esfera: secret detection"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Known storage key, removed credential marker and test fixture"
+regexTarget = "secret"
+regexes = ['''^esfera_v3_company$''', '''^REMOVED_SECRET$''', '''^segredo$''']
+
+[[rules]]
+id = "esfera-hardcoded-credential"
+description = "Hardcoded bootstrap password or Hub token"
+regex = '''(?i)(?:hash_password\(|hub_token:\s*|HUB_MASTER_TOKEN\s*=\s*)["']([^"'\r\n]{4,})["']'''
+secretGroup = 1
+
+[[rules]]
+id = "esfera-credential-fallback"
+description = "Literal credential used as environment fallback"
+regex = '''(?s)std::env::var\("(?:HUB_MASTER_TOKEN|ESFERA_HUB_TOKEN|ESFERA_COMPANY_TOKEN)"\).{0,240}?\.unwrap_or_else\(\|_\|\s*"([^"\r\n]+)"'''
+secretGroup = 1
+
+[[rules]]
+id = "esfera-legacy-master-password"
+description = "Literal legacy master password"
+regex = '''(?i)AUTH_MASTER_PASS\s*(?::[^=\r\n]+)?=\s*"([^"\r\n]+)"'''
+secretGroup = 1

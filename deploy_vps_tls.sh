@@ -2,6 +2,11 @@
 # Deploy do canal TLS no VPS Esfera (rodar no esfera-v3-hub como vicenzzoconstantine).
 # Faz: git pull -> build hub release -> gera cert self-signed -> restart hub com TLS.
 set -e
+: "${HUB_MASTER_TOKEN:?Defina HUB_MASTER_TOKEN no ambiente antes do deploy}"
+if [[ -z "${HUB_MASTER_TOKEN//[[:space:]]/}" ]]; then
+  echo "HUB_MASTER_TOKEN deve conter caracteres diferentes de espacos" >&2
+  exit 1
+fi
 cd ~/esfera_v3
 echo "[1/5] git pull"
 git pull --ff-only
@@ -17,7 +22,7 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 echo "[4/5] restart hub"
 pkill -f esfera-hub-standalone || true
 sleep 2
-export HUB_MASTER_TOKEN="REMOVED_SECRET"
+export HUB_MASTER_TOKEN
 export HUB_PORT=8555 HTTP_PORT=8080 TUNNEL_PORT=8888 PRESENCE_PORT=7779 TLS_PORT=8443
 nohup ./target/release/esfera-hub-standalone > hub.log 2>&1 &
 sleep 4

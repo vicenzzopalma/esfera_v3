@@ -4975,28 +4975,24 @@ pub fn get_hub_credentials(
     let company_id = session.company_id.unwrap_or(0);
     let role = session.role.clone();
 
-    // Token do hub: prioriza o configurado em Settings (config.hub_token), que o
-    // usuário alinha com HUB_MASTER_TOKEN da VPS. Se vazio, usa env/role (master:
-    // HUB_MASTER_TOKEN; empresa: ESFERA_COMPANY_TOKEN) e, na falta, o default
-    // embutido (igual ao seed do VPS em db.rs). Garante que o app conecte ao VPS
-    // e os celulares remotos (via_tunnel) apareçam no get_devices.
+    if role != "master" && company_id <= 0 {
+        return Err("Usuário sem empresa válida para conectar ao hub.".into());
+    }
+
+    // A configuração compartilhada contém o token master e só pode ser lida pelo master.
     let cfg = config::load_config();
-    let fallback_master = "REMOVED_SECRET".to_string();
-    let hub_token = if !cfg.hub_token.trim().is_empty() {
-        cfg.hub_token.trim().to_string()
-    } else if role == "master" {
-        std::env::var("HUB_MASTER_TOKEN")
-            .or_else(|_| std::env::var("ESFERA_HUB_TOKEN"))
-            .unwrap_or_else(|_| fallback_master.clone())
+    let hub_token = if role == "master" {
+        if !cfg.hub_token.trim().is_empty() {
+            Some(cfg.hub_token.trim().to_string())
+        } else {
+            ["HUB_MASTER_TOKEN", "ESFERA_HUB_TOKEN"].iter().find_map(|key| {
+                std::env::var(key).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+            })
+        }
     } else {
-        std::env::var("ESFERA_COMPANY_TOKEN")
-            .unwrap_or_else(|_| "REMOVED_SECRET".to_string())
-    };
-    let is_master_tok = hub_token == fallback_master
-        || hub_token == "REMOVED_SECRET"
-        || hub_token == std::env::var("HUB_MASTER_TOKEN").unwrap_or_default()
-        || hub_token.starts_with("EsferaHubMaster_");
-    let effective_role = if is_master_tok || role == "master" { "master" } else { "empresa" };
+        std::env::var("ESFERA_COMPANY_TOKEN").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+    }.ok_or_else(|| "Token do hub não configurado para este usuário.".to_string())?;
+    let effective_role = if role == "master" { "master" } else { "empresa" };
 
     let company_name = if company_id > 0 {
         state
@@ -5188,13 +5184,14 @@ fn vps_hub_update_target(cfg: &config::AppConfig) -> Result<(String, String), St
     let saved_or_env = |saved: &str, envs: &[&str]| Some(saved.trim().to_string()).filter(|v| !v.is_empty())
         .or_else(|| envs.iter().find_map(|k| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())));
     let address = saved_or_env(&cfg.hub_address, &["ESFERA_HUB_ADDR"]).unwrap_or_else(|| "127.0.0.1:8555".to_string());
-    let hub_token = saved_or_env(&cfg.hub_token, &["HUB_MASTER_TOKEN", "ESFERA_HUB_TOKEN"]).unwrap_or_else(|| "REMOVED_SECRET".to_string());
     let host = vps_hub_host(&address).ok_or_else(|| "Endereço do hub inválido. Confira em Configurações.".to_string())?;
     let local = host.eq_ignore_ascii_case("localhost") || host == "[::1]"
         || host.parse::<std::net::Ipv4Addr>().map(|ip| ip.is_loopback() || ip.is_unspecified()).unwrap_or(false);
     if local {
         return Err("O endereço do hub em Configurações é deste computador. Informe o endereço da VPS para atualizar o hub.".into());
     }
+    let hub_token = saved_or_env(&cfg.hub_token, &["HUB_MASTER_TOKEN", "ESFERA_HUB_TOKEN"])
+        .ok_or_else(|| "Token do hub não configurado. Confira em Configurações.".to_string())?;
     Ok((host, hub_token))
 }
 

@@ -1448,8 +1448,9 @@ impl Database {
         // Seed do token master (CompanyId = 0) a partir de env HUB_MASTER_TOKEN.
         // Sem isso o hub local não aceita nenhum master. Espelha o hub-standalone.
         if let Ok(token) = std::env::var("HUB_MASTER_TOKEN") {
+            let token = token.trim();
             if !token.is_empty() {
-                let _ = self.upsert_company_token(0, &token, "master");
+                self.upsert_company_token(0, token, "master")?;
             }
         }
 
@@ -1604,55 +1605,50 @@ impl Database {
 
     fn seed_data(&self) -> Result<()> {
         let conn = self.conn();
-        let count: i32 = conn
-            .query_row("SELECT COUNT(*) FROM ESF_Company", [], |r| r.get(0))?;
-
+        let count: i32 = conn.query_row("SELECT COUNT(*) FROM ESF_Company", [], |r| r.get(0))?;
         if count == 0 {
-            // Empresa Padrão REALESS
             conn.execute(
                 "INSERT INTO ESF_Company (CompanyId, CompanyName, DeviceLimit, UserLimit) VALUES (1, 'REALESS', 100, 50);",
                 [],
             )?;
-
-            // Usuários seedados: SOMENTE contas do dono, com senhas não-triviais.
-            // Contas de demonstração com senhas fracas (admin/admin, gestor/gestor, colab/colab)
-            // FORAM REMOVIDAS — eram fallbacks inseguros.
-            let hash_master = hash_password("REMOVED_SECRET");
-            let hash_gestor = hash_password("REMOVED_SECRET");
-
-            conn.execute(
-                "INSERT INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId) VALUES
-                (?1, ?2, 'Vicenzzo Master', 'master', NULL),
-                (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1);",
-                params![
-                    "vicenzzo.master", hash_master,
-                    "vicenzzo.mastronikolis", hash_gestor,
-                ],
-            )?;
-
-            // Permissões padrão para o gestor (UserId = 2)
-            conn.execute(
-                "INSERT INTO ESF_Permission (UserId, PermissionKey, Enabled) VALUES
-                (2, 'allow_all_tabs', 1),
-                (2, 'allow_edit_devices', 1),
-                (2, 'allow_manage_users', 0),
-                (2, 'allow_dashboard', 1),
-                (2, 'is_active', 1);",
-                [],
-            )?;
-
-            // Permissões de setor para o gestor
-            conn.execute(
-                "INSERT INTO ESF_SectorPermission (UserId, Sector, CanView, CanConfigure) VALUES
-                (2, 'junior', 1, 1),
-                (2, 'senior', 1, 1),
-                (2, 'pesquisa', 1, 0),
-                (2, 'pa_fixa_1', 1, 0),
-                (2, 'pa_fixa_2', 1, 0);",
-                [],
-            )?;
         }
 
+        // Provisionamento explícito; contas existentes mantêm suas senhas e permissões.
+        for (username, display_name, role, company_id, env_key) in [
+            ("vicenzzo.master", "Vicenzzo Master", "master", None, "ESFERA_MASTER_PASSWORD"),
+            ("vicenzzo.mastronikolis", "Vicenzzo Mastronikolis", "gestor", Some(1), "ESFERA_GESTOR_PASSWORD"),
+        ] {
+            let password = match std::env::var(env_key).ok().filter(|value| !value.trim().is_empty()) {
+                Some(value) => value,
+                None => continue,
+            };
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId) VALUES (?1, ?2, ?3, ?4, ?5);",
+                params![username, hash_password(&password), display_name, role, company_id],
+            )?;
+            if inserted == 0 || role != "gestor" {
+                continue;
+            }
+            let user_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO ESF_Permission (UserId, PermissionKey, Enabled) VALUES
+                (?1, 'allow_all_tabs', 1),
+                (?1, 'allow_edit_devices', 1),
+                (?1, 'allow_manage_users', 0),
+                (?1, 'allow_dashboard', 1),
+                (?1, 'is_active', 1);",
+                params![user_id],
+            )?;
+            conn.execute(
+                "INSERT INTO ESF_SectorPermission (UserId, Sector, CanView, CanConfigure) VALUES
+                (?1, 'junior', 1, 1),
+                (?1, 'senior', 1, 1),
+                (?1, 'pesquisa', 1, 0),
+                (?1, 'pa_fixa_1', 1, 0),
+                (?1, 'pa_fixa_2', 1, 0);",
+                params![user_id],
+            )?;
+        }
         Ok(())
     }
 

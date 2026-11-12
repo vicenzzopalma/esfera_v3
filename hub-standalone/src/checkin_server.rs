@@ -6,6 +6,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use crate::db::Database;
 
+fn master_token_matches(provided: &str, expected: Option<&str>) -> bool {
+    expected.map(str::trim).filter(|value| !value.is_empty())
+        .map(|value| !provided.trim().is_empty() && provided == value)
+        .unwrap_or(false)
+}
+
 /// Self-update remoto: o app desktop (ou script) envia o binário novo do
 /// hub-standalone via POST /admin/update (header X-Hub-Token = master). O hub
 /// salva como .new, faz swap atômico e reinicia a si mesmo — sem SSH manual.
@@ -14,13 +20,12 @@ pub async fn handle_update(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> (axum::http::StatusCode, String) {
-    let master_token = std::env::var("HUB_MASTER_TOKEN")
-        .unwrap_or_else(|_| "REMOVED_SECRET".to_string());
+    let master_token = std::env::var("HUB_MASTER_TOKEN").ok();
     let provided = headers
         .get("X-Hub-Token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if provided != master_token {
+    if !master_token_matches(provided, master_token.as_deref()) {
         return (axum::http::StatusCode::UNAUTHORIZED, "token invalido".into());
     }
     if body.is_empty() {
@@ -136,9 +141,9 @@ pub async fn handle_egress_report(
     Json(payload): Json<EgressReportPayload>,
 ) -> (axum::http::StatusCode, String) {
     use axum::http::StatusCode;
-    let master_token = std::env::var("HUB_MASTER_TOKEN").unwrap_or_else(|_| "REMOVED_SECRET".to_string());
+    let master_token = std::env::var("HUB_MASTER_TOKEN").ok();
     let provided = headers.get("X-Hub-Token").and_then(|v| v.to_str().ok()).unwrap_or("");
-    if provided != master_token {
+    if !master_token_matches(provided, master_token.as_deref()) {
         return (StatusCode::UNAUTHORIZED, "token invalido".into());
     }
     if payload.device_id <= 0 {
@@ -279,6 +284,16 @@ fn dirs_home() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn master_token_exige_configuracao_e_header_nao_vazios() {
+        assert!(!master_token_matches("", None));
+        assert!(!master_token_matches("", Some("")));
+        assert!(!master_token_matches(" ", Some(" ")));
+        assert!(!master_token_matches("", Some("token-de-teste")));
+        assert!(!master_token_matches("errado", Some("token-de-teste")));
+        assert!(master_token_matches("token-de-teste", Some("token-de-teste")));
+    }
 
     #[tokio::test]
     async fn egress_devolve_o_ip_da_conexao() {
