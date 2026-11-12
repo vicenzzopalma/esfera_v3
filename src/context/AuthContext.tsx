@@ -86,13 +86,13 @@ function loginErrorMessage(err: unknown): string {
 function devPreviewAccount(username: string, password: string): User | null {
   if (!import.meta.env.DEV || isTauri()) return null;
   const accounts: Record<string, { pass: string; user: User }> = {
-    "vicenzzo.master": {
-      pass: "REMOVED_SECRET",
-      user: { id: 10, username: "vicenzzo.master", displayName: "Vicenzzo Master", role: "master", companyId: null },
+    "demo.master": {
+      pass: "demo-master-only",
+      user: { id: 10, username: "demo.master", displayName: "Demo Master", role: "master", companyId: null },
     },
-    "vicenzzo.mastronikolis": {
-      pass: "REMOVED_SECRET",
-      user: { id: 11, username: "vicenzzo.mastronikolis", displayName: "Vicenzzo Mastronikolis", role: "gestor", companyId: 1 },
+    "demo.gestor": {
+      pass: "demo-gestor-only",
+      user: { id: 11, username: "demo.gestor", displayName: "Demo Gestor", role: "gestor", companyId: 1 },
     },
     admin: {
       pass: "admin",

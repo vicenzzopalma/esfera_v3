@@ -6,9 +6,8 @@ use std::path::PathBuf;
 pub struct AppConfig {
     pub hub_enabled: bool,
     pub hub_address: String,
-    /// Token master do Hub VPS. Se vazio, usa o default embutido
-    /// (REMOVED_SECRET) que bate com o seed do VPS.
-    /// Configurável em Settings (master) para alinhar com HUB_MASTER_TOKEN da VPS.
+    /// Token master do Hub VPS, configurado localmente ou por ambiente.
+    /// Sem credencial explícita, a conexão remota é recusada.
     pub hub_token: String,
     pub vexor_token: String,
     pub empresa_server_enabled: bool,
@@ -26,7 +25,7 @@ impl Default for AppConfig {
             hub_enabled: false,
             // Modo Standalone Local (Opera direto via USB ou WireGuard VPN P2P)
             hub_address: "127.0.0.1:8555".to_string(),
-            hub_token: "REMOVED_SECRET".to_string(),
+            hub_token: String::new(),
             vexor_token: String::new(),
             empresa_server_enabled: false,
             empresa_server_port: 7777,

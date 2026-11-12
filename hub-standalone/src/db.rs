@@ -868,69 +868,58 @@ impl Database {
     fn seed_data(&self) -> Result<()> {
         let conn = self.conn();
         let count: i32 = conn.query_row("SELECT COUNT(*) FROM ESF_Company", [], |r| r.get(0))?;
-
         if count == 0 {
-            // Empresa Padrão REALESS
-            self.conn().execute(
+            conn.execute(
                 "INSERT INTO ESF_Company (CompanyId, CompanyName, DeviceLimit, UserLimit) VALUES (1, 'REALESS', 100, 50);",
                 [],
             )?;
-
-            // Token MASTER do Hub (CompanyId = 0).
-            let master_token = std::env::var("HUB_MASTER_TOKEN")
-                .unwrap_or_else(|_| "REMOVED_SECRET".to_string());
-            self.upsert_company_token(0, &master_token, "master")?;
-
-            // Token da Empresa REALESS (CompanyId = 1).
-            let company_token = std::env::var("ESFERA_COMPANY_TOKEN")
-                .unwrap_or_else(|_| "REMOVED_SECRET".to_string());
-            self.upsert_company_token(1, &company_token, "empresa")?;
-
-            // Usuários seedados: SOMENTE contas do dono, com senhas não-triviais.
-            // Contas de demonstração com senhas fracas (admin/admin, gestor/gestor, colab/colab)
-            // FORAM REMOVIDAS — eram fallbacks inseguros.
-            let hash_master = hash_password("REMOVED_SECRET");
-            let hash_gestor = hash_password("REMOVED_SECRET");
-
-            self.conn().execute(
-                "INSERT INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId) VALUES
-                (?1, ?2, 'Vicenzzo Master', 'master', NULL),
-                (?3, ?4, 'Vicenzzo Mastronikolis', 'gestor', 1);",
-                params![
-                    "vicenzzo.master",
-                    hash_master,
-                    "vicenzzo.mastronikolis",
-                    hash_gestor,
-                ],
-            )?;
-
-            // Permissões padrão para o gestor (UserId = 2)
-            self.conn().execute(
-                "INSERT INTO ESF_Permission (UserId, PermissionKey, Enabled) VALUES
-                (2, 'allow_all_tabs', 1),
-                (2, 'allow_edit_devices', 1),
-                (2, 'allow_manage_users', 0),
-                (2, 'allow_dashboard', 1),
-                (2, 'is_active', 1);",
-                [],
-            )?;
-
-            // Permissões de setor para o gestor
-            self.conn().execute(
-                "INSERT INTO ESF_SectorPermission (UserId, Sector, CanView, CanConfigure) VALUES
-                (2, 'junior', 1, 1),
-                (2, 'senior', 1, 1),
-                (2, 'pesquisa', 1, 0),
-                (2, 'pa_fixa_1', 1, 0),
-                (2, 'pa_fixa_2', 1, 0);",
-                [],
-            )?;
-
-            // DISPOSITIVOS FANTASMAS REMOVIDOS: nao pre-cadastramos mais exemplos
-// (Aparelho 1..8). Os celulares reais aparecem via check-in/presenca do
-// agente Kotlin na VPS (via_tunnel). Seed de exemplo so poluia a lista.
         }
 
+        for (company_id, role, env_key) in [
+            (0, "master", "HUB_MASTER_TOKEN"),
+            (1, "empresa", "ESFERA_COMPANY_TOKEN"),
+        ] {
+            if let Some(token) = std::env::var(env_key).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+                self.upsert_company_token(company_id, &token, role)?;
+            }
+        }
+
+        // Provisionamento explícito; contas existentes mantêm suas senhas e permissões.
+        for (username, display_name, role, company_id, env_key) in [
+            ("vicenzzo.master", "Vicenzzo Master", "master", None, "ESFERA_MASTER_PASSWORD"),
+            ("vicenzzo.mastronikolis", "Vicenzzo Mastronikolis", "gestor", Some(1), "ESFERA_GESTOR_PASSWORD"),
+        ] {
+            let password = match std::env::var(env_key).ok().filter(|value| !value.trim().is_empty()) {
+                Some(value) => value,
+                None => continue,
+            };
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO ESF_User (Username, PasswordHash, DisplayName, Role, CompanyId) VALUES (?1, ?2, ?3, ?4, ?5);",
+                params![username, hash_password(&password), display_name, role, company_id],
+            )?;
+            if inserted == 0 || role != "gestor" {
+                continue;
+            }
+            let user_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO ESF_Permission (UserId, PermissionKey, Enabled) VALUES
+                (?1, 'allow_all_tabs', 1),
+                (?1, 'allow_edit_devices', 1),
+                (?1, 'allow_manage_users', 0),
+                (?1, 'allow_dashboard', 1),
+                (?1, 'is_active', 1);",
+                params![user_id],
+            )?;
+            conn.execute(
+                "INSERT INTO ESF_SectorPermission (UserId, Sector, CanView, CanConfigure) VALUES
+                (?1, 'junior', 1, 1),
+                (?1, 'senior', 1, 1),
+                (?1, 'pesquisa', 1, 0),
+                (?1, 'pa_fixa_1', 1, 0),
+                (?1, 'pa_fixa_2', 1, 0);",
+                params![user_id],
+            )?;
+        }
         Ok(())
     }
 

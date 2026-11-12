@@ -186,7 +186,7 @@ export default function LoginPage() {
                   type="button"
                   variant="secondary"
                   size="sm"
-                  onClick={() => fillCredentials("vicenzzo.master", "REMOVED_SECRET")}
+                  onClick={() => fillCredentials("demo.master", "demo-master-only")}
                 >
                   Master
                 </Button>
@@ -194,7 +194,7 @@ export default function LoginPage() {
                   type="button"
                   variant="secondary"
                   size="sm"
-                  onClick={() => fillCredentials("vicenzzo.mastronikolis", "REMOVED_SECRET")}
+                  onClick={() => fillCredentials("demo.gestor", "demo-gestor-only")}
                 >
                   Gestor
                 </Button>

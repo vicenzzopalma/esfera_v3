@@ -6,6 +6,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use crate::db::Database;
 
+fn master_token_matches(provided: &str, expected: Option<&str>) -> bool {
+    expected.map(str::trim).filter(|value| !value.is_empty())
+        .map(|value| !provided.trim().is_empty() && provided == value)
+        .unwrap_or(false)
+}
+
 /// Self-update remoto: o app desktop (ou script) envia o binário novo do
 /// hub-standalone via POST /admin/update (header X-Hub-Token = master). O hub
 /// salva como .new, faz swap atômico e reinicia a si mesmo — sem SSH manual.
@@ -14,13 +20,12 @@ pub async fn handle_update(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> (axum::http::StatusCode, String) {
-    let master_token = std::env::var("HUB_MASTER_TOKEN")
-        .unwrap_or_else(|_| "REMOVED_SECRET".to_string());
+    let master_token = std::env::var("HUB_MASTER_TOKEN").ok();
     let provided = headers
         .get("X-Hub-Token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if provided != master_token {
+    if !master_token_matches(provided, master_token.as_deref()) {
         return (axum::http::StatusCode::UNAUTHORIZED, "token invalido".into());
     }
     if body.is_empty() {
@@ -222,4 +227,17 @@ fn dirs_home() -> std::path::PathBuf {
         return std::path::PathBuf::from(h);
     }
     std::path::PathBuf::from(".")
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::master_token_matches;
+    #[test]
+    fn absent_or_empty_credentials_are_rejected() {
+        assert!(!master_token_matches("", None));
+        assert!(!master_token_matches("", Some("")));
+        assert!(!master_token_matches(" ", Some(" ")));
+        assert!(!master_token_matches("wrong", Some("test-token")));
+        assert!(master_token_matches("test-token", Some("test-token")));
+    }
 }

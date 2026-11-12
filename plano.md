@@ -105,12 +105,7 @@ Diferente do modelo engessado de Helpdesk, este módulo oferece consulta direta 
 
 ## 👥 7. Matriz de Usuários e Permissões Iniciais
 
-| Usuário | Login | Senha | Perfil | Finalidade |
-| :--- | :--- | :--- | :--- | :--- |
-| **Yasmin** | `yasmin` | `REMOVED_SECRET` | Administrador | Supervisão e Auditoria Geral |
-| **Arthur Hille** | `arthur.hille` | `REMOVED_SECRET` | Administrador | Gestão Técnica e Conexões |
-| **Jana Juttel** | `jana.juttel` | `REMOVED_SECRET` | Administrador | Supervisão de Atendimento |
-| **Admin Geral** | `admin@whaticket.com` | `admin` | Administrador | Manutenção Master |
+As credenciais das contas operacionais devem ser provisionadas fora do repositorio, pelo administrador. Nunca registre senhas em documentos versionados.
 
 ---
 

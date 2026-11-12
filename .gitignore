@@ -34,6 +34,24 @@ device-agent/target/
 
 # Secrets e caches Python
 **/.env
+**/.env.*
+!**/.env.example
+!**/.env.sample
+!**/.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+esfera_config.json
+src-agent/app/build/
+src-agent/.gradle/
+tt
+src-tauri/MONSTRO.txt
+update_vps_tokens.py
+distributable/*.exe
+distributable/*.msi
 __pycache__/
 *.pyc
 
