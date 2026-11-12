@@ -200,9 +200,46 @@ O botão de **3 pontinhos (`⋮`)** no card abre diretamente a central de config
 > [!CAUTION]
 > **Não existe modo somente leitura durante a campanha.** Não há `--no-control` no código, nem bloqueio do espelhamento enquanto um disparo roda. Tocar na tela de um aparelho em campanha **quebra o envio em curso**: o texto vai para o campo errado, a conversa muda e o motor registra a tentativa como `INCERTO` (que nunca é reenviada). Durante o disparo, espelhe apenas para observar.
 
-### 7. 🌐 Isolamento de IA e Escopo por Campanha
-- **Configurações de IA Desacopladas no SQLite**: Chaves de API, endpoints, prompts e temperatura encapsulados no escopo de cada campanha (`ESF_Campaign`), eliminando vazamentos de contexto.
+### 7. 🌐 Inteligência Artificial: Provedores, Reservas e Escopo
+
+A IA reescreve as mensagens das campanhas e alimenta o banco de variações da seção 10.3. O catálogo abaixo está implementado no código versionado de `src/constants/aiProviders.ts` e `src-tauri/src/ai_engine.rs`; os modelos indicados são os padrões cadastrados no aplicativo.
+
+| Integração | ID do provedor | Modelo padrão | Configuração |
+| :--- | :--- | :--- | :--- |
+| **Groq** | `groq` | `openai/gpt-oss-120b` | Chave de API; principal recomendada no aplicativo, com `openai/gpt-oss-20b` como alternativa |
+| **IA própria na VPS (Ollama)** | `vps_ia` | `qwen3:4b-instruct` | Endpoint HTTPS, modelo e token no cartão **IA própria (VPS)**; pode ser principal ou reserva |
+| **Gemini Web** | `gemini_web` | Selecionado pelo serviço web | Login Google em perfil de navegador exclusivo do Esfera, sem chave de API; somente reserva opcional |
+| **Cerebras** | `cerebras` | `llama3.1-8b` | Chave de API; pode ser principal ou reserva |
+| **OpenRouter** | `openrouter` | `nvidia/nemotron-3.5-lightning:free` | Chave de API; pode ser principal ou reserva, com `openrouter/free` como alternativa |
+| **Ollama local** | `ollama` | `llama3.2:3b` | Serviço local em `http://localhost:11434`, com o modelo instalado, sem chave de API |
+| **LM Studio local** | `lmstudio` | `local-model` | Servidor local em `http://localhost:1234/v1/chat/completions`, com um modelo carregado, sem chave de API |
+| **OpenAI** | `openai` | `gpt-4o-mini` | API paga, com chave própria |
+| **Anthropic** | `anthropic` | `claude-3-haiku-20240307` | API paga, com chave própria |
+| **Endpoint personalizado** | `custom` | Informado pelo operador | Endereço, modelo e credencial do serviço compatível |
+
+**Onde configurar:** **Configurações → Inteligência artificial** reúne a **IA principal**, as **Reservas automáticas**, a **IA própria (VPS)** e o **Gemini Web**. A tela permite testar a reescrita, acompanhar o tempo e interromper o teste. Modelo ou endereço inválido é apontado antes da chamada. As chaves salvas não são devolvidas à tela; deixar o campo em branco ao salvar mantém a chave atual. Para cadastrar uma reserva, selecione o provedor, salve sua chave e depois volte à principal e salve novamente.
+
+**Ordem das reservas:** a principal escolhida é tentada primeiro. Com a configuração padrão do Groq e todas as reservas configuradas, a cadeia é **Groq GPT-OSS 120B → Groq GPT-OSS 20B → IA própria da VPS → Gemini Web → Cerebras → OpenRouter → `openrouter/free`**. As reservas por API só entram com credenciais salvas; a VPS também exige endpoint e o Gemini exige a conta conectada. Ollama local, LM Studio, OpenAI, Anthropic e endpoint personalizado podem ser escolhidos como principal, mas não são acrescentados automaticamente como reservas. A ordem é montada em `build_ai_fallback_chain`, em `src-tauri/src/dispatcher.rs`.
+
+**Escopo no SQLite:** a configuração principal e a temperatura são **por empresa** (`ESF_AiConfig`); as credenciais, endpoints e modelos das reservas ficam **por empresa e provedor** (`ESF_AiProviderKey`). Cada campanha (`ESF_Campaign`) pode sobrescrever **provedor, modelo e prompt**, e tem seu próprio banco de variações (`ESF_AiVariant`). A configuração da VPS pode ser sincronizada pelo hub; quando ela é a principal, o painel usa o endereço e o modelo do cartão **IA própria (VPS)**.
+
+**Dados e validação:** o nome do contato é substituído por `{nome}` antes da chamada e restaurado localmente após a validação. O motor confere marcadores, datas, documentos, links, telefones e opção SAIR, além de recusar valores e alterações detectadas de sentido, prazos ou condições. Resposta inválida faz a cadeia tentar outra IA; sem variação válida disponível no prazo, o disparo usa o texto original, sujeito às mesmas travas de envio. Cada processo do desktop enfileira suas chamadas à VPS, uma por vez.
+
+**Histórico versionado:** `d9f4d0e` introduziu o Gemini Web; `5365072` e `be1ea88`, a IA da VPS e sua sincronização; `933f79d`, a VPS na lista de provedores e o botão Parar do teste; `cc1b5c9`, a proteção de dados e validação; `a596cfc`, o painel unificado; `a793b35` e `307f595`, os ajustes de configuração e teste.
+
 - **Rota de saída**: o tratamento de IP é **verificar e pausar**, não rotacionar — ver a seção 9. Não há rotação de IP no código: nem reset de modem, nem pool de proxy, nem modo avião. É decisão de projeto, registrada no cabeçalho de `src-tauri/src/network_manager.rs`.
+
+#### 7.1 Segurança, Credenciais e Primeira Execução
+
+**Conexão ao hub:** o aplicativo não fornece token master embutido. Para o perfil master, configure o token nas **Configurações** do cliente ou no ambiente: `HUB_MASTER_TOKEN`, com `ESFERA_HUB_TOKEN` como alternativa. A configuração salva tem precedência sobre o ambiente. Para um perfil de empresa, forneça `ESFERA_COMPANY_TOKEN`; o token master salvo no cliente não é entregue a esse perfil. Sem credencial explícita para o perfil conectado, a conexão remota é recusada.
+
+**Bootstrap dos usuários:** antes da primeira execução com banco novo, defina `ESFERA_MASTER_PASSWORD` e/ou `ESFERA_GESTOR_PASSWORD` no ambiente do processo, conforme as contas que deseja provisionar. Cada conta inicial só é criada quando a variável correspondente contém uma senha; não há senha padrão. Esse provisionamento existe tanto no desktop quanto no hub standalone. Para o deploy do hub, `deploy_vps_tls.sh` também exige `HUB_MASTER_TOKEN` no ambiente e interrompe antes de atualizar ou compilar se ele estiver ausente ou vazio.
+
+**Migração de instalações existentes:** configurações salvas, usuários, senhas e permissões existentes são preservados. As variáveis de bootstrap não redefinem senhas de contas já criadas. A troca dos tokens deve ser coordenada entre hub, clientes e integrações para que continuem usando a mesma credencial válida.
+
+**Controle de segredos no Git:** `.gitignore` ignora `.env` e `.env.*`, com exceção dos modelos `.env.example`, `.env.sample` e `.env.template`, e ignora formatos de chaves privadas e keystores (`*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`). Isso evita novas inclusões acidentais; não remove arquivos já rastreados nem suas versões antigas. `.gitleaks.toml` acrescenta regras para credenciais embutidas às regras padrão do Gitleaks. O workflow `.github/workflows/secrets.yml` roda em push, pull request e execução manual, busca o histórico completo e examina todos os refs disponíveis com `--all --full-history`, ocultando os valores encontrados no relatório.
+
+**Estado da limpeza histórica:** a limpeza foi preparada apenas em uma cópia isolada. O histórico remoto ainda não foi reescrito, e as credenciais expostas que permanecem ativas ainda não foram rotacionadas. Remover um segredo do código ou do histórico não o revoga; a rotação precisa ser concluída de forma coordenada. Enquanto as versões antigas permanecerem acessíveis, a varredura do histórico pode continuar apontando essas exposições.
 
 ### 8. 🎨 Design UIX & Correção Global de Inputs
 - Interface moderna estilo Linear SaaS em Dark Mode.
@@ -284,7 +321,7 @@ Nenhuma camada sozinha protege um número. O que protege é o conjunto: **quem p
 - **A mensagem sai em partes separadas**, como uma pessoa escreve: cada bloco separado por linha em branco vira uma mensagem própria, com pausa de **1,8 a 4,2 s** entre elas. Bloco único é quebrado em saudação / assunto / despedida quando tem 3 frases ou mais.
 - **Banco de variações da IA.** A IA não é chamada por contato: cada campanha mantém até **12 versões de cada parte** (**1.728 combinações**), e cada contato recebe uma combinação ainda não usada. O banco é gravado em `ESF_AiVariant`, então **sobrevive ao reinício do app**; editar o texto da campanha começa um banco novo. Enquanto o banco está vazio o motor **espera a IA** (até 3 min, dentro da pausa entre contatos) em vez de mandar o texto original repetido; se nenhuma IA responder, sai o original e ele é trocado pela variação assim que ela ficar pronta.
 - **O nome do devedor nunca vai para a IA**: ela reescreve com o marcador `{nome}`, substituído no aparelho.
-- **Cadeia de IA gratuita**: Groq `gpt-oss-120b` → Groq `gpt-oss-20b` → IA própria da VPS (`qwen3:4b-instruct`) → Gemini Web → Cerebras → OpenRouter → `openrouter/free`. Sem nenhuma disponível, sai o texto original.
+- **IA principal e reservas automáticas**: a cadeia configurada tenta outra IA quando a anterior falha, excede o prazo ou devolve texto inválido. Provedores, modelos, credenciais e ordem estão na seção 7. Sem variação válida disponível, sai o texto original, sujeito às mesmas travas de envio.
 - **Regras legais fixas no prompt**, acima de qualquer instrução da empresa (CDC arts. 42, 42-A, 71 e 54-C IV; LGPD arts. 6º e 7º, X): sem ameaça, coação, humilhação ou deboche; sem inventar consequências (negativação, protesto, processo, visita); sem urgência falsa; sem mencionar família, trabalho ou vizinhos; sem apagar a identificação do credor nem o canal de descadastro; sem acrescentar dado pessoal. A reescrita que viola é descartada, não enviada.
 
 #### 10.4 Como é digitado
