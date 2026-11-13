@@ -999,7 +999,8 @@ pub fn build_ai_fallback_chain(
             }
         }
     }
-    for alt in ["groq", "cerebras", "openrouter"] {
+    // 12/11: Cloudflare Workers AI e Requesty (compatíveis com OpenAI) entram como reserva quando têm chave.
+    for alt in ["groq", "cerebras", "openrouter", "cloudflare", "requesty"] {
         if alt == config.provider.to_lowercase() {
             continue;
         }
