@@ -78,6 +78,34 @@ export const AI_PROVIDERS: AiProviderInfo[] = [
     ],
   },
   {
+    id: "cloudflare",
+    name: "Cloudflare Workers AI (grátis, 10 mil neurônios/dia)",
+    category: "cloud_free",
+    defaultEndpoint: "https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/v1/chat/completions",
+    defaultModel: "@cf/openai/gpt-oss-120b",
+    keyPlaceholder: "Token de API da Cloudflare (modelo “Workers AI”)",
+    keyUrl: "https://dash.cloudflare.com/profile/api-tokens",
+    keyHint: "Crie o token em dash.cloudflare.com/profile/api-tokens (modelo “Workers AI”, sem filtro de IP) e troque ACCOUNT_ID no endereço pelo Account ID do painel. Não treina com os dados.",
+    suggestedModels: [
+      { id: "@cf/openai/gpt-oss-120b", name: "GPT-OSS 120B", tag: "Recomendado · ~9 s" },
+      { id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", name: "Llama 3.3 70B", tag: "Alternativo · ~6 s" },
+    ],
+  },
+  {
+    id: "requesty",
+    name: "Requesty (modelos grátis, 50/dia)",
+    category: "cloud_free",
+    defaultEndpoint: "https://router.requesty.ai/v1/chat/completions",
+    defaultModel: "mistral/leanstral-1-5",
+    keyPlaceholder: "rqsty-sk-...",
+    keyUrl: "https://app.requesty.ai/api-keys",
+    keyHint: "Crie a chave em app.requesty.ai. Só os modelos indicados não treinam com os dados; os nvidia/* grátis treinam.",
+    suggestedModels: [
+      { id: "mistral/leanstral-1-5", name: "Mistral Leanstral 1.5", tag: "Grátis · ~10 s" },
+      { id: "google/gemma-4-31b-it", name: "Gemma 4 31B", tag: "Grátis · ~17 s" },
+    ],
+  },
+  {
     id: "ollama",
     name: "Ollama (neste computador, offline)",
     category: "local_free",
@@ -171,6 +199,8 @@ export const AI_RESERVE_CHAIN: { id: string; provider: string; label: string; de
   { id: "gemini_web", provider: "gemini_web", label: "Gemini Web", detail: "só se a conta Google estiver conectada" },
   { id: "cerebras", provider: "cerebras", label: "Cerebras", detail: "com a chave da Cerebras" },
   { id: "openrouter", provider: "openrouter", label: "OpenRouter", detail: "com a chave; depois o roteador grátis" },
+  { id: "cloudflare", provider: "cloudflare", label: "Cloudflare Workers AI", detail: "com o token e o Account ID no endereço" },
+  { id: "requesty", provider: "requesty", label: "Requesty", detail: "com a chave; modelos grátis que não treinam com os dados" },
 ];
 
 // Persona padrão da empresa. As regras legais (CDC/LGPD) ficam fixas no backend (ai_engine.rs).

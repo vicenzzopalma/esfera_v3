@@ -637,15 +637,23 @@ pub fn cleanup_campaign_contacts(db: Arc<Database>, company_id: i32, device_ids:
             if db.device_has_open_campaign(company_id, &device.serial, device.esfera_device_id.as_deref()).unwrap_or(true) { continue; }
             if let Err(e) = crate::contact_backup::snapshot_device_contacts(&db, &serial) { eprintln!("[CONTATOS] Limpeza adiada em {}: a cópia dos contatos falhou: {}", serial, e); continue; }
             let _ = AdbManager::cleanup_all_temporary_contacts(&serial);
-            if let Ok(mut s) = TEMP_CONTACTS.lock() {
-                s.retain(|k| !k.starts_with(&format!("{}|", serial)));
-            }
-            if let Ok(mut m) = TEMP_CONTACT_SAVED_AT.lock() {
-                m.retain(|k, _| !k.starts_with(&format!("{}|", serial)));
-            }
+            forget_device_temp_contacts(&serial);
             println!("[CONTATOS TEMP] Contatos temporários apagados de {}.", serial);
         }
     });
+}
+
+pub fn forget_device_temp_contacts(serial: &str) {
+    let prefix = format!("{}|", serial);
+    if let Ok(mut s) = TEMP_CONTACTS.lock() {
+        s.retain(|k| !k.starts_with(&prefix));
+    }
+    if let Ok(mut m) = TEMP_CONTACT_SAVED_AT.lock() {
+        m.retain(|k, _| !k.starts_with(&prefix));
+    }
+    if let Ok(mut loaded) = TEMP_CONTACTS_LOADED_DEVICES.lock() {
+        loaded.remove(serial);
+    }
 }
 
 fn campaign_uses_keyboard(campaign: &crate::db::Campaign, device: &crate::db::Device) -> bool {
@@ -999,7 +1007,8 @@ pub fn build_ai_fallback_chain(
             }
         }
     }
-    for alt in ["groq", "cerebras", "openrouter"] {
+    // 12/11: Cloudflare Workers AI e Requesty (compatíveis com OpenAI) entram como reserva quando têm chave.
+    for alt in ["groq", "cerebras", "openrouter", "cloudflare", "requesty"] {
         if alt == config.provider.to_lowercase() {
             continue;
         }

@@ -85,7 +85,8 @@ impl AiEngine {
             "cerebras" => Self::call_cerebras(&client, config, &prompt).await?,
             "lmstudio" | "lm_studio" => Self::call_lmstudio(&client, config, &prompt).await?,
             "ollama" | "ollama_local" => Self::call_ollama(&client, config, &prompt).await?,
-            "openai" | "vps_ia" => Self::call_openai(&client, config, &prompt).await?,
+            // 12/11: Cloudflare Workers AI e Requesty falam o formato da OpenAI (chat/completions + Bearer).
+            "openai" | "vps_ia" | "cloudflare" | "requesty" => Self::call_openai(&client, config, &prompt).await?,
             "anthropic" => Self::call_anthropic(&client, config, &prompt).await?,
             "custom" => Self::call_custom_endpoint(&client, config, &prompt).await?,
             _ => {
@@ -96,6 +97,8 @@ impl AiEngine {
                     Self::call_openrouter(&client, config, &prompt).await?
                 } else if config.endpoint.contains("cerebras.ai") {
                     Self::call_cerebras(&client, config, &prompt).await?
+                } else if config.endpoint.contains("api.cloudflare.com") || config.endpoint.contains("requesty.ai") {
+                    Self::call_openai(&client, config, &prompt).await?
                 } else if !config.endpoint.is_empty() && !config.endpoint.contains("11434") {
                     Self::call_custom_endpoint(&client, config, &prompt).await?
                 } else {
@@ -934,16 +937,32 @@ impl AiEngine {
         }).await.map_err(|e| format!("Falha na fila da VPS: {}", e))?
     }
 
-    async fn call_openai_raw(client: &Client, config: &AiConfig, prompt: &str) -> Result<String, String> {
-        let endpoint = if config.endpoint.is_empty() {
+    /// Endereço final de uma API no formato da OpenAI a partir do que foi salvo na tela (vazio = OpenAI;
+    /// base sem /v1 ganha /v1/chat/completions; base com /v1 ganha /chat/completions; completo fica como está).
+    pub fn resolve_openai_endpoint(provider: &str, endpoint: &str) -> Result<String, String> {
+        let endpoint = endpoint.trim();
+        if provider.eq_ignore_ascii_case("cloudflare") {
+            // 12/11: o endereço da Cloudflare leva o Account ID da conta; o modelo da tela vem com ACCOUNT_ID.
+            if endpoint.is_empty() || endpoint.contains("ACCOUNT_ID") || !endpoint.contains("/accounts/") {
+                return Err("Cloudflare: troque ACCOUNT_ID no endereço pelo Account ID do painel (dash.cloudflare.com).".to_string());
+            }
+        }
+        if provider.eq_ignore_ascii_case("requesty") && endpoint.is_empty() {
+            return Ok("https://router.requesty.ai/v1/chat/completions".to_string());
+        }
+        Ok(if endpoint.is_empty() {
             "https://api.openai.com/v1/chat/completions".to_string()
-        } else if !config.endpoint.contains("/chat/completions") && !config.endpoint.contains("/v1") {
-            format!("{}/v1/chat/completions", config.endpoint.trim_end_matches('/'))
-        } else if !config.endpoint.contains("/chat/completions") {
-            format!("{}/chat/completions", config.endpoint.trim_end_matches('/'))
+        } else if !endpoint.contains("/chat/completions") && !endpoint.contains("/v1") {
+            format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'))
+        } else if !endpoint.contains("/chat/completions") {
+            format!("{}/chat/completions", endpoint.trim_end_matches('/'))
         } else {
-            config.endpoint.clone()
-        };
+            endpoint.to_string()
+        })
+    }
+
+    async fn call_openai_raw(client: &Client, config: &AiConfig, prompt: &str) -> Result<String, String> {
+        let endpoint = Self::resolve_openai_endpoint(&config.provider, &config.endpoint)?;
 
         let model = if config.model.is_empty() { "gpt-4o-mini".to_string() } else { config.model.clone() };
 
@@ -2864,5 +2883,31 @@ mod privacidade_ia_tests {
         let request = server.await.unwrap();
         assert!(!request.to_lowercase().contains("ana exemplo"));
         assert!(result.contains("Ana Exemplo"));
+    }
+
+    // 12/11: Cloudflare Workers AI e Requesty no disparo (compatíveis com OpenAI).
+    #[test]
+    fn test_endpoint_openai_vazio_e_bases() {
+        assert_eq!(AiEngine::resolve_openai_endpoint("openai", "").unwrap(), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(AiEngine::resolve_openai_endpoint("custom", "https://x.ai").unwrap(), "https://x.ai/v1/chat/completions");
+        assert_eq!(AiEngine::resolve_openai_endpoint("custom", "https://x.ai/v1/").unwrap(), "https://x.ai/v1/chat/completions");
+        assert_eq!(AiEngine::resolve_openai_endpoint("vps_ia", "https://187.77.243.224:11435/v1/chat/completions").unwrap(),
+                   "https://187.77.243.224:11435/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_endpoint_cloudflare_exige_account_id() {
+        let modelo = "https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/v1/chat/completions";
+        assert!(AiEngine::resolve_openai_endpoint("cloudflare", modelo).unwrap_err().contains("Account ID"));
+        assert!(AiEngine::resolve_openai_endpoint("cloudflare", "").is_err());
+        let certo = "https://api.cloudflare.com/client/v4/accounts/0123456789abcdef0123456789abcdef/ai/v1/chat/completions";
+        assert_eq!(AiEngine::resolve_openai_endpoint("cloudflare", certo).unwrap(), certo);
+    }
+
+    #[test]
+    fn test_endpoint_requesty_padrao() {
+        assert_eq!(AiEngine::resolve_openai_endpoint("requesty", "").unwrap(), "https://router.requesty.ai/v1/chat/completions");
+        assert_eq!(AiEngine::resolve_openai_endpoint("requesty", "https://router.requesty.ai/v1").unwrap(),
+                   "https://router.requesty.ai/v1/chat/completions");
     }
 }

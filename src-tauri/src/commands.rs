@@ -5715,7 +5715,11 @@ pub fn clear_device_temporary_contacts(
     // Copia a agenda antes de limpar; sem cópia, não limpa.
     crate::contact_backup::snapshot_device_contacts(&state.db, &serial)
         .map_err(|e| format!("A limpeza não foi feita: não deu para copiar os contatos do aparelho antes ({}).", e))?;
-    AdbManager::clear_all_temporary_contacts(&serial)
+    let res = AdbManager::clear_all_temporary_contacts(&serial);
+    if res.is_ok() {
+        crate::dispatcher::forget_device_temp_contacts(&serial);
+    }
+    res
 }
 
 // ============================================================

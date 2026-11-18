@@ -4374,12 +4374,22 @@ impl AdbManager {
     /// Assegura permissões essenciais de contatos para o pacote WhatsApp
     #[allow(dead_code)]
     pub fn grant_whatsapp_contact_permissions(serial: &str, package: &str) {
+        Self::grant_whatsapp_contact_permissions_for_user(serial, package, 0);
+    }
+
+    pub fn grant_whatsapp_contact_permissions_for_user(serial: &str, package: &str, user_id: u32) {
         let target_serial = Self::resolve_target_serial(serial).unwrap_or_else(|_| serial.to_string());
         if Self::use_native_adb(&target_serial) {
-            let cmd = format!(
+            let mut cmd = format!(
                 "pm grant {} android.permission.READ_CONTACTS 2>/dev/null && pm grant {} android.permission.WRITE_CONTACTS 2>/dev/null",
                 package, package
             );
+            if user_id > 0 {
+                cmd.push_str(&format!(
+                    " && pm grant --user {} {} android.permission.READ_CONTACTS 2>/dev/null && pm grant --user {} {} android.permission.WRITE_CONTACTS 2>/dev/null",
+                    user_id, package, user_id, package
+                ));
+            }
             let _ = crate::adb_tcp::exec_shell_bytes(&target_serial, &cmd);
         } else {
             let _ = create_cmd("adb")
@@ -4388,6 +4398,56 @@ impl AdbManager {
             let _ = create_cmd("adb")
                 .args(["-s", &target_serial, "shell", "pm", "grant", package, "android.permission.WRITE_CONTACTS"])
                 .output_timeout(Duration::from_secs(8));
+            if user_id > 0 {
+                let u = user_id.to_string();
+                let _ = create_cmd("adb")
+                    .args(["-s", &target_serial, "shell", "pm", "grant", "--user", &u, package, "android.permission.READ_CONTACTS"])
+                    .output_timeout(Duration::from_secs(8));
+                let _ = create_cmd("adb")
+                    .args(["-s", &target_serial, "shell", "pm", "grant", "--user", &u, package, "android.permission.WRITE_CONTACTS"])
+                    .output_timeout(Duration::from_secs(8));
+            }
+        }
+    }
+
+    fn content_cmd_for_user(cmd: &str, user_id: u32) -> String {
+        if user_id == 0 {
+            return cmd.to_string();
+        }
+        let mut out = cmd.to_string();
+        for sub in ["query", "insert", "delete", "update"] {
+            let from = format!("content {} --uri ", sub);
+            let to = format!("content {} --user {} --uri ", sub, user_id);
+            out = out.replace(&from, &to);
+        }
+        out
+    }
+
+    /// Conta local do Esfera visível na agenda e SEM sincronizar: os contatos temporários nunca
+    /// vão para a conta Google (compartilhada por todos os aparelhos) nem dependem dela.
+    fn temp_contact_settings_command(user_id: u32) -> String {
+        Self::content_cmd_for_user(
+            &format!(
+                "content update --uri content://com.android.contacts/settings --bind ungrouped_visible:i:1 --bind should_sync:i:0 --where \"account_name='{}' AND account_type='{}'\"",
+                Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME,
+                Self::ESFERA_TEMP_CONTACT_ACCOUNT_TYPE
+            ),
+            user_id,
+        )
+    }
+
+    fn ensure_temp_contact_account_visible(serial: &str, user_id: u32) {
+        static READY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let key = format!("{}|{}", serial, user_id);
+        if READY.lock().map(|s| s.contains(&key)).unwrap_or(false) {
+            return;
+        }
+        let update_cmd = Self::temp_contact_settings_command(user_id);
+        if Self::execute_shell(serial, &update_cmd, 5).is_ok() {
+            if let Ok(mut s) = READY.lock() {
+                s.insert(key);
+            }
         }
     }
 
@@ -4417,8 +4477,27 @@ impl AdbManager {
     pub fn insert_temporary_contact(serial: &str, _contact_name: &str, phone: &str) -> Result<Option<i64>, String> {
         static CONTACT_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = CONTACT_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, user_id) = Self::active_whatsapp_target(serial);
         let marker = Self::temp_contact_marker(&Self::normalize_target_phone(phone));
         let result = Self::insert_temporary_contact_with(phone, &marker, &mut |cmd| Self::execute_shell(serial, cmd, 6));
+        if result.is_ok() {
+            Self::ensure_temp_contact_account_visible(serial, 0);
+        }
+        if user_id > 0 {
+            let clone_marker = Self::temp_contact_marker(&Self::normalize_target_phone(phone));
+            let clone_res = Self::insert_temporary_contact_with(phone, &clone_marker, &mut |cmd| {
+                let user_cmd = Self::content_cmd_for_user(cmd, user_id);
+                Self::execute_shell(serial, &user_cmd, 6)
+            });
+            if clone_res.is_ok() {
+                Self::ensure_temp_contact_account_visible(serial, user_id);
+            }
+            if result.is_err() {
+                if let Ok(Some(id)) = clone_res {
+                    return Ok(Some(id));
+                }
+            }
+        }
         if let Err(ref e) = result { eprintln!("[CONTATOS TEMP] {} em {}: {}", phone, serial, e); }
         result
     }
@@ -4496,7 +4575,16 @@ impl AdbManager {
     /// Apaga só os contatos temporários do Esfera: conta `esfera_temp` E nome exato "Esfera <número>".
     /// Contato salvo ou renomeado pelo operador, mesmo que tenha ficado dentro da conta do Esfera, fica.
     pub fn cleanup_all_temporary_contacts(serial: &str) -> Result<(), String> {
-        let apagados = Self::cleanup_temporary_contacts_with(&mut |cmd| Self::execute_shell(serial, cmd, 10))?;
+        let (_, user_id) = Self::active_whatsapp_target(serial);
+        let mut apagados = Self::cleanup_temporary_contacts_with(&mut |cmd| Self::execute_shell(serial, cmd, 10))?;
+        if user_id > 0 {
+            if let Ok(clone_del) = Self::cleanup_temporary_contacts_with(&mut |cmd| {
+                let user_cmd = Self::content_cmd_for_user(cmd, user_id);
+                Self::execute_shell(serial, &user_cmd, 10)
+            }) {
+                apagados += clone_del;
+            }
+        }
         if apagados > 0 { println!("[CONTATOS TEMP] {} contatos \"Esfera <número>\" apagados de {}.", apagados, serial); }
         Ok(())
     }
@@ -4558,9 +4646,13 @@ impl AdbManager {
 
     /// Consulta uma única vez os nomes dos contatos já existentes na conta isolada `esfera_temp` do aparelho.
     pub fn list_temporary_contact_names(serial: &str) -> Result<Vec<String>, String> {
-        let query_data = format!(
-            "content query --uri content://com.android.contacts/data --projection data1 --where \"account_name='{}' AND mimetype='vnd.android.cursor.item/name'\"",
-            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME
+        let (_, user_id) = Self::active_whatsapp_target(serial);
+        let query_data = Self::content_cmd_for_user(
+            &format!(
+                "content query --uri content://com.android.contacts/data --projection data1 --where \"account_name='{}' AND mimetype='vnd.android.cursor.item/name'\"",
+                Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME
+            ),
+            user_id,
         );
         if let Ok(out) = Self::execute_shell(serial, &query_data, 8) {
             let names = Self::parse_temporary_contact_names_from_query(&out);
@@ -4568,9 +4660,12 @@ impl AdbManager {
                 return Ok(names);
             }
         }
-        let query_raw = format!(
-            "content query --uri content://com.android.contacts/raw_contacts --projection display_name --where \"account_name='{}' AND (deleted IS NULL OR deleted=0)\"",
-            Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME
+        let query_raw = Self::content_cmd_for_user(
+            &format!(
+                "content query --uri content://com.android.contacts/raw_contacts --projection display_name --where \"account_name='{}' AND (deleted IS NULL OR deleted=0)\"",
+                Self::ESFERA_TEMP_CONTACT_ACCOUNT_NAME
+            ),
+            user_id,
         );
         let out = Self::execute_shell(serial, &query_raw, 8)?;
         Ok(Self::parse_temporary_contact_names_from_query(&out))
@@ -4722,7 +4817,10 @@ impl AdbManager {
             return Err("Mensagem vazia".to_string());
         }
         let tail = digits[digits.len() - 8..].to_string();
-        let pkg = package.unwrap_or_else(|| Self::active_whatsapp(serial));
+        let (pkg, user_id) = match package {
+            Some(p) => (p, Self::active_whatsapp_user_for_pkg(serial, p)),
+            None => Self::active_whatsapp_target(serial),
+        };
 
         let (screen_w, screen_h) = {
             let (w, h) = Self::get_device_screen_size(serial);
@@ -4733,7 +4831,7 @@ impl AdbManager {
         //    lista (o 1º "voltar" às vezes só fecha o teclado); nunca sai do WhatsApp.
         for _ in 0..4 {
             let focus_raw = Self::wa_focus(serial);
-            let in_app = Self::focus_in(&focus_raw, pkg);
+            let in_app = Self::focus_in_user(&focus_raw, pkg, user_id);
             if in_app && Self::shows_restricted_account(&Self::ui_dump(serial)) {
                 return Err("CONTA_RESTRITA: WhatsApp indica conta restrita ou banida".to_string());
             }
@@ -4741,7 +4839,7 @@ impl AdbManager {
                 break;
             }
             if !in_app {
-                let bring_fg = format!("monkey -p {} -c android.intent.category.LAUNCHER 1", pkg);
+                let bring_fg = Self::wa_bring_fg_command(pkg, user_id);
                 let _ = Self::execute_shell(serial, &bring_fg, 3);
                 let d = Self::calculate_gaussian_delay(500, 800);
                 std::thread::sleep(Duration::from_millis(d as u64));
@@ -4752,25 +4850,23 @@ impl AdbManager {
             }
         }
 
-        // 2. Abre a conversa pela busca: acha o contato salvo pela campanha (conta esfera_temp,
-        //    nome "Esfera <número>") e só toca na linha que mostra o próprio número.
-        //    Em internet lenta, o link api.whatsapp.com/send depende de consulta online ao servidor
-        //    do WhatsApp; por isso, se a 1ª busca não achar, garante o contato temporário local na
-        //    agenda e tenta novamente pela busca local antes de recorrer ao link.
+        // 2. Abre a conversa SÓ pela busca do WhatsApp, nunca por link: acha o contato salvo pela
+        //    campanha (conta esfera_temp, nome "Esfera <número>") ou o número fora da agenda
+        //    ("Não estão na sua lista de contatos" → Conversar) e só toca na linha do próprio número.
+        //    Se a 1ª busca não achar, garante o contato temporário na agenda e busca de novo.
         let mut opened_via_search = Self::wa_open_chat_via_search(serial, pkg, &digits, &tail, screen_w, screen_h)?;
         if !opened_via_search {
-            // Falha ao preparar o contato nunca derruba o envio: segue para o link, como antes.
             match Self::insert_temporary_contact(serial, &format!("Esfera {}", digits), &digits) {
                 Ok(_) => {
                     std::thread::sleep(Duration::from_millis(700));
                     opened_via_search = Self::wa_open_chat_via_search(serial, pkg, &digits, &tail, screen_w, screen_h)?;
                 }
-                Err(e) => eprintln!("[CONTATOS TEMP] Contato de {} não ficou pronto em {} ({}); abrindo pelo link.", digits, serial, e),
+                Err(e) => eprintln!("[CONTATOS TEMP] Contato de {} não ficou pronto em {} ({}).", digits, serial, e),
             }
         }
         if !opened_via_search {
-            // Abre a conversa vazia: o texto é sempre digitado, nunca pré-preenchido pelo link.
-            Self::wa_open_link(serial, pkg, &digits)?;
+            // Falha comum: o contato volta para nova tentativa. Não marca "sem WhatsApp" (não há prova).
+            return Err(format!("A conversa com {} não abriu: o número não apareceu na busca do WhatsApp", phone));
         }
 
         // 3. Envia cada parte como uma mensagem. Antes de cada parte confere de novo se pode seguir
@@ -4805,23 +4901,15 @@ impl AdbManager {
         Ok(())
     }
 
-    fn wa_open_link_command(pkg: &str, digits: &str) -> String {
-        let url = format!("whatsapp://send?phone={}", digits);
-        format!(
-            "am start -a android.intent.action.VIEW -p {} -d '{}'",
-            pkg,
-            Self::shell_quote(&url)
-        )
-    }
-
-    /// Abre somente o número no pacote autorizado; o texto sempre é digitado.
-    fn wa_open_link(serial: &str, pkg: &str, digits: &str) -> Result<(), String> {
-        if !Self::WHATSAPP_PACKAGES.contains(&pkg) { return Err("Use somente o WhatsApp (normal ou Business) para o envio".into()); }
-        let cmd = Self::wa_open_link_command(pkg, digits);
-        Self::execute_shell(serial, &cmd, 8).map_err(|e| format!("Falha ao abrir conversa por link: {}", e))?;
-        let d = Self::calculate_gaussian_delay(2200, 3200);
-        std::thread::sleep(Duration::from_millis(d as u64));
-        Ok(())
+    fn wa_bring_fg_command(pkg: &str, user_id: u32) -> String {
+        if user_id > 0 {
+            format!(
+                "am start --user {} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n {}/com.whatsapp.Main",
+                user_id, pkg
+            )
+        } else {
+            format!("monkey -p {} -c android.intent.category.LAUNCHER 1", pkg)
+        }
     }
 
     /// Lê o campo de mensagem da conversa aberta. Em internet lenta, se o WhatsApp ainda estiver
@@ -4975,7 +5063,7 @@ impl AdbManager {
                     let _ = Self::send_keyevent(serial, 4); // fecha o aviso sem sair do WhatsApp
                     return Err(format!("SEM_WHATSAPP: o número {} não está no WhatsApp", phone));
                 }
-                // Se o WhatsApp bloqueou o link por detecção de rede lenta ("Não foi possível conectar"),
+                // Se o WhatsApp mostrou alerta de rede lenta ao abrir a conversa ("Não foi possível conectar"),
                 // fecha o alerta e abre a conversa via contato local na agenda (que não exige validação online).
                 if Self::shows_network_error(&dump) && digits.len() >= 8 {
                     let _ = Self::send_keyevent(serial, 4);
@@ -5102,12 +5190,24 @@ impl AdbManager {
     /// mostre o próprio número (nunca abre conversa de outra pessoa). Retorna false se não achou.
     /// Linha do resultado da busca que é o próprio número: o número puro (sem contato salvo) ou o
     /// contato temporário "Esfera <número>". Confere DDD + 8 dígitos (sem DDI e sem o 9º), não só o
-    /// final: "(11) 8805-2539" e "(75) 8805-2539" são pessoas diferentes. Vale para a seção
-    /// "Conversas" e para "Pessoas" (contato sem conversa ainda, caso de todo primeiro disparo).
+    /// final: "(11) 8805-2539" e "(75) 8805-2539" são pessoas diferentes. Vale para as seções
+    /// "Conversas", "Pessoas" (contato sem conversa ainda, caso de todo primeiro disparo) e
+    /// "Não estão na sua lista de contatos" (número fora da agenda, com o botão Conversar).
+    #[cfg(test)]
     fn search_hit<'a>(results: &'a [UiNode], digits: &str, tail: &str) -> Option<&'a UiNode> {
+        Self::search_hit_index(results, digits, tail).map(|i| &results[i])
+    }
+
+    /// Nome da linha de um resultado: contato ou conversa (`*contact_name`) ou número fora da
+    /// agenda (`name`).
+    fn search_row_name(n: &UiNode) -> bool {
+        n.rid.contains("contact_name") || Self::wa_rid(n, "name")
+    }
+
+    fn search_hit_index(results: &[UiNode], digits: &str, tail: &str) -> Option<usize> {
         let want = crate::db::Database::opt_out_key(digits);
-        results.iter().find(|n| {
-            if !n.rid.contains("contact_name") {
+        results.iter().position(|n| {
+            if !Self::search_row_name(n) {
                 return false;
             }
             // Um nome qualquer que só contenha os dígitos não serve: só o número puro ou
@@ -5116,6 +5216,28 @@ impl AdbManager {
                 row.len() >= 10 && row.ends_with(tail) && crate::db::Database::opt_out_key(&row) == want
             })
         })
+    }
+
+    /// Onde tocar para abrir a conversa do número achado: o botão "Conversar" da MESMA linha
+    /// (número fora da agenda) ou, sem botão, a própria linha (contato salvo ou conversa).
+    /// Nunca usa o botão de outro resultado: sobe só até o bloco que contém este nome sozinho.
+    fn search_open_point(results: &[UiNode], digits: &str, tail: &str) -> Option<(i32, i32)> {
+        let hit = Self::search_hit_index(results, digits, tail)?;
+        let inside = |mut i: usize, ancestor: usize| loop {
+            match results[i].parent { Some(p) if p == ancestor => return true, Some(p) => i = p, None => return false }
+        };
+        let mut cursor = results[hit].parent;
+        while let Some(a) = cursor {
+            if Self::is_list(&results[a]) { break; }
+            let names = results.iter().enumerate().filter(|(i, n)| Self::search_row_name(n) && inside(*i, a)).count();
+            if names > 1 { break; }
+            if let Some((_, b)) = results.iter().enumerate()
+                .find(|(i, n)| Self::wa_rid(n, "action_btn") && n.enabled && n.cx > 0 && n.cy > 0 && inside(*i, a)) {
+                return Some((b.cx, b.cy));
+            }
+            cursor = results[a].parent;
+        }
+        Some((results[hit].cx, results[hit].cy))
     }
 
     /// Fecha teclado e busca, voltando à lista de conversas.
@@ -5148,8 +5270,7 @@ impl AdbManager {
             nodes = Self::ui_nodes(&Self::ui_dump_uiautomator(serial));
         }
         // A busca pode já estar aberta: ao voltar da conversa anterior, o WhatsApp mostra os
-        // resultados da última busca (com o número antigo no campo). Reaproveita o campo em vez
-        // de desistir e abrir pelo link.
+        // resultados da última busca (com o número antigo no campo). Reaproveita o campo.
         let field_empty = match nodes.iter().find(|n| n.rid == search_id) {
             Some(field) => {
                 // Toca no campo para garantir o foco (o teclado pode ter sido fechado).
@@ -5177,7 +5298,7 @@ impl AdbManager {
         };
         // O agente esvazia o campo antes (número anterior ou a dica "Pesquisar") e digita tecla a tecla.
         if let Err(e) = Self::type_text_human_hpc_opts(serial, digits, true, field_empty) {
-            eprintln!("[BUSCA] Não foi possível digitar o número na busca ({}); abrindo pelo link.", e);
+            eprintln!("[BUSCA] Não foi possível digitar o número na busca ({}).", e);
             Self::wa_close_search(serial, pkg);
             return Ok(false);
         }
@@ -5190,8 +5311,8 @@ impl AdbManager {
         let hit = loop {
             let results = Self::ui_nodes(&Self::ui_dump_until(serial, Self::read_deadline(deadline, cap)));
             reads += 1;
-            if let Some(n) = Self::search_hit(&results, digits, tail) {
-                break Some((n.cx, n.cy));
+            if let Some(point) = Self::search_open_point(&results, digits, tail) {
+                break Some(point);
             }
             let now = Instant::now();
             if now >= cap || (now >= deadline && reads >= 2) {
@@ -5207,7 +5328,7 @@ impl AdbManager {
                 Ok(true)
             }
             None => {
-                println!("[BUSCA] {} não apareceu na busca do WhatsApp em 8 s; abrindo pelo link.", digits);
+                println!("[BUSCA] {} não apareceu na busca do WhatsApp em 8 s.", digits);
                 Self::wa_close_search(serial, pkg);
                 Ok(false)
             }
@@ -5220,31 +5341,99 @@ impl AdbManager {
 
     /// O app está em primeiro plano. Compara "pacote/" porque "com.whatsapp" é prefixo de
     /// "com.whatsapp.w4b" (as atividades do Business também se chamam com.whatsapp.*).
+    #[allow(dead_code)]
     fn focus_in(focus: &str, pkg: &str) -> bool {
         focus.contains(&format!("{}/", pkg))
     }
 
+    /// Confere se a janela em foco pertence ao pacote E ao usuário Android (`u0` vs clone `u10`/`u999`).
+    fn focus_in_user(focus: &str, pkg: &str, user_id: u32) -> bool {
+        let needle = format!("{}/", pkg);
+        focus.lines().any(|line| {
+            let Some(pos) = line.find(&needle) else { return false };
+            let line_user = line[..pos]
+                .split_whitespace()
+                .last()
+                .and_then(|tok| tok.strip_prefix('u'))
+                .and_then(|d| d.parse::<u32>().ok())
+                .unwrap_or(0);
+            line_user == user_id
+        })
+    }
+
     /// Qual WhatsApp (normal ou Business) está em primeiro plano, se algum.
+    #[allow(dead_code)]
     fn whatsapp_in_focus(focus: &str) -> Option<&'static str> {
-        [Self::BUSINESS_WHATSAPP_PACKAGE, Self::DEFAULT_WHATSAPP_PACKAGE].into_iter().find(|p| Self::focus_in(focus, p))
+        Self::whatsapp_target_in_focus(focus).map(|(pkg, _)| pkg)
+    }
+
+    /// Qual WhatsApp (normal ou Business) e usuário Android (`u0` ou clone `u10`/`u999`) estão em foco.
+    fn whatsapp_target_in_focus(focus: &str) -> Option<(&'static str, u32)> {
+        for line in focus.lines() {
+            for pkg in [Self::BUSINESS_WHATSAPP_PACKAGE, Self::DEFAULT_WHATSAPP_PACKAGE] {
+                let needle = format!("{}/", pkg);
+                if let Some(pos) = line.find(&needle) {
+                    let user_id = line[..pos]
+                        .split_whitespace()
+                        .last()
+                        .and_then(|tok| tok.strip_prefix('u'))
+                        .and_then(|d| d.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    return Some((pkg, user_id));
+                }
+            }
+        }
+        None
     }
 
     /// WhatsApp do disparo neste aparelho: o que está aberto agora; sem nenhum na tela, o último
-    /// visto aberto nele; sem histórico, o normal. Na primeira vez que o Business aparece, garante
-    /// que ele leia a agenda (os contatos temporários "Esfera <número>" são achados pela busca).
+    /// visto aberto nele; sem histórico, o normal (`u0`).
+    #[allow(dead_code)]
     pub fn active_whatsapp(serial: &str) -> &'static str {
-        static LAST: std::sync::LazyLock<std::sync::Mutex<HashMap<String, &'static str>>> =
+        Self::active_whatsapp_target(serial).0
+    }
+
+    pub fn active_whatsapp_target(serial: &str) -> (&'static str, u32) {
+        static LAST: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (&'static str, u32)>>> =
             std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-        let seen = Self::whatsapp_in_focus(&Self::wa_focus(serial));
-        let Some(pkg) = seen else {
-            return LAST.lock().unwrap_or_else(|e| e.into_inner()).get(serial).copied().unwrap_or(Self::DEFAULT_WHATSAPP_PACKAGE);
+        let focus = Self::wa_focus(serial);
+        let seen = Self::whatsapp_target_in_focus(&focus);
+        let Some((pkg, user_id)) = seen else {
+            return LAST
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(serial)
+                .copied()
+                .unwrap_or((Self::DEFAULT_WHATSAPP_PACKAGE, 0));
         };
-        let changed = LAST.lock().unwrap_or_else(|e| e.into_inner()).insert(serial.to_string(), pkg) != Some(pkg);
-        if changed {
-            println!("[ENVIO] {} usa o {} (aberto na tela)", serial, pkg);
-            Self::grant_whatsapp_contact_permissions(serial, pkg);
+        // Se uma instância secundária bloqueada por biometria (AppAuthentication) saltou na frente
+        // da instância já conhecida do aparelho, preserva o alvo anterior.
+        if focus.contains("AppAuthentication") {
+            if let Some(prev) = LAST.lock().unwrap_or_else(|e| e.into_inner()).get(serial).copied() {
+                if prev != (pkg, user_id) {
+                    return prev;
+                }
+            }
         }
-        pkg
+        let changed = LAST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(serial.to_string(), (pkg, user_id))
+            != Some((pkg, user_id));
+        if changed {
+            if user_id > 0 {
+                println!("[ENVIO] {} usa o {} (clone u{} aberto na tela)", serial, pkg, user_id);
+            } else {
+                println!("[ENVIO] {} usa o {} (aberto na tela)", serial, pkg);
+            }
+            Self::grant_whatsapp_contact_permissions_for_user(serial, pkg, user_id);
+        }
+        (pkg, user_id)
+    }
+
+    fn active_whatsapp_user_for_pkg(serial: &str, pkg: &str) -> u32 {
+        let (active_pkg, user_id) = Self::active_whatsapp_target(serial);
+        if active_pkg == pkg { user_id } else { 0 }
     }
 
     /// Lê a árvore de UI da tela atual. Caminho rápido: serviço de acessibilidade do agente
@@ -5410,8 +5599,8 @@ impl AdbManager {
     }
 
     /// Recusa só com PROVA de destinatário errado: grupo ou número diferente no cabeçalho. Contato
-    /// salvo com nome, cabeçalho sem número ou leitura ilegível não provam nada (a busca e o link já
-    /// casaram o número); nesses casos o envio segue, como antes da conferência existir.
+    /// salvo com nome, cabeçalho sem número ou leitura ilegível não provam nada (a busca já casou o
+    /// número); nesses casos o envio segue, como antes da conferência existir.
     fn verify_chat_identity(xml: &str, phone: &str) -> Result<(), String> {
         let nodes = Self::ui_nodes(xml);
         if nodes.iter().any(|n| Self::whatsapp_node(n) &&
@@ -6729,16 +6918,6 @@ mod send_safety_tests {
     }
 
     #[test]
-    fn wa_open_link_command_abre_numero_no_pacote_sem_texto() {
-        for (pkg, expected) in [
-            ("com.whatsapp", "am start -a android.intent.action.VIEW -p com.whatsapp -d 'whatsapp://send?phone=5511999998888'"),
-            ("com.whatsapp.w4b", "am start -a android.intent.action.VIEW -p com.whatsapp.w4b -d 'whatsapp://send?phone=5511999998888'"),
-        ] {
-            assert_eq!(AdbManager::wa_open_link_command(pkg, "5511999998888"), expected);
-        }
-    }
-
-    #[test]
     fn pacote_fora_do_whatsapp_e_recusado_antes_de_acessar_aparelho() {
         let result = AdbManager::send_whatsapp_parts("nao_acessar", "5511999998888", &["Olá".into()], Some("com.outro.app"), &|| true);
         assert!(result.unwrap_err().contains("WhatsApp"));
@@ -6763,6 +6942,28 @@ mod send_safety_tests {
         assert!(!AdbManager::focus_in(business, AdbManager::DEFAULT_WHATSAPP_PACKAGE));
         assert!(AdbManager::focus_in(business, AdbManager::BUSINESS_WHATSAPP_PACKAGE));
         assert!(!AdbManager::focus_in(normal, AdbManager::BUSINESS_WHATSAPP_PACKAGE));
+    }
+
+    #[test]
+    fn foco_respeita_whatsapp_clonado_em_usuario_secundario() {
+        // Saída real do Telefone 11 (Realme RMX3930 com WhatsApp Clone no user 10):
+        let clone_u10 = "  mCurrentFocus=Window{7d55cc7 u10 com.whatsapp/com.whatsapp.home.ui.HomeActivity}, [type=1, isChildWindow=false]\n  mFocusedApp=ActivityRecord{c8e43df u10 com.whatsapp/.home.ui.HomeActivity t5979 d0}";
+        let normal_u0 = "  mCurrentFocus=Window{a44fde0 u0 com.whatsapp/com.whatsapp.authentication.AppAuthenticationActivity}";
+        assert_eq!(
+            AdbManager::whatsapp_target_in_focus(clone_u10),
+            Some((AdbManager::DEFAULT_WHATSAPP_PACKAGE, 10))
+        );
+        assert!(AdbManager::focus_in_user(clone_u10, AdbManager::DEFAULT_WHATSAPP_PACKAGE, 10));
+        assert!(!AdbManager::focus_in_user(clone_u10, AdbManager::DEFAULT_WHATSAPP_PACKAGE, 0));
+        assert!(!AdbManager::focus_in_user(normal_u0, AdbManager::DEFAULT_WHATSAPP_PACKAGE, 10));
+        assert_eq!(
+            AdbManager::wa_bring_fg_command("com.whatsapp", 10),
+            "am start --user 10 -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n com.whatsapp/com.whatsapp.Main"
+        );
+        assert_eq!(
+            AdbManager::content_cmd_for_user("content insert --uri content://com.android.contacts/raw_contacts --bind account_name:s:esfera_temp", 10),
+            "content insert --user 10 --uri content://com.android.contacts/raw_contacts --bind account_name:s:esfera_temp"
+        );
     }
 }
 
@@ -6889,6 +7090,23 @@ mod temp_contact_tests {
         assert!(row.2.contains(&("vnd.android.cursor.item/name".into(), "Esfera 5575988052539".into())));
         assert!(row.2.contains(&("vnd.android.cursor.item/phone_v2".into(), "+5575988052539".into())));
         assert!(agenda.log.iter().any(|c| c.contains("--bind sourceid:s:esf-5575988052539-a1")));
+        // Nunca na conta Google (compartilhada por todos os aparelhos): só na conta local do Esfera.
+        let creates: Vec<_> = agenda.log.iter().filter(|c| c.starts_with("content insert --uri content://com.android.contacts/raw_contacts")).collect();
+        assert_eq!(creates.len(), 1);
+        assert!(creates[0].contains("--bind account_name:s:esfera_temp --bind account_type:s:com.esfera"));
+        assert!(!agenda.log.iter().any(|c| c.contains("com.google") || c.contains("gmail")));
+    }
+
+    #[test]
+    fn conta_do_esfera_fica_visivel_e_sem_sincronizar() {
+        for user in [0, 10] {
+            let cmd = AdbManager::temp_contact_settings_command(user);
+            assert!(cmd.contains("ungrouped_visible:i:1"), "{}", cmd);
+            assert!(cmd.contains("should_sync:i:0"), "{}", cmd);
+            assert!(cmd.contains("account_name='esfera_temp' AND account_type='com.esfera'"), "{}", cmd);
+            assert!(!cmd.contains("com.google"), "{}", cmd);
+        }
+        assert!(AdbManager::temp_contact_settings_command(10).starts_with("content update --user 10 --uri"));
     }
 
     #[test]
@@ -7377,6 +7595,27 @@ mod search_hit_tests {
         assert_eq!((hit.cx, hit.cy), (291, 305));
         // Mesmo final com outro DDD não é a mesma pessoa.
         assert!(AdbManager::search_hit(&nodes, "5511991359303", "91359303").is_none());
+        // Contato salvo não tem botão na linha: toca no próprio nome.
+        assert_eq!(AdbManager::search_open_point(&nodes, "5534991359303", "91359303"), Some((291, 305)));
+    }
+
+    #[test]
+    fn numero_fora_da_agenda_toca_em_conversar_da_mesma_linha() {
+        // Tela capturada no Telefone 11 (Realme RMX3930, WhatsApp clonado u10) em 10/11: o número
+        // não está na agenda e aparece em "Não estão na sua lista de contatos" com o botão Conversar.
+        let xml = r#"<node index="3" text="" resource-id="com.whatsapp:id/result_list" class="androidx.recyclerview.widget.RecyclerView" package="com.whatsapp" content-desc="" clickable="false" enabled="true" bounds="[0,177][720,994]"><node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.whatsapp" content-desc="" clickable="false" enabled="true" bounds="[0,177][720,252]"><node index="0" text="Não estão na sua lista de contatos" resource-id="com.whatsapp:id/title" class="android.widget.TextView" package="com.whatsapp" content-desc="" clickable="false" enabled="true" bounds="[0,193][720,236]" /></node><node index="1" text="" resource-id="com.whatsapp:id/row_container" class="android.widget.RelativeLayout" package="com.whatsapp" content-desc="" clickable="true" enabled="true" bounds="[0,252][720,404]"><node index="0" text="" resource-id="com.whatsapp:id/photo" class="android.widget.ImageView" package="com.whatsapp" content-desc="Foto de +55 75 8805-2539" clickable="true" enabled="true" bounds="[28,276][132,380]" /><node index="1" text="" resource-id="" class="android.widget.LinearLayout" package="com.whatsapp" content-desc="" clickable="false" enabled="true" bounds="[160,305][488,351]"><node index="0" text="+55 75 8805-2539" resource-id="com.whatsapp:id/name" class="android.widget.TextView" package="com.whatsapp" content-desc="+55 75 8805-2539" clickable="false" enabled="true" bounds="[160,305][435,351]" /></node><node index="2" text="Conversar" resource-id="com.whatsapp:id/action_btn" class="android.widget.Button" package="com.whatsapp" content-desc="" clickable="true" enabled="true" bounds="[520,280][720,376]" /></node><node index="2" text="" resource-id="" class="android.widget.FrameLayout" package="com.whatsapp" content-desc="" clickable="false" enabled="true" bounds="[0,404][720,479]"><node index="0" text="Mensagens" resource-id="com.whatsapp:id/title" class="android.widget.TextView" package="com.whatsapp" content-desc="" clickable="false" enabled="true" bounds="[0,420][720,463]" /></node></node>"#;
+        let nodes = AdbManager::ui_nodes(xml);
+        assert_eq!(AdbManager::search_open_point(&nodes, "5575988052539", "88052539"), Some((620, 328)));
+        // Mesmo final com outro DDD não é a mesma pessoa: não toca em nada.
+        assert_eq!(AdbManager::search_open_point(&nodes, "5511988052539", "88052539"), None);
+    }
+
+    #[test]
+    fn botao_conversar_de_outra_linha_nunca_e_usado() {
+        // Dois resultados no mesmo bloco: o Conversar pertence ao outro número.
+        let xml = r#"<node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.whatsapp" bounds="[0,177][720,700]"><node index="0" text="+55 11 8805-2539" resource-id="com.whatsapp:id/name" class="android.widget.TextView" package="com.whatsapp" bounds="[160,305][435,351]" /><node index="1" text="Conversar" resource-id="com.whatsapp:id/action_btn" class="android.widget.Button" package="com.whatsapp" bounds="[520,280][720,376]" /><node index="2" text="Esfera 5575988052539" resource-id="com.whatsapp:id/conversations_row_contact_name" class="android.widget.TextView" package="com.whatsapp" bounds="[140,486][442,524]" /></node>"#;
+        let nodes = AdbManager::ui_nodes(xml);
+        assert_eq!(AdbManager::search_open_point(&nodes, "5575988052539", "88052539"), Some((291, 505)));
     }
 
     #[test]
